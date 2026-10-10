@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.28)
 # Exploratory CPU benchmark: OpenCV on the CPU vs FKL's CPU backend (BVF), Figure 1 pipeline.
 # Meant to be built with the latest stable clang and the best SIMD the CPU has, for example:
-#   cmake -S cpu -B build-cpu -DCMAKE_CXX_COMPILER=../tools/llvm-23.1.3/bin/clang++ -DOpenCV_DIR=../builds/opencv
+#   cmake -S cpu -B build-cpu -DCMAKE_CXX_COMPILER=<path to clang++> -DOpenCV_DIR=<OpenCV build or install>
 project(bvf_cpu_bench LANGUAGES CXX)
 
 if(NOT CMAKE_BUILD_TYPE)

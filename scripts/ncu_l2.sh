@@ -2,7 +2,11 @@
 # Memory traffic between the SMs and the L2 cache of every Figure 1 pipeline with Nsight Compute: every byte the
 # kernels read or write, whether it then stays in L2 or goes to DRAM. Needs root for the GPU performance counters:
 #
-#     sudo /home/oscar/bvf-bench/paper-bench/scripts/ncu_l2.sh
+#     sudo scripts/ncu_l2.sh
+#
+# Paths default to the layout described in README.md (this repository, FKL-vs-NPPDx and results/ side by side in
+# one directory) and can be overridden with the environment variables NCU, PAPER_BENCH, NPPDX_BENCH and OUT, e.g.
+#     sudo NCU=/usr/local/cuda-13.3/bin/ncu scripts/ncu_l2.sh
 #
 # For every pipeline and N in {1, 16, 100}, profiles one execution (the NVTX range "measure" of the --ncu-target mode
 # of the benchmarks) with the caches flushed before every kernel. Reports go to results/ncu_l2 and are given back to
@@ -15,12 +19,13 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-NCU=/usr/local/cuda-13.3/bin/ncu
-ROOT=/home/oscar/bvf-bench
-PAPER_BENCH=$ROOT/paper-bench/build/bvf_bench
-NPPDX_BENCH=$ROOT/FKL-vs-NPPDx/build/benchmark_figure1_bvf
-OUT=$ROOT/results/ncu_l2
-OWNER=${SUDO_USER:-oscar}
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+ROOT=$(dirname "$REPO")
+NCU=${NCU:-/usr/local/cuda/bin/ncu}
+PAPER_BENCH=${PAPER_BENCH:-$REPO/build/bvf_bench}
+NPPDX_BENCH=${NPPDX_BENCH:-$ROOT/FKL-vs-NPPDx/build/benchmark_figure1_bvf}
+OUT=${OUT:-$ROOT/results/ncu_l2}
+OWNER=${SUDO_USER:-$(id -un)}
 METRICS=lts__t_sectors_srcunit_tex_op_read.sum,lts__t_sectors_srcunit_tex_op_write.sum,lts__t_bytes.sum,dram__bytes_read.sum,dram__bytes_write.sum,gpu__time_duration.sum
 
 mkdir -p "$OUT"

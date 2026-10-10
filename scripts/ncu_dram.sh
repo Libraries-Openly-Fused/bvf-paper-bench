@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # DRAM traffic of every Figure 1 pipeline with Nsight Compute. Needs root because the NVIDIA driver restricts the GPU
-# performance counters to admin users on this machine (RmProfilingAdminOnly=1):
+# performance counters to admin users by default (RmProfilingAdminOnly=1):
 #
-#     sudo /home/oscar/bvf-bench/paper-bench/scripts/ncu_dram.sh
+#     sudo scripts/ncu_dram.sh
+#
+# Paths default to the layout described in README.md (this repository, FKL-vs-NPPDx and results/ side by side in
+# one directory) and can be overridden with the environment variables NCU, PAPER_BENCH, NPPDX_BENCH and OUT, e.g.
+#     sudo NCU=/usr/local/cuda-13.3/bin/ncu scripts/ncu_dram.sh
 #
 # For every pipeline and N in {1, 16, 100}, profiles one execution (the NVTX range "measure" of the --ncu-target mode
 # of the benchmarks) twice: with the caches flushed before every kernel (--cache-control all, cold) and without
@@ -15,12 +19,13 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-NCU=/usr/local/cuda-13.3/bin/ncu
-ROOT=/home/oscar/bvf-bench
-PAPER_BENCH=$ROOT/paper-bench/build/bvf_bench
-NPPDX_BENCH=$ROOT/FKL-vs-NPPDx/build/benchmark_figure1_bvf
-OUT=$ROOT/results/ncu
-OWNER=${SUDO_USER:-oscar}
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+ROOT=$(dirname "$REPO")
+NCU=${NCU:-/usr/local/cuda/bin/ncu}
+PAPER_BENCH=${PAPER_BENCH:-$REPO/build/bvf_bench}
+NPPDX_BENCH=${NPPDX_BENCH:-$ROOT/FKL-vs-NPPDx/build/benchmark_figure1_bvf}
+OUT=${OUT:-$ROOT/results/ncu}
+OWNER=${SUDO_USER:-$(id -un)}
 METRICS=dram__bytes_read.sum,dram__bytes_write.sum,gpu__time_duration.sum
 
 mkdir -p "$OUT"

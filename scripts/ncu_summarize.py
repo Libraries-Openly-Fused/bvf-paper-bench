@@ -8,13 +8,16 @@ Run without sudo after the profiling script:
 For every pipeline, N and cache control it writes the number of kernels and the bytes summed over all of them.
 """
 import csv
+import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 
-NCU = "/usr/local/cuda-13.3/bin/ncu"
-RESULTS = pathlib.Path("/home/oscar/bvf-bench/results")
+# Override with the environment variables NCU and BVF_RESULTS; by default results/ is next to this repository
+NCU = os.environ.get("NCU") or shutil.which("ncu") or "/usr/local/cuda/bin/ncu"
+RESULTS = pathlib.Path(os.environ.get("BVF_RESULTS", pathlib.Path(__file__).resolve().parents[2] / "results"))
 REPORT_NAME = re.compile(r"^(?P<repo>nppdxrepo_)?(?P<impl>.+)_N(?P<n>\d+)_cache-(?P<cache>all|none)$")
 SECTOR_BYTES = 32
 
