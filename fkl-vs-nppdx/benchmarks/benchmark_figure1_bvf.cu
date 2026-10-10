@@ -38,6 +38,8 @@
 
 #include <nppdx.hpp>
 
+#include <nvtx3/nvToolsExt.h>
+
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -602,6 +604,48 @@ void gpuOnlyBatch(Workload& w, std::vector<benchmark::TwoExecutionsResult>& resu
     }(std::make_index_sequence<NPPDX_CONFIGS.size()>{});
 }
 
+// Target for Nsight Compute: warms up NPPDx (block 256, the configuration chosen for every batch size on the
+// RTX 4090) or FKL, then runs it once more inside the NVTX range "measure", for ncu --nvtx --nvtx-include "measure/"
+template <size_t N>
+void ncuTarget(Workload& w, const std::string& name) {
+    using Nppdx = NppdxFigure1<NPPDX_SM, N, 256, CROP_W, CROP_H>;
+    Nppdx::init();
+    const auto crops = firstCrops<N>(w);
+    CropOrigins<N> origins{};
+    for (size_t i = 0; i < N; ++i) {
+        origins.origin[i] = int2{static_cast<int>(crops[i].x), static_cast<int>(crops[i].y)};
+    }
+    fk::Tensor<fk::float3> fklOut(OUT_W, OUT_H, N, 1, fk::MemType::Device);
+    float* nppdxOut = nullptr;
+    gpuErrchk(cudaMalloc(&nppdxOut, N * OUT_W * OUT_H * 3 * sizeof(float)));
+    std::function<void()> run;
+    if (name == "nppdx") {
+        run = [&]() { Nppdx::run(w, origins, nppdxOut); };
+    } else if (name == "fkl_bvf") {
+        run = [&]() { runFKL<N>(w, crops, fklOut); };
+    } else {
+        throw std::runtime_error("Unknown implementation " + name + ", use nppdx or fkl_bvf");
+    }
+    for (int i = 0; i < 3; ++i) {
+        run();
+    }
+    gpuErrchk(cudaStreamSynchronize(w.stream));
+    nvtxRangePushA("measure");
+    run();
+    gpuErrchk(cudaStreamSynchronize(w.stream));
+    nvtxRangePop();
+    gpuErrchk(cudaFree(nppdxOut));
+}
+
+template <size_t... Is>
+void ncuTargetDispatch(Workload& w, const std::string& name, size_t batch, std::index_sequence<Is...>) {
+    bool found = false;
+    ((BATCHES[Is] == batch ? (ncuTarget<BATCHES[Is]>(w, name), found = true) : false), ...);
+    if (!found) {
+        throw std::runtime_error("Batch size " + std::to_string(batch) + " is not one of the benchmarked ones");
+    }
+}
+
 template <size_t... Is>
 void gpuOnlyAllBatches(Workload& w, std::vector<benchmark::TwoExecutionsResult>& results, std::index_sequence<Is...>) {
     (gpuOnlyBatch<BATCHES[Is]>(w, results), ...);
@@ -647,6 +691,10 @@ int main(int argc, char** argv) {
 
         Workload w;
         initWorkload(w);
+        if (argc > 4 && std::string(argv[2]) == "--ncu-target") {
+            ncuTargetDispatch(w, argv[3], std::stoul(argv[4]), std::make_index_sequence<BATCHES.size()>{});
+            return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "--analyze") {
             std::cout << "### NPPDx recommended block configuration" << std::endl;
             analyze<0>(w);

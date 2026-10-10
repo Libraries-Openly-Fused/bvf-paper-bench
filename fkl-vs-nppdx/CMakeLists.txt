@@ -46,7 +46,7 @@ function(add_benchmark TARGET_NAME SOURCE)
     target_compile_definitions(${TARGET_NAME} PRIVATE NPPDX_SM=${NPPDX_SM}
                                FKL_VERSION="${FKL_VERSION}" NPPDX_GIT_VERSION="${NPPDX_GIT_VERSION}"
                                CUDA_ARCHITECTURES_STR="${CUDA_ARCH}")
-    target_link_libraries(${TARGET_NAME} PRIVATE nppdx::nppdx CUDA::cudart CUDA::cupti)
+    target_link_libraries(${TARGET_NAME} PRIVATE nppdx::nppdx CUDA::cudart CUDA::cupti CUDA::nvtx3)
     # Like FKL, benchmarks are registered as tests; they write their CSV files to results/ in the build folder
     add_test(NAME ${TARGET_NAME} COMMAND ${TARGET_NAME} ${CMAKE_CURRENT_BINARY_DIR}/results)
 endfunction()
