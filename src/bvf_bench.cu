@@ -7,7 +7,8 @@
 //   npp                NV12->RGB, per crop 8u->32f, one batched resize (nppiResize for N = 1, since
 //                      nppiResizeBatch rejects a batch of one), per crop CopyConstBorder,
 //                      then MulC, SubC, DivC on the whole output tensor
-//   fkl_vf_hf          four FKL kernels with the intermediates in DRAM (VF + HF, no BVF)
+//   fkl_vf_hf          four FKL kernels with the intermediates in DRAM (VF + HF, no BVF), float3 RGB frame
+//   fkl_vf_hf_8bit     the same with an 8 bit (uchar3) RGB frame and crops, like the OpenCV and NPP pipelines
 //   fkl_bvf            one FKL kernel for the whole chain (BVF)
 
 #include <fused_kernel/fused_kernel.h>
@@ -203,6 +204,8 @@ struct Implementation {
     std::function<void()> run;
     std::function<std::vector<float>()> download;
     std::function<void()> fillNaN;
+    // Optional: the kernels of a multi-kernel pipeline, in order, for the per-kernel breakdown
+    std::vector<std::pair<std::string, std::function<void()>>> stages;
 };
 
 std::vector<float> downloadDevice(const void* data, size_t floats) {
@@ -240,48 +243,63 @@ Implementation makeFklBvf(Context& ctx) {
     return impl;
 }
 
-template <size_t N>
-std::array<fk::RawPtr<fk::ND::_2D, fk::float3>, N> planeViews(const fk::Tensor<fk::float3>& tensor, int width,
-                                                               int height) {
+template <size_t N, typename T>
+std::array<fk::RawPtr<fk::ND::_2D, T>, N> planeViews(const fk::Tensor<T>& tensor, int width, int height) {
     const auto raw = tensor.ptr();
-    if (raw.dims.pitch != width * sizeof(fk::float3)) {
+    if (raw.dims.pitch != width * sizeof(T)) {
         throw std::runtime_error("Expected a contiguous Tensor");
     }
-    std::array<fk::RawPtr<fk::ND::_2D, fk::float3>, N> views{};
+    std::array<fk::RawPtr<fk::ND::_2D, T>, N> views{};
     for (size_t i = 0; i < N; ++i) {
         views[i].data = raw.data + i * width * height;
-        views[i].dims = fk::PtrDims<fk::ND::_2D>(width, height, width * sizeof(fk::float3));
+        views[i].dims = fk::PtrDims<fk::ND::_2D>(width, height, width * sizeof(T));
     }
     return views;
 }
 
-template <size_t N>
+// VF + HF without BVF: four kernels with the intermediates in DRAM. The full frame RGB intermediate is float3,
+// or with EIGHT_BIT uchar3 like the 8 bit RGB of the OpenCV and NPP pipelines, quantized as in the 8 bit
+// reference (normalize, add half a level, __saturatef, denormalize); the crops are then also uchar3.
+template <size_t N, bool EIGHT_BIT>
 Implementation makeFklVfHf(Context& ctx) {
-    auto rgb = std::make_shared<fk::Ptr2D<fk::float3>>(FRAME_W, FRAME_H, 0, fk::MemType::Device);
-    auto cropped = std::make_shared<fk::Tensor<fk::float3>>(CROP_W, CROP_H, N, 1, fk::MemType::Device);
+    using RGB = std::conditional_t<EIGHT_BIT, fk::uchar3, fk::float3>;
+    auto rgb = std::make_shared<fk::Ptr2D<RGB>>(FRAME_W, FRAME_H, 0, fk::MemType::Device);
+    auto cropped = std::make_shared<fk::Tensor<RGB>>(CROP_W, CROP_H, N, 1, fk::MemType::Device);
     auto resized = std::make_shared<fk::Tensor<fk::float3>>(RES_W, RES_H, N, 1, fk::MemType::Device);
     auto out = std::make_shared<fk::Tensor<fk::float3>>(OUT_W, OUT_H, N, 1, fk::MemType::Device);
     const auto crops = firstCrops<N>(ctx);
     const auto croppedViews = planeViews<N>(*cropped, CROP_W, CROP_H);
     const auto resizedViews = planeViews<N>(*resized, RES_W, RES_H);
-    Implementation impl{"fkl_vf_hf", false};
-    impl.run = [&ctx, rgb, cropped, resized, out, crops, croppedViews, resizedViews]() {
-        // Kernel 1: full frame NV12 -> RGB
+    Implementation impl{EIGHT_BIT ? "fkl_vf_hf_8bit" : "fkl_vf_hf", EIGHT_BIT};
+    impl.stages.emplace_back("1_nv12_to_rgb_full_frame", [&ctx, rgb]() {
+        if constexpr (EIGHT_BIT) {
+            fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
+                fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
+                YUVToRGB::build(),
+                fk::NormalizePixel<fk::float3, fk::ColorDepth::p8bit>::build(),
+                fk::Add<fk::float3>::build(fk::make_set<fk::float3>(QUANTIZATION_OFFSET)),
+                fk::SaturateDenormalizePixel<fk::float3, fk::uchar3, fk::ColorDepth::p8bit>::build(),
+                fk::PerThreadWrite<fk::ND::_2D, fk::uchar3>::build(rgb->ptr()));
+        } else {
+            fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
+                fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
+                YUVToRGB::build(),
+                fk::PerThreadWrite<fk::ND::_2D, fk::float3>::build(rgb->ptr()));
+        }
+    });
+    impl.stages.emplace_back("2_crop", [&ctx, rgb, cropped, crops]() {
         fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
-            fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
-            YUVToRGB::build(),
-            fk::PerThreadWrite<fk::ND::_2D, fk::float3>::build(rgb->ptr()));
-        // Kernel 2: batched crop
-        fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
-            fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(rgb->ptr()),
+            fk::PerThreadRead<fk::ND::_2D, RGB>::build(rgb->ptr()),
             fk::Crop<>::build(crops),
-            fk::TensorWrite<fk::float3>::build(cropped->ptr()));
-        // Kernel 3: batched resize
+            fk::TensorWrite<RGB>::build(cropped->ptr()));
+    });
+    impl.stages.emplace_back("3_resize", [&ctx, resized, croppedViews]() {
         fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
-            fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(croppedViews),
+            fk::PerThreadRead<fk::ND::_2D, RGB>::build(croppedViews),
             fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(RES_W, RES_H)),
             fk::TensorWrite<fk::float3>::build(resized->ptr()));
-        // Kernel 4: batched AddBorder + Mul + Sub + Div + Write
+    });
+    impl.stages.emplace_back("4_addborder_mul_sub_div_write", [&ctx, out, resizedViews]() {
         fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
             fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(resizedViews),
             fk::AddBorder<>::build(BORDER_TOP, BORDER_BOTTOM, 0, 0, black),
@@ -289,6 +307,11 @@ Implementation makeFklVfHf(Context& ctx) {
             fk::Sub<fk::float3>::build(subValue),
             fk::Div<fk::float3>::build(divValue),
             fk::TensorWrite<fk::float3>::build(out->ptr()));
+    });
+    impl.run = [stages = impl.stages]() {
+        for (const auto& stage : stages) {
+            stage.second();
+        }
     };
     impl.download = [out]() { return downloadDevice(out->ptr().data, N * OUT_W * OUT_H * 3); };
     impl.fillNaN = [out]() { gpuErrchk(cudaMemset(out->ptr().data, 0xFF, N * OUT_W * OUT_H * sizeof(fk::float3))); };
@@ -561,6 +584,48 @@ TimingStats measure(const Context& ctx, const Implementation& impl) {
 
 // Kernel, memset and memcpy counts of one pipeline, from CUPTI activity tracing (no hardware counters,
 // so it works without admin rights). It runs in a separate pass after all the timings.
+// Time of each kernel of a multi-kernel pipeline: CUDA events between its kernels on the same stream
+struct StageTiming {
+    std::string name;
+    int batch{0};
+    std::string stage;
+    TimingStats timing;
+};
+std::vector<StageTiming> breakdown;
+
+void measureStages(const Context& ctx, const Implementation& impl, int batch) {
+    const size_t numStages = impl.stages.size();
+    std::vector<cudaEvent_t> events(numStages + 1);
+    for (auto& e : events) {
+        gpuErrchk(cudaEventCreate(&e));
+    }
+    for (int i = 0; i < WARMUP_ITERS; ++i) {
+        impl.run();
+        gpuErrchk(cudaStreamSynchronize(ctx.stream));
+    }
+    std::vector<std::vector<float>> ms(numStages, std::vector<float>(TIMED_ITERS));
+    for (int i = 0; i < TIMED_ITERS; ++i) {
+        gpuErrchk(cudaEventRecord(events[0], ctx.stream));
+        for (size_t s = 0; s < numStages; ++s) {
+            impl.stages[s].second();
+            gpuErrchk(cudaEventRecord(events[s + 1], ctx.stream));
+        }
+        gpuErrchk(cudaEventSynchronize(events[numStages]));
+        for (size_t s = 0; s < numStages; ++s) {
+            gpuErrchk(cudaEventElapsedTime(&ms[s][i], events[s], events[s + 1]));
+        }
+    }
+    for (auto& e : events) {
+        gpuErrchk(cudaEventDestroy(e));
+    }
+    for (size_t s = 0; s < numStages; ++s) {
+        std::sort(ms[s].begin(), ms[s].end());
+        breakdown.push_back({impl.name, batch, impl.stages[s].first,
+                             {percentile(ms[s], 0.5) * 1000., percentile(ms[s], 0.1) * 1000.,
+                              percentile(ms[s], 0.9) * 1000.}});
+    }
+}
+
 struct LaunchCounts {
     size_t kernels{0}, memsets{0}, memcpys{0};
 };
@@ -635,7 +700,8 @@ std::vector<Implementation> makeImplementations(Context& ctx, std::shared_ptr<Op
     std::vector<Implementation> impls;
     impls.push_back(makeOpenCV<N>(ctx, ocvState));
     impls.push_back(makeNPP<N>(ctx));
-    impls.push_back(makeFklVfHf<N>(ctx));
+    impls.push_back(makeFklVfHf<N, false>(ctx));
+    impls.push_back(makeFklVfHf<N, true>(ctx));
     impls.push_back(makeFklBvf<N>(ctx));
     return impls;
 }
@@ -661,6 +727,9 @@ void runBatch(Context& ctx, std::vector<Result>& results) {
         r.errorVsFloatReference = compare(output, refFloat);
         r.errorVsNppConventionReference = compare(output, refNppConvention);
         r.timing = measure(ctx, impl);
+        if (!impl.stages.empty()) {
+            measureStages(ctx, impl, static_cast<int>(N));
+        }
         std::cout << std::left << std::setw(10) << r.name << " median " << std::right << std::setw(9) << std::fixed
                   << std::setprecision(1) << r.timing.median << " us  p10 " << std::setw(9) << r.timing.p10
                   << "  p90 " << std::setw(9) << r.timing.p90 << "  max err " << std::scientific
@@ -827,6 +896,12 @@ int main(int argc, char** argv) {
                        << (e.max() <= TOLERANCE ? "yes" : "no") << "\n";
             kernels << r.name << "," << r.batch << "," << r.launches.kernels << "," << r.launches.memsets << ","
                     << r.launches.memcpys << "\n";
+        }
+        std::ofstream stages(outDir / "vf_hf_breakdown.csv");
+        stages << "implementation,N,kernel,median_us,p10_us,p90_us\n";
+        for (const auto& b : breakdown) {
+            stages << b.name << "," << b.batch << "," << b.stage << "," << std::fixed << std::setprecision(2)
+                   << b.timing.median << "," << b.timing.p10 << "," << b.timing.p90 << "\n";
         }
         writePlatform(outDir / "platform.txt", ctx, diagnostic.str());
         std::cout << "Results written to " << std::filesystem::absolute(outDir) << std::endl;
