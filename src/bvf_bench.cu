@@ -37,6 +37,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -192,7 +193,40 @@ void initContext(Context& ctx) {
     }
 }
 
+// L2 flush before every kernel, for the GPU only benchmark with a flushed L2: simulates a GPU that runs other kernels
+// in between, so that no intermediate result (nor the input frame) can be assumed to still be in L2. The flush kernel
+// reads a buffer of twice the L2 size, which evicts every other line (writing back the dirty ones during the flush)
+// and leaves L2 clean. Every library call of the pipelines launches exactly one kernel, and beforeKernel() is called
+// right before each of them; it does nothing unless the flushed benchmark is running.
+__global__ void flushL2Kernel(const int4* buffer, size_t count, int* sink) {
+    int acc = 0;
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const int4 v = __ldcg(buffer + i);
+        acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    if (acc == 0x7fffffff) {
+        *sink = acc; // never true for the zeroed buffer, keeps the loads
+    }
+}
+
+struct L2Flusher {
+    int4* buffer{nullptr};
+    size_t count{0};
+    int* sink{nullptr};
+    cudaStream_t stream{};
+    int blocks{0};
+};
+L2Flusher* activeFlusher = nullptr;
+
+inline void beforeKernel() {
+    if (activeFlusher) {
+        flushL2Kernel<<<activeFlusher->blocks, 256, 0, activeFlusher->stream>>>(activeFlusher->buffer,
+                                                                              activeFlusher->count, activeFlusher->sink);
+    }
+}
+
 void nv12ToRgb8(const Context& ctx, Npp8u* dst, int dstStep) {
+    beforeKernel();
     const Npp8u* src[2] = {ctx.y, ctx.uv};
     int srcSteps[2] = {ctx.pitch, ctx.pitch};
     NPP_CHECK(nppiNV12ToRGB_8u_ColorTwist32f_P2C3R_Ctx(src, srcSteps, dst, dstStep, NppiSize{FRAME_W, FRAME_H},
@@ -230,6 +264,7 @@ Implementation makeFklBvf(Context& ctx) {
     const auto crops = firstCrops<N>(ctx);
     Implementation impl{"fkl_bvf", false};
     impl.run = [&ctx, out, crops]() {
+        beforeKernel();
         fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
             fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
             YUVToRGB::build(),
@@ -279,6 +314,7 @@ Implementation makeFklVfHf(Context& ctx) {
     Implementation impl{EIGHT_BIT ? "fkl_vf_hf" : "fkl_vf_hf_float3_frame", EIGHT_BIT};
     impl.stages.emplace_back(EIGHT_BIT ? "1_nv12_to_rgb8_full_frame" : "1_nv12_to_rgb_float3_full_frame", [&ctx, rgb]() {
         if constexpr (EIGHT_BIT) {
+            beforeKernel();
             fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
                 fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
                 YUVToRGB::build(),
@@ -287,6 +323,7 @@ Implementation makeFklVfHf(Context& ctx) {
                 fk::SaturateDenormalizePixel<fk::float3, fk::uchar3, fk::ColorDepth::p8bit>::build(),
                 fk::PerThreadWrite<fk::ND::_2D, fk::uchar3>::build(rgb->ptr()));
         } else {
+            beforeKernel();
             fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
                 fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
                 YUVToRGB::build(),
@@ -295,12 +332,14 @@ Implementation makeFklVfHf(Context& ctx) {
     });
     impl.stages.emplace_back("2_crop_to_float3", [&ctx, rgb, cropped, crops]() {
         if constexpr (EIGHT_BIT) {
+            beforeKernel();
             fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
                 fk::PerThreadRead<fk::ND::_2D, RGB>::build(rgb->ptr()),
                 fk::Crop<>::build(crops),
                 fk::Cast<fk::uchar3, fk::float3>::build(),
                 fk::TensorWrite<fk::float3>::build(cropped->ptr()));
         } else {
+            beforeKernel();
             fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
                 fk::PerThreadRead<fk::ND::_2D, RGB>::build(rgb->ptr()),
                 fk::Crop<>::build(crops),
@@ -308,12 +347,14 @@ Implementation makeFklVfHf(Context& ctx) {
         }
     });
     impl.stages.emplace_back("3_resize", [&ctx, resized, croppedViews]() {
+        beforeKernel();
         fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
             fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(croppedViews),
             fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(RES_W, RES_H)),
             fk::TensorWrite<fk::float3>::build(resized->ptr()));
     });
     impl.stages.emplace_back("4_addborder_mul_sub_div_write", [&ctx, out, resizedViews]() {
+        beforeKernel();
         fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
             fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(resizedViews),
             fk::AddBorder<>::build(BORDER_TOP, BORDER_BOTTOM, 0, 0, black),
@@ -358,17 +399,23 @@ Implementation makeOpenCV(Context& ctx, std::shared_ptr<OpenCVState>& stateOut) 
     });
     impl.stages.emplace_back("2_per_crop_convertTo_resize_copyMakeBorder", [&ctx, st]() {
         for (size_t i = 0; i < N; ++i) {
+            beforeKernel();
             st->rgb8(st->rects[i]).convertTo(st->cropped[i], CV_32F, ctx.cvStream);
+            beforeKernel();
             cv::cuda::resize(st->cropped[i], st->resized[i], cv::Size(RES_W, RES_H), 0., 0., cv::INTER_LINEAR,
                              ctx.cvStream);
             cv::cuda::GpuMat plane = st->tensor.rowRange(static_cast<int>(i) * OUT_H, static_cast<int>(i + 1) * OUT_H);
+            beforeKernel();
             cv::cuda::copyMakeBorder(st->resized[i], plane, BORDER_TOP, BORDER_BOTTOM, 0, 0, cv::BORDER_CONSTANT,
                                      cv::Scalar(0., 0., 0.), ctx.cvStream);
         }
     });
     impl.stages.emplace_back("3_multiply_subtract_divide", [&ctx, st]() {
+        beforeKernel();
         cv::cuda::multiply(st->tensor, cv::Scalar(MUL[0], MUL[1], MUL[2]), st->tensor, 1., -1, ctx.cvStream);
+        beforeKernel();
         cv::cuda::subtract(st->tensor, cv::Scalar(SUB[0], SUB[1], SUB[2]), st->tensor, cv::noArray(), -1, ctx.cvStream);
+        beforeKernel();
         cv::cuda::divide(st->tensor, cv::Scalar(DIV[0], DIV[1], DIV[2]), st->tensor, 1., -1, ctx.cvStream);
     });
     impl.run = [stages = impl.stages]() {
@@ -438,6 +485,7 @@ Implementation makeNPP(Context& ctx) {
         for (size_t i = 0; i < N; ++i) {
             const fk::Rect& r = st->rects[i];
             const Npp8u* cropSrc = st->rgb8 + static_cast<size_t>(r.y) * st->rgbStep + r.x * 3;
+            beforeKernel();
             NPP_CHECK(nppiConvert_8u32f_C3R_Ctx(cropSrc, st->rgbStep, st->cropped + i * cropFloats, cropStep,
                                                 NppiSize{CROP_W, CROP_H}, ctx.npp));
         }
@@ -445,10 +493,12 @@ Implementation makeNPP(Context& ctx) {
     impl.stages.emplace_back("3_resize_batch", [&ctx, st]() {
         if constexpr (N == 1) {
             // nppiResizeBatch rejects a batch of one image with NPP_BAD_ARGUMENT_ERROR
+            beforeKernel();
             NPP_CHECK(nppiResize_32f_C3R_Ctx(st->cropped, cropStep, NppiSize{CROP_W, CROP_H}, NppiRect{0, 0, CROP_W, CROP_H},
                                              st->resized, outStep, NppiSize{RES_W, RES_H}, NppiRect{0, 0, RES_W, RES_H},
                                              NPPI_INTER_LINEAR, ctx.npp));
         } else {
+            beforeKernel();
             NPP_CHECK(nppiResizeBatch_32f_C3R_Advanced_Ctx(RES_W, RES_H, st->srcDescriptors, st->dstDescriptors, st->rois,
                                                            static_cast<unsigned int>(N), NPPI_INTER_LINEAR, ctx.npp));
         }
@@ -456,6 +506,7 @@ Implementation makeNPP(Context& ctx) {
     impl.stages.emplace_back("4_per_crop_copy_const_border", [&ctx, st]() {
         static const Npp32f zero[3] = {0.f, 0.f, 0.f};
         for (size_t i = 0; i < N; ++i) {
+            beforeKernel();
             NPP_CHECK(nppiCopyConstBorder_32f_C3R_Ctx(st->resized + i * resizedFloats, outStep, NppiSize{RES_W, RES_H},
                                                       st->tensor + i * outFloats, outStep, NppiSize{OUT_W, OUT_H},
                                                       BORDER_TOP, 0, zero, ctx.npp));
@@ -463,8 +514,11 @@ Implementation makeNPP(Context& ctx) {
     });
     impl.stages.emplace_back("5_mulc_subc_divc", [&ctx, st]() {
         const NppiSize tensorSize{OUT_W, static_cast<int>(N) * OUT_H};
+        beforeKernel();
         NPP_CHECK(nppiMulC_32f_C3IR_Ctx(MUL, st->tensor, outStep, tensorSize, ctx.npp));
+        beforeKernel();
         NPP_CHECK(nppiSubC_32f_C3IR_Ctx(SUB, st->tensor, outStep, tensorSize, ctx.npp));
+        beforeKernel();
         NPP_CHECK(nppiDivC_32f_C3IR_Ctx(DIV, st->tensor, outStep, tensorSize, ctx.npp));
     });
     impl.run = [stages = impl.stages]() {
@@ -721,8 +775,9 @@ void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer, size_t, size
     while (cuptiActivityGetNextRecord(buffer, validSize, &record) == CUPTI_SUCCESS) {
         if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL || record->kind == CUPTI_ACTIVITY_KIND_KERNEL) {
             counts.kernels++;
-            if (keepKernels) {
-                const auto* k = reinterpret_cast<const CUpti_ActivityKernel12*>(record);
+            const auto* k = reinterpret_cast<const CUpti_ActivityKernel12*>(record);
+            const bool flushKernel = k->name && std::strstr(k->name, "flushL2Kernel");
+            if (keepKernels && !flushKernel) {
                 kernels.push_back({k->start, k->end, static_cast<unsigned>(k->gridX), static_cast<unsigned>(k->gridY),
                                    static_cast<unsigned>(k->gridZ), static_cast<unsigned>(k->blockX),
                                    static_cast<unsigned>(k->blockY), static_cast<unsigned>(k->blockZ)});
@@ -837,6 +892,9 @@ struct Result {
     // GPU time only: sum of the execution times of the pipeline's kernels (CUPTI), per execution
     TimingStats gpuTiming;
     double meanGpuSpeedupOfBvf{NAN};
+    // GPU time only with L2 flushed before every kernel
+    TimingStats gpuFlushedTiming;
+    double meanGpuFlushedSpeedupOfBvf{NAN};
     ErrorStats errorVsOwnReference;
     ErrorStats errorVsFloatReference;
     ErrorStats errorVsNppConventionReference;
@@ -1177,7 +1235,7 @@ void profileAllBatches(Context& ctx, std::index_sequence<Is...>) {
 // GPU time only benchmark: the same interleaved iterations as the CPU + GPU one, with CUPTI kernel tracing on. The
 // GPU time of one execution is the sum of the execution times of its kernels: no host work and no launch gaps.
 template <size_t N>
-void gpuOnlyBatch(Context& ctx, std::vector<Result>& results) {
+void gpuOnlyBatch(Context& ctx, std::vector<Result>& results, L2Flusher* flusher = nullptr) {
     std::shared_ptr<OpenCVState> ocvState;
     const auto impls = makeImplementations<N>(ctx, ocvState);
     const size_t bvf = impls.size() - 1;
@@ -1185,6 +1243,7 @@ void gpuOnlyBatch(Context& ctx, std::vector<Result>& results) {
     for (size_t k = 0; k < impls.size(); ++k) {
         kernelsPerRun[k] = countLaunches(ctx, impls[k]).kernels;
     }
+    activeFlusher = flusher;
     for (int i = 0; i < WARMUP_ITERS; ++i) {
         for (const auto& impl : impls) {
             impl.run();
@@ -1207,6 +1266,7 @@ void gpuOnlyBatch(Context& ctx, std::vector<Result>& results) {
     CUPTI_CHECK(cuptiActivityDisable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
     CUPTI_CHECK(cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED));
     cupti::keepKernels = false;
+    activeFlusher = nullptr;
     auto& records = cupti::kernels;
     std::sort(records.begin(), records.end(), [](const KernelRecord& a, const KernelRecord& b) { return a.start < b.start; });
     size_t expected = 0;
@@ -1234,27 +1294,39 @@ void gpuOnlyBatch(Context& ctx, std::vector<Result>& results) {
     for (size_t k = 0; k < impls.size(); ++k) {
         auto r = std::find_if(results.begin(), results.end(),
                               [&](const Result& x) { return x.name == impls[k].name && x.batch == static_cast<int>(N); });
-        r->gpuTiming = computeStats(ms[k]);
+        if (r == results.end()) {
+            Result fresh;
+            fresh.name = impls[k].name;
+            fresh.batch = static_cast<int>(N);
+            fresh.launches.kernels = kernelsPerRun[k];
+            results.push_back(fresh);
+            r = results.end() - 1;
+        }
+        TimingStats& timing = flusher ? r->gpuFlushedTiming : r->gpuTiming;
+        double& speedup = flusher ? r->meanGpuFlushedSpeedupOfBvf : r->meanGpuSpeedupOfBvf;
+        timing = computeStats(ms[k]);
         if (k != bvf) {
             double sum = 0.;
             for (int i = 0; i < TIMED_ITERS; ++i) {
                 sum += ms[k][i] / ms[bvf][i];
             }
-            r->meanGpuSpeedupOfBvf = sum / TIMED_ITERS;
+            speedup = sum / TIMED_ITERS;
         }
-        std::cout << "GPU only " << std::left << std::setw(12) << r->name << std::right << " N " << std::setw(3) << N
-                  << std::fixed << std::setprecision(2) << "  median " << std::setw(7) << r->gpuTiming.median
-                  << " us  p10 " << std::setw(7) << r->gpuTiming.p10 << "  p90 " << std::setw(7) << r->gpuTiming.p90;
+        std::cout << (flusher ? "GPU only, L2 flushed " : "GPU only ") << std::left << std::setw(12) << r->name
+                  << std::right << " N " << std::setw(3) << N << std::fixed << std::setprecision(2) << "  median "
+                  << std::setw(7) << timing.median << " us  p10 " << std::setw(7) << timing.p10 << "  p90 "
+                  << std::setw(7) << timing.p90;
         if (k != bvf) {
-            std::cout << "  FKL BVF mean speedup " << std::setw(6) << r->meanGpuSpeedupOfBvf << "x";
+            std::cout << "  FKL BVF mean speedup " << std::setw(6) << speedup << "x";
         }
         std::cout << std::defaultfloat << std::endl;
     }
 }
 
 template <size_t... Is>
-void gpuOnlyAllBatches(Context& ctx, std::vector<Result>& results, std::index_sequence<Is...>) {
-    (gpuOnlyBatch<BATCHES[Is]>(ctx, results), ...);
+void gpuOnlyAllBatches(Context& ctx, std::vector<Result>& results, std::index_sequence<Is...>,
+                       L2Flusher* flusher = nullptr) {
+    (gpuOnlyBatch<BATCHES[Is]>(ctx, results, flusher), ...);
 }
 
 template <size_t... Is>
@@ -1273,6 +1345,76 @@ int main(int argc, char** argv) {
         Context ctx;
         initContext(ctx);
 
+        if (argc > 2 && std::string(argv[2]) == "--gpu-only-l2-flushed") {
+            // GPU time only with the L2 flushed before every kernel of every pipeline (no intermediate result or
+            // input can be assumed to be in L2). Separate from the main run, which it does not touch.
+            int device = 0;
+            gpuErrchk(cudaGetDevice(&device));
+            cudaDeviceProp prop{};
+            gpuErrchk(cudaGetDeviceProperties(&prop, device));
+            L2Flusher flusher;
+            const size_t bytes = 2 * static_cast<size_t>(prop.l2CacheSize);
+            flusher.count = bytes / sizeof(int4);
+            gpuErrchk(cudaMalloc(&flusher.buffer, bytes));
+            gpuErrchk(cudaMemset(flusher.buffer, 0, bytes));
+            gpuErrchk(cudaMalloc(&flusher.sink, sizeof(int)));
+            flusher.stream = ctx.stream;
+            flusher.blocks = prop.multiProcessorCount * 8;
+            std::cout << "Flushing " << bytes / (1 << 20) << " MiB (2x L2) before every kernel" << std::endl;
+            cupti::init();
+            std::vector<Result> flushed;
+            gpuOnlyAllBatches(ctx, flushed, std::make_index_sequence<BATCHES.size()>{}, &flusher);
+            std::ofstream csv(outDir / "gpu_time_l2_flushed.csv");
+            csv << "implementation,N,gpu_median_us,gpu_p10_us,gpu_p90_us,gpu_mean_us,iterations,kernels_launched,"
+                   "fkl_bvf_mean_gpu_speedup\n";
+            for (const auto& r : flushed) {
+                csv << r.name << "," << r.batch << "," << std::fixed << std::setprecision(2) << r.gpuFlushedTiming.median
+                    << "," << r.gpuFlushedTiming.p10 << "," << r.gpuFlushedTiming.p90 << ","
+                    << r.gpuFlushedTiming.mean << "," << TIMED_ITERS << "," << r.launches.kernels << ",";
+                if (!std::isnan(r.meanGpuFlushedSpeedupOfBvf)) {
+                    csv << std::setprecision(3) << r.meanGpuFlushedSpeedupOfBvf;
+                }
+                csv << "\n";
+            }
+            const std::string parArch(fk::toStrView(fk::defaultParArch));
+            for (const std::string baseline : {"opencv_cuda", "npp", "fkl_vf_hf"}) {
+                std::ofstream two(outDir / (baseline + "_vs_fkl_bvf_gpu_only_l2_flushed_" + parArch + ".csv"));
+                two << "Batch size";
+                for (const std::string label : {baseline, std::string("fkl_bvf")}) {
+                    two << ", " << label << " MeanTime, " << label << " TimeVariance, " << label << " MaxTime, "
+                        << label << " MinTime";
+                }
+                two << ", Mean Speedup";
+                for (const std::string label : {baseline, std::string("fkl_bvf")}) {
+                    two << ", " << label << " MedianTime, " << label << " P10Time, " << label << " P90Time";
+                }
+                two << std::endl;
+                for (const auto& b : flushed) {
+                    if (b.name != baseline) {
+                        continue;
+                    }
+                    const auto f = std::find_if(flushed.begin(), flushed.end(), [&](const Result& r) {
+                        return r.name == "fkl_bvf" && r.batch == b.batch;
+                    });
+                    two << b.batch;
+                    for (const TimingStats* t :
+                         std::array<const TimingStats*, 2>{&b.gpuFlushedTiming, &f->gpuFlushedTiming}) {
+                        two << ", " << t->mean / 1000. << ", " << t->variance / 1e6 << ", " << t->max / 1000. << ", "
+                            << t->min / 1000.;
+                    }
+                    two << ", " << b.meanGpuFlushedSpeedupOfBvf;
+                    for (const TimingStats* t :
+                         std::array<const TimingStats*, 2>{&b.gpuFlushedTiming, &f->gpuFlushedTiming}) {
+                        two << ", " << t->median / 1000. << ", " << t->p10 / 1000. << ", " << t->p90 / 1000.;
+                    }
+                    two << std::endl;
+                }
+            }
+            gpuErrchk(cudaFree(flusher.buffer));
+            gpuErrchk(cudaFree(flusher.sink));
+            std::cout << "Results written to " << std::filesystem::absolute(outDir) << std::endl;
+            return 0;
+        }
         if (argc > 4 && std::string(argv[2]) == "--ncu-target") {
             ncuTargetDispatch(ctx, argv[3], std::stoul(argv[4]), std::make_index_sequence<BATCHES.size()>{});
             return 0;
