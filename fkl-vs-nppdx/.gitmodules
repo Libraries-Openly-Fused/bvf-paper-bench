@@ -1,0 +1,7 @@
+[submodule "fkl"]
+	path = fkl
+	url = https://github.com/Libraries-Openly-Fused/FusedKernelLibrary.git
+	branch = bvf-paper-bench
+[submodule "nppdx"]
+	path = nppdx
+	url = https://github.com/NVIDIA/NPPDx.git
