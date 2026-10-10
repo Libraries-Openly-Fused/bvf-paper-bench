@@ -55,6 +55,13 @@ The CSV files and the platform description are in [`results/RTX4090`](results/RT
 driver 610.43.02, CUDA 13.3, GCC 15.2, AMD Ryzen 9 5950X, Ubuntu 26.04.1, FKL `b9f4281`, NPPDx v0.1.2.
 GPU clocks were not locked.
 
+**DRAM traffic** (Nsight Compute, `dram__bytes_read.sum` and `dram__bytes_write.sum` of one execution, see
+`benchmark_figure1_bvf_dram_traffic_GPU_NVIDIA.csv`). With the L2 cache flushed before the kernel, NPPDx reads 77,
+91 and 154 KB from DRAM for N = 1, 16 and 100, and FKL 9, 22 and 84 KB. With a warm cache both read nothing from
+DRAM, and neither writes to DRAM while the kernel runs: the RTX 4090's 72 MB L2 is write-back and holds the
+whole working set (the 12.4 MB NV12 frame and an output of at most 4.9 MB). Collected with
+`--ncu-target <nppdx|fkl_bvf> <N>`, which runs one execution inside the NVTX range `measure`.
+
 ## Correctness and sampling conventions
 
 Every run checks both outputs before timing them:
