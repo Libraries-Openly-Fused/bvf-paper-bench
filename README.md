@@ -17,7 +17,12 @@ output); FKL BVF keeps float3 in registers from the color conversion to the writ
 iterations (after 100 warm-up ones) the four implementations run one after the other, and FKL BVF's speedup over
 each baseline is computed per iteration and averaged, as in FKL's two-execution benchmarks.
 
-Output files: `latency.csv` (median, p10, p90 and mean in us, kernels launched, FKL BVF mean speedup),
+Two benchmarks come out of every run, both with per-execution speedups: CPU + GPU (CUDA events around everything
+the host does to enqueue a pipeline plus its GPU execution) and GPU only (a second pass with CUPTI kernel tracing,
+where the time of an execution is the sum of the execution times of its kernels).
+
+Output files: `latency.csv` (CPU + GPU: median, p10, p90 and mean in us, kernels launched, FKL BVF mean speedup),
+`gpu_time.csv` (GPU only, same columns), `<baseline>_vs_fkl_bvf_gpu_only_GPU_NVIDIA.csv`,
 `<baseline>_vs_fkl_bvf_GPU_NVIDIA.csv` (FKL's two-execution format, times in ms), `kernel_breakdown.csv` (time of
 each kernel or stage of the multi-kernel pipelines, plus VF+HF with a float3 frame), `validation.csv`,
 `kernels.csv` and `platform.txt`.

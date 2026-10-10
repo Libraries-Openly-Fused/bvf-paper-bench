@@ -833,6 +833,9 @@ struct Result {
     TimingStats timing;
     // Mean over the timed iterations of (this implementation's time / FKL BVF's time) in the same iteration
     double meanSpeedupOfBvf{NAN};
+    // GPU time only: sum of the execution times of the pipeline's kernels (CUPTI), per execution
+    TimingStats gpuTiming;
+    double meanGpuSpeedupOfBvf{NAN};
     ErrorStats errorVsOwnReference;
     ErrorStats errorVsFloatReference;
     ErrorStats errorVsNppConventionReference;
@@ -1021,6 +1024,9 @@ void writePlatform(const std::filesystem::path& path, const Context& ctx, const 
        << "Intermediates: OpenCV, NPP and FKL VF+HF all write an 8 bit RGB frame (NPP's NV12->RGB only outputs 8 or "
        << "16 bit integers and OpenCV CUDA has no NV12 conversion), then float3 crops, float3 resized crops and the "
        << "float3 output. FKL BVF has no intermediates in memory: float3 from the color conversion to the write.\n"
+       << "GPU time only: a second pass with the same interleaved iterations and CUPTI kernel tracing on; the GPU "
+       << "time of one execution is the sum of the execution times of its kernels (no host work, no launch gaps), "
+       << "and FKL BVF's speedups are again computed per execution and averaged.\n"
        << "Kernel counts: CUPTI activity tracing of one pipeline, in a separate pass after all timings\n"
        << "\n" << diagnostic;
 }
@@ -1137,6 +1143,89 @@ void profileAllBatches(Context& ctx, std::index_sequence<Is...>) {
     (profileBatch<BATCHES[Is]>(ctx), ...);
 }
 
+// GPU time only benchmark: the same interleaved iterations as the CPU + GPU one, with CUPTI kernel tracing on. The
+// GPU time of one execution is the sum of the execution times of its kernels: no host work and no launch gaps.
+template <size_t N>
+void gpuOnlyBatch(Context& ctx, std::vector<Result>& results) {
+    std::shared_ptr<OpenCVState> ocvState;
+    const auto impls = makeImplementations<N>(ctx, ocvState);
+    const size_t bvf = impls.size() - 1;
+    std::vector<size_t> kernelsPerRun(impls.size());
+    for (size_t k = 0; k < impls.size(); ++k) {
+        kernelsPerRun[k] = countLaunches(ctx, impls[k]).kernels;
+    }
+    for (int i = 0; i < WARMUP_ITERS; ++i) {
+        for (const auto& impl : impls) {
+            impl.run();
+            gpuErrchk(cudaStreamSynchronize(ctx.stream));
+        }
+    }
+    CUPTI_CHECK(cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED));
+    cupti::kernels.clear();
+    cupti::keepKernels = true;
+    CUPTI_CHECK(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
+    for (int i = 0; i < TIMED_ITERS; ++i) {
+        for (const auto& impl : impls) {
+            impl.run();
+            gpuErrchk(cudaStreamSynchronize(ctx.stream));
+        }
+        if (i % 100 == 99) {
+            CUPTI_CHECK(cuptiActivityFlushAll(0));
+        }
+    }
+    CUPTI_CHECK(cuptiActivityDisable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
+    CUPTI_CHECK(cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED));
+    cupti::keepKernels = false;
+    auto& records = cupti::kernels;
+    std::sort(records.begin(), records.end(), [](const KernelRecord& a, const KernelRecord& b) { return a.start < b.start; });
+    size_t expected = 0;
+    for (const size_t n : kernelsPerRun) {
+        expected += n * TIMED_ITERS;
+    }
+    if (records.size() != expected) {
+        throw std::runtime_error("GPU only benchmark: expected " + std::to_string(expected) + " kernel records, got " +
+                                 std::to_string(records.size()));
+    }
+    // The executions are sequential, so in start time order the records are iteration by iteration, implementation
+    // by implementation
+    std::vector<std::vector<float>> ms(impls.size(), std::vector<float>(TIMED_ITERS));
+    size_t idx = 0;
+    for (int i = 0; i < TIMED_ITERS; ++i) {
+        for (size_t k = 0; k < impls.size(); ++k) {
+            uint64_t ns = 0;
+            for (size_t j = 0; j < kernelsPerRun[k]; ++j, ++idx) {
+                ns += records[idx].end - records[idx].start;
+            }
+            ms[k][i] = static_cast<float>(ns * 1e-6);
+        }
+    }
+    records.clear();
+    for (size_t k = 0; k < impls.size(); ++k) {
+        auto r = std::find_if(results.begin(), results.end(),
+                              [&](const Result& x) { return x.name == impls[k].name && x.batch == static_cast<int>(N); });
+        r->gpuTiming = computeStats(ms[k]);
+        if (k != bvf) {
+            double sum = 0.;
+            for (int i = 0; i < TIMED_ITERS; ++i) {
+                sum += ms[k][i] / ms[bvf][i];
+            }
+            r->meanGpuSpeedupOfBvf = sum / TIMED_ITERS;
+        }
+        std::cout << "GPU only " << std::left << std::setw(12) << r->name << std::right << " N " << std::setw(3) << N
+                  << std::fixed << std::setprecision(2) << "  median " << std::setw(7) << r->gpuTiming.median
+                  << " us  p10 " << std::setw(7) << r->gpuTiming.p10 << "  p90 " << std::setw(7) << r->gpuTiming.p90;
+        if (k != bvf) {
+            std::cout << "  FKL BVF mean speedup " << std::setw(6) << r->meanGpuSpeedupOfBvf << "x";
+        }
+        std::cout << std::defaultfloat << std::endl;
+    }
+}
+
+template <size_t... Is>
+void gpuOnlyAllBatches(Context& ctx, std::vector<Result>& results, std::index_sequence<Is...>) {
+    (gpuOnlyBatch<BATCHES[Is]>(ctx, results), ...);
+}
+
 template <size_t... Is>
 void countAllBatches(Context& ctx, std::vector<Result>& results, std::index_sequence<Is...>) {
     (countBatch<BATCHES[Is]>(ctx, results), ...);
@@ -1196,6 +1285,8 @@ int main(int argc, char** argv) {
         runAllBatches(ctx, results, std::make_index_sequence<BATCHES.size()>{});
         std::cout << "=== Kernel counts (CUPTI activity tracing, after all timings)" << std::endl;
         cupti::init();
+        std::cout << "=== GPU time only (CUPTI kernel execution times, after all CPU + GPU timings)" << std::endl;
+        gpuOnlyAllBatches(ctx, results, std::make_index_sequence<BATCHES.size()>{});
         countAllBatches(ctx, results, std::make_index_sequence<BATCHES.size()>{});
 
         std::ofstream latency(outDir / "latency.csv");
@@ -1225,37 +1316,55 @@ int main(int argc, char** argv) {
             kernels << r.name << "," << r.batch << "," << r.launches.kernels << "," << r.launches.memsets << ","
                     << r.launches.memcpys << "\n";
         }
-        // One CSV per baseline in FKL's two-execution format (times in ms): <baseline>_vs_fkl_bvf_GPU_NVIDIA.csv
+        // One CSV per baseline in FKL's two-execution format (times in ms), for both benchmarks:
+        // <baseline>_vs_fkl_bvf_GPU_NVIDIA.csv (CPU + GPU) and <baseline>_vs_fkl_bvf_gpu_only_GPU_NVIDIA.csv
         const std::string parArch(fk::toStrView(fk::defaultParArch));
-        for (const std::string baseline : {"opencv_cuda", "npp", "fkl_vf_hf"}) {
-            std::ofstream two(outDir / (baseline + "_vs_fkl_bvf_" + parArch + ".csv"));
-            two << "Batch size";
-            for (const std::string label : {baseline, std::string("fkl_bvf")}) {
-                two << ", " << label << " MeanTime, " << label << " TimeVariance, " << label << " MaxTime, " << label
-                    << " MinTime";
-            }
-            two << ", Mean Speedup";
-            for (const std::string label : {baseline, std::string("fkl_bvf")}) {
-                two << ", " << label << " MedianTime, " << label << " P10Time, " << label << " P90Time";
-            }
-            two << std::endl;
-            for (const auto& b : results) {
-                if (b.name != baseline) {
-                    continue;
+        for (const bool gpuOnly : {false, true}) {
+            for (const std::string baseline : {"opencv_cuda", "npp", "fkl_vf_hf"}) {
+                std::ofstream two(outDir / (baseline + "_vs_fkl_bvf_" + (gpuOnly ? "gpu_only_" : "") + parArch + ".csv"));
+                two << "Batch size";
+                for (const std::string label : {baseline, std::string("fkl_bvf")}) {
+                    two << ", " << label << " MeanTime, " << label << " TimeVariance, " << label << " MaxTime, "
+                        << label << " MinTime";
                 }
-                const auto f = std::find_if(results.begin(), results.end(),
-                                            [&](const Result& r) { return r.name == "fkl_bvf" && r.batch == b.batch; });
-                two << b.batch;
-                for (const TimingStats* t : std::array<const TimingStats*, 2>{&b.timing, &f->timing}) {
-                    two << ", " << t->mean / 1000. << ", " << t->variance / 1e6 << ", " << t->max / 1000. << ", "
-                        << t->min / 1000.;
-                }
-                two << ", " << b.meanSpeedupOfBvf;
-                for (const TimingStats* t : std::array<const TimingStats*, 2>{&b.timing, &f->timing}) {
-                    two << ", " << t->median / 1000. << ", " << t->p10 / 1000. << ", " << t->p90 / 1000.;
+                two << ", Mean Speedup";
+                for (const std::string label : {baseline, std::string("fkl_bvf")}) {
+                    two << ", " << label << " MedianTime, " << label << " P10Time, " << label << " P90Time";
                 }
                 two << std::endl;
+                for (const auto& b : results) {
+                    if (b.name != baseline) {
+                        continue;
+                    }
+                    const auto f = std::find_if(results.begin(), results.end(), [&](const Result& r) {
+                        return r.name == "fkl_bvf" && r.batch == b.batch;
+                    });
+                    const TimingStats& tb = gpuOnly ? b.gpuTiming : b.timing;
+                    const TimingStats& tf = gpuOnly ? f->gpuTiming : f->timing;
+                    two << b.batch;
+                    for (const TimingStats* t : std::array<const TimingStats*, 2>{&tb, &tf}) {
+                        two << ", " << t->mean / 1000. << ", " << t->variance / 1e6 << ", " << t->max / 1000. << ", "
+                            << t->min / 1000.;
+                    }
+                    two << ", " << (gpuOnly ? b.meanGpuSpeedupOfBvf : b.meanSpeedupOfBvf);
+                    for (const TimingStats* t : std::array<const TimingStats*, 2>{&tb, &tf}) {
+                        two << ", " << t->median / 1000. << ", " << t->p10 / 1000. << ", " << t->p90 / 1000.;
+                    }
+                    two << std::endl;
+                }
             }
+        }
+        std::ofstream gpuTime(outDir / "gpu_time.csv");
+        gpuTime << "implementation,N,gpu_median_us,gpu_p10_us,gpu_p90_us,gpu_mean_us,iterations,kernels_launched,"
+                   "fkl_bvf_mean_gpu_speedup\n";
+        for (const auto& r : results) {
+            gpuTime << r.name << "," << r.batch << "," << std::fixed << std::setprecision(2) << r.gpuTiming.median << ","
+                    << r.gpuTiming.p10 << "," << r.gpuTiming.p90 << "," << r.gpuTiming.mean << "," << TIMED_ITERS << ","
+                    << r.launches.kernels << ",";
+            if (!std::isnan(r.meanGpuSpeedupOfBvf)) {
+                gpuTime << std::setprecision(3) << r.meanGpuSpeedupOfBvf;
+            }
+            gpuTime << "\n";
         }
         std::ofstream stages(outDir / "kernel_breakdown.csv");
         stages << "implementation,N,kernel,median_us,p10_us,p90_us\n";
