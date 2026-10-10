@@ -11,6 +11,12 @@
 //           (up to AVX2 here) and its thread pool; it is timed with 1 thread and with all the hardware threads.
 //   fkl:    one executeOperations<TransformDPP<ParArch::CPU>> call with the whole chain (BVF). FKL's CPU backend runs
 //           on one thread, compiled with -march=native.
+//   fkl mt: the same call with TransformDPP<ParArch::CPU_MULTITHREAD>: the stream enqueues the execution in FKL's shared
+//           thread pool (one worker per hardware thread), in chunks of one output row of one crop, and sync() waits.
+//
+// Both libraries' thread pools spin for a while after finishing before their workers go to sleep, so every timed run
+// is preceded by an idle gap that lets them fall asleep: neither steals cores from the other, and both start from
+// sleeping workers, as when a pipeline runs once per video frame.
 
 #include <fused_kernel/fused_kernel.h>
 #include <fused_kernel/algorithms/basic_ops/arithmetic.h>
@@ -20,6 +26,7 @@
 #include <fused_kernel/algorithms/image_processing/crop.h>
 #include <fused_kernel/algorithms/image_processing/image.h>
 #include <fused_kernel/algorithms/image_processing/resize.h>
+#include <fused_kernel/core/execution_model/cpu_multithread.h>
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
@@ -35,6 +42,7 @@
 #include <iostream>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace cpubench {
@@ -53,6 +61,7 @@ constexpr int MAX_BATCH = 100;
 constexpr std::array<size_t, 5> BATCHES{1, 4, 16, 50, 100};
 constexpr int WARMUP_ITERS = 100;
 constexpr int ITERS = 1000;
+constexpr auto IDLE_GAP = std::chrono::milliseconds(1);
 constexpr unsigned FRAME_SEED = 1;
 constexpr unsigned CROP_SEED = 42;
 
@@ -134,21 +143,22 @@ struct OpenCVCpu {
 };
 
 // ------------------------------------------------------------------------------------------------
-// FKL CPU backend, BVF: one executeOperations call
+// FKL CPU backends, BVF: one executeOperations call, on one thread (ParArch::CPU) or on FKL's thread pool
+// (ParArch::CPU_MULTITHREAD)
 // ------------------------------------------------------------------------------------------------
-template <size_t N>
+template <size_t N, fk::ParArch PA = fk::ParArch::CPU>
 struct FklCpu {
     const Workload& w;
     std::array<fk::Rect, N> crops{};
     fk::Tensor<fk::float3> out{OUT_W, OUT_H, N, 1, fk::MemType::Host};
-    fk::Stream_<fk::ParArch::CPU> stream;
+    fk::Stream_<PA> stream;
 
     explicit FklCpu(const Workload& workload) : w(workload) {
         std::copy_n(w.crops.begin(), N, crops.begin());
     }
 
     void run() {
-        fk::executeOperations<fk::TransformDPP<fk::ParArch::CPU>>(stream,
+        fk::executeOperations<fk::TransformDPP<PA>>(stream,
             fk::ReadYUV<fk::PixelFormat::NV12>::build(*w.frame),
             YUVToRGB::build(),
             fk::Crop<>::build(crops),
@@ -230,7 +240,8 @@ float maxAbsError(const std::vector<float>& a, const std::vector<float>& b) {
 }
 
 // ------------------------------------------------------------------------------------------------
-// Two-execution timing in FKL's format: in every iteration OpenCV and then FKL, each timed with steady_clock
+// Two-execution timing in FKL's format: in every iteration OpenCV and then FKL, each timed with steady_clock after an
+// idle gap
 // ------------------------------------------------------------------------------------------------
 struct Stats {
     double mean{0.}, variance{0.}, max{0.}, min{0.}, median{0.}, p10{0.}, p90{0.};
@@ -269,6 +280,7 @@ struct Row {
 Row timeTwo(size_t batch, const std::function<void()>& opencv, const std::function<void()>& fkl) {
     using Clock = std::chrono::steady_clock;
     const auto time = [](const std::function<void()>& f) {
+        std::this_thread::sleep_for(IDLE_GAP);
         const auto t0 = Clock::now();
         f();
         return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
@@ -287,14 +299,15 @@ Row timeTwo(size_t batch, const std::function<void()>& opencv, const std::functi
     return {batch, stats(a), stats(b), speedup / ITERS};
 }
 
-void writeCSV(const std::filesystem::path& path, const std::string& opencvLabel, const std::vector<Row>& rows) {
+void writeCSV(const std::filesystem::path& path, const std::string& opencvLabel, const std::vector<Row>& rows,
+              const std::string& fklLabel = "FKL CPU") {
     std::ofstream f(path);
     f << "Batch size";
-    for (const std::string label : {opencvLabel, std::string("FKL CPU")}) {
+    for (const std::string label : {opencvLabel, fklLabel}) {
         f << ", " << label << " MeanTime, " << label << " TimeVariance, " << label << " MaxTime, " << label << " MinTime";
     }
     f << ", Mean Speedup";
-    for (const std::string label : {opencvLabel, std::string("FKL CPU")}) {
+    for (const std::string label : {opencvLabel, fklLabel}) {
         f << ", " << label << " MedianTime, " << label << " P10Time, " << label << " P90Time";
     }
     f << std::endl;
@@ -313,34 +326,40 @@ void writeCSV(const std::filesystem::path& path, const std::string& opencvLabel,
 
 struct Check {
     size_t batch;
-    float fklVsReference, opencvVsReference, opencvVsFkl;
+    float fklVsReference, opencvVsReference, opencvVsFkl, fklMultithreadVsFkl;
 };
 
 template <size_t N>
-void runBatch(Workload& w, std::vector<Row>& singleThread, std::vector<Row>& multiThread, std::vector<Check>& checks,
-              int hardwareThreads) {
+void runBatch(Workload& w, std::vector<Row>& singleThread, std::vector<Row>& multiThread,
+              std::vector<Row>& multiThreadFkl, std::vector<Check>& checks, int hardwareThreads) {
     OpenCVCpu opencv(w, N);
     FklCpu<N> fkl(w);
+    FklCpu<N, fk::ParArch::CPU_MULTITHREAD> fklMT(w);
     cv::setNumThreads(1);
     opencv.run();
     fkl.run();
+    fklMT.run();
     const auto ocvOut = opencv.output();
     const auto fklOut = fkl.output();
     const Check c{N, maxAbsError(fklOut, hostReference(w, N, false)), maxAbsError(ocvOut, hostReference(w, N, true)),
-                  maxAbsError(ocvOut, fklOut)};
+                  maxAbsError(ocvOut, fklOut), maxAbsError(fklMT.output(), fklOut)};
     checks.push_back(c);
 
     singleThread.push_back(timeTwo(N, [&]() { opencv.run(); }, [&]() { fkl.run(); }));
     cv::setNumThreads(hardwareThreads);
     multiThread.push_back(timeTwo(N, [&]() { opencv.run(); }, [&]() { fkl.run(); }));
+    multiThreadFkl.push_back(timeTwo(N, [&]() { opencv.run(); }, [&]() { fklMT.run(); }));
     cv::setNumThreads(1);
     const Row& s = singleThread.back();
     const Row& m = multiThread.back();
-    std::printf("N %3zu | OpenCV 1 thread %8.1f us, OpenCV %d threads %8.1f us, FKL CPU %8.1f us | FKL speedup %6.2fx "
-                "(1 thread), %6.2fx (%d threads) | max err: FKL vs reference %.2e, OpenCV vs OpenCV-convention "
-                "reference %.2e, OpenCV vs FKL %.2e\n",
+    const Row& mt = multiThreadFkl.back();
+    std::printf("N %3zu | OpenCV 1 thread %8.1f us, OpenCV %d threads %8.1f us, FKL CPU %8.1f us, FKL CPU_MULTITHREAD "
+                "%8.1f us | mean speedup: FKL CPU vs OpenCV 1 thread %6.2fx, FKL CPU vs OpenCV %d threads %6.2fx, FKL "
+                "CPU_MULTITHREAD vs OpenCV %d threads %6.2fx | max err: FKL vs reference %.2e, OpenCV vs "
+                "OpenCV-convention reference %.2e, OpenCV vs FKL %.2e, FKL CPU_MULTITHREAD vs FKL CPU %.2e\n",
                 N, s.opencv.median * 1000., hardwareThreads, m.opencv.median * 1000., s.fkl.median * 1000.,
-                s.meanSpeedup, m.meanSpeedup, hardwareThreads, c.fklVsReference, c.opencvVsReference, c.opencvVsFkl);
+                mt.fkl.median * 1000., s.meanSpeedup, hardwareThreads, m.meanSpeedup, hardwareThreads, mt.meanSpeedup,
+                c.fklVsReference, c.opencvVsReference, c.opencvVsFkl, c.fklMultithreadVsFkl);
 }
 
 std::string shell(const std::string& command) {
@@ -364,34 +383,42 @@ int main(int argc, char** argv) {
 
     Workload w;
     initWorkload(w);
-    std::vector<Row> singleThread, multiThread;
+    std::vector<Row> singleThread, multiThread, multiThreadFkl;
     std::vector<Check> checks;
     [&]<size_t... Is>(std::index_sequence<Is...>) {
-        (runBatch<BATCHES[Is]>(w, singleThread, multiThread, checks, hardwareThreads), ...);
+        (runBatch<BATCHES[Is]>(w, singleThread, multiThread, multiThreadFkl, checks, hardwareThreads), ...);
     }(std::make_index_sequence<BATCHES.size()>{});
 
     writeCSV(outDir / "benchmark_cpu_opencv_1thread_vs_fkl_bvf_CPU.csv", "OpenCV 1 thread", singleThread);
     writeCSV(outDir / ("benchmark_cpu_opencv_" + std::to_string(hardwareThreads) + "threads_vs_fkl_bvf_CPU.csv"),
              "OpenCV " + std::to_string(hardwareThreads) + " threads", multiThread);
+    writeCSV(outDir / ("benchmark_cpu_opencv_" + std::to_string(hardwareThreads) +
+                       "threads_vs_fkl_bvf_CPU_MULTITHREAD.csv"),
+             "OpenCV " + std::to_string(hardwareThreads) + " threads", multiThreadFkl, "FKL CPU_MULTITHREAD");
     std::ofstream v(outDir / "cpu_validation.csv");
     v << "Batch size, FKL MaxAbsError vs FKL-convention reference, OpenCV MaxAbsError vs OpenCV-convention reference, "
-         "OpenCV vs FKL MaxAbsDifference" << std::endl;
+         "OpenCV vs FKL MaxAbsDifference, FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference" << std::endl;
     for (const auto& c : checks) {
-        v << c.batch << ", " << c.fklVsReference << ", " << c.opencvVsReference << ", " << c.opencvVsFkl << std::endl;
+        v << c.batch << ", " << c.fklVsReference << ", " << c.opencvVsReference << ", " << c.opencvVsFkl << ", "
+          << c.fklMultithreadVsFkl << std::endl;
     }
     std::ofstream p(outDir / "cpu_platform.txt");
     p << "CPU: " << shell("lscpu | sed -n 's/^Model name: *//p'") << ", " << hardwareThreads << " hardware threads\n"
       << "SIMD of the CPU: " << shell("grep -o -w -E 'avx|avx2|fma|avx512f|avx512bw|avx512vl' /proc/cpuinfo | sort -u | paste -sd' '")
       << "\n"
-      << "FKL: commit " << BENCH_FKL_COMMIT << ", CPU backend (single thread), compiled with " << BENCH_COMPILER
-      << ", flags " << BENCH_CXX_FLAGS << "\n"
+      << "FKL: commit " << BENCH_FKL_COMMIT << ", CPU backend (single thread) and CPU_MULTITHREAD backend (thread pool of "
+      << fk::cpuThreadPool().size() << " workers, thread-pool " << BENCH_THREAD_POOL_COMMIT
+      << ", workers spin 100 us before sleeping, one chunk per output row of each crop), compiled with "
+      << BENCH_COMPILER << ", flags " << BENCH_CXX_FLAGS << "\n"
       << "OpenCV: " << CV_VERSION << ", built with GCC 15.2 (baseline SSE3, runtime dispatch up to AVX2 on this CPU: "
       << (cv::checkHardwareSupport(CV_CPU_AVX2) ? "AVX2 available" : "no AVX2") << "), parallel framework pthreads\n"
       << "OS: " << shell(". /etc/os-release && echo $PRETTY_NAME") << "\n"
       << "Pipeline: as the GPU benchmarks, with BT.601 limited range for NV12 -> RGB (the only NV12 conversion of "
          "OpenCV's CPU cvtColor)\n"
       << "Timing: steady_clock around each pipeline, " << WARMUP_ITERS << " warm-up and " << ITERS
-      << " timed iterations, OpenCV and FKL one after the other in each; speedup computed per iteration and averaged.\n";
+      << " timed iterations, OpenCV and FKL one after the other in each, each run preceded by a "
+      << std::chrono::milliseconds(IDLE_GAP).count()
+      << " ms idle gap so that both thread pools are asleep; speedup computed per iteration and averaged.\n";
     std::cout << "Results written to " << std::filesystem::absolute(outDir) << std::endl;
     return 0;
 }
