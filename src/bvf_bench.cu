@@ -687,8 +687,16 @@ struct LaunchCounts {
     size_t kernels{0}, memsets{0}, memcpys{0};
 };
 
+// GPU execution of one kernel, from its CUPTI activity record (nanosecond timestamps)
+struct KernelRecord {
+    uint64_t start{0}, end{0};
+    unsigned gridX{0}, gridY{0}, gridZ{0}, blockX{0}, blockY{0}, blockZ{0};
+};
+
 namespace cupti {
 LaunchCounts counts;
+bool keepKernels = false;
+std::vector<KernelRecord> kernels;
 
 #define CUPTI_CHECK(expr)                                                                                    \
     do {                                                                                                     \
@@ -711,6 +719,12 @@ void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer, size_t, size
     while (cuptiActivityGetNextRecord(buffer, validSize, &record) == CUPTI_SUCCESS) {
         if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL || record->kind == CUPTI_ACTIVITY_KIND_KERNEL) {
             counts.kernels++;
+            if (keepKernels) {
+                const auto* k = reinterpret_cast<const CUpti_ActivityKernel12*>(record);
+                kernels.push_back({k->start, k->end, static_cast<unsigned>(k->gridX), static_cast<unsigned>(k->gridY),
+                                   static_cast<unsigned>(k->gridZ), static_cast<unsigned>(k->blockX),
+                                   static_cast<unsigned>(k->blockY), static_cast<unsigned>(k->blockZ)});
+            }
         } else if (record->kind == CUPTI_ACTIVITY_KIND_MEMSET) {
             counts.memsets++;
         } else if (record->kind == CUPTI_ACTIVITY_KIND_MEMCPY) {
@@ -740,6 +754,77 @@ LaunchCounts countLaunches(const Context& ctx, const Implementation& impl) {
     CUPTI_CHECK(cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED));
     return cupti::counts;
 }
+
+// What the GPU actually does in one pipeline, from CUPTI kernel records over PROFILE_RUNS runs (median per run):
+// the sum of the kernel execution times (GPU busy), the time from the first kernel start to the last kernel end,
+// and the execution time and launch configuration of every kernel of the pipeline
+constexpr int PROFILE_RUNS = 100;
+
+struct KernelProfile {
+    unsigned gridX, gridY, gridZ, blockThreads;
+    double medianUs;
+};
+
+struct PipelineProfile {
+    std::string name;
+    int batch{0};
+    size_t kernelsPerRun{0};
+    double busyUs{0.}, spanUs{0.};
+    std::vector<KernelProfile> kernels;
+};
+
+double medianOf(std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    const size_t n = v.size();
+    return n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+}
+
+PipelineProfile profilePipeline(const Context& ctx, const Implementation& impl, int batch) {
+    for (int i = 0; i < 10; ++i) {
+        impl.run();
+    }
+    gpuErrchk(cudaStreamSynchronize(ctx.stream));
+    CUPTI_CHECK(cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED));
+    cupti::kernels.clear();
+    cupti::keepKernels = true;
+    CUPTI_CHECK(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
+    for (int r = 0; r < PROFILE_RUNS; ++r) {
+        impl.run();
+        gpuErrchk(cudaStreamSynchronize(ctx.stream));
+    }
+    CUPTI_CHECK(cuptiActivityDisable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
+    CUPTI_CHECK(cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED));
+    cupti::keepKernels = false;
+    auto& k = cupti::kernels;
+    std::sort(k.begin(), k.end(), [](const KernelRecord& a, const KernelRecord& b) { return a.start < b.start; });
+    if (k.empty() || k.size() % PROFILE_RUNS != 0) {
+        throw std::runtime_error("Unexpected number of kernel records for " + impl.name);
+    }
+    PipelineProfile profile{impl.name, batch, k.size() / PROFILE_RUNS};
+    const size_t perRun = profile.kernelsPerRun;
+    std::vector<double> busy, span;
+    std::vector<std::vector<double>> perKernel(perRun);
+    for (int r = 0; r < PROFILE_RUNS; ++r) {
+        double b = 0.;
+        for (size_t i = 0; i < perRun; ++i) {
+            const KernelRecord& rec = k[r * perRun + i];
+            b += (rec.end - rec.start) * 1e-3;
+            perKernel[i].push_back((rec.end - rec.start) * 1e-3);
+        }
+        busy.push_back(b);
+        span.push_back((k[r * perRun + perRun - 1].end - k[r * perRun].start) * 1e-3);
+    }
+    profile.busyUs = medianOf(busy);
+    profile.spanUs = medianOf(span);
+    for (size_t i = 0; i < perRun; ++i) {
+        const KernelRecord& rec = k[i];
+        profile.kernels.push_back({rec.gridX, rec.gridY, rec.gridZ, rec.blockX * rec.blockY * rec.blockZ,
+                                   medianOf(perKernel[i])});
+    }
+    return profile;
+}
+
+std::vector<PipelineProfile> profiles;
 
 struct Result {
     std::string name;
@@ -944,6 +1029,26 @@ void runAllBatches(Context& ctx, std::vector<Result>& results, std::index_sequen
     (runBatch<BATCHES[Is]>(ctx, results), ...);
 }
 
+template <size_t N>
+void profileBatch(Context& ctx) {
+    std::shared_ptr<OpenCVState> ocvState;
+    auto impls = makeImplementations<N>(ctx, ocvState);
+    impls.insert(impls.begin() + 3, makeFklVfHf<N, false>(ctx));
+    for (const auto& impl : impls) {
+        profiles.push_back(profilePipeline(ctx, impl, static_cast<int>(N)));
+        const auto& p = profiles.back();
+        std::cout << std::left << std::setw(24) << p.name << " N " << std::right << std::setw(3) << N << "  kernels "
+                  << std::setw(3) << p.kernelsPerRun << "  GPU busy " << std::fixed << std::setprecision(2)
+                  << std::setw(7) << p.busyUs << " us  first start to last end " << std::setw(7) << p.spanUs << " us"
+                  << std::defaultfloat << std::endl;
+    }
+}
+
+template <size_t... Is>
+void profileAllBatches(Context& ctx, std::index_sequence<Is...>) {
+    (profileBatch<BATCHES[Is]>(ctx), ...);
+}
+
 template <size_t... Is>
 void countAllBatches(Context& ctx, std::vector<Result>& results, std::index_sequence<Is...>) {
     (countBatch<BATCHES[Is]>(ctx, results), ...);
@@ -959,6 +1064,31 @@ int main(int argc, char** argv) {
 
         Context ctx;
         initContext(ctx);
+
+        if (argc > 2 && std::string(argv[2]) == "--profile-kernels") {
+            // GPU execution time of every kernel (CUPTI), without touching the latency results
+            cupti::init();
+            profileAllBatches(ctx, std::make_index_sequence<BATCHES.size()>{});
+            std::ofstream summary(outDir / "kernel_gpu_times.csv");
+            summary << "implementation,N,kernels_per_pipeline,gpu_busy_us,first_kernel_start_to_last_kernel_end_us\n";
+            std::ofstream details(outDir / "kernel_gpu_times_fkl.csv");
+            details << "implementation,N,kernel,grid_x,grid_y,grid_z,threads_per_block,total_threads,gpu_time_us\n";
+            for (const auto& p : profiles) {
+                summary << p.name << "," << p.batch << "," << p.kernelsPerRun << "," << std::fixed
+                        << std::setprecision(2) << p.busyUs << "," << p.spanUs << "\n";
+                if (p.name.rfind("fkl_", 0) == 0) {
+                    for (size_t i = 0; i < p.kernels.size(); ++i) {
+                        const auto& k = p.kernels[i];
+                        const size_t threads = static_cast<size_t>(k.gridX) * k.gridY * k.gridZ * k.blockThreads;
+                        details << p.name << "," << p.batch << "," << i + 1 << "," << k.gridX << "," << k.gridY << ","
+                                << k.gridZ << "," << k.blockThreads << "," << threads << "," << std::fixed
+                                << std::setprecision(2) << k.medianUs << "\n";
+                    }
+                }
+            }
+            std::cout << "Kernel profiles written to " << std::filesystem::absolute(outDir) << std::endl;
+            return 0;
+        }
 
         std::ostringstream diagnostic;
         conversionDiagnostic(ctx, diagnostic);
