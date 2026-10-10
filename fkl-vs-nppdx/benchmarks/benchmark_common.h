@@ -32,6 +32,7 @@
 #include <fstream>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <stdexcept>
 #include <string>
@@ -164,7 +165,10 @@ inline void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer, size_
     while (cuptiActivityGetNextRecord(buffer, validSize, &record) == CUPTI_SUCCESS) {
         if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL) {
             const auto* k = reinterpret_cast<const CUpti_ActivityKernel12*>(record);
-            kernels().push_back({k->start, k->end});
+            // The L2 flush kernels of the flushed benchmark are not part of any pipeline
+            if (!(k->name && std::strstr(k->name, "flushL2Kernel"))) {
+                kernels().push_back({k->start, k->end});
+            }
         }
     }
     std::free(buffer);
@@ -200,10 +204,63 @@ inline std::vector<KernelSpan> trace(cudaStream_t stream, const std::function<vo
 }
 } // namespace cupti
 
-// Same iterations as runTwoExecutions, but each execution is timed by the sum of its kernels' GPU execution times
+// L2 flush for the GPU only benchmark with a flushed L2: reads a buffer of twice the L2 size, which evicts every other
+// line (writing back the dirty ones during the flush) and leaves L2 clean, so that the next kernel finds neither its
+// input nor any previous result in L2, as on a GPU that runs other kernels in between
+__global__ void flushL2Kernel(const int4* buffer, size_t count, int* sink) {
+    int acc = 0;
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const int4 v = __ldcg(buffer + i);
+        acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    if (acc == 0x7fffffff) {
+        *sink = acc; // never true for the zeroed buffer, keeps the loads
+    }
+}
+
+class L2Flusher {
+public:
+    explicit L2Flusher(cudaStream_t stream) : m_stream(stream) {
+        int device = 0;
+        gpuErrchk(cudaGetDevice(&device));
+        cudaDeviceProp prop{};
+        gpuErrchk(cudaGetDeviceProperties(&prop, device));
+        m_bytes = 2 * static_cast<size_t>(prop.l2CacheSize);
+        m_blocks = prop.multiProcessorCount * 8;
+        gpuErrchk(cudaMalloc(&m_buffer, m_bytes));
+        gpuErrchk(cudaMemset(m_buffer, 0, m_bytes));
+        gpuErrchk(cudaMalloc(&m_sink, sizeof(int)));
+    }
+    ~L2Flusher() {
+        cudaFree(m_buffer);
+        cudaFree(m_sink);
+    }
+    void flush() const {
+        flushL2Kernel<<<m_blocks, 256, 0, m_stream>>>(m_buffer, m_bytes / sizeof(int4), m_sink);
+    }
+    size_t bytes() const { return m_bytes; }
+private:
+    cudaStream_t m_stream;
+    int4* m_buffer{nullptr};
+    int* m_sink{nullptr};
+    size_t m_bytes{0};
+    int m_blocks{0};
+};
+
+// Same iterations as runTwoExecutions, but each execution is timed by the sum of its kernels' GPU execution times.
+// With a flusher, the L2 is flushed before every execution (each implementation here is a single kernel).
 inline TwoExecutionsResult runTwoExecutionsGpuOnly(cudaStream_t stream, const int variableDimensionValue,
-                                                   const std::function<void()>& first,
-                                                   const std::function<void()>& second) {
+                                                   const std::function<void()>& firstRun,
+                                                   const std::function<void()>& secondRun,
+                                                   const L2Flusher* flusher = nullptr) {
+    const std::function<void()> first = [&]() {
+        if (flusher) flusher->flush();
+        firstRun();
+    };
+    const std::function<void()> second = [&]() {
+        if (flusher) flusher->flush();
+        secondRun();
+    };
     const size_t firstKernels = cupti::trace(stream, first, 1).size();
     const size_t secondKernels = cupti::trace(stream, second, 1).size();
     for (int i = 0; i < WARMUP_ITERS; ++i) {

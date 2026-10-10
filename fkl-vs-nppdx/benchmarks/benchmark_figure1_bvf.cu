@@ -574,7 +574,8 @@ void runBatch(Workload& w, std::vector<benchmark::TwoExecutionsResult>& results,
 
 // GPU time only: the same comparison, timing each execution by the GPU execution time of its kernel (CUPTI)
 template <size_t N, NppdxConfig C>
-void compareGpuOnly(Workload& w, std::vector<benchmark::TwoExecutionsResult>& results) {
+void compareGpuOnly(Workload& w, std::vector<benchmark::TwoExecutionsResult>& results,
+                    const benchmark::L2Flusher* flusher = nullptr) {
     using Nppdx = NppdxFigure1<NPPDX_SM, N, C.block, C.tileX, C.tileY>;
     Nppdx::init();
     const auto crops = firstCrops<N>(w);
@@ -588,9 +589,9 @@ void compareGpuOnly(Workload& w, std::vector<benchmark::TwoExecutionsResult>& re
     gpuErrchk(cudaMalloc(&nppdxOut, outFloats * sizeof(float)));
     const auto r = benchmark::runTwoExecutionsGpuOnly(
         w.stream, static_cast<int>(N), [&]() { Nppdx::run(w, origins, nppdxOut); },
-        [&]() { runFKL<N>(w, crops, fklOut); });
+        [&]() { runFKL<N>(w, crops, fklOut); }, flusher);
     results.push_back(r);
-    std::cout << "GPU only, batch " << N << ": NPPDx (block " << Nppdx::block.x << ") median "
+    std::cout << (flusher ? "GPU only, L2 flushed, batch " : "GPU only, batch ") << N << ": NPPDx (block " << Nppdx::block.x << ") median "
               << r.first.median * 1000.f << " us, FKL median " << r.second.median * 1000.f << " us, mean speedup "
               << r.meanSpeedup << std::endl;
     gpuErrchk(cudaFree(nppdxOut));
@@ -646,6 +647,14 @@ void ncuTargetDispatch(Workload& w, const std::string& name, size_t batch, std::
     }
 }
 
+// GPU only with the L2 flushed before every kernel, with NPPDx in the block 256 configuration (the one chosen for every
+// batch size on the RTX 4090)
+template <size_t... Is>
+void gpuOnlyFlushedAllBatches(Workload& w, std::vector<benchmark::TwoExecutionsResult>& results,
+                              const benchmark::L2Flusher& flusher, std::index_sequence<Is...>) {
+    (compareGpuOnly<BATCHES[Is], NppdxConfig{256, CROP_W, CROP_H}>(w, results, &flusher), ...);
+}
+
 template <size_t... Is>
 void gpuOnlyAllBatches(Workload& w, std::vector<benchmark::TwoExecutionsResult>& results, std::index_sequence<Is...>) {
     (gpuOnlyBatch<BATCHES[Is]>(w, results), ...);
@@ -691,6 +700,15 @@ int main(int argc, char** argv) {
 
         Workload w;
         initWorkload(w);
+        if (argc > 2 && std::string(argv[2]) == "--gpu-only-l2-flushed") {
+            const benchmark::L2Flusher flusher(w.stream);
+            std::cout << "Flushing " << flusher.bytes() / (1 << 20) << " MiB (2x L2) before every kernel" << std::endl;
+            std::vector<benchmark::TwoExecutionsResult> flushed;
+            gpuOnlyFlushedAllBatches(w, flushed, flusher, std::make_index_sequence<BATCHES.size()>{});
+            benchmark::writeTwoExecutionsCSV(outDir, "benchmark_figure1_bvf_gpu_only_l2_flushed", "Batch size", "NPPDx",
+                                             "FKL", flushed);
+            return 0;
+        }
         if (argc > 4 && std::string(argv[2]) == "--ncu-target") {
             ncuTargetDispatch(w, argv[3], std::stoul(argv[4]), std::make_index_sequence<BATCHES.size()>{});
             return 0;

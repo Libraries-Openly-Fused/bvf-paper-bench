@@ -48,6 +48,18 @@ microseconds:
 | 50 | 32.8 | 2.66 | 12.4 |
 | 100 | 58.9 | 3.78 | 15.5 |
 
+**GPU only, L2 flushed**: like GPU only, but the L2 cache is flushed (a kernel reads twice the L2 size) before every
+execution, as on a GPU that runs other kernels in between, so that the input cannot be assumed to be in L2. Run with
+`benchmark_figure1_bvf <dir> --gpu-only-l2-flushed` (NPPDx with 256 threads per block). Median in microseconds:
+
+| N | NPPDx (us) | FKL (us) | Speedup |
+|---|---|---|---|
+| 1 | 16.9 | 1.92 | 8.9 |
+| 4 | 17.1 | 2.21 | 7.7 |
+| 16 | 17.7 | 2.43 | 7.3 |
+| 50 | 34.3 | 3.46 | 9.9 |
+| 100 | 62.8 | 4.51 | 13.9 |
+
 Most of the difference between the two benchmarks for FKL is host work: building and back-fusing the chain of
 operations for N crops and launching a kernel with their parameters (about 1.7 us at N = 1 and 7 us at N = 100).
 
