@@ -24,11 +24,16 @@
 #include <fused_kernel/core/execution_model/parallel_architectures.h>
 #include <fused_kernel/core/utils/utils.h>
 
+#include <cupti.h>
+
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <cstdint>
+#include <cstdlib>
 #include <functional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -127,6 +132,112 @@ inline TimeStats runOneExecution(cudaStream_t stream, const std::function<void()
     gpuErrchk(cudaEventDestroy(start));
     gpuErrchk(cudaEventDestroy(stop));
     return computeStats(times);
+}
+
+// GPU time only: CUPTI kernel activity tracing gives the start and end of every kernel on the GPU. The GPU time of
+// one execution is the sum of the execution times of its kernels: no host work and no launch gaps.
+namespace cupti {
+struct KernelSpan {
+    uint64_t start, end;
+};
+inline std::vector<KernelSpan>& kernels() {
+    static std::vector<KernelSpan> records;
+    return records;
+}
+
+inline void check(CUptiResult result, const char* what) {
+    if (result != CUPTI_SUCCESS) {
+        const char* message = nullptr;
+        cuptiGetResultString(result, &message);
+        throw std::runtime_error(std::string("CUPTI error ") + (message ? message : "") + " in " + what);
+    }
+}
+
+inline void CUPTIAPI bufferRequested(uint8_t** buffer, size_t* size, size_t* maxNumRecords) {
+    *size = 8 << 20;
+    *buffer = static_cast<uint8_t*>(std::aligned_alloc(8, *size));
+    *maxNumRecords = 0;
+}
+
+inline void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer, size_t, size_t validSize) {
+    CUpti_Activity* record = nullptr;
+    while (cuptiActivityGetNextRecord(buffer, validSize, &record) == CUPTI_SUCCESS) {
+        if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL) {
+            const auto* k = reinterpret_cast<const CUpti_ActivityKernel12*>(record);
+            kernels().push_back({k->start, k->end});
+        }
+    }
+    std::free(buffer);
+}
+
+inline void init() {
+    static bool initialized = false;
+    if (!initialized) {
+        check(cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted), "cuptiActivityRegisterCallbacks");
+        initialized = true;
+    }
+}
+
+// Runs run() `times` times with kernel tracing on and returns the kernel records in start order
+inline std::vector<KernelSpan> trace(cudaStream_t stream, const std::function<void()>& run, int times) {
+    init();
+    check(cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED), "cuptiActivityFlushAll");
+    kernels().clear();
+    check(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL), "cuptiActivityEnable");
+    for (int i = 0; i < times; ++i) {
+        run();
+        gpuErrchk(cudaStreamSynchronize(stream));
+        if (i % 100 == 99) {
+            check(cuptiActivityFlushAll(0), "cuptiActivityFlushAll");
+        }
+    }
+    check(cuptiActivityDisable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL), "cuptiActivityDisable");
+    check(cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED), "cuptiActivityFlushAll");
+    std::vector<KernelSpan> records;
+    records.swap(kernels());
+    std::sort(records.begin(), records.end(), [](const KernelSpan& a, const KernelSpan& b) { return a.start < b.start; });
+    return records;
+}
+} // namespace cupti
+
+// Same iterations as runTwoExecutions, but each execution is timed by the sum of its kernels' GPU execution times
+inline TwoExecutionsResult runTwoExecutionsGpuOnly(cudaStream_t stream, const int variableDimensionValue,
+                                                   const std::function<void()>& first,
+                                                   const std::function<void()>& second) {
+    const size_t firstKernels = cupti::trace(stream, first, 1).size();
+    const size_t secondKernels = cupti::trace(stream, second, 1).size();
+    for (int i = 0; i < WARMUP_ITERS; ++i) {
+        first();
+        gpuErrchk(cudaStreamSynchronize(stream));
+        second();
+        gpuErrchk(cudaStreamSynchronize(stream));
+    }
+    const auto records = cupti::trace(stream, [&]() {
+        first();
+        gpuErrchk(cudaStreamSynchronize(stream));
+        second();
+    }, ITERS);
+    if (records.size() != (firstKernels + secondKernels) * ITERS) {
+        throw std::runtime_error("GPU only benchmark: unexpected number of kernel records");
+    }
+    std::vector<float> firstTimes(ITERS), secondTimes(ITERS);
+    double speedupSum = 0.;
+    size_t idx = 0;
+    for (int i = 0; i < ITERS; ++i) {
+        uint64_t ns = 0;
+        for (size_t j = 0; j < firstKernels; ++j, ++idx) {
+            ns += records[idx].end - records[idx].start;
+        }
+        firstTimes[i] = static_cast<float>(ns * 1e-6);
+        ns = 0;
+        for (size_t j = 0; j < secondKernels; ++j, ++idx) {
+            ns += records[idx].end - records[idx].start;
+        }
+        secondTimes[i] = static_cast<float>(ns * 1e-6);
+        speedupSum += firstTimes[i] / secondTimes[i];
+    }
+    return {variableDimensionValue, computeStats(firstTimes), computeStats(secondTimes),
+            static_cast<float>(speedupSum / ITERS)};
 }
 
 // <benchmarkName>_<ParArch>.csv, as FKL names its benchmark files

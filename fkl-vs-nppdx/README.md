@@ -22,16 +22,34 @@ Both libraries run the whole pipeline in **one kernel**:
 
 ## Results on an RTX 4090
 
-Median latency of one pipeline in microseconds, over 1000 runs after 100 warm-up runs, and FKL's mean speedup
-(the mean of the per-iteration NPPDx / FKL ratios, as in FKL's and cvGPUSpeedup's benchmarks).
+Two benchmarks, with the same iterations: 1000 timed after 100 warm-up ones, NPPDx and FKL one after the other in
+each, and FKL's mean speedup computed per iteration (NPPDx time / FKL time) and averaged, as in FKL's and
+cvGPUSpeedup's benchmarks.
+
+**CPU + GPU**: CUDA events around everything the host does to enqueue the kernel plus its execution. Median
+latency in microseconds:
 
 | N | NPPDx (us) | FKL (us) | Speedup |
 |---|---|---|---|
-| 1 | 18.4 | 3.1 | 5.7 |
-| 4 | 18.4 | 3.7 | 5.3 |
-| 16 | 19.2 | 4.1 | 4.4 |
+| 1 | 19.4 | 3.1 | 5.9 |
+| 4 | 18.4 | 3.4 | 5.3 |
+| 16 | 19.1 | 4.1 | 4.4 |
 | 50 | 34.6 | 7.9 | 4.5 |
-| 100 | 61.1 | 11.5 | 5.2 |
+| 100 | 61.1 | 11.4 | 5.3 |
+
+**GPU only**: the GPU execution time of each kernel, from CUPTI kernel tracing (no host work). Median in
+microseconds:
+
+| N | NPPDx (us) | FKL (us) | Speedup |
+|---|---|---|---|
+| 1 | 16.4 | 1.38 | 12.0 |
+| 4 | 16.5 | 1.47 | 11.3 |
+| 16 | 17.2 | 1.60 | 10.7 |
+| 50 | 32.8 | 2.66 | 12.4 |
+| 100 | 58.9 | 3.78 | 15.5 |
+
+Most of the difference between the two benchmarks for FKL is host work: building and back-fusing the chain of
+operations for N crops and launching a kernel with their parameters (about 1.7 us at N = 1 and 7 us at N = 100).
 
 The CSV files and the platform description are in [`results/RTX4090`](results/RTX4090): NVIDIA GeForce RTX 4090,
 driver 610.43.02, CUDA 13.3, GCC 15.2, AMD Ryzen 9 5950X, Ubuntu 26.04.1, FKL `b9f4281`, NPPDx v0.1.2.
@@ -82,7 +100,8 @@ Following FKL's benchmark convention, each benchmark writes `<benchmark>_<ParArc
 size: `Batch size`, then `MeanTime`, `TimeVariance`, `MaxTime` and `MinTime` of the first (baseline, NPPDx) and
 second (FKL) implementation in milliseconds, `Mean Speedup`, and the `MedianTime`, `P10Time` and `P90Time` of
 each. In every iteration both implementations are timed one after the other with CUDA events on one stream,
-synchronizing after each. Next to it are `_validation_` (errors), `_nppdx_block_sweep_` and `_platform.txt`.
+synchronizing after each. `<benchmark>_gpu_only_<ParArch>.csv` has the same columns for the GPU only benchmark.
+Next to them are `_validation_` (errors), `_nppdx_block_sweep_` and `_platform.txt`.
 
 ## License
 

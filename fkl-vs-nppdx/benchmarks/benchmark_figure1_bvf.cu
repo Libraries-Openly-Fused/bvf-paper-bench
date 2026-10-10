@@ -45,6 +45,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <random>
 #include <string>
@@ -456,6 +457,10 @@ constexpr std::array<NppdxConfig, 5> NPPDX_CONFIGS{{{0, 20, 10}, {64, 20, 10}, {
                                                     {512, 20, 10}}};
 constexpr float TOLERANCE = 1e-3f;
 
+// NPPDx configuration (index into NPPDX_CONFIGS) chosen for every batch size in the CPU + GPU benchmark, reused by
+// the GPU only benchmark
+std::map<size_t, size_t> chosenConfig;
+
 struct BlockSweep {
     size_t batch{0};
     unsigned requestedBlock{0}, tileX{0}, tileY{0}, actualBlock{0}, blocksPerCrop{0};
@@ -555,6 +560,7 @@ void runBatch(Workload& w, std::vector<benchmark::TwoExecutionsResult>& results,
     if (best == NPPDX_CONFIGS.size()) {
         throw std::runtime_error("No NPPDx configuration produced a correct result for batch " + std::to_string(N));
     }
+    chosenConfig[N] = best;
     [&]<size_t... Is>(std::index_sequence<Is...>) {
         ((Is == best ? compareWithFKL<N, NPPDX_CONFIGS[Is]>(w, origins, crops, nppdxOut, fklOut, fklReference,
                                                             pixelCenters, results, checks)
@@ -562,6 +568,43 @@ void runBatch(Workload& w, std::vector<benchmark::TwoExecutionsResult>& results,
          ...);
     }(std::make_index_sequence<NPPDX_CONFIGS.size()>{});
     gpuErrchk(cudaFree(nppdxOut));
+}
+
+// GPU time only: the same comparison, timing each execution by the GPU execution time of its kernel (CUPTI)
+template <size_t N, NppdxConfig C>
+void compareGpuOnly(Workload& w, std::vector<benchmark::TwoExecutionsResult>& results) {
+    using Nppdx = NppdxFigure1<NPPDX_SM, N, C.block, C.tileX, C.tileY>;
+    Nppdx::init();
+    const auto crops = firstCrops<N>(w);
+    CropOrigins<N> origins{};
+    for (size_t i = 0; i < N; ++i) {
+        origins.origin[i] = int2{static_cast<int>(crops[i].x), static_cast<int>(crops[i].y)};
+    }
+    constexpr size_t outFloats = N * OUT_W * OUT_H * 3;
+    fk::Tensor<fk::float3> fklOut(OUT_W, OUT_H, N, 1, fk::MemType::Device);
+    float* nppdxOut = nullptr;
+    gpuErrchk(cudaMalloc(&nppdxOut, outFloats * sizeof(float)));
+    const auto r = benchmark::runTwoExecutionsGpuOnly(
+        w.stream, static_cast<int>(N), [&]() { Nppdx::run(w, origins, nppdxOut); },
+        [&]() { runFKL<N>(w, crops, fklOut); });
+    results.push_back(r);
+    std::cout << "GPU only, batch " << N << ": NPPDx (block " << Nppdx::block.x << ") median "
+              << r.first.median * 1000.f << " us, FKL median " << r.second.median * 1000.f << " us, mean speedup "
+              << r.meanSpeedup << std::endl;
+    gpuErrchk(cudaFree(nppdxOut));
+}
+
+template <size_t N>
+void gpuOnlyBatch(Workload& w, std::vector<benchmark::TwoExecutionsResult>& results) {
+    const size_t chosen = chosenConfig.at(N);
+    [&]<size_t... Is>(std::index_sequence<Is...>) {
+        ((Is == chosen ? compareGpuOnly<N, NPPDX_CONFIGS[Is]>(w, results) : void()), ...);
+    }(std::make_index_sequence<NPPDX_CONFIGS.size()>{});
+}
+
+template <size_t... Is>
+void gpuOnlyAllBatches(Workload& w, std::vector<benchmark::TwoExecutionsResult>& results, std::index_sequence<Is...>) {
+    (gpuOnlyBatch<BATCHES[Is]>(w, results), ...);
 }
 
 template <size_t... Is>
@@ -615,9 +658,13 @@ int main(int argc, char** argv) {
         std::vector<Validation> checks;
         std::vector<BlockSweep> sweep;
         runAllBatches(w, results, checks, sweep, std::make_index_sequence<BATCHES.size()>{});
+        // GPU time only, after all the CPU + GPU measurements so that CUPTI cannot affect them
+        std::vector<benchmark::TwoExecutionsResult> gpuOnlyResults;
+        gpuOnlyAllBatches(w, gpuOnlyResults, std::make_index_sequence<BATCHES.size()>{});
 
         const std::string name = "benchmark_figure1_bvf";
         benchmark::writeTwoExecutionsCSV(outDir, name, "Batch size", "NPPDx", "FKL", results);
+        benchmark::writeTwoExecutionsCSV(outDir, name + "_gpu_only", "Batch size", "NPPDx", "FKL", gpuOnlyResults);
         const std::string parArch(fk::toStrView(fk::defaultParArch));
         std::ofstream validation(outDir / (name + "_validation_" + parArch + ".csv"));
         validation << "Batch size, NPPDx BlockSize, NPPDx Tile, NPPDx MaxAbsError vs pixel-center reference, "
@@ -651,9 +698,12 @@ int main(int argc, char** argv) {
                  << "NPPDx: " << NPPDX_GIT_VERSION << ", operations for SM " << NPPDX_SM << "\n"
                  << "CPU: " << shell("lscpu | sed -n 's/^Model name: *//p'") << "\n"
                  << "OS: " << shell(". /etc/os-release && echo $PRETTY_NAME") << "\n"
-                 << "Timing: " << benchmark::WARMUP_ITERS << " warm-up and " << benchmark::ITERS
-                 << " timed iterations; in each one NPPDx and FKL are timed one after the other with CUDA events "
-                    "and a synchronization after each. Times in the CSV are in ms.\n"
+                 << "Timing, two benchmarks: " << benchmark::WARMUP_ITERS << " warm-up and " << benchmark::ITERS
+                 << " timed iterations, in each one NPPDx and then FKL, with a synchronization after each. "
+                    "CPU + GPU (" << name << "_" << parArch << ".csv): CUDA events around everything the host does "
+                    "to enqueue the kernel plus its execution. GPU only (" << name << "_gpu_only_" << parArch
+                 << ".csv): a second pass with CUPTI kernel tracing, the GPU execution time of the kernel. The speedup "
+                    "is computed per iteration and averaged. Times in the CSV are in ms.\n"
                  << "nvcc flags: -O3 -DNDEBUG -std=c++20 --threads 0 -rdc=false -split-compile=0 -ftemplate-depth=1000 "
                     "-lineinfo --expt-relaxed-constexpr, CUDA_ARCHITECTURES " << CUDA_ARCHITECTURES_STR << "\n"
                  << "Correctness: FKL against FKL's CPU backend running the same chain (resize samples at dst * scale); "

@@ -1,5 +1,5 @@
 Batch size, NPPDx BlockSize, NPPDx Tile, NPPDx MaxAbsError vs pixel-center reference, NPPDx MeanAbsError vs pixel-center reference, NPPDx MaxAbsError vs FKL reference, NPPDx MeanAbsError vs FKL reference, FKL MaxAbsError vs FKL reference, FKL MeanAbsError vs FKL reference
-1, 512, 20x10, 1.43051e-06, 7.39365e-08, 4.4743, 0.376718, 1.43051e-06, 6.39128e-08
+1, 256, 20x10, 1.43051e-06, 7.39365e-08, 4.4743, 0.376718, 1.43051e-06, 6.39128e-08
 4, 256, 20x10, 1.66893e-06, 6.9418e-08, 4.4743, 0.368596, 1.43051e-06, 5.8794e-08
 16, 256, 20x10, 1.66893e-06, 6.75583e-08, 4.4743, 0.36762, 1.90735e-06, 5.57658e-08
 50, 256, 20x10, 1.90735e-06, 6.70347e-08, 4.4743, 0.363475, 1.90735e-06, 5.48023e-08
