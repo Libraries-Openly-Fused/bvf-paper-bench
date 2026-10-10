@@ -31,7 +31,7 @@ function(add_bench_target TARGET_NAME SOURCE)
         BENCH_FKL_COMMIT="${FKL_COMMIT}" BENCH_FKL_BRANCH="${FKL_BRANCH}"
         BENCH_NVCC_VERSION="${CMAKE_CUDA_COMPILER_VERSION}" BENCH_NVCC_FLAGS="${BENCH_NVCC_FLAGS}")
     target_link_libraries(${TARGET_NAME} PRIVATE CUDA::cudart CUDA::nppc CUDA::nppicc CUDA::nppig CUDA::nppial
-                                                 CUDA::nppidei CUDA::cupti opencv_core opencv_cudaarithm opencv_cudawarping)
+                                                 CUDA::nppidei CUDA::cupti CUDA::nvtx3 opencv_core opencv_cudaarithm opencv_cudawarping)
 endfunction()
 
 add_bench_target(bvf_bench src/bvf_bench.cu)

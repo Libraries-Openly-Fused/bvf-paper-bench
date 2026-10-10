@@ -31,6 +31,7 @@
 #include <npp.h>
 
 #include <cupti.h>
+#include <nvtx3/nvToolsExt.h>
 
 #include <algorithm>
 #include <array>
@@ -1133,6 +1134,36 @@ void hostOverheadBatch(Context& ctx) {
     }
 }
 
+// Target for Nsight Compute: warms up one pipeline, then runs it once more inside the NVTX range "measure", so that
+// ncu --nvtx --nvtx-include "measure/" profiles exactly one execution of it
+template <size_t N>
+void ncuTarget(Context& ctx, const std::string& name) {
+    std::shared_ptr<OpenCVState> ocvState;
+    auto impls = makeImplementations<N>(ctx, ocvState);
+    impls.push_back(makeFklVfHf<N, false>(ctx));
+    const auto impl = std::find_if(impls.begin(), impls.end(), [&](const Implementation& i) { return i.name == name; });
+    if (impl == impls.end()) {
+        throw std::runtime_error("Unknown implementation " + name);
+    }
+    for (int i = 0; i < 3; ++i) {
+        impl->run();
+    }
+    gpuErrchk(cudaStreamSynchronize(ctx.stream));
+    nvtxRangePushA("measure");
+    impl->run();
+    gpuErrchk(cudaStreamSynchronize(ctx.stream));
+    nvtxRangePop();
+}
+
+template <size_t... Is>
+void ncuTargetDispatch(Context& ctx, const std::string& name, size_t batch, std::index_sequence<Is...>) {
+    bool found = false;
+    ((BATCHES[Is] == batch ? (ncuTarget<BATCHES[Is]>(ctx, name), found = true) : false), ...);
+    if (!found) {
+        throw std::runtime_error("Batch size " + std::to_string(batch) + " is not one of the benchmarked ones");
+    }
+}
+
 template <size_t... Is>
 void hostOverheadAllBatches(Context& ctx, std::index_sequence<Is...>) {
     (hostOverheadBatch<BATCHES[Is]>(ctx), ...);
@@ -1242,6 +1273,10 @@ int main(int argc, char** argv) {
         Context ctx;
         initContext(ctx);
 
+        if (argc > 4 && std::string(argv[2]) == "--ncu-target") {
+            ncuTargetDispatch(ctx, argv[3], std::stoul(argv[4]), std::make_index_sequence<BATCHES.size()>{});
+            return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "--host-overhead") {
             hostOverheadAllBatches(ctx, std::make_index_sequence<BATCHES.size()>{});
             std::ofstream csv(outDir / "host_overhead.csv");
