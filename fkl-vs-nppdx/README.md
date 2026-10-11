@@ -100,6 +100,33 @@ configuration and `BlockDim` 64, 128, 256 and 512 for every N, checks each one, 
 correct one (256 or 512 threads, which are within noise of each other). The sweep is in
 `benchmark_figure1_bvf_nppdx_block_sweep_GPU_NVIDIA.csv`.
 
+## Region size sweep
+
+`benchmark_figure1_bvf <dir> --region-sweep` runs the same chain with N = 16 regions of growing size, each resized
+exactly 2x (NPPDx ratio 1:2) and given the 16 black rows on top and bottom:
+
+| Region | Source | Resized | Output | 16 regions cover |
+|---|---|---|---|---|
+| A | 32x16 | 64x32 | 64x64 | 0.0988% of the frame |
+| B | 112x96 | 224x192 | 224x224 | 2.0741% |
+| C | 320x304 | 640x608 | 640x640 | 18.7654% |
+| D | 960x524 | 1920x1048 | 1920x1080 | 97.0370% |
+
+The regions sit at the origins of a 4x4 grid of 960x540 cells (region i = row * 4 + column), so they never overlap.
+Only a 32x16 region fits in one NPPDx tile: for the larger ones NPPDx rejects a whole-region tile (its output tile
+does not fit in the shared memory of a block), so every region is split in tiles, several thread blocks per region.
+For every size the benchmark checks three tiles with NPPDx's recommended block and with `BlockDim` 128 and 256,
+times the correct ones alone and compares FKL with the fastest. A `BlockDim` smaller than the recommended block of
+a tile gives wrong results and is never chosen. As in the main benchmark there are three comparisons: CPU + GPU,
+GPU only and GPU only with the L2 flushed. The files start with `benchmark_figure1_bvf_region_sweep`, with
+`Source pixels per region` as the first column, plus `_validation_`, `_nppdx_configs_` (every tile and block tried),
+`_summary_` (sizes, coverage, chosen NPPDx configuration, kernels per execution and bytes written) and
+`_platform.txt`.
+
+`--region-sweep-validate` only checks the results, without timing. `--region-ncu-target <nppdx|fkl_bvf> <A|B|C|D>
+[<tileX>x<tileY> <block>]` runs one execution inside the NVTX range `measure` for Nsight Compute; NPPDx needs the
+tile and block, for example the ones chosen in the summary file (block 0 is NPPDx's recommended one).
+
 ## Build and run
 
 Requirements: CUDA 13, CMake 3.30, a C++20 host compiler, and an NVIDIA GPU (sm_75 or newer).

@@ -24,6 +24,9 @@
 //          because NPPDx has no border operation, its affine map only takes integer constants, and it
 //          has no float output format.
 //   FKL:   one executeOperations call (Backwards Vertical Fusion), the paper's Listing 2.
+//
+// --region-sweep runs the same chain with N = 16 regions of growing size and an exact 2x resize (NPPDx ratio 1:2),
+// from 32x16 regions up to 960x524 ones that cover 97% of the frame (see namespace region below).
 
 #include <benchmarks/benchmark_common.h>
 
@@ -44,8 +47,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -75,6 +80,17 @@ constexpr unsigned CROP_SEED = 42;
 constexpr unsigned RESIZE_J = 5;
 constexpr unsigned RESIZE_K = 16;
 static_assert(CROP_W * RESIZE_K == RES_W * RESIZE_J && CROP_H * RESIZE_K == RES_H * RESIZE_J);
+
+// Sizes of one benchmark: CropW x CropH regions resized (J:K in both axes) to ResW x ResH, plus the border rows
+template <int CropW, int CropH, int ResW, int ResH, unsigned J, unsigned K>
+struct Geometry {
+    static constexpr int cropW = CropW, cropH = CropH, resW = ResW, resH = ResH;
+    static constexpr int outW = ResW, outH = ResH + BORDER_TOP + BORDER_BOTTOM;
+    static constexpr unsigned resizeJ = J, resizeK = K;
+    static_assert(CropW * K == ResW * J && CropH * K == ResH * J, "The resize must be J:K in both dimensions");
+};
+// The main benchmark: 20x10 crops resized to 64x32
+using MainGeometry = Geometry<CROP_W, CROP_H, RES_W, RES_H, RESIZE_J, RESIZE_K>;
 
 // ImageNet normalization of 8 bit RGB
 struct Normalization {
@@ -143,13 +159,13 @@ std::array<fk::Rect, N> firstCrops(const Workload& w) {
 // ------------------------------------------------------------------------------------------------
 // FKL: Backwards Vertical Fusion, one kernel
 // ------------------------------------------------------------------------------------------------
-template <size_t N>
+template <size_t N, typename G = MainGeometry>
 void runFKL(Workload& w, const std::array<fk::Rect, N>& crops, fk::Tensor<fk::float3>& out) {
     fk::executeOperations<fk::TransformDPP<>>(*w.fkStream,
         fk::ReadYUV<fk::PixelFormat::NV12>::build(*w.frameDevice),
         YUVToRGB::build(),
         fk::Crop<>::build(crops),
-        fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(RES_W, RES_H)),
+        fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(G::resW, G::resH)),
         fk::AddBorder<>::build(BORDER_TOP, BORDER_BOTTOM, 0, 0, fk::float3{0.f, 0.f, 0.f}),
         fk::Mul<fk::float3>::build(fk::float3{norm.mul[0], norm.mul[1], norm.mul[2]}),
         fk::Sub<fk::float3>::build(fk::float3{norm.sub[0], norm.sub[1], norm.sub[2]}),
@@ -165,7 +181,7 @@ struct CropOrigins {
     int2 origin[N];
 };
 
-template <typename Ingest, typename Convert, typename Resize, typename InputTile, typename OutputTile,
+template <typename G, typename Ingest, typename Convert, typename Resize, typename InputTile, typename OutputTile,
           typename TempTile, size_t N>
 __global__ void nppdxFigure1Kernel(const uint8_t* y, const uint8_t* uv, const int pitch,
                                    const CropOrigins<N> crops, const Normalization n, float* out) {
@@ -175,17 +191,17 @@ __global__ void nppdxFigure1Kernel(const uint8_t* y, const uint8_t* uv, const in
     auto resizedTile = std::get<1>(tiles);
     auto tempTile = std::get<2>(tiles);
 
-    // ReadNV12 + Crop: the crop is ingested as a CROP_W x CROP_H NV12 image inside the frame; NPPDx takes
+    // ReadNV12 + Crop: the crop is ingested as a cropW x cropH NV12 image inside the frame; NPPDx takes
     // the position of this block's tile in the crop from blockIdx.x and blockIdx.y, and blockIdx.z is the crop
     const int2 o = crops.origin[blockIdx.z];
     const nppdx::ImageLayout<const uint8_t, 2> crop{{{y + static_cast<size_t>(o.y) * pitch + o.x,
                                                       uv + static_cast<size_t>(o.y / 2) * pitch + o.x}},
                                                     {{pitch, pitch}}};
-    Ingest().execute(crop, inputTile, CROP_W, CROP_H);
+    Ingest().execute(crop, inputTile, G::cropW, G::cropH);
     // YUVtoRGB, in place on the shared memory tile
-    Convert().execute(inputTile, CROP_W, CROP_H);
-    // Resize, 5 input pixels to 16 output pixels in both dimensions
-    Resize().execute(inputTile, tempTile, resizedTile, CROP_W, CROP_H);
+    Convert().execute(inputTile, G::cropW, G::cropH);
+    // Resize, J input pixels to K output pixels in both dimensions
+    Resize().execute(inputTile, tempTile, resizedTile, G::cropW, G::cropH);
     __syncthreads();
 
     // AddBorder + Mul + Sub + Div + Write float3 (no NPPDx operations for these). Each block writes its
@@ -195,15 +211,15 @@ __global__ void nppdxFigure1Kernel(const uint8_t* y, const uint8_t* uv, const in
     const int ox = blockIdx.x * OTW;
     const int oy = blockIdx.y * OTH;
     const int rowBegin = blockIdx.y == 0 ? 0 : BORDER_TOP + oy;
-    const int rowEnd = blockIdx.y == gridDim.y - 1 ? OUT_H : BORDER_TOP + oy + OTH;
-    float* plane = out + static_cast<size_t>(blockIdx.z) * OUT_W * OUT_H * 3;
+    const int rowEnd = blockIdx.y == gridDim.y - 1 ? G::outH : BORDER_TOP + oy + OTH;
+    float* plane = out + static_cast<size_t>(blockIdx.z) * G::outW * G::outH * 3;
     const int numThreads = blockDim.x * blockDim.y * blockDim.z;
     const int tid = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
     for (int idx = tid; idx < (rowEnd - rowBegin) * OTW; idx += numThreads) {
         const int tx = idx % OTW;
         const int outY = rowBegin + idx / OTW;
-        const bool inside = outY >= BORDER_TOP && outY < BORDER_TOP + RES_H;
-        float* pixel = plane + (static_cast<size_t>(outY) * OUT_W + ox + tx) * 3;
+        const bool inside = outY >= BORDER_TOP && outY < BORDER_TOP + G::resH;
+        float* pixel = plane + (static_cast<size_t>(outY) * G::outW + ox + tx) * 3;
 #pragma unroll
         for (int c = 0; c < 3; ++c) {
             const float value = inside ? resizedTile.channel(c)(outY - BORDER_TOP - oy, tx) : 0.f;
@@ -216,13 +232,15 @@ __global__ void nppdxFigure1Kernel(const uint8_t* y, const uint8_t* uv, const in
 template <unsigned BlockX>
 using NppdxBlock = std::conditional_t<BlockX == 0, decltype(nppdx::Block()), decltype(nppdx::Block() + nppdx::BlockDim<BlockX>())>;
 
-// TileX x TileY is the input tile of one thread block; its output tile is TileX x TileY * RESIZE_K / RESIZE_J
-template <int Arch, size_t N, unsigned BlockX = 0, unsigned TileX = CROP_W, unsigned TileY = CROP_H>
+// TileX x TileY is the input tile of one thread block; its output tile is TileX x TileY * K / J
+template <int Arch, size_t N, unsigned BlockX = 0, unsigned TileX = CROP_W, unsigned TileY = CROP_H,
+          typename G = MainGeometry>
 struct NppdxFigure1 {
-    static_assert(CROP_W % TileX == 0 && CROP_H % TileY == 0 && TileX % RESIZE_J == 0 && TileY % RESIZE_J == 0,
+    static constexpr unsigned J = G::resizeJ, K = G::resizeK;
+    static_assert(G::cropW % TileX == 0 && G::cropH % TileY == 0 && TileX % J == 0 && TileY % J == 0,
                   "Tiles must split the crop and be multiples of the resize input ratio");
     using ResizePre = decltype(nppdx::Function<nppdx::function::resize>() +
-                               nppdx::Resize<RESIZE_J, RESIZE_K, nppdx::interpolation_method::bilinear>() +
+                               nppdx::Resize<J, K, nppdx::interpolation_method::bilinear>() +
                                nppdx::TileSize<TileX, TileY>() + nppdx::SM<Arch>() + NppdxBlock<BlockX>());
     static constexpr auto halo = ResizePre::local_halo;
     using Ingest = decltype(nppdx::InputOutput<nppdx::input_output_direction::ingest>() +
@@ -241,8 +259,7 @@ struct NppdxFigure1 {
     using TempTile = nppdx::temp_storage_of_t<Resize>;
     static constexpr unsigned outTileX = OutputTile::ChannelSliceType::width;
     static constexpr unsigned outTileY = OutputTile::ChannelSliceType::height;
-    static_assert(outTileX * RESIZE_J == TileX * RESIZE_K && outTileY * RESIZE_J == TileY * RESIZE_K,
-                  "Unexpected output tile size");
+    static_assert(outTileX * J == TileX * K && outTileY * J == TileY * K, "Unexpected output tile size");
     static_assert(nppdx::is_supported_v<Ingest, Arch> && nppdx::is_supported_v<Convert, Arch> &&
                   nppdx::is_supported_v<Resize, Arch>);
     static constexpr size_t smem = nppdx::shared_memory::compute_total_tile_storage<InputTile, OutputTile, TempTile>();
@@ -250,9 +267,9 @@ struct NppdxFigure1 {
     // (with BlockDim<X> they are all X). Ingest alone would not be enough: its recommended block has one thread
     // per 4x2 cell of the tile, but it loads the tile plus the resize halo, which has more cells.
     static constexpr dim3 block{std::max({Ingest::block_dim.x, Convert::block_dim.x, Resize::block_dim.x}), 1, 1};
-    static constexpr dim3 grid{RES_W / outTileX, RES_H / outTileY, N};
+    static constexpr dim3 grid{G::resW / outTileX, G::resH / outTileY, N};
 
-    static constexpr auto kernel = nppdxFigure1Kernel<Ingest, Convert, Resize, InputTile, OutputTile, TempTile, N>;
+    static constexpr auto kernel = nppdxFigure1Kernel<G, Ingest, Convert, Resize, InputTile, OutputTile, TempTile, N>;
 
     static void init() {
         if constexpr (smem > 48 * 1024) {
@@ -269,16 +286,15 @@ struct NppdxFigure1 {
 // ------------------------------------------------------------------------------------------------
 // Reference on FKL's CPU backend
 // ------------------------------------------------------------------------------------------------
-template <size_t N>
-std::vector<float> cpuReference(const Workload& w) {
-    const auto crops = firstCrops<N>(w);
+template <size_t N, typename G = MainGeometry>
+std::vector<float> cpuReference(const Workload& w, const std::array<fk::Rect, N>& crops) {
     fk::Stream_<fk::ParArch::CPU> cpuStream;
-    fk::Tensor<fk::float3> out(OUT_W, OUT_H, N, 1, fk::MemType::Host);
+    fk::Tensor<fk::float3> out(G::outW, G::outH, N, 1, fk::MemType::Host);
     fk::executeOperations<fk::TransformDPP<fk::ParArch::CPU>>(cpuStream,
         fk::ReadYUV<fk::PixelFormat::NV12>::build(*w.frameHost),
         YUVToRGB::build(),
         fk::Crop<>::build(crops),
-        fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(RES_W, RES_H)),
+        fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(G::resW, G::resH)),
         fk::AddBorder<>::build(BORDER_TOP, BORDER_BOTTOM, 0, 0, fk::float3{0.f, 0.f, 0.f}),
         fk::Mul<fk::float3>::build(fk::float3{norm.mul[0], norm.mul[1], norm.mul[2]}),
         fk::Sub<fk::float3>::build(fk::float3{norm.sub[0], norm.sub[1], norm.sub[2]}),
@@ -286,7 +302,7 @@ std::vector<float> cpuReference(const Workload& w) {
         fk::TensorWrite<fk::float3>::build(out.ptr()));
     cpuStream.sync();
     const float* data = reinterpret_cast<const float*>(out.ptr().data);
-    return std::vector<float>(data, data + N * OUT_W * OUT_H * 3);
+    return std::vector<float>(data, data + N * G::outW * G::outH * 3);
 }
 
 struct Error {
@@ -315,20 +331,22 @@ std::vector<float> download(const float* data, size_t floats) {
 // optional clamp of RGB to [0, 255] after the color conversion, and the bilinear sampling convention
 enum class Sampling { DstTimesScale, PixelCenters, NppMinusQuarter };
 
-std::vector<float> hostVariant(const Workload& w, size_t cropIdx, bool clampRGB, Sampling sampling) {
-    std::vector<float> out(OUT_W * OUT_H * 3);
-    const fk::Rect& r = w.crops[cropIdx];
-    float crop[CROP_H][CROP_W][3];
-    for (int y = 0; y < CROP_H; ++y) {
-        for (int x = 0; x < CROP_W; ++x) {
+template <typename G = MainGeometry>
+std::vector<float> hostVariant(const Workload& w, const fk::Rect& r, bool clampRGB, Sampling sampling) {
+    constexpr int CW = G::cropW, CH = G::cropH, OW = G::outW, OH = G::outH;
+    std::vector<float> out(static_cast<size_t>(OW) * OH * 3);
+    std::vector<float> cropPixels(static_cast<size_t>(CW) * CH * 3);
+    const auto crop = [&](int y, int x, int c) -> float& { return cropPixels[(static_cast<size_t>(y) * CW + x) * 3 + c]; };
+    for (int y = 0; y < CH; ++y) {
+        for (int x = 0; x < CW; ++x) {
             const fk::float3 rgb = YUVToRGB::exec(w.frameHost->readAt(fk::Point{static_cast<int>(r.x) + x, static_cast<int>(r.y) + y, 0}));
             const float c3[3] = {rgb.x, rgb.y, rgb.z};
             for (int c = 0; c < 3; ++c) {
-                crop[y][x][c] = clampRGB ? std::min(255.f, std::max(0.f, c3[c])) : c3[c];
+                crop(y, x, c) = clampRGB ? std::min(255.f, std::max(0.f, c3[c])) : c3[c];
             }
         }
     }
-    const float sx = static_cast<float>(CROP_W) / RES_W, sy = static_cast<float>(CROP_H) / RES_H;
+    const float sx = static_cast<float>(CW) / G::resW, sy = static_cast<float>(CH) / G::resH;
     const auto map = [&](int d, float scale) {
         switch (sampling) {
             case Sampling::DstTimesScale: return d * scale;
@@ -336,23 +354,23 @@ std::vector<float> hostVariant(const Workload& w, size_t cropIdx, bool clampRGB,
             default: return d * scale - 0.25f;
         }
     };
-    for (int y = 0; y < OUT_H; ++y) {
-        for (int x = 0; x < OUT_W; ++x) {
+    for (int y = 0; y < OH; ++y) {
+        for (int x = 0; x < OW; ++x) {
             const int ry = y - BORDER_TOP;
             float v[3] = {0.f, 0.f, 0.f};
-            if (ry >= 0 && ry < RES_H) {
-                const float fxs = std::min<float>(CROP_W - 1, std::max(0.f, map(x, sx)));
-                const float fys = std::min<float>(CROP_H - 1, std::max(0.f, map(ry, sy)));
+            if (ry >= 0 && ry < G::resH) {
+                const float fxs = std::min<float>(CW - 1, std::max(0.f, map(x, sx)));
+                const float fys = std::min<float>(CH - 1, std::max(0.f, map(ry, sy)));
                 const int x0 = static_cast<int>(fxs), y0 = static_cast<int>(fys);
-                const int x1 = std::min(x0 + 1, CROP_W - 1), y1 = std::min(y0 + 1, CROP_H - 1);
+                const int x1 = std::min(x0 + 1, CW - 1), y1 = std::min(y0 + 1, CH - 1);
                 const float ax = fxs - x0, ay = fys - y0;
                 for (int c = 0; c < 3; ++c) {
-                    v[c] = (crop[y0][x0][c] * (1.f - ax) + crop[y0][x1][c] * ax) * (1.f - ay) +
-                           (crop[y1][x0][c] * (1.f - ax) + crop[y1][x1][c] * ax) * ay;
+                    v[c] = (crop(y0, x0, c) * (1.f - ax) + crop(y0, x1, c) * ax) * (1.f - ay) +
+                           (crop(y1, x0, c) * (1.f - ax) + crop(y1, x1, c) * ax) * ay;
                 }
             }
             for (int c = 0; c < 3; ++c) {
-                out[(y * OUT_W + x) * 3 + c] = ((v[c] * norm.mul[c]) - norm.sub[c]) / norm.div[c];
+                out[(static_cast<size_t>(y) * OW + x) * 3 + c] = ((v[c] * norm.mul[c]) - norm.sub[c]) / norm.div[c];
             }
         }
     }
@@ -399,7 +417,7 @@ void analyze(Workload& w) {
     const char* names[] = {"dst*scale (FKL)", "pixel centers", "dst*scale-0.25 (NPP)"};
     for (bool clampRGB : {false, true}) {
         for (Sampling s : {Sampling::DstTimesScale, Sampling::PixelCenters, Sampling::NppMinusQuarter}) {
-            const Error e = compare(nppdx, hostVariant(w, 0, clampRGB, s));
+            const Error e = compare(nppdx, hostVariant(w, w.crops[0], clampRGB, s));
             std::cout << "NPPDx vs host reference, " << (clampRGB ? "RGB clamped to [0,255], " : "RGB not clamped,      ")
                       << names[static_cast<int>(s)] << ": max " << e.max << ", mean " << e.mean << std::endl;
         }
@@ -438,7 +456,7 @@ void analyze(Workload& w) {
         std::cout << "Ingest + ColorConvert tile vs FKL conversion (8 bit levels): max diff not clamped " << maxRaw
                   << ", clamped to [0,255] " << maxClamped << std::endl;
     }
-    const auto ref = hostVariant(w, 0, false, Sampling::DstTimesScale);
+    const auto ref = hostVariant(w, w.crops[0], false, Sampling::DstTimesScale);
     for (const int y : {0, 16, 17, 30, 47, 48}) {
         for (const int x : {0, 1, 31, 63}) {
             const size_t i = (y * OUT_W + x) * 3;
@@ -478,11 +496,12 @@ struct Validation {
 
 // NPPDx samples the bilinear resize at pixel centers, FKL at dst * scale (see --analyze); this reference
 // is the same chain as FKL's CPU reference but with pixel-center sampling
-template <size_t N>
-std::vector<float> pixelCenterReference(const Workload& w) {
+template <size_t N, typename G = MainGeometry>
+std::vector<float> pixelCenterReference(const Workload& w, const std::array<fk::Rect, N>& crops) {
     std::vector<float> out;
+    out.reserve(N * G::outW * G::outH * 3);
     for (size_t i = 0; i < N; ++i) {
-        const auto plane = hostVariant(w, i, false, Sampling::PixelCenters);
+        const auto plane = hostVariant<G>(w, crops[i], false, Sampling::PixelCenters);
         out.insert(out.end(), plane.begin(), plane.end());
     }
     return out;
@@ -543,8 +562,8 @@ void runBatch(Workload& w, std::vector<benchmark::TwoExecutionsResult>& results,
     fk::Tensor<fk::float3> fklOut(OUT_W, OUT_H, N, 1, fk::MemType::Device);
     float* nppdxOut = nullptr;
     gpuErrchk(cudaMalloc(&nppdxOut, outFloats * sizeof(float)));
-    const auto fklReference = cpuReference<N>(w);
-    const auto pixelCenters = pixelCenterReference<N>(w);
+    const auto fklReference = cpuReference<N>(w, crops);
+    const auto pixelCenters = pixelCenterReference<N>(w, crops);
 
     // NPPDx block size sweep; the fastest configuration that is correct is compared with FKL
     const size_t first = sweep.size();
@@ -666,6 +685,388 @@ void runAllBatches(Workload& w, std::vector<benchmark::TwoExecutionsResult>& res
     (runBatch<BATCHES[Is]>(w, results, checks, sweep), ...);
 }
 
+// ------------------------------------------------------------------------------------------------
+// Region size sweep: the same chain with N = 16 regions of growing size, resized exactly 2x in both dimensions
+// (NPPDx ratio 1:2), to see how the advantage of fusion depends on how much of the frame the regions use
+// ------------------------------------------------------------------------------------------------
+namespace region {
+
+constexpr size_t N = 16;
+// A fixed 4x4 grid of 960x540 cells; region i = row * 4 + column is at the origin of its cell, so regions never
+// overlap and the largest ones (960x524) nearly tile the frame. The origins are even, as NV12 chroma needs.
+constexpr int GRID_COLS = 4;
+constexpr int CELL_W = FRAME_W / GRID_COLS;
+constexpr int CELL_H = FRAME_H / 4;
+static_assert(GRID_COLS * 4 == N && CELL_W % 2 == 0 && CELL_H % 2 == 0);
+constexpr std::array<unsigned, 3> BLOCKS{0, 128, 256};
+
+// Tiles x block sizes tried for one region size. NPPDx tiles must split the region, be multiples of its 4x2 pixel
+// cells, and their input, temporary and output tiles must fit in the shared memory of one block (101376 bytes on
+// sm_89): a tile with the whole region is only possible for the smallest size; for the others NPPDx rejects it with
+// the static_assert "This operation configuration is not supported".
+constexpr std::array<NppdxConfig, 9> configsFor(const std::array<std::pair<unsigned, unsigned>, 3>& tiles) {
+    std::array<NppdxConfig, 9> configs{};
+    for (size_t t = 0; t < tiles.size(); ++t) {
+        for (size_t b = 0; b < BLOCKS.size(); ++b) {
+            configs[t * BLOCKS.size() + b] = NppdxConfig{BLOCKS[b], tiles[t].first, tiles[t].second};
+        }
+    }
+    return configs;
+}
+
+template <char Name, int CropW, int CropH>
+struct Case : Geometry<CropW, CropH, 2 * CropW, 2 * CropH, 1, 2> {
+    static constexpr char name = Name;
+    static constexpr int pixels = CropW * CropH;
+    static constexpr size_t outputFloats = N * (2 * CropW) * (2 * CropH + BORDER_TOP + BORDER_BOTTOM) * 3;
+    static_assert(CropW <= CELL_W && CropH <= CELL_H, "Regions must fit in their grid cell");
+};
+struct CaseA : Case<'A', 32, 16> {
+    static constexpr auto configs = configsFor({{{32, 16}, {16, 16}, {16, 8}}});
+    static constexpr const char* note = "a 32x16 tile holds the whole region: one block per region is possible";
+};
+struct CaseB : Case<'B', 112, 96> {
+    static constexpr auto configs = configsFor({{{28, 32}, {28, 24}, {16, 16}}});
+    static constexpr const char* note = "a whole-region 112x96 tile is rejected by NPPDx (its 224x192 output tile does "
+                                        "not fit in shared memory): regions are split in tiles";
+};
+struct CaseC : Case<'C', 320, 304> {
+    static constexpr auto configs = configsFor({{{64, 16}, {32, 16}, {20, 38}}});
+    static constexpr const char* note = "a whole-region 320x304 tile is rejected by NPPDx (its 640x608 output tile does "
+                                        "not fit in shared memory): regions are split in tiles";
+};
+struct CaseD : Case<'D', 960, 524> {
+    static constexpr auto configs = configsFor({{{192, 4}, {64, 4}, {4, 262}}});
+    static constexpr const char* note = "a whole-region 960x524 tile is rejected by NPPDx (its 1920x1048 output tile does "
+                                        "not fit in shared memory): regions are split in tiles; 524 = 4 x 131 so tile "
+                                        "heights can only be 2; 4; 262 or 524";
+};
+
+template <typename C>
+std::array<fk::Rect, N> regions() {
+    std::array<fk::Rect, N> r{};
+    for (size_t i = 0; i < N; ++i) {
+        r[i] = fk::Rect(static_cast<int>(i % GRID_COLS) * CELL_W, static_cast<int>(i / GRID_COLS) * CELL_H, C::cropW,
+                        C::cropH);
+    }
+    return r;
+}
+
+CropOrigins<N> originsOf(const std::array<fk::Rect, N>& r) {
+    CropOrigins<N> origins{};
+    for (size_t i = 0; i < N; ++i) {
+        origins.origin[i] = int2{static_cast<int>(r[i].x), static_cast<int>(r[i].y)};
+    }
+    return origins;
+}
+
+struct ConfigResult {
+    char caseName{};
+    int pixels{0};
+    NppdxConfig config{};
+    unsigned actualBlock{0}, blocksPerRegion{0};
+    size_t smem{0};
+    Error vsPixelCenters;
+    bool timed{false}, chosen{false};
+    benchmark::TimeStats time;
+};
+
+struct CaseResult {
+    char name{};
+    int cropW{0}, cropH{0}, resW{0}, resH{0}, outW{0}, outH{0};
+    const char* note{""};
+    bool nppdxFeasible{false};
+    NppdxConfig chosen{};
+    size_t chosenIndex{0};
+    unsigned actualBlock{0};
+    size_t smem{0};
+    dim3 grid{};
+    Error nppdxVsPixelCenters, nppdxVsFkl, fkl;
+    size_t nppdxKernels{0}, fklKernels{0};
+};
+
+struct Results {
+    std::vector<ConfigResult> configs;
+    std::vector<CaseResult> cases;
+    std::vector<benchmark::TwoExecutionsResult> cpuGpu, gpuOnly, gpuOnlyFlushed;
+};
+
+size_t kernelsPerExecution(cudaStream_t stream, const std::function<void()>& run) {
+    return benchmark::cupti::trace(stream, run, 1).size();
+}
+
+template <typename C, NppdxConfig Cfg>
+using Nppdx = NppdxFigure1<NPPDX_SM, N, Cfg.block, Cfg.tileX, Cfg.tileY, C>;
+
+template <typename C, NppdxConfig Cfg>
+void tryConfig(Workload& w, const CropOrigins<N>& origins, float* out, const std::vector<float>& pixelCenters,
+               const bool timing, std::vector<ConfigResult>& results) {
+    using K = Nppdx<C, Cfg>;
+    K::init();
+    gpuErrchk(cudaMemset(out, 0xFF, C::outputFloats * sizeof(float)));
+    K::run(w, origins, out);
+    gpuErrchk(cudaStreamSynchronize(w.stream));
+    ConfigResult r{C::name, C::pixels, Cfg, K::block.x, K::grid.x * K::grid.y, K::smem,
+                   compare(download(out, C::outputFloats), pixelCenters)};
+    if (timing && r.vsPixelCenters.max <= TOLERANCE) {
+        r.timed = true;
+        r.time = benchmark::runOneExecution(w.stream, [&]() { K::run(w, origins, out); });
+    }
+    results.push_back(r);
+}
+
+// Calls f.template operator()<Cfg>() with the configuration C::configs[index]
+template <typename C, typename F>
+void withConfig(const size_t index, F&& f) {
+    [&]<size_t... Is>(std::index_sequence<Is...>) {
+        ((Is == index ? f.template operator()<C::configs[Is]>() : void()), ...);
+    }(std::make_index_sequence<C::configs.size()>{});
+}
+
+// Validation and choice of the NPPDx configuration, then the CPU + GPU comparison when timing
+template <typename C>
+void firstPass(Workload& w, const bool timing, Results& res) {
+    const auto crops = regions<C>();
+    const auto origins = originsOf(crops);
+    float* nppdxOut = nullptr;
+    gpuErrchk(cudaMalloc(&nppdxOut, C::outputFloats * sizeof(float)));
+    fk::Tensor<fk::float3> fklOut(C::outW, C::outH, N, 1, fk::MemType::Device);
+    const auto fklReference = cpuReference<N, C>(w, crops);
+    const auto pixelCenters = pixelCenterReference<N, C>(w, crops);
+
+    const size_t first = res.configs.size();
+    [&]<size_t... Is>(std::index_sequence<Is...>) {
+        (tryConfig<C, C::configs[Is]>(w, origins, nppdxOut, pixelCenters, timing, res.configs), ...);
+    }(std::make_index_sequence<C::configs.size()>{});
+    // The fastest correct configuration (without timing, the first correct one)
+    size_t best = C::configs.size();
+    float bestMedian = INFINITY;
+    for (size_t i = first; i < res.configs.size(); ++i) {
+        const ConfigResult& r = res.configs[i];
+        if (r.vsPixelCenters.max <= TOLERANCE && (timing ? r.time.median < bestMedian : best == C::configs.size())) {
+            bestMedian = r.time.median;
+            best = i - first;
+        }
+    }
+    CaseResult c{C::name, C::cropW, C::cropH, C::resW, C::resH, C::outW, C::outH, C::note};
+    const auto runFkl = [&]() { runFKL<N, C>(w, crops, fklOut); };
+    gpuErrchk(cudaMemset(fklOut.ptr().data, 0xFF, C::outputFloats * sizeof(float)));
+    runFkl();
+    gpuErrchk(cudaStreamSynchronize(w.stream));
+    c.fkl = compare(download(reinterpret_cast<const float*>(fklOut.ptr().data), C::outputFloats), fklReference);
+    if (best < C::configs.size()) {
+        c.nppdxFeasible = true;
+        c.chosenIndex = best;
+        res.configs[first + best].chosen = true;
+        withConfig<C>(best, [&]<NppdxConfig Cfg>() {
+            using K = Nppdx<C, Cfg>;
+            c.chosen = Cfg;
+            c.actualBlock = K::block.x;
+            c.smem = K::smem;
+            c.grid = K::grid;
+            gpuErrchk(cudaMemset(nppdxOut, 0xFF, C::outputFloats * sizeof(float)));
+            K::run(w, origins, nppdxOut);
+            gpuErrchk(cudaStreamSynchronize(w.stream));
+            const auto nppdx = download(nppdxOut, C::outputFloats);
+            c.nppdxVsPixelCenters = compare(nppdx, pixelCenters);
+            c.nppdxVsFkl = compare(nppdx, fklReference);
+            if (timing) {
+                const auto r = benchmark::runTwoExecutions(w.stream, C::pixels, [&]() { K::run(w, origins, nppdxOut); },
+                                                           runFkl);
+                res.cpuGpu.push_back(r);
+                std::cout << "Region " << C::name << " (" << C::cropW << "x" << C::cropH << "): NPPDx (tile "
+                          << Cfg.tileX << "x" << Cfg.tileY << ", block " << K::block.x << ") median "
+                          << r.first.median * 1000.f << " us, FKL median " << r.second.median * 1000.f
+                          << " us, mean speedup " << r.meanSpeedup << std::endl;
+            } else {
+                c.nppdxKernels = kernelsPerExecution(w.stream, [&]() { K::run(w, origins, nppdxOut); });
+                c.fklKernels = kernelsPerExecution(w.stream, runFkl);
+            }
+        });
+    }
+    std::cout << "Region " << C::name << " (" << C::cropW << "x" << C::cropH << " -> " << C::resW << "x" << C::resH
+              << ", output " << C::outW << "x" << C::outH << "): ";
+    if (c.nppdxFeasible) {
+        std::cout << "NPPDx tile " << c.chosen.tileX << "x" << c.chosen.tileY << " block " << c.actualBlock << " ("
+                  << c.grid.x * c.grid.y << " blocks per region, " << c.smem << " B shared memory) max abs error "
+                  << c.nppdxVsPixelCenters.max << " vs pixel-center reference, " << c.nppdxVsFkl.max
+                  << " vs FKL reference; ";
+    } else {
+        std::cout << "no NPPDx configuration matched the pixel-center reference; ";
+    }
+    std::cout << "FKL max abs error " << c.fkl.max << " vs FKL reference" << std::endl;
+    res.cases.push_back(c);
+    gpuErrchk(cudaFree(nppdxOut));
+}
+
+// GPU time only (CUPTI), with or without the L2 flushed before every kernel, with the configuration chosen in the
+// first pass. Also counts the kernels of one execution of each library.
+template <typename C>
+void gpuOnlyPass(Workload& w, const benchmark::L2Flusher* flusher, Results& res) {
+    auto c = std::find_if(res.cases.begin(), res.cases.end(), [](const CaseResult& r) { return r.name == C::name; });
+    if (c == res.cases.end() || !c->nppdxFeasible) {
+        return;
+    }
+    const auto crops = regions<C>();
+    const auto origins = originsOf(crops);
+    float* nppdxOut = nullptr;
+    gpuErrchk(cudaMalloc(&nppdxOut, C::outputFloats * sizeof(float)));
+    fk::Tensor<fk::float3> fklOut(C::outW, C::outH, N, 1, fk::MemType::Device);
+    const auto runFkl = [&]() { runFKL<N, C>(w, crops, fklOut); };
+    withConfig<C>(c->chosenIndex, [&]<NppdxConfig Cfg>() {
+        using K = Nppdx<C, Cfg>;
+        const auto runNppdx = [&]() { K::run(w, origins, nppdxOut); };
+        if (!flusher) {
+            c->nppdxKernels = kernelsPerExecution(w.stream, runNppdx);
+            c->fklKernels = kernelsPerExecution(w.stream, runFkl);
+        }
+        const auto r = benchmark::runTwoExecutionsGpuOnly(w.stream, C::pixels, runNppdx, runFkl, flusher);
+        (flusher ? res.gpuOnlyFlushed : res.gpuOnly).push_back(r);
+        std::cout << (flusher ? "GPU only, L2 flushed, region " : "GPU only, region ") << C::name << ": NPPDx median "
+                  << r.first.median * 1000.f << " us, FKL median " << r.second.median * 1000.f << " us, mean speedup "
+                  << r.meanSpeedup << std::endl;
+    });
+    gpuErrchk(cudaFree(nppdxOut));
+}
+
+using Cases = std::tuple<CaseA, CaseB, CaseC, CaseD>;
+
+template <typename F>
+void forEachCase(F&& f) {
+    std::apply([&](auto... c) { (f.template operator()<decltype(c)>(), ...); }, Cases{});
+}
+
+void writeCSVs(const std::filesystem::path& outDir, const Results& res, const bool timing) {
+    const std::string name = "benchmark_figure1_bvf_region_sweep";
+    const std::string parArch(fk::toStrView(fk::defaultParArch));
+    const std::string variable = "Source pixels per region";
+    if (timing) {
+        benchmark::writeTwoExecutionsCSV(outDir, name, variable, "NPPDx", "FKL", res.cpuGpu);
+        benchmark::writeTwoExecutionsCSV(outDir, name + "_gpu_only", variable, "NPPDx", "FKL", res.gpuOnly);
+        benchmark::writeTwoExecutionsCSV(outDir, name + "_gpu_only_l2_flushed", variable, "NPPDx", "FKL",
+                                         res.gpuOnlyFlushed);
+    }
+    std::filesystem::create_directories(outDir);
+    std::ofstream validation(outDir / (name + "_validation_" + parArch + ".csv"));
+    validation << "Region, " << variable << ", NPPDx Tile, NPPDx BlockSize, NPPDx MaxAbsError vs pixel-center reference, "
+                  "NPPDx MeanAbsError vs pixel-center reference, NPPDx MaxAbsError vs FKL reference, "
+                  "NPPDx MeanAbsError vs FKL reference, FKL MaxAbsError vs FKL reference, "
+                  "FKL MeanAbsError vs FKL reference, Within tolerance 1e-3" << std::endl;
+    for (const auto& c : res.cases) {
+        validation << c.name << ", " << c.cropW * c.cropH << ", ";
+        if (c.nppdxFeasible) {
+            validation << c.chosen.tileX << "x" << c.chosen.tileY << ", " << c.actualBlock << ", "
+                       << c.nppdxVsPixelCenters.max << ", " << c.nppdxVsPixelCenters.mean << ", " << c.nppdxVsFkl.max
+                       << ", " << c.nppdxVsFkl.mean << ", ";
+        } else {
+            validation << "none, , , , , , ";
+        }
+        validation << c.fkl.max << ", " << c.fkl.mean << ", "
+                   << (c.fkl.max <= TOLERANCE && c.nppdxFeasible && c.nppdxVsPixelCenters.max <= TOLERANCE ? "yes" : "no")
+                   << std::endl;
+    }
+    std::ofstream configs(outDir / (name + "_nppdx_configs_" + parArch + ".csv"));
+    configs << "Region, " << variable << ", Tile, Requested BlockDim (0 = NPPDx recommended), Actual BlockSize, "
+               "Blocks per region, Dynamic shared memory bytes, MeanTime, MedianTime, P10Time, P90Time, "
+               "MaxAbsError vs pixel-center reference, Chosen" << std::endl;
+    for (const auto& r : res.configs) {
+        configs << r.caseName << ", " << r.pixels << ", " << r.config.tileX << "x" << r.config.tileY << ", "
+                << r.config.block << ", " << r.actualBlock << ", " << r.blocksPerRegion << ", " << r.smem << ", ";
+        if (r.timed) {
+            configs << r.time.mean << ", " << r.time.median << ", " << r.time.p10 << ", " << r.time.p90 << ", ";
+        } else {
+            configs << ", , , , ";
+        }
+        configs << r.vsPixelCenters.max << ", " << (r.chosen ? "yes" : "no") << std::endl;
+    }
+    std::ofstream summary(outDir / (name + "_summary_" + parArch + ".csv"));
+    summary << "Region, Crop, Resize, Output, " << variable << ", Coverage of the frame by the 16 regions (%), "
+               "NPPDx Tile, NPPDx BlockSize, NPPDx Grid, NPPDx Blocks per region, NPPDx Dynamic shared memory bytes, "
+               "NPPDx Kernels per execution, FKL Kernels per execution, NPPDx Intermediate bytes in global memory, "
+               "FKL Intermediate bytes in global memory, Output bytes, NPPDx note" << std::endl;
+    for (const auto& c : res.cases) {
+        const double coverage = 100. * N * c.cropW * c.cropH / (static_cast<double>(FRAME_W) * FRAME_H);
+        const size_t outputBytes = N * static_cast<size_t>(c.outW) * c.outH * 3 * sizeof(float);
+        summary << c.name << ", " << c.cropW << "x" << c.cropH << ", " << c.resW << "x" << c.resH << ", " << c.outW
+                << "x" << c.outH << ", " << c.cropW * c.cropH << ", " << std::fixed << std::setprecision(4) << coverage
+                << std::defaultfloat << ", ";
+        if (c.nppdxFeasible) {
+            summary << c.chosen.tileX << "x" << c.chosen.tileY << ", " << c.actualBlock << ", " << c.grid.x << "x"
+                    << c.grid.y << "x" << c.grid.z << ", " << c.grid.x * c.grid.y << ", " << c.smem << ", "
+                    << c.nppdxKernels << ", ";
+        } else {
+            summary << "none, , , , , , ";
+        }
+        summary << c.fklKernels << ", 0, 0, " << outputBytes << ", " << c.note << std::endl;
+    }
+}
+
+void run(Workload& w, const std::filesystem::path& outDir, const bool timing) {
+    Results res;
+    forEachCase([&]<typename C>() { firstPass<C>(w, timing, res); });
+    if (timing) {
+        // GPU time only, after all the CPU + GPU measurements so that CUPTI cannot affect them
+        forEachCase([&]<typename C>() { gpuOnlyPass<C>(w, nullptr, res); });
+        const benchmark::L2Flusher flusher(w.stream);
+        std::cout << "Flushing " << flusher.bytes() / (1 << 20) << " MiB (2x L2) before every kernel" << std::endl;
+        forEachCase([&]<typename C>() { gpuOnlyPass<C>(w, &flusher, res); });
+    }
+    writeCSVs(outDir, res, timing);
+    std::cout << "CSV files written to " << std::filesystem::absolute(outDir) << std::endl;
+}
+
+// Target for Nsight Compute: one execution of NPPDx (with the given tile and block, block 0 being NPPDx's recommended
+// configuration) or FKL for one region size, inside the NVTX range "measure", after 3 warm-up executions
+template <typename C>
+bool ncuTarget(Workload& w, const std::string& impl, const char name, const unsigned tileX, const unsigned tileY,
+               const unsigned block) {
+    if (name != C::name) {
+        return false;
+    }
+    const auto crops = regions<C>();
+    const auto origins = originsOf(crops);
+    float* nppdxOut = nullptr;
+    gpuErrchk(cudaMalloc(&nppdxOut, C::outputFloats * sizeof(float)));
+    fk::Tensor<fk::float3> fklOut(C::outW, C::outH, N, 1, fk::MemType::Device);
+    std::function<void()> runOnce;
+    if (impl == "fkl_bvf") {
+        runOnce = [&]() { runFKL<N, C>(w, crops, fklOut); };
+    } else if (impl == "nppdx") {
+        size_t index = C::configs.size();
+        for (size_t i = 0; i < C::configs.size(); ++i) {
+            if (C::configs[i].tileX == tileX && C::configs[i].tileY == tileY && C::configs[i].block == block) {
+                index = i;
+            }
+        }
+        if (index < C::configs.size()) {
+            withConfig<C>(index, [&]<NppdxConfig Cfg>() {
+                Nppdx<C, Cfg>::init();
+                runOnce = [&]() { Nppdx<C, Cfg>::run(w, origins, nppdxOut); };
+            });
+        } else {
+            std::string valid;
+            for (const auto& cfg : C::configs) {
+                valid += " " + std::to_string(cfg.tileX) + "x" + std::to_string(cfg.tileY) + " " + std::to_string(cfg.block) + ",";
+            }
+            throw std::runtime_error(std::string("Region ") + name + " has no NPPDx configuration with that tile and block; valid:" + valid);
+        }
+    } else {
+        throw std::runtime_error("Unknown implementation " + impl + ", use nppdx or fkl_bvf");
+    }
+    for (int i = 0; i < 3; ++i) {
+        runOnce();
+    }
+    gpuErrchk(cudaStreamSynchronize(w.stream));
+    nvtxRangePushA("measure");
+    runOnce();
+    gpuErrchk(cudaStreamSynchronize(w.stream));
+    nvtxRangePop();
+    gpuErrchk(cudaFree(nppdxOut));
+    return true;
+}
+
+} // namespace region
+
 std::string shell(const std::string& command) {
     std::string output;
     if (FILE* pipe = popen(command.c_str(), "r")) {
@@ -709,7 +1110,63 @@ int main(int argc, char** argv) {
                                              "FKL", flushed);
             return 0;
         }
-        if (argc > 4 && std::string(argv[2]) == "--ncu-target") {
+        if (argc > 2 && (std::string(argv[2]) == "--region-sweep" || std::string(argv[2]) == "--region-sweep-validate")) {
+            const bool timing = std::string(argv[2]) == "--region-sweep";
+            region::run(w, outDir, timing);
+            if (timing) {
+                int runtime = 0;
+                gpuErrchk(cudaRuntimeGetVersion(&runtime));
+                std::ofstream platform(outDir / "benchmark_figure1_bvf_region_sweep_platform.txt");
+                platform << "GPU: " << prop.name << " (sm_" << prop.major << prop.minor << ", " << prop.multiProcessorCount
+                         << " SMs)\n"
+                         << "NVIDIA driver: " << shell("nvidia-smi --query-gpu=driver_version --format=csv,noheader") << "\n"
+                         << "CUDA runtime: " << runtime / 1000 << "." << (runtime % 1000) / 10 << "\n"
+                         << "Host compiler: GCC " << __VERSION__ << "\n"
+                         << "FKL: " << FKL_VERSION << "\n"
+                         << "NPPDx: " << NPPDX_GIT_VERSION << ", operations for SM " << NPPDX_SM << "\n"
+                         << "CPU: " << shell("lscpu | sed -n 's/^Model name: *//p'") << "\n"
+                         << "OS: " << shell(". /etc/os-release && echo $PRETTY_NAME") << "\n"
+                         << "Region sweep: N = 16 regions on a 4x4 grid of 960x540 cells (region i = row * 4 + column at "
+                            "the origin of its cell), sizes 32x16, 112x96, 320x304 and 960x524, resized exactly 2x "
+                            "(NPPDx ratio 1:2), 16 black rows added top and bottom, same frame and normalization as the "
+                            "main benchmark. For every size the NPPDx tiles and block sizes of "
+                            "benchmark_figure1_bvf_region_sweep_nppdx_configs_" << fk::toStrView(fk::defaultParArch)
+                         << ".csv are validated and timed alone, and the fastest correct one is compared with FKL. "
+                            "Timing as in the main benchmark: " << benchmark::WARMUP_ITERS << " warm-up and "
+                         << benchmark::ITERS << " timed iterations, CPU + GPU (CUDA events), GPU only (CUPTI) and "
+                            "GPU only with the L2 flushed before every kernel; per-iteration speedups averaged; times in ms.\n";
+            }
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "--region-ncu-target") {
+            // --region-ncu-target <nppdx|fkl_bvf> <A|B|C|D> [<tileX>x<tileY> <block>], the tile and block for nppdx
+            if (argc < 5 || std::strlen(argv[4]) != 1) {
+                throw std::runtime_error("Usage: --region-ncu-target <nppdx|fkl_bvf> <A|B|C|D> "
+                                         "[<tileX>x<tileY> <block>] (the tile and block for nppdx)");
+            }
+            const std::string impl = argv[3];
+            const char name = argv[4][0];
+            unsigned tileX = 0, tileY = 0, block = 0;
+            if (impl == "nppdx") {
+                if (argc < 7 || std::sscanf(argv[5], "%ux%u", &tileX, &tileY) != 2) {
+                    throw std::runtime_error("nppdx needs the tile and block: --region-ncu-target nppdx <A|B|C|D> "
+                                             "<tileX>x<tileY> <block>");
+                }
+                block = static_cast<unsigned>(std::stoul(argv[6]));
+            }
+            bool found = false;
+            region::forEachCase([&]<typename C>() {
+                found = region::ncuTarget<C>(w, impl, name, tileX, tileY, block) || found;
+            });
+            if (!found) {
+                throw std::runtime_error(std::string("Unknown region ") + name + ", use A, B, C or D");
+            }
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "--ncu-target") {
+            if (argc < 5) {
+                throw std::runtime_error("Usage: --ncu-target <nppdx|fkl_bvf> <N>");
+            }
             ncuTargetDispatch(w, argv[3], std::stoul(argv[4]), std::make_index_sequence<BATCHES.size()>{});
             return 0;
         }
@@ -719,6 +1176,10 @@ int main(int argc, char** argv) {
             std::cout << "### BlockDim<256>" << std::endl;
             analyze<256>(w);
             return 0;
+        }
+        // Any other argument is a mistake: running the default benchmark instead would overwrite its results in outDir
+        if (argc > 2) {
+            throw std::runtime_error(std::string("Unknown mode: ") + argv[2] + " (see the modes in README.md)");
         }
         std::vector<benchmark::TwoExecutionsResult> results;
         std::vector<Validation> checks;
