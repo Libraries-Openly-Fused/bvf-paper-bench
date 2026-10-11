@@ -30,6 +30,8 @@ if(WIN32)
 endif()
 string(JOIN " " BENCH_CUDA_OPTIONS_STR ${BENCH_CUDA_OPTIONS})
 set(BENCH_NVCC_FLAGS "${CMAKE_CUDA_FLAGS} ${CMAKE_CUDA_FLAGS_RELEASE} -std=c++20 ${BENCH_CUDA_OPTIONS_STR}, CUDA_ARCHITECTURES ${CUDA_ARCH_DESCRIPTION}")
+# The flags become a string literal: CMake's Windows defaults have double quotes (-Xcompiler=" /GR /EHsc")
+string(REPLACE "\"" "'" BENCH_NVCC_FLAGS "${BENCH_NVCC_FLAGS}")
 
 function(add_bench_target TARGET_NAME SOURCE)
     add_executable(${TARGET_NAME} ${SOURCE})

@@ -134,14 +134,6 @@ jobs:
             runner: [self-hosted, windows, x64, cuda]
             benchmarks: gpu
             compiler: "cl"
-            msvc_env_version: "14.44"
-            cuda_version: "13.0"
-            vswhere_latest: true
-            artifact: windows-cuda-x64-cuda13.0
-          - platform: "CUDA x64"
-            runner: [self-hosted, windows, x64, cuda]
-            benchmarks: gpu
-            compiler: "cl"
             msvc_env_version: "14.51"
             cuda_version: "13.4"
             vswhere_latest: true

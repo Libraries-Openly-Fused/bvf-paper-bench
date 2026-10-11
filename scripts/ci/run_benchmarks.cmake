@@ -210,6 +210,10 @@ endif()
 # reused; a lock lets jobs that run at the same time on one machine wait for each other's build.
 function(build_opencv RESULT)
     get_filename_component(compiler "${OPENCV_CXX_COMPILER}" NAME_WE)
+    if(CMAKE_HOST_WIN32 AND "$ENV{VCToolsVersion}" MATCHES "^([0-9]+\\.[0-9]+)")
+        # OpenCV installs its binaries per Visual Studio runtime: one build per MSVC toolset
+        string(APPEND compiler "${CMAKE_MATCH_1}")
+    endif()
     if(BENCHMARKS STREQUAL "gpu")
         set(modules core,imgproc,cudev,cudaarithm,cudawarping)
         string(REPLACE "." "" sm "${CUDA_ARCH_BIN}")

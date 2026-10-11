@@ -130,7 +130,7 @@ tile and block, for example the ones chosen in the summary file (block 0 is NPPD
 
 ## Build and run
 
-Requirements: Linux x86_64 or Windows x64 (the platforms of NPPDx), CUDA 13, CMake 3.30, a C++20 host compiler, and
+Requirements: Linux x86_64 or Windows x64 (the platforms of NPPDx), CUDA 13.3 or newer, CMake 3.30, a C++20 host compiler, and
 an NVIDIA GPU (sm_75 or newer). FKL and NPPDx are the `fkl` and `nppdx` submodules of this repository. From its root:
 
     git clone --recursive https://github.com/Libraries-Openly-Fused/bvf-paper-bench.git

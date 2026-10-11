@@ -165,6 +165,8 @@ inline void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer, size_
     CUpti_Activity* record = nullptr;
     while (cuptiActivityGetNextRecord(buffer, validSize, &record) == CUPTI_SUCCESS) {
         if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL) {
+            // CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL records are CUpti_ActivityKernel12 in CUDA 13.3 and 13 in 13.4; new
+            // versions only append fields, so the ones read here have the same offsets in both (and in 9 to 11)
             const auto* k = reinterpret_cast<const CUpti_ActivityKernel12*>(record);
             // The L2 flush kernels of the flushed benchmark are not part of any pipeline
             if (!(k->name && std::strstr(k->name, "flushL2Kernel"))) {

@@ -803,6 +803,8 @@ void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer, size_t, size
     while (cuptiActivityGetNextRecord(buffer, validSize, &record) == CUPTI_SUCCESS) {
         if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL || record->kind == CUPTI_ACTIVITY_KIND_KERNEL) {
             counts.kernels++;
+            // CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL records are CUpti_ActivityKernel12 in CUDA 13.3 and 13 in 13.4; new
+            // versions only append fields, so the ones read here have the same offsets in both (and in 9 to 11)
             const auto* k = reinterpret_cast<const CUpti_ActivityKernel12*>(record);
             const bool flushKernel = k->name && std::strstr(k->name, "flushL2Kernel");
             if (keepKernels && !flushKernel) {
