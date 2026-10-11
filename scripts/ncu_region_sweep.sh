@@ -4,8 +4,8 @@
 #
 #     sudo scripts/ncu_region_sweep.sh
 #
-# Paths default to the layout described in README.md (this repository, FKL-vs-NPPDx and results/ side by side in
-# one directory) and can be overridden with the environment variables NCU, PAPER_BENCH, NPPDX_BENCH, NPPDX_CONFIGS and
+# Paths default to the layout described in README.md (the build and build-nppdx folders of this repository, and
+# results/ next to it) and can be overridden with the environment variables NCU, PAPER_BENCH, NPPDX_BENCH, NPPDX_CONFIGS and
 # OUT, e.g.
 #     sudo NCU=/usr/local/cuda-13.3/bin/ncu scripts/ncu_region_sweep.sh
 #
@@ -25,14 +25,14 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)
 ROOT=$(dirname "$REPO")
 NCU=${NCU:-/usr/local/cuda/bin/ncu}
 PAPER_BENCH=${PAPER_BENCH:-$REPO/build/bvf_bench}
-NPPDX_BENCH=${NPPDX_BENCH:-$ROOT/FKL-vs-NPPDx/build/benchmark_figure1_bvf}
+NPPDX_BENCH=${NPPDX_BENCH:-$REPO/build-nppdx/benchmark_figure1_bvf}
 NPPDX_CONFIGS=${NPPDX_CONFIGS:-$ROOT/results/region_sweep/nppdx/benchmark_figure1_bvf_region_sweep_nppdx_configs_GPU_NVIDIA.csv}
 OUT=${OUT:-$ROOT/results/ncu_region}
 OWNER=${SUDO_USER:-$(id -un)}
 METRICS=lts__t_sectors_srcunit_tex_op_read.sum,lts__t_sectors_srcunit_tex_op_write.sum,lts__t_bytes.sum,dram__bytes_read.sum,dram__bytes_write.sum,gpu__time_duration.sum
 
 if [ ! -f "$NPPDX_CONFIGS" ]; then
-    echo "NPPDx configurations not found: $NPPDX_CONFIGS (run FKL-vs-NPPDx's --region-sweep first)" >&2
+    echo "NPPDx configurations not found: $NPPDX_CONFIGS (run build-nppdx/benchmark_figure1_bvf with --region-sweep first)" >&2
     exit 1
 fi
 
