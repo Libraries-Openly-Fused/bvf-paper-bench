@@ -182,7 +182,7 @@ Output files: those of the CUDA benchmark with `GPU_AMD` instead of `GPU_NVIDIA`
 `kernels.csv`, `kernel_breakdown.csv`, `<baseline>_vs_fkl_bvf_[gpu_only_|gpu_only_l2_flushed_]GPU_AMD.csv`,
 `gpu_time.csv`, `gpu_time_l2_flushed.csv`, `region_sweep_*.csv`, `platform.txt`), plus
 `kernel_counts_per_operation.csv`, `rpp_selection.csv` and `rpp_resize_convention.csv`; `validation.csv` has one more
-column, the error against the paper's 8 bit reference. `--validate` validates every RPP variant. The region-size sweep (`--region-sweep`) is implemented but not
+column, the error against the paper's 8 bit reference, and `gpu_time*.csv` five more, the GPU time and dispatches of the HIP runtime's blit kernels (memsets, copies) of each execution, which the GPU time only sums leave out. `--validate` validates every RPP variant. The region-size sweep (`--region-sweep`) is implemented but not
 part of the default run (`RUN_REGION=1` in `run_all.sh`).
 
 ### CPU benchmark (`rocm/cpu/`)

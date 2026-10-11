@@ -1147,6 +1147,10 @@ struct Result {
     TimingStats gpuTiming;
     double meanGpuSpeedupOfBvf{NAN};
     bool gpuMeasured{false};
+    // GPU time of the HIP runtime's blit kernels (memsets and copies, __amd_rocclr_*) of each execution, not part of
+    // the GPU time only sums, and their dispatches per execution (median)
+    TimingStats gpuBlitTiming, gpuFlushedBlitTiming;
+    double gpuBlitDispatches{0.}, gpuFlushedBlitDispatches{0.};
     // GPU time only with the caches flushed before every GPU operation
     TimingStats gpuFlushedTiming;
     double meanGpuFlushedSpeedupOfBvf{NAN};
@@ -1504,11 +1508,25 @@ void gpuOnlyBatch(Context& ctx, std::vector<Result>& results, CacheFlusher* flus
         std::lock_guard<std::mutex> lock(rocprof::mutex);
         rocprof::kernels.clear();
     }
+    // Every execution runs inside a window of rocprofiler timestamps (the clock of the dispatch records); a record
+    // belongs to the execution whose window contains its start. The executions are sequential (synchronized), so the
+    // windows do not overlap.
+    struct Window {
+        rocprofiler_timestamp_t begin, end;
+        size_t k;
+        int i;
+    };
+    std::vector<Window> windows;
+    windows.reserve(static_cast<size_t>(TIMED_ITERS) * impls.size());
     ROCP_CHECK(rocprofiler_start_context(rocprof::kernelContext));
     for (int i = 0; i < TIMED_ITERS; ++i) {
-        for (const auto& impl : impls) {
-            impl.run();
+        for (size_t k = 0; k < impls.size(); ++k) {
+            Window w{0, 0, k, i};
+            ROCP_CHECK(rocprofiler_get_timestamp(&w.begin));
+            impls[k].run();
             gpuErrchk(hipStreamSynchronize(ctx.stream));
+            ROCP_CHECK(rocprofiler_get_timestamp(&w.end));
+            windows.push_back(w);
         }
         if (i % 100 == 99) {
             rocprof::flushKernels();
@@ -1518,35 +1536,52 @@ void gpuOnlyBatch(Context& ctx, std::vector<Result>& results, CacheFlusher* flus
     rocprof::flushKernels();
     activeFlusher = nullptr;
     std::vector<KernelRecord> records;
+    std::vector<bool> blit;
     {
         std::lock_guard<std::mutex> lock(rocprof::mutex);
         for (const auto& r : rocprof::kernels) {
-            if (!rocprof::isFlushKernel(r.kernelId) && !rocprof::isRuntimeBlitKernel(r.kernelId)) {
+            if (!rocprof::isFlushKernel(r.kernelId)) {
                 records.push_back(r);
             }
         }
         rocprof::kernels.clear();
+        for (const auto& r : records) {
+            blit.push_back(rocprof::isRuntimeBlitKernel(r.kernelId));
+        }
     }
-    std::sort(records.begin(), records.end(), [](const KernelRecord& a, const KernelRecord& b) { return a.start < b.start; });
-    size_t expected = 0;
-    for (const size_t n : kernelsPerRun) {
-        expected += n * TIMED_ITERS;
+    // The GPU time of an execution is the sum of the execution times of its kernels; the HIP runtime's blit kernels
+    // (memsets, copies) are summed separately, like CUPTI's kernel records in bvf_bench.cu, which have no memsets
+    std::vector<std::vector<float>> ms(impls.size(), std::vector<float>(TIMED_ITERS, 0.f));
+    std::vector<std::vector<float>> blitMs(impls.size(), std::vector<float>(TIMED_ITERS, 0.f));
+    std::vector<std::vector<float>> blitCount(impls.size(), std::vector<float>(TIMED_ITERS, 0.f));
+    std::vector<std::vector<size_t>> kernelCount(impls.size(), std::vector<size_t>(TIMED_ITERS, 0));
+    size_t unassigned = 0;
+    for (size_t j = 0; j < records.size(); ++j) {
+        const auto& r = records[j];
+        const auto w = std::upper_bound(windows.begin(), windows.end(), r.start,
+                                        [](rocprofiler_timestamp_t t, const Window& x) { return t < x.begin; });
+        if (w == windows.begin() || r.start > std::prev(w)->end) {
+            unassigned += blit[j] ? 0 : 1;
+            continue;
+        }
+        const Window& x = *std::prev(w);
+        const float dur = static_cast<float>((r.end - r.start) * 1e-6);
+        if (blit[j]) {
+            blitMs[x.k][x.i] += dur;
+            blitCount[x.k][x.i] += 1.f;
+        } else {
+            ms[x.k][x.i] += dur;
+            kernelCount[x.k][x.i]++;
+        }
     }
-    if (records.size() != expected) {
-        throw std::runtime_error("GPU only benchmark: expected " + std::to_string(expected) + " kernel records, got " +
-                                 std::to_string(records.size()));
-    }
-    // The executions are sequential, so in start time order the records are iteration by iteration, implementation
-    // by implementation
-    std::vector<std::vector<float>> ms(impls.size(), std::vector<float>(TIMED_ITERS));
-    size_t idx = 0;
-    for (int i = 0; i < TIMED_ITERS; ++i) {
-        for (size_t k = 0; k < impls.size(); ++k) {
-            uint64_t ns = 0;
-            for (size_t j = 0; j < kernelsPerRun[k]; ++j, ++idx) {
-                ns += records[idx].end - records[idx].start;
+    for (size_t k = 0; k < impls.size(); ++k) {
+        for (int i = 0; i < TIMED_ITERS; ++i) {
+            if (kernelCount[k][i] != kernelsPerRun[k]) {
+                throw std::runtime_error("GPU only benchmark: " + impls[k].name + " execution " + std::to_string(i) +
+                                         " has " + std::to_string(kernelCount[k][i]) + " kernel records, expected " +
+                                         std::to_string(kernelsPerRun[k]) + " (" + std::to_string(unassigned) +
+                                         " kernel records outside every execution)");
             }
-            ms[k][i] = static_cast<float>(ns * 1e-6);
         }
     }
     for (size_t k = 0; k < impls.size(); ++k) {
@@ -1565,6 +1600,10 @@ void gpuOnlyBatch(Context& ctx, std::vector<Result>& results, CacheFlusher* flus
         double& speedup = flusher ? r->meanGpuFlushedSpeedupOfBvf : r->meanGpuSpeedupOfBvf;
         (flusher ? r->gpuFlushedMeasured : r->gpuMeasured) = true;
         timing = computeStats(ms[k]);
+        (flusher ? r->gpuFlushedBlitTiming : r->gpuBlitTiming) = computeStats(blitMs[k]);
+        std::vector<float> counts = blitCount[k];
+        std::sort(counts.begin(), counts.end());
+        (flusher ? r->gpuFlushedBlitDispatches : r->gpuBlitDispatches) = percentile(counts, 0.5);
         if (k != bvf) {
             double sum = 0.;
             for (int i = 0; i < TIMED_ITERS; ++i) {
@@ -1955,7 +1994,10 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
                            "included; RPP's internal copies run inside its calls, after the flush of the call). The "
                            "output files keep the CUDA benchmark's names (l2_flushed), here meaning L2 and MALL. "
                            "Dispatches of the HIP runtime's own blit kernels (__amd_rocclr_*, which execute memsets and "
-                           "some copies) are not counted, like CUPTI's kernel records in the CUDA benchmark."
+                           "some copies) are not in the GPU time only sums, like CUPTI's kernel records in the CUDA "
+                           "benchmark; their GPU time and dispatches per execution are in the runtime_blit_* columns of "
+                           "gpu_time.csv and gpu_time_l2_flushed.csv. Records are attributed to executions by windows of "
+                           "rocprofiler timestamps around each execution."
                          : " (not run).")
        << "\n"
        << "Memory traffic (Experiment 2): rocm/scripts/rocprof_counters.sh (rocprofv3 --pmc), not part of this program"
@@ -2029,7 +2071,11 @@ void writeProfileRows(const std::filesystem::path& file, const std::vector<Resul
         writeStats(os, r.gpuTiming);
         os << "," << r.meanGpuSpeedupOfBvf << "," << (r.gpuFlushedMeasured ? 1 : 0);
         writeStats(os, r.gpuFlushedTiming);
-        os << "," << r.meanGpuFlushedSpeedupOfBvf << "\n";
+        os << "," << r.meanGpuFlushedSpeedupOfBvf;
+        writeStats(os, r.gpuBlitTiming);
+        os << "," << r.gpuBlitDispatches;
+        writeStats(os, r.gpuFlushedBlitTiming);
+        os << "," << r.gpuFlushedBlitDispatches << "\n";
     }
 }
 
@@ -2047,7 +2093,7 @@ bool mergeProfileRows(const std::filesystem::path& file, std::vector<Result>& re
             tracing = f[1] == "1";
             continue;
         }
-        if (f.size() != 24) {
+        if (f.size() != 40) {
             throw std::runtime_error("Malformed profiling pass row: " + line);
         }
         const std::string region = f[0] == "-" ? "" : f[0];
@@ -2068,6 +2114,10 @@ bool mergeProfileRows(const std::filesystem::path& file, std::vector<Result>& re
         r->gpuFlushedMeasured = f[15] == "1";
         r->gpuFlushedTiming = stats(16);
         r->meanGpuFlushedSpeedupOfBvf = std::stod(f[23]);
+        r->gpuBlitTiming = stats(24);
+        r->gpuBlitDispatches = std::stod(f[31]);
+        r->gpuFlushedBlitTiming = stats(32);
+        r->gpuFlushedBlitDispatches = std::stod(f[39]);
     }
     return tracing;
 }
@@ -2632,7 +2682,8 @@ int main(int argc, char** argv) {
             for (const bool flushed : {false, true}) {
                 std::ofstream gpuTime(outDir / (flushed ? "gpu_time_l2_flushed.csv" : "gpu_time.csv"));
                 gpuTime << "implementation,N,gpu_median_us,gpu_p10_us,gpu_p90_us,gpu_mean_us,iterations,kernels_launched,"
-                           "fkl_bvf_mean_gpu_speedup\n";
+                           "fkl_bvf_mean_gpu_speedup,runtime_blit_median_us,runtime_blit_p10_us,runtime_blit_p90_us,"
+                           "runtime_blit_mean_us,runtime_blit_dispatches_per_execution\n";
                 for (const auto& r : results) {
                     const TimingStats& t = flushed ? r.gpuFlushedTiming : r.gpuTiming;
                     const double s = flushed ? r.meanGpuFlushedSpeedupOfBvf : r.meanGpuSpeedupOfBvf;
@@ -2642,7 +2693,10 @@ int main(int argc, char** argv) {
                     if (!std::isnan(s)) {
                         gpuTime << std::setprecision(3) << s;
                     }
-                    gpuTime << "\n";
+                    const TimingStats& b = flushed ? r.gpuFlushedBlitTiming : r.gpuBlitTiming;
+                    gpuTime << std::setprecision(2) << "," << b.median << "," << b.p10 << "," << b.p90 << "," << b.mean
+                            << "," << std::setprecision(1) << (flushed ? r.gpuFlushedBlitDispatches : r.gpuBlitDispatches)
+                            << "\n";
                 }
             }
         }
