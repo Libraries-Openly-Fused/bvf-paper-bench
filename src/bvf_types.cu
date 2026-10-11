@@ -12,7 +12,9 @@
 #include <fused_kernel/algorithms/image_processing/resize.h>
 #include <fused_kernel/core/utils/type_to_string.h>
 
+#if !defined(_MSC_VER)
 #include <cxxabi.h>
+#endif
 
 #include <array>
 #include <cstdlib>
@@ -22,11 +24,16 @@
 
 template <typename T>
 std::string demangled() {
+#if defined(_MSC_VER)
+    // MSVC's type names are not mangled
+    return typeid(T).name();
+#else
     int status = 0;
     char* name = abi::__cxa_demangle(typeid(T).name(), nullptr, nullptr, &status);
     std::string result = status == 0 ? name : typeid(T).name();
     std::free(name);
     return result;
+#endif
 }
 
 int main() {

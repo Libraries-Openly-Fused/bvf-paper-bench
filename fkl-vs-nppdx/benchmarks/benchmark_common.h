@@ -156,7 +156,8 @@ inline void check(CUptiResult result, const char* what) {
 
 inline void CUPTIAPI bufferRequested(uint8_t** buffer, size_t* size, size_t* maxNumRecords) {
     *size = 8 << 20;
-    *buffer = static_cast<uint8_t*>(std::aligned_alloc(8, *size));
+    // CUPTI needs 8 byte alignment, which malloc guarantees (std::aligned_alloc does not exist on Windows)
+    *buffer = static_cast<uint8_t*>(std::malloc(*size));
     *maxNumRecords = 0;
 }
 

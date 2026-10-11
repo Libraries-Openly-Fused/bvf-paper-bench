@@ -31,6 +31,8 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include "bench_platform.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -362,17 +364,6 @@ void runBatch(Workload& w, std::vector<Row>& singleThread, std::vector<Row>& mul
                 c.fklVsReference, c.opencvVsReference, c.opencvVsFkl, c.fklMultithreadVsFkl);
 }
 
-std::string shell(const std::string& command) {
-    std::string output;
-    if (FILE* pipe = popen(command.c_str(), "r")) {
-        char buffer[512];
-        while (fgets(buffer, sizeof(buffer), pipe)) output += buffer;
-        pclose(pipe);
-    }
-    while (!output.empty() && output.back() == '\n') output.pop_back();
-    return output;
-}
-
 } // namespace cpubench
 
 int main(int argc, char** argv) {
@@ -402,17 +393,28 @@ int main(int argc, char** argv) {
         v << c.batch << ", " << c.fklVsReference << ", " << c.opencvVsReference << ", " << c.opencvVsFkl << ", "
           << c.fklMultithreadVsFkl << std::endl;
     }
+    const std::string opencvBuild = cv::getBuildInformation();
+    std::ofstream(outDir / "cpu_opencv_build_information.txt") << opencvBuild;
     std::ofstream p(outDir / "cpu_platform.txt");
-    p << "CPU: " << shell("lscpu | sed -n 's/^Model name: *//p'") << ", " << hardwareThreads << " hardware threads\n"
-      << "SIMD of the CPU: " << shell("grep -o -w -E 'avx|avx2|fma|avx512f|avx512bw|avx512vl' /proc/cpuinfo | sort -u | paste -sd' '")
+    p << "CPU: " << bench::cpuName() << ", " << hardwareThreads << " hardware threads\n"
+#ifdef _WIN32
+      << "SIMD of the CPU: see the CPU model\n"
+#else
+      << "SIMD of the CPU: "
+      << bench::shell("grep -o -w -E 'avx|avx2|fma|avx512f|avx512bw|avx512vl|asimd|sve|sve2' /proc/cpuinfo | sort -u | paste -sd' '")
       << "\n"
+#endif
+      << "SIMD the FKL code is compiled for: " << bench::compiledSimd() << "\n"
       << "FKL: commit " << BENCH_FKL_COMMIT << ", CPU backend (single thread) and CPU_MULTITHREAD backend (thread pool of "
       << fk::cpuThreadPool().size() << " workers, thread-pool " << BENCH_THREAD_POOL_COMMIT
       << ", workers spin 100 us before sleeping, one chunk per output row of each crop), compiled with "
       << BENCH_COMPILER << ", flags " << BENCH_CXX_FLAGS << "\n"
-      << "OpenCV: " << CV_VERSION << ", built with GCC 15.2 (baseline SSE3, runtime dispatch up to AVX2 on this CPU: "
-      << (cv::checkHardwareSupport(CV_CPU_AVX2) ? "AVX2 available" : "no AVX2") << "), parallel framework pthreads\n"
-      << "OS: " << shell(". /etc/os-release && echo $PRETTY_NAME") << "\n"
+      << "OpenCV: " << CV_VERSION << ", built with " << bench::buildInfoValue(opencvBuild, "C++ Compiler:")
+      << " (baseline " << bench::buildInfoValue(opencvBuild, "Baseline:") << ", runtime dispatch "
+      << bench::buildInfoValue(opencvBuild, "Dispatched code generation:") << "; features of this CPU: "
+      << cv::getCPUFeaturesLine() << "), parallel framework " << bench::buildInfoValue(opencvBuild, "Parallel framework:")
+      << "; full configuration in cpu_opencv_build_information.txt\n"
+      << "OS: " << bench::osName() << "\n"
       << "Pipeline: as the GPU benchmarks, with BT.601 limited range for NV12 -> RGB (the only NV12 conversion of "
          "OpenCV's CPU cvtColor)\n"
       << "Timing: steady_clock around each pipeline, " << WARMUP_ITERS << " warm-up and " << ITERS

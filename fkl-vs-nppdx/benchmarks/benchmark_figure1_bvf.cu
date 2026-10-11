@@ -29,6 +29,7 @@
 // from 32x16 regions up to 960x524 ones that cover 97% of the frame (see namespace region below).
 
 #include <benchmarks/benchmark_common.h>
+#include "bench_platform.h"
 
 #include <fused_kernel/fused_kernel.h>
 #include <fused_kernel/algorithms/basic_ops/arithmetic.h>
@@ -1067,21 +1068,6 @@ bool ncuTarget(Workload& w, const std::string& impl, const char name, const unsi
 
 } // namespace region
 
-std::string shell(const std::string& command) {
-    std::string output;
-    if (FILE* pipe = popen(command.c_str(), "r")) {
-        char buffer[512];
-        while (fgets(buffer, sizeof(buffer), pipe)) {
-            output += buffer;
-        }
-        pclose(pipe);
-    }
-    while (!output.empty() && output.back() == '\n') {
-        output.pop_back();
-    }
-    return output;
-}
-
 } // namespace figure1
 
 int main(int argc, char** argv) {
@@ -1119,13 +1105,13 @@ int main(int argc, char** argv) {
                 std::ofstream platform(outDir / "benchmark_figure1_bvf_region_sweep_platform.txt");
                 platform << "GPU: " << prop.name << " (sm_" << prop.major << prop.minor << ", " << prop.multiProcessorCount
                          << " SMs)\n"
-                         << "NVIDIA driver: " << shell("nvidia-smi --query-gpu=driver_version --format=csv,noheader") << "\n"
+                         << "NVIDIA driver: " << bench::shell("nvidia-smi --query-gpu=driver_version --format=csv,noheader") << "\n"
                          << "CUDA runtime: " << runtime / 1000 << "." << (runtime % 1000) / 10 << "\n"
-                         << "Host compiler: GCC " << __VERSION__ << "\n"
+                         << "Host compiler: " << bench::hostCompiler() << "\n"
                          << "FKL: " << FKL_VERSION << "\n"
                          << "NPPDx: " << NPPDX_GIT_VERSION << ", operations for SM " << NPPDX_SM << "\n"
-                         << "CPU: " << shell("lscpu | sed -n 's/^Model name: *//p'") << "\n"
-                         << "OS: " << shell(". /etc/os-release && echo $PRETTY_NAME") << "\n"
+                         << "CPU: " << bench::cpuName() << "\n"
+                         << "OS: " << bench::osName() << "\n"
                          << "Region sweep: N = 16 regions on a 4x4 grid of 960x540 cells (region i = row * 4 + column at "
                             "the origin of its cell), sizes 32x16, 112x96, 320x304 and 960x524, resized exactly 2x "
                             "(NPPDx ratio 1:2), 16 black rows added top and bottom, same frame and normalization as the "
@@ -1218,13 +1204,13 @@ int main(int argc, char** argv) {
         std::ofstream platform(outDir / (name + "_platform.txt"));
         platform << "GPU: " << prop.name << " (sm_" << prop.major << prop.minor << ", " << prop.multiProcessorCount
                  << " SMs)\n"
-                 << "NVIDIA driver: " << shell("nvidia-smi --query-gpu=driver_version --format=csv,noheader") << "\n"
+                 << "NVIDIA driver: " << bench::shell("nvidia-smi --query-gpu=driver_version --format=csv,noheader") << "\n"
                  << "CUDA runtime: " << runtime / 1000 << "." << (runtime % 1000) / 10 << "\n"
-                 << "Host compiler: GCC " << __VERSION__ << "\n"
+                 << "Host compiler: " << bench::hostCompiler() << "\n"
                  << "FKL: " << FKL_VERSION << "\n"
                  << "NPPDx: " << NPPDX_GIT_VERSION << ", operations for SM " << NPPDX_SM << "\n"
-                 << "CPU: " << shell("lscpu | sed -n 's/^Model name: *//p'") << "\n"
-                 << "OS: " << shell(". /etc/os-release && echo $PRETTY_NAME") << "\n"
+                 << "CPU: " << bench::cpuName() << "\n"
+                 << "OS: " << bench::osName() << "\n"
                  << "Timing, two benchmarks: " << benchmark::WARMUP_ITERS << " warm-up and " << benchmark::ITERS
                  << " timed iterations, in each one NPPDx and then FKL, with a synchronization after each. "
                     "CPU + GPU (" << name << "_" << parArch << ".csv): CUDA events around everything the host does "

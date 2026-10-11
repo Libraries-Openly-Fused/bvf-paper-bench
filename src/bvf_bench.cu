@@ -33,6 +33,8 @@
 #include <cupti.h>
 #include <nvtx3/nvToolsExt.h>
 
+#include "bench_platform.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -791,7 +793,8 @@ std::vector<KernelRecord> kernels;
 
 void CUPTIAPI bufferRequested(uint8_t** buffer, size_t* size, size_t* maxNumRecords) {
     *size = 8 << 20;
-    *buffer = static_cast<uint8_t*>(std::aligned_alloc(8, *size));
+    // CUPTI needs 8 byte alignment, which malloc guarantees (std::aligned_alloc does not exist on Windows)
+    *buffer = static_cast<uint8_t*>(std::malloc(*size));
     *maxNumRecords = 0;
 }
 
@@ -1070,21 +1073,6 @@ void conversionDiagnostic(const Context& ctx, std::ostream& os) {
        << maxTrunc << " levels\n";
 }
 
-std::string shell(const std::string& command) {
-    std::string output;
-    if (FILE* pipe = popen(command.c_str(), "r")) {
-        char buffer[512];
-        while (fgets(buffer, sizeof(buffer), pipe)) {
-            output += buffer;
-        }
-        pclose(pipe);
-    }
-    while (!output.empty() && (output.back() == '\n' || output.back() == ' ')) {
-        output.pop_back();
-    }
-    return output;
-}
-
 // System, versions and protocol of a run; workload replaces the main benchmark's workload description
 void writePlatform(const std::filesystem::path& path, const Context& ctx, const std::string& diagnostic,
                    const std::string& workload = "") {
@@ -1095,23 +1083,28 @@ void writePlatform(const std::filesystem::path& path, const Context& ctx, const 
     gpuErrchk(cudaRuntimeGetVersion(&runtime));
     gpuErrchk(cudaDriverGetVersion(&driver));
     const NppLibraryVersion* npp = nppGetLibVersion();
+    const std::string opencvBuild = cv::getBuildInformation();
+    std::ofstream(path.parent_path() / "opencv_build_information.txt") << opencvBuild;
     std::ofstream os(path);
     os << "GPU: " << prop.name << " (sm_" << prop.major << prop.minor << ", " << prop.multiProcessorCount << " SMs, "
        << (prop.totalGlobalMem >> 20) << " MiB)\n"
-       << "NVIDIA driver: " << shell("nvidia-smi --query-gpu=driver_version --format=csv,noheader") << "\n"
+       << "NVIDIA driver: " << bench::shell("nvidia-smi --query-gpu=driver_version --format=csv,noheader") << "\n"
        << "CUDA runtime: " << runtime / 1000 << "." << (runtime % 1000) / 10 << ", CUDA driver API: " << driver / 1000
        << "." << (driver % 1000) / 10 << "\n"
        << "nvcc: " << BENCH_NVCC_VERSION << "\n"
        << "nvcc flags: " << BENCH_NVCC_FLAGS << "\n"
-       << "Host compiler: GCC " << __VERSION__ << "\n"
-       << "OpenCV: " << cv::getVersionString() << " (with opencv_contrib 4.14.0, CUDA_ARCH_BIN=8.9, no DNN/OpenCL/python)\n"
+       << "Host compiler: " << bench::hostCompiler() << "\n"
+       << "OpenCV: " << cv::getVersionString() << " (opencv_contrib "
+       << bench::buildInfoValue(opencvBuild, "Version control (extra):") << ", CUDA_ARCH_BIN "
+       << bench::buildInfoValue(opencvBuild, "NVIDIA GPU arch:") << ", C++ compiler "
+       << bench::buildInfoValue(opencvBuild, "C++ Compiler:") << "; full configuration in opencv_build_information.txt)\n"
        << "NPP: " << npp->major << "." << npp->minor << "." << npp->build << "\n"
        << "FKL: branch " << BENCH_FKL_BRANCH << ", commit " << BENCH_FKL_COMMIT << "\n"
-       << "NPPDx: compared in https://github.com/Libraries-Openly-Fused/FKL-vs-NPPDx\n"
-       << "CPU: " << shell("lscpu | sed -n 's/^Model name: *//p'") << "\n"
-       << "OS: " << shell(". /etc/os-release && echo $PRETTY_NAME") << ", kernel " << shell("uname -r") << "\n"
+       << "NPPDx: compared in fkl-vs-nppdx/ of this repository\n"
+       << "CPU: " << bench::cpuName() << "\n"
+       << "OS: " << bench::osName() << ", kernel " << bench::kernelVersion() << "\n"
        << "GPU clocks: not locked (locking needs root); application clocks as reported by nvidia-smi: "
-       << shell("nvidia-smi --query-gpu=clocks.max.sm,clocks.max.mem --format=csv,noheader") << "\n"
+       << bench::shell("nvidia-smi --query-gpu=clocks.max.sm,clocks.max.mem --format=csv,noheader") << "\n"
        << "\nWorkload: ";
     if (workload.empty()) {
         os << FRAME_W << "x" << FRAME_H << " NV12 frame (uniform random bytes, seed " << FRAME_SEED << "), N crops of "

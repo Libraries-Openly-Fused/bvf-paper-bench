@@ -22,17 +22,24 @@ endif()
 set(NPPDX_SM ${DEFAULT_NPPDX_SM} CACHE STRING "SM version used for the NPPDx operations, for example 890")
 message(STATUS "NPPDx operations specialized for SM ${NPPDX_SM}")
 
+set(FKL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../fkl" CACHE PATH "FusedKernelLibrary checkout (default: the fkl submodule)")
+set(NPPDX_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../nppdx" CACHE PATH "NPPDx checkout (default: the nppdx submodule)")
+
 find_package(CUDAToolkit REQUIRED)
-list(APPEND CMAKE_PREFIX_PATH "${CMAKE_CURRENT_SOURCE_DIR}/nppdx")
+list(APPEND CMAKE_PREFIX_PATH "${NPPDX_DIR}")
 find_package(nppdx CONFIG REQUIRED)
 
-execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR}/fkl describe --always --tags
+execute_process(COMMAND git -C ${FKL_DIR} describe --always --tags
                 OUTPUT_VARIABLE FKL_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE)
-execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR}/nppdx describe --always --tags
+execute_process(COMMAND git -C ${NPPDX_DIR} describe --always --tags
                 OUTPUT_VARIABLE NPPDX_GIT_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE)
 
 # Same nvcc options FKL uses for its own CUDA targets (fkl/cmake/libs/cuda/target_generation.cmake)
 set(BENCHMARK_CUDA_OPTIONS --threads 0 -rdc=false -split-compile=0 -ftemplate-depth=1000 -lineinfo)
+if(WIN32)
+    # As FKL on Windows: big object files and the conforming preprocessor of MSVC
+    list(APPEND BENCHMARK_CUDA_OPTIONS -Xcompiler=/bigobj -Xcompiler=/Zc:preprocessor)
+endif()
 
 enable_testing()
 
@@ -40,8 +47,8 @@ function(add_benchmark TARGET_NAME SOURCE)
     add_executable(${TARGET_NAME} ${SOURCE})
     set_target_properties(${TARGET_NAME} PROPERTIES CUDA_ARCHITECTURES "${CUDA_ARCH}"
                           CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
-    target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/fkl/include
-                                                      ${CMAKE_CURRENT_SOURCE_DIR})
+    target_include_directories(${TARGET_NAME} PRIVATE ${FKL_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}
+                                                      ${CMAKE_CURRENT_SOURCE_DIR}/../common)
     target_compile_options(${TARGET_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${BENCHMARK_CUDA_OPTIONS}>)
     target_compile_definitions(${TARGET_NAME} PRIVATE NPPDX_SM=${NPPDX_SM}
                                FKL_VERSION="${FKL_VERSION}" NPPDX_GIT_VERSION="${NPPDX_GIT_VERSION}"

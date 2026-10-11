@@ -1,5 +1,6 @@
 # FKL vs NPPDx
 
+Part of the [BVF paper benchmarks](../README.md) (until October 2026 the separate repository FKL-vs-NPPDx).
 Benchmarks comparing the [Fused Kernel Library (FKL)](https://github.com/Libraries-Openly-Fused/FusedKernelLibrary)
 and NVIDIA [NPPDx](https://github.com/NVIDIA/NPPDx) on the image preprocessing pipeline of the Backwards Vertical
 Fusion paper (Figure 1):
@@ -13,8 +14,8 @@ One 3840x2160 NV12 frame in device memory, N crops of 20x10 pixels at fixed rand
 
 Both libraries run the whole pipeline in **one kernel**:
 
-- **FKL**: one `executeOperations` call with the nine operations (Backwards Vertical Fusion). `AddBorder` is on the
-  FKL branch `bvf-paper-bench`, which is the commit the `fkl` submodule points to.
+- **FKL**: one `executeOperations` call with the nine operations (Backwards Vertical Fusion), from the `fkl`
+  submodule of this repository (FKL main, which has `AddBorder`).
 - **NPPDx**: one CUDA kernel built from NPPDx operations, one thread block per crop: NV12 ingest of the crop,
   `ColorConvert<yuv_bt2020, rgb>` and `Resize<5, 16, bilinear>` on the shared memory tile. AddBorder, Mul, Sub,
   Div and the float3 write are written by hand in the same kernel, because NPPDx 0.1.2 has no border
@@ -129,16 +130,18 @@ tile and block, for example the ones chosen in the summary file (block 0 is NPPD
 
 ## Build and run
 
-Requirements: CUDA 13, CMake 3.30, a C++20 host compiler, and an NVIDIA GPU (sm_75 or newer).
+Requirements: Linux x86_64 or Windows x64 (the platforms of NPPDx), CUDA 13, CMake 3.30, a C++20 host compiler, and
+an NVIDIA GPU (sm_75 or newer). FKL and NPPDx are the `fkl` and `nppdx` submodules of this repository. From its root:
 
-    git clone --recursive https://github.com/Libraries-Openly-Fused/FKL-vs-NPPDx.git
-    cd FKL-vs-NPPDx
-    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-    cmake --build build
-    ./build/benchmark_figure1_bvf results/my_gpu     # or: ctest --test-dir build (writes to build/results)
+    git clone --recursive https://github.com/Libraries-Openly-Fused/bvf-paper-bench.git
+    cd bvf-paper-bench
+    cmake -S fkl-vs-nppdx -B build-nppdx -DCMAKE_BUILD_TYPE=Release
+    cmake --build build-nppdx
+    ./build-nppdx/benchmark_figure1_bvf results/my_gpu     # or: ctest --test-dir build-nppdx (writes to build-nppdx/results)
 
 `CUDA_ARCH` (default `native`) selects the CUDA architectures, and `NPPDX_SM` (detected with `nvidia-smi`) the
 SM version the NPPDx operations are specialized for, for example `-DNPPDX_SM=890` for compute capability 8.9.
+`FKL_DIR` and `NPPDX_DIR` select other FKL and NPPDx checkouts.
 
 ## Output files
 
@@ -151,4 +154,4 @@ Next to them are `_validation_` (errors), `_nppdx_block_sweep_` and `_platform.t
 
 ## License
 
-Apache License 2.0, like FKL and NPPDx.
+Apache License 2.0, like FKL and NPPDx (see [LICENSE](../LICENSE)).

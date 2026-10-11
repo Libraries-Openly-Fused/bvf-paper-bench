@@ -1,3 +1,4 @@
 build/
-build-cpu/
+build-*/
+ci-results/
 __pycache__/
