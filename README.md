@@ -135,6 +135,8 @@ expect those folders, and a `results` directory next to this repository.
     ./build-cpu/cpu_bench ../results/cpu
 
 `CUDA_ARCH` (default `native`, the GPU of the machine) selects the CUDA architectures of the GPU benchmarks.
+`BENCH_ITERATIONS` and `BENCH_WARMUP_ITERATIONS` (default 1000 and 100, as for the paper's results) set the timed and
+warm-up iterations of every benchmark in all three projects.
 
 ## Continuous integration
 
@@ -147,10 +149,11 @@ NVIDIA GPU and run the CPU benchmark only. FKL vs NPPDx runs on the x86_64 CUDA 
 
 Every job runs [`scripts/ci/run_benchmarks.cmake`](scripts/ci/run_benchmarks.cmake), which also runs on any machine
 (see its header). It builds OpenCV 4.14.0 with the modules the benchmarks use once per runner and configuration, in
-`~/bvf-paper-bench-deps` (so the first run on a runner takes much longer), builds the benchmarks, runs every mode except
-the Nsight Compute profiles (they need root), and fails if a benchmark fails or if FKL's outputs do not match their
-references (the baselines' errors are reported, not checked: OpenCV and NPP round and sample differently). The results
-and logs of every job are uploaded as artifacts. Times measured on shared CI runners are not the paper's numbers.
+`~/bvf-paper-bench-deps` (so the first run on a runner takes much longer), builds the benchmarks with one timed
+iteration and no warm-up (`ITERATIONS` and `WARMUP_ITERATIONS` of the script), runs every mode except the Nsight
+Compute profiles (they need root), and fails if a benchmark fails or if FKL's outputs do not match their references
+(the baselines' errors are reported, not checked: OpenCV and NPP round and sample differently). The results and logs
+of every job are uploaded as artifacts. Times measured on shared CI runners are not the paper's numbers.
 
 The runners are persistent machines and this repository is public, so the workflow only runs trusted code: pull
 requests from forks are skipped (push their commits to a branch of this repository after reviewing them to test them),

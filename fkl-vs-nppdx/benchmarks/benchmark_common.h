@@ -40,8 +40,10 @@
 
 namespace benchmark {
 
-constexpr int WARMUP_ITERS = 100;
-constexpr int ITERS = 1000;
+// BENCH_WARMUP_ITERATIONS and BENCH_ITERATIONS come from CMake: 100 and 1000 for the paper's results, 0 and 1 in the CI
+constexpr int WARMUP_ITERS = BENCH_WARMUP_ITERATIONS;
+constexpr int ITERS = BENCH_ITERATIONS;
+static_assert(WARMUP_ITERS >= 0 && ITERS >= 1, "at least one timed iteration");
 
 struct TimeStats {
     float mean{0.f}, variance{0.f}, max{0.f}, min{0.f}, median{0.f}, p10{0.f}, p90{0.f};
@@ -71,7 +73,7 @@ inline TimeStats computeStats(const std::vector<float>& times) {
     for (const float t : times) {
         sumOfDiff += (t - stats.mean) * (t - stats.mean);
     }
-    stats.variance = static_cast<float>(sumOfDiff / (times.size() - 1));
+    stats.variance = times.size() > 1 ? static_cast<float>(sumOfDiff / (times.size() - 1)) : 0.f;
     std::vector<float> sorted(times);
     std::sort(sorted.begin(), sorted.end());
     stats.min = sorted.front();

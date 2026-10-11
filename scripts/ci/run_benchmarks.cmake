@@ -1,5 +1,5 @@
-# Builds OpenCV (once per machine), builds the benchmarks of this repository and runs every one of them, then checks
-# that FKL's outputs match their references. Runs on Linux and Windows; the CI workflow
+# Builds OpenCV (once per machine), builds the benchmarks of this repository and runs every one of them once, then
+# checks that FKL's outputs match their references. Runs on Linux and Windows; the CI workflow
 # (.github/workflows/benchmarks.yml) runs it on FKL's self-hosted runners, and it runs the same way on any machine:
 #
 #   cmake -DBENCHMARKS=cpu -DCXX_COMPILER=clang++ -P scripts/ci/run_benchmarks.cmake
@@ -18,6 +18,9 @@
 #   BUILD_DIR            build folders of the benchmarks (default <repo>/build-ci)
 #   OUT_DIR              results and logs (default <repo>/ci-results)
 #   GENERATOR            CMake generator (default Ninja)
+#   ITERATIONS           timed iterations of every benchmark (default 1: the CI checks the results, it does not
+#                        measure; 1000 for the paper's numbers)
+#   WARMUP_ITERATIONS    warm-up iterations before them (default 0; 100 for the paper's numbers)
 #   OPENCV_VERSION       default 4.14.0, the version of the paper's results; another version needs the SHA-256 of its
 #                        source archives in OPENCV_SHA256 and OPENCV_CONTRIB_SHA256
 cmake_minimum_required(VERSION 3.28)
@@ -30,7 +33,8 @@ else()
     set(HOME_DIR "$ENV{HOME}")
     set(EXE "")
 endif()
-foreach(default IN ITEMS "GENERATOR=Ninja" "OPENCV_VERSION=4.14.0" "NPPDX=AUTO" "DEPS_DIR=${HOME_DIR}/bvf-paper-bench-deps"
+foreach(default IN ITEMS "GENERATOR=Ninja" "OPENCV_VERSION=4.14.0" "NPPDX=AUTO" "ITERATIONS=1" "WARMUP_ITERATIONS=0"
+                         "DEPS_DIR=${HOME_DIR}/bvf-paper-bench-deps"
                          "BUILD_DIR=${REPO}/build-ci" "OUT_DIR=${REPO}/ci-results")
     string(FIND "${default}" "=" eq)
     string(SUBSTRING "${default}" 0 ${eq} name)
@@ -302,7 +306,8 @@ endif()
 # Configures and builds one benchmark project in BUILD_DIR/<NAME>
 function(build_benchmark NAME SOURCE)
     set(options -G "${GENERATOR}" -S "${SOURCE}" -B "${BUILD_DIR}/${NAME}" -DCMAKE_BUILD_TYPE=Release
-        "-DCMAKE_CXX_COMPILER=${CXX_COMPILER}" "-DCMAKE_PREFIX_PATH=${OPENCV_PREFIX}" ${ARGN})
+        "-DCMAKE_CXX_COMPILER=${CXX_COMPILER}" "-DCMAKE_PREFIX_PATH=${OPENCV_PREFIX}"
+        -DBENCH_ITERATIONS=${ITERATIONS} -DBENCH_WARMUP_ITERATIONS=${WARMUP_ITERATIONS} ${ARGN})
     run(${NAME}_configure FATAL COMMAND "${CMAKE_COMMAND}" ${options})
     if(CMAKE_HOST_WIN32 AND CUDA_COMPILER AND EXISTS "${BUILD_DIR}/${NAME}/CMakeFiles/rules.ninja")
         # The same workaround as FKL's Windows CUDA CI: CMake writes an nvcc path without its toolkit folder

@@ -76,8 +76,10 @@ constexpr int OUT_W = RES_W;
 constexpr int OUT_H = RES_H + BORDER_TOP + BORDER_BOTTOM;
 constexpr int MAX_BATCH = 100;
 constexpr std::array<int, 5> BATCHES{1, 4, 16, 50, 100};
-constexpr int WARMUP_ITERS = 100;
-constexpr int TIMED_ITERS = 1000;
+// BENCH_WARMUP_ITERATIONS and BENCH_ITERATIONS come from CMake: 100 and 1000 for the paper's results, 0 and 1 in the CI
+constexpr int WARMUP_ITERS = BENCH_WARMUP_ITERATIONS;
+constexpr int TIMED_ITERS = BENCH_ITERATIONS;
+static_assert(WARMUP_ITERS >= 0 && TIMED_ITERS >= 1, "at least one timed iteration");
 constexpr unsigned FRAME_SEED = 1;
 constexpr unsigned CROP_SEED = 42;
 constexpr float TOLERANCE = 1e-3f;
@@ -681,7 +683,7 @@ TimingStats computeStats(std::vector<float> ms) {
     for (const float v : ms) {
         sumOfDiff += (v * 1000. - t.mean) * (v * 1000. - t.mean);
     }
-    t.variance = sumOfDiff / (ms.size() - 1);
+    t.variance = ms.size() > 1 ? sumOfDiff / (ms.size() - 1) : 0.;
     std::sort(ms.begin(), ms.end());
     t.min = ms.front() * 1000.;
     t.max = ms.back() * 1000.;

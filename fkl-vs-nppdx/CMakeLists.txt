@@ -25,6 +25,10 @@ message(STATUS "NPPDx operations specialized for SM ${NPPDX_SM}")
 set(FKL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../fkl" CACHE PATH "FusedKernelLibrary checkout (default: the fkl submodule)")
 set(NPPDX_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../nppdx" CACHE PATH "NPPDx checkout (default: the nppdx submodule)")
 
+# Timed and warm-up iterations of every benchmark: 1000 and 100 for the paper's results; the CI runs 1 and 0
+set(BENCH_ITERATIONS 1000 CACHE STRING "Timed iterations of every benchmark (at least 1)")
+set(BENCH_WARMUP_ITERATIONS 100 CACHE STRING "Warm-up iterations before the timed ones")
+
 find_package(CUDAToolkit REQUIRED)
 list(APPEND CMAKE_PREFIX_PATH "${NPPDX_DIR}")
 find_package(nppdx CONFIG REQUIRED)
@@ -37,8 +41,10 @@ execute_process(COMMAND git -C ${NPPDX_DIR} describe --always --tags
 # Same nvcc options FKL uses for its own CUDA targets (fkl/cmake/libs/cuda/target_generation.cmake)
 set(BENCHMARK_CUDA_OPTIONS --threads 0 -rdc=false -split-compile=0 -ftemplate-depth=1000 -lineinfo)
 if(WIN32)
-    # As FKL on Windows: big object files and the conforming preprocessor of MSVC
-    list(APPEND BENCHMARK_CUDA_OPTIONS -Xcompiler=/bigobj -Xcompiler=/Zc:preprocessor)
+    # As FKL on Windows: big object files and the conforming preprocessor of MSVC. As NPPDx's examples: the real value
+    # of __cplusplus (MSVC reports 199711L without /Zc:__cplusplus, and NPPDx checks for C++17) and no min/max macros
+    list(APPEND BENCHMARK_CUDA_OPTIONS -Xcompiler=/bigobj -Xcompiler=/Zc:preprocessor -Xcompiler=/Zc:__cplusplus)
+    add_compile_definitions(NOMINMAX)
 endif()
 
 enable_testing()
@@ -51,6 +57,7 @@ function(add_benchmark TARGET_NAME SOURCE)
                                                       ${CMAKE_CURRENT_SOURCE_DIR}/../common)
     target_compile_options(${TARGET_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${BENCHMARK_CUDA_OPTIONS}>)
     target_compile_definitions(${TARGET_NAME} PRIVATE NPPDX_SM=${NPPDX_SM}
+                               BENCH_ITERATIONS=${BENCH_ITERATIONS} BENCH_WARMUP_ITERATIONS=${BENCH_WARMUP_ITERATIONS}
                                FKL_VERSION="${FKL_VERSION}" NPPDX_GIT_VERSION="${NPPDX_GIT_VERSION}"
                                CUDA_ARCHITECTURES_STR="${CUDA_ARCH}")
     target_link_libraries(${TARGET_NAME} PRIVATE nppdx::nppdx CUDA::cudart CUDA::cupti CUDA::nvtx3)

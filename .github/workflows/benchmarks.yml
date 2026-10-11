@@ -3,9 +3,10 @@ name: Benchmarks
 # Builds and runs every benchmark on the self-hosted runners of FKL's CI, with the toolchains of FKL's workflows
 # (FusedKernelLibrary/.github/workflows). The ROCm runners have no NVIDIA GPU, so they run the CPU benchmark only.
 # scripts/ci/run_benchmarks.cmake does the work: it builds OpenCV once per runner and configuration in
-# ~/bvf-paper-bench-deps (the first run on a runner takes much longer), builds the benchmarks, runs every mode except the
-# Nsight Compute profiles (they need root), and fails if FKL's outputs do not match their references. The results and
-# logs of every job are uploaded as artifacts. Times measured on shared CI runners are not the paper's numbers.
+# ~/bvf-paper-bench-deps (the first run on a runner takes much longer), builds the benchmarks with one timed iteration
+# and no warm-up (the CI checks results, it does not measure), runs every mode except the Nsight Compute profiles (they
+# need root), and fails if FKL's outputs do not match their references. The results and logs of every job are uploaded
+# as artifacts. Times measured on shared CI runners are not the paper's numbers.
 #
 # The runners are persistent machines and this repository is public, so only trusted code runs on them: pull requests
 # from branches of this repository (pushing one needs write access) and runs started by hand. Pull requests from forks

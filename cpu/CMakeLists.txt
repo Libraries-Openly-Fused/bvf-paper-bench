@@ -16,6 +16,9 @@ else()
     set(DEFAULT_CPU_ARCH_FLAGS "-march=native")
 endif()
 set(CPU_ARCH_FLAGS "${DEFAULT_CPU_ARCH_FLAGS}" CACHE STRING "CPU code generation flags for the FKL code")
+# Timed and warm-up iterations of every benchmark: 1000 and 100 for the paper's results; the CI runs 1 and 0
+set(BENCH_ITERATIONS 1000 CACHE STRING "Timed iterations of every benchmark (at least 1)")
+set(BENCH_WARMUP_ITERATIONS 100 CACHE STRING "Warm-up iterations before the timed ones")
 
 # OpenCVConfig.cmake still calls find_package(CUDA) when OpenCV was built with CUDA, which needs FindCUDA
 cmake_policy(SET CMP0146 OLD)
@@ -48,6 +51,7 @@ string(JOIN " " EXTRA_FLAGS_STR ${EXTRA_FLAGS})
 # FK_CPU_MULTITHREAD_ENABLED turns on FKL's CPU_MULTITHREAD backend (what FKL::FKL defines when FKL is configured with it)
 target_compile_definitions(cpu_bench PRIVATE FK_CPU_MULTITHREAD_ENABLED
                            BENCH_FKL_COMMIT="${FKL_COMMIT}" BENCH_THREAD_POOL_COMMIT="${THREAD_POOL_COMMIT}"
+                           BENCH_ITERATIONS=${BENCH_ITERATIONS} BENCH_WARMUP_ITERATIONS=${BENCH_WARMUP_ITERATIONS}
                            BENCH_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
                            BENCH_CXX_FLAGS="${CMAKE_CXX_FLAGS_RELEASE} ${STD_FLAG} ${CPU_ARCH_FLAGS} ${EXTRA_FLAGS_STR}")
 target_link_libraries(cpu_bench PRIVATE opencv_core opencv_imgproc Threads::Threads)
