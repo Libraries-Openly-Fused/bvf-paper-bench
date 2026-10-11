@@ -40,6 +40,9 @@ Other modes, selected with a second argument:
 | `--profile-kernels` | GPU time of every kernel of every pipeline |
 | `--host-overhead` | host time to enqueue the FKL pipelines |
 | `--ncu-target <impl> <N>` | runs one execution of one pipeline inside the NVTX range `measure`, for Nsight Compute |
+| `--region-sweep` | the region-size sweep below: validation, CPU + GPU, GPU only and GPU only with the L2 flushed, kernel counts |
+| `--region-sweep-validate` | the validation of the region-size sweep only |
+| `--region-ncu-target <impl> <A\|B\|C\|D>` | like `--ncu-target`, for one case of the region-size sweep |
 
 No CUDA Graphs are used anywhere.
 
@@ -47,6 +50,30 @@ Output files: `latency.csv` (CPU + GPU: median, p10, p90 and mean in us, kernels
 `gpu_time.csv` (GPU only, same columns), `<baseline>_vs_fkl_bvf_gpu_only_GPU_NVIDIA.csv` and
 `<baseline>_vs_fkl_bvf_GPU_NVIDIA.csv` (FKL's two-execution format, times in ms), `kernel_breakdown.csv` (time of
 each kernel or stage of the multi-kernel pipelines), `validation.csv`, `kernels.csv` and `platform.txt`.
+
+### Region-size sweep (`--region-sweep`)
+
+How the BVF advantage depends on how much of the producer's output is used: N = 16 regions, one at the origin of
+each 960x540 cell of a 4x4 grid (they never overlap), resized exactly 2x in both axes, then the same 16 + 16 black
+border rows, normalization and float3 write as the main benchmark. Same frame, constants, implementations,
+intermediates, references and timing protocol.
+
+| Case | Region | Resized | Output per region | 16 regions cover |
+|---|---|---|---|---|
+| A | 32x16 | 64x32 | 64x64 | 8,192 px, 0.0988% of the frame |
+| B | 112x96 | 224x192 | 224x224 | 172,032 px, 2.0741% |
+| C | 320x304 | 640x608 | 640x640 | 1,556,480 px, 18.7654% |
+| D | 960x524 | 1920x1048 | 1920x1080 | 8,048,640 px, 97.0370% |
+
+Output files: `region_sweep_times.csv` (the three timings, kernels launched and FKL BVF's mean speedups per case and
+implementation), `<baseline>_vs_fkl_bvf_region_sweep_[gpu_only_|gpu_only_l2_flushed_]GPU_NVIDIA.csv` (FKL's
+two-execution format, keyed by the source pixels of one region), `region_sweep_validation.csv`,
+`region_sweep_kernels.csv`, `region_sweep_kernel_breakdown.csv`, `region_sweep_cases.csv` (sizes and exact frame
+coverage), `region_sweep_buffers.csv` (the logical size of every buffer each implementation uses in global memory and
+the bytes it writes and reads there in one execution, from the sizes in the code) and `region_sweep_platform.txt`.
+NPPDx is in FKL-vs-NPPDx's `--region-sweep` mode. After both sweeps have run, `sudo scripts/ncu_region_sweep.sh`
+profiles the memory traffic of every pipeline of both benchmarks for every case in one go (NPPDx in the tile and block
+its sweep chose); summarize it with `scripts/ncu_summarize.py region`.
 
 ### Memory traffic with Nsight Compute
 
@@ -91,6 +118,7 @@ Nsight Compute scripts) and a `results` directory:
     cmake --build build -j
     ./build/bvf_bench ../results                          # CPU + GPU and GPU only
     ./build/bvf_bench ../results --gpu-only-l2-flushed    # adds the *_l2_flushed* files (same for the other modes)
+    ./build/bvf_bench ../results/region_sweep --region-sweep
     ./build/bvf_types                                     # C++ type of the fused read operation for N = 100
 
     # CPU benchmark, preferably with a recent clang; -march=native by default (CPU_ARCH_FLAGS)
