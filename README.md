@@ -71,10 +71,10 @@ comparison in FKL's two-execution format, plus `cpu_validation.csv` and `cpu_pla
 - OpenCV 4.14 built with CUDA and the opencv_contrib modules `cudaarithm` and `cudawarping` (the CPU benchmark only
   needs `core` and `imgproc`).
 - A FusedKernelLibrary checkout, by default next to this repository (set another one with `-DFKL_DIR=<path>`), with
-  the `AddBorder` operation: FKL `main` once
-  [PR #370](https://github.com/Libraries-Openly-Fused/FusedKernelLibrary/pull/370) is merged, or its branch
-  `369-add-addborder-operation` until then. The CPU benchmark also needs the `CPU_MULTITHREAD` backend and its
-  `thread-pool` submodule, which go in FKL's `cpu-multithread` branch on top of AddBorder.
+  the `AddBorder` operation, which is in FKL `main`
+  ([PR #370](https://github.com/Libraries-Openly-Fused/FusedKernelLibrary/pull/370)). The CPU benchmark also needs
+  the `CPU_MULTITHREAD` backend of FKL's `cpu-multithread` branch, cloned with its `thread-pool` submodule
+  (`git clone --recursive -b cpu-multithread https://github.com/Libraries-Openly-Fused/FusedKernelLibrary.git`).
 
 The default paths assume one directory that holds this repository, FusedKernelLibrary, FKL-vs-NPPDx (only for the
 Nsight Compute scripts) and a `results` directory:
