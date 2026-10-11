@@ -26,7 +26,9 @@ set_target_properties(cpu_bench PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
 target_include_directories(cpu_bench PRIVATE ${FKL_DIR}/include ${FKL_DIR}/thread-pool/include)
 separate_arguments(CPU_ARCH_FLAGS_LIST UNIX_COMMAND "${CPU_ARCH_FLAGS}")
 target_compile_options(cpu_bench PRIVATE ${CPU_ARCH_FLAGS_LIST} -ftemplate-depth=1000)
-target_compile_definitions(cpu_bench PRIVATE BENCH_FKL_COMMIT="${FKL_COMMIT}" BENCH_THREAD_POOL_COMMIT="${THREAD_POOL_COMMIT}"
+# FK_CPU_MULTITHREAD_ENABLED turns on FKL's CPU_MULTITHREAD backend (what FKL::FKL defines when FKL is configured with it)
+target_compile_definitions(cpu_bench PRIVATE FK_CPU_MULTITHREAD_ENABLED
+                           BENCH_FKL_COMMIT="${FKL_COMMIT}" BENCH_THREAD_POOL_COMMIT="${THREAD_POOL_COMMIT}"
                            BENCH_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
                            BENCH_CXX_FLAGS="${CMAKE_CXX_FLAGS_RELEASE} -std=c++20 ${CPU_ARCH_FLAGS} -ftemplate-depth=1000")
 target_link_libraries(cpu_bench PRIVATE opencv_core opencv_imgproc Threads::Threads)
