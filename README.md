@@ -83,6 +83,29 @@ L2) profile every pipeline with Nsight Compute through the `--ncu-target` mode o
 ran sudo. Summarize them afterwards, without sudo, with `scripts/ncu_summarize.py` (DRAM) or
 `scripts/ncu_summarize.py l2`.
 
+### Compile time (`compile_time/`)
+
+How long nvcc takes to compile the pipelines. `compile_time/pipeline.cu` holds one pipeline per translation unit (TU),
+selected with `-DIMPL_<NAME>` and `-DCT_BATCH=<N>` (not `BATCH`, which FKL uses as a template parameter name): FKL BVF
+(`BVF`), the same with the `CONDITIONAL_WITH_DEFAULT` plane policy for 100 planes (`BVF_CWD`), FKL VF+HF (`VFHF`),
+OpenCV (`OPENCV`) and NPP (`NPP`), with the calls of `src/bvf_bench.cu`, plus two baselines without a pipeline: the FKL
+headers only (`HEADERS_FKL`) and every header of the other TUs (`HEADERS_ALL`). The TUs are compiled, never run.
+`fkl-vs-nppdx/benchmarks/compile_time_pipeline.cu` does the same for the NPPDx kernel of `nppdx_figure1.h` and FKL's
+`runFKL` (`HEADERS`, `NPPDX`, `BVF`).
+
+`compile_time/run.sh` compiles every TU with the nvcc command line of the benchmark target (read from
+`compile_commands.json`, so configure with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`), 10 times after one discarded warm-up,
+round-robin, one nvcc at a time on an idle machine (it waits for a load average below 0.5). It records the wall, user
+and sys time and max RSS with `/usr/bin/time`, the phases with `nvcc --time` (with `--threads 0` they run in parallel,
+so their sum exceeds the wall time), and from one more compile with `-Xptxas -v --keep` the kernels, registers, spills,
+stack frame and PTX, cubin and object sizes. `compile_time/summarize.py` writes `compile_time_summary.csv` (one row per
+TU, medians, min and max), `compile_time_kernels.csv` and `compile_time_phases.csv`, and prints a Markdown table.
+
+    compile_time/run.sh ../results/compile_time                    # BUILD=build: src/bvf_bench.cu's command
+    SET=nppdx compile_time/run.sh ../results/compile_time_nppdx    # BUILD=build-nppdx: benchmark_figure1_bvf's command
+
+The results of the RTX 4090 machine for FKL vs NPPDx are in `fkl-vs-nppdx/results/RTX4090/compile_time*`.
+
 ## CPU benchmark (`cpu/`)
 
 The same pipeline on the CPU: OpenCV (with 1 thread and with all hardware threads) against FKL's CPU backends with
