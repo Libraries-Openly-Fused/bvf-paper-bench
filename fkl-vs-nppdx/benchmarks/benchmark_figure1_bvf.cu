@@ -47,6 +47,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -1137,8 +1138,12 @@ int main(int argc, char** argv) {
             }
             return 0;
         }
-        if (argc > 4 && std::string(argv[2]) == "--region-ncu-target") {
+        if (argc > 2 && std::string(argv[2]) == "--region-ncu-target") {
             // --region-ncu-target <nppdx|fkl_bvf> <A|B|C|D> [<tileX>x<tileY> <block>], the tile and block for nppdx
+            if (argc < 5 || std::strlen(argv[4]) != 1) {
+                throw std::runtime_error("Usage: --region-ncu-target <nppdx|fkl_bvf> <A|B|C|D> "
+                                         "[<tileX>x<tileY> <block>] (the tile and block for nppdx)");
+            }
             const std::string impl = argv[3];
             const char name = argv[4][0];
             unsigned tileX = 0, tileY = 0, block = 0;
@@ -1158,7 +1163,10 @@ int main(int argc, char** argv) {
             }
             return 0;
         }
-        if (argc > 4 && std::string(argv[2]) == "--ncu-target") {
+        if (argc > 2 && std::string(argv[2]) == "--ncu-target") {
+            if (argc < 5) {
+                throw std::runtime_error("Usage: --ncu-target <nppdx|fkl_bvf> <N>");
+            }
             ncuTargetDispatch(w, argv[3], std::stoul(argv[4]), std::make_index_sequence<BATCHES.size()>{});
             return 0;
         }
@@ -1168,6 +1176,10 @@ int main(int argc, char** argv) {
             std::cout << "### BlockDim<256>" << std::endl;
             analyze<256>(w);
             return 0;
+        }
+        // Any other argument is a mistake: running the default benchmark instead would overwrite its results in outDir
+        if (argc > 2) {
+            throw std::runtime_error(std::string("Unknown mode: ") + argv[2] + " (see the modes in README.md)");
         }
         std::vector<benchmark::TwoExecutionsResult> results;
         std::vector<Validation> checks;
