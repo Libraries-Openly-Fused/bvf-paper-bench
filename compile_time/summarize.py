@@ -17,6 +17,11 @@ from pathlib import Path
 
 UNIT_SECONDS = {"s": 1.0, "ms": 1e-3, "us": 1e-6}
 CATEGORIES = ("cudafe", "cicc", "ptxas", "fatbinary", "host_compiler", "other")
+# host_compiler groups every gcc row, as asked. Its three phases are also reported on their own: "preprocessing 4"
+# (host code, for cudafe++) and "preprocessing 1" (device code, for cicc) run at the same time, and "compiling" is the
+# host code's compile
+GCC_PHASES = {"gcc_preprocess_host": "gcc (preprocessing 4)", "gcc_preprocess_device": "gcc (preprocessing 1)",
+              "gcc_compile": "gcc (compiling)"}
 
 
 def category(phase):
@@ -90,6 +95,10 @@ def sizes(keep):
     return ptx, cubin, obj
 
 
+def dash(value):
+    return "-" if value is None else value
+
+
 def median(values):
     return statistics.median(values) if values else None
 
@@ -111,13 +120,14 @@ def main():
             times.setdefault(key, []).append(row)
 
     summary, kernel_rows, phase_rows, header, notes = [], [], [], None, []
+    overlap_check = []  # per timed compile: wall - (sum of phases - the shorter of the two gcc preprocessing passes)
     for impl, batch in order:
-        rows = times.get((impl, batch), [])
+        rows = sorted(times.get((impl, batch), []), key=lambda r: int(r["rep"]))
         reps = len(rows)
         wall = [float(r["wall_s"]) for r in rows]
         phase_file = out / f"phases_{impl}_{batch}.csv"
         cats = {c: [] for c in CATEGORIES}
-        phase_sum = []
+        gcc = {g: [] for g in GCC_PHASES}
         if phase_file.exists():
             header, compiles = read_phases(phase_file)
             if len(compiles) != reps + 1:
@@ -129,7 +139,11 @@ def main():
                     totals[category(phase)] += seconds
                 for c in CATEGORIES:
                     cats[c].append(totals[c])
-                phase_sum.append(sum(totals.values()))
+                for g, phase in GCC_PHASES.items():
+                    gcc[g].append(compile_phases.get(phase, 0.0))
+            for compile_phases, row in zip(timed, rows):
+                prep = [compile_phases.get(GCC_PHASES[g], 0.0) for g in ("gcc_preprocess_host", "gcc_preprocess_device")]
+                overlap_check.append(float(row["wall_s"]) - (sum(compile_phases.values()) - min(prep)))
             for phase in sorted({p for c in timed for p in c}):
                 phase_rows.append({"impl": impl, "batch": batch, "phase": phase, "category": category(phase),
                                    "median_s": fmt(median([c.get(phase, 0.0) for c in timed]), 4)})
@@ -141,6 +155,10 @@ def main():
                                  f"{median(wall):.2f} s")
         keep = out / f"keep_{impl}_{batch}"
         kernels = kernel_facts(keep)
+        log = (keep / "ptxas.log").read_text() if (keep / "ptxas.log").exists() else ""
+        if log.count("Compiling entry function") != len(kernels):
+            notes.append(f"{impl} {batch}: ptxas compiled {log.count('Compiling entry function')} entry functions, "
+                         f"cuobjdump lists {len(kernels)}")
         for name, k in kernels.items():
             kernel_rows.append({"impl": impl, "batch": batch, "kernel": name, "registers": k["registers"],
                                 "stack_frame_bytes": k["stack"], "spill_stores_bytes": k["spill_stores"],
@@ -162,7 +180,7 @@ def main():
             "kernels": len(kernels), "registers_max": kmax("registers"),
             "spill_stores_bytes_max": kmax("spill_stores"), "stack_frame_bytes_max": kmax("stack"),
             "ptx_bytes": ptx, "cubin_bytes": cubin, "object_bytes": obj,
-            "phases_sum_median_s": fmt(median(phase_sum)),
+            **{f"{g}_median_s": fmt(median(gcc[g])) for g in GCC_PHASES},
         })
 
     with open(out / "compile_time_summary.csv", "w", newline="") as f:
@@ -179,16 +197,42 @@ def main():
         writer.writeheader()
         writer.writerows(phase_rows)
 
+    # Machine CPU time per round outside the benchmark's nvcc processes: busy CPU time of /proc/stat minus the user +
+    # sys time of the round's compiles
+    load_rows = []
+    if (out / "load.csv").exists():
+        with open(out / "load.csv", newline="") as f:
+            for row in csv.DictReader(f):
+                rep = int(row["rep"])
+                busy = (int(row["busy_jiffies_end"]) - int(row["busy_jiffies_start"])) / int(row["clock_ticks_per_s"])
+                nvcc = sum(float(r["user_s"]) + float(r["sys_s"]) for k in times for r in times[k] if int(r["rep"]) == rep)
+                if rep > 0:
+                    load_rows.append({"rep": rep, "machine_busy_cpu_s": f"{busy:.2f}", "nvcc_cpu_s": f"{nvcc:.2f}",
+                                      "other_cpu_s": f"{busy - nvcc:.2f}", "loadavg_1min": row["loadavg_1min"]})
+        with open(out / "compile_time_load.csv", "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["rep", "machine_busy_cpu_s", "nvcc_cpu_s", "other_cpu_s",
+                                                   "loadavg_1min"])
+            writer.writeheader()
+            writer.writerows(load_rows)
+
     print("nvcc --time header: " + ", ".join(header or []))
-    print("Phases run in parallel with --threads 0, so their sum (phases_sum) can exceed the wall time.\n")
-    print("| TU | N | wall median (min-max) s | cudafe++ s | cicc s | ptxas s | host compiler s | phases sum s | "
-          "kernels | registers max | spill stores max | cubin bytes | object bytes |")
+    if overlap_check:
+        print(f"With --threads 0 only gcc (preprocessing 1) and (preprocessing 4) run at the same time: in every timed "
+              f"compile, wall = sum of the phases - the shorter of the two, to within "
+              f"{max(abs(x) for x in overlap_check):.3f} s. host_compiler groups all the gcc rows as asked; "
+              f"gcc compile is the host code's compile alone.")
+    if load_rows:
+        print(f"CPU time used outside the benchmark's nvcc, per round: max "
+              f"{max(float(r['other_cpu_s']) for r in load_rows):.2f} s (compile_time_load.csv)")
+    print()
+    print("| TU | N | wall median (min-max) s | cudafe++ s | cicc s | ptxas s | gcc compile s | host compiler s "
+          "(all gcc) | kernels | registers max | spill stores max | cubin bytes | object bytes |")
     print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for s in summary:
         print(f"| {s['impl']} | {s['batch']} | {s['wall_median_s']} ({s['wall_min_s']}-{s['wall_max_s']}) | "
-              f"{s['cudafe_median_s']} | {s['cicc_median_s']} | {s['ptxas_median_s']} | {s['host_compiler_median_s']} | "
-              f"{s['phases_sum_median_s']} | {s['kernels']} | {s['registers_max']} | {s['spill_stores_bytes_max']} | "
-              f"{s['cubin_bytes']} | {s['object_bytes']} |")
+              f"{s['cudafe_median_s']} | {s['cicc_median_s']} | {s['ptxas_median_s']} | {s['gcc_compile_median_s']} | "
+              f"{s['host_compiler_median_s']} | {s['kernels']} | {dash(s['registers_max'])} | "
+              f"{dash(s['spill_stores_bytes_max'])} | {s['cubin_bytes']} | {s['object_bytes']} |")
     for note in notes:
         print("Note: " + note)
 

@@ -14,7 +14,8 @@
 
 // One pipeline of the paper's Figure 1 per translation unit, for measuring nvcc compile time (compile_time/run.sh with
 // SET=nppdx). Select with exactly one of:
-//   -DIMPL_HEADERS  the headers of benchmark_figure1_bvf.cu (FKL, NPPDx, nppdx_figure1.h, NVTX), no pipeline
+//   -DIMPL_HEADERS  the headers of the other two variants (FKL, NPPDx, nppdx_figure1.h, NVTX: the ones of
+//                   benchmark_figure1_bvf.cu without its benchmark scaffolding), no pipeline
 //   -DIMPL_NPPDX    the NPPDx kernel of the paper: NppdxFigure1<NPPDX_SM, N, 256, 20, 10> (256 threads per block, one
 //                   20x10 tile per crop); CropOrigins<N> is a kernel parameter, so it is instantiated for every N
 //   -DIMPL_BVF      FKL, the runFKL<N> call of benchmark_figure1_bvf.cu

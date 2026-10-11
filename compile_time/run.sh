@@ -98,14 +98,18 @@ compile() {  # impl batch rep: one timed compile, wall/user/sys/maxrss appended 
   echo "$impl,$batch,$rep,$(cat "$WORK/time.txt")" >> "$OUT/compile_time.csv"
 }
 
+busy_jiffies() {  # CPU time the whole machine has used since boot (user, nice, system, irq, softirq, steal)
+  awk '/^cpu / { print $2 + $3 + $4 + $7 + $8 + $9 }' /proc/stat
+}
 rm -f "$OUT"/phases_*.csv "$OUT/compile_time.csv" "$OUT/load.csv"
 echo "impl,batch,rep,wall_s,user_s,sys_s,maxrss_kb" > "$OUT/compile_time.csv"
-echo "rep,loadavg_1min,loadavg_5min" > "$OUT/load.csv"
-for tu in "${TUS[@]}"; do compile $tu 0; done      # warm-up (page cache): rep 0, left out of the summary
-echo "0,$(cut -d' ' -f1,2 /proc/loadavg | tr ' ' ',')" >> "$OUT/load.csv"
-for rep in $(seq 1 "$REPS"); do                    # round-robin, so that any drift affects every TU alike
+# Per round: the machine's busy CPU time, to compare with the user + sys time of the round's nvcc processes (the load
+# average mostly shows the benchmark's own nvcc)
+echo "rep,busy_jiffies_start,busy_jiffies_end,clock_ticks_per_s,loadavg_1min" > "$OUT/load.csv"
+for rep in $(seq 0 "$REPS"); do                    # rep 0: warm-up (page cache), left out of the summary;
+  start=$(busy_jiffies)                            # round-robin, so that any drift affects every TU alike
   for tu in "${TUS[@]}"; do compile $tu "$rep"; done
-  echo "$rep,$(cut -d' ' -f1,2 /proc/loadavg | tr ' ' ',')" >> "$OUT/load.csv"
+  echo "$rep,$start,$(busy_jiffies),$(getconf CLK_TCK),$(cut -d' ' -f1 /proc/loadavg)" >> "$OUT/load.csv"
   echo "round $rep of $REPS done" >&2
 done
 END=$(date -Is)
@@ -119,8 +123,8 @@ for tu in "${TUS[@]}"; do
   mkdir -p "$keep"
   "${NVCC[@]}" "-DIMPL_$1" "-DCT_BATCH=$2" -Xptxas -v --keep --keep-dir "$keep" -c "$SOURCE" -o "$keep/$tag.o" \
     > "$keep/ptxas.log" 2>&1
-  cuobjdump --dump-resource-usage "$keep/$tag.o" > "$keep/resource_usage.txt" 2>&1 || true
-  stat -c "%s" "$keep/$tag.o" > "$keep/object_bytes.txt"
+  "$(dirname "${NVCC[0]}")/cuobjdump" --dump-resource-usage "$keep/$tag.o" > "$keep/resource_usage.txt"
+  stat -c "%s" "$WORK/$tag.o" > "$keep/object_bytes.txt"   # the object of the last timed compile
   # The kept intermediates are large; keep only what the summary reads
   find "$keep" -maxdepth 1 -type f \( -name '*.ii' -o -name '*.cudafe1.*' -o -name '*.module_id' -o -name '*.fatbin*' \
        -o -name '*.reg.c' -o -name '*.stub.c' \) -delete
@@ -132,7 +136,7 @@ done
 # 4. Platform
 {
   echo "date: $START to $END"
-  echo "load average before start: $LOAD_BEFORE (per round in load.csv)"
+  echo "load average before start: $LOAD_BEFORE; machine CPU time outside the benchmark's nvcc per round in the summary"
   echo "nvcc: $("${NVCC[0]}" --version | tail -2 | tr '\n' ' ')"
   echo "host compiler: $(gcc --version | head -1)"
   echo "CPU: $(lscpu | sed -n 's/^Model name: *//p'), $(nproc) hardware threads, governor:" \
@@ -142,7 +146,7 @@ done
   if [ -n "$NPPDX_DIR" ]; then
     echo "NPPDx: $NPPDX_DIR at $(git -C "$NPPDX_DIR" describe --always --tags)"
   fi
-  echo "bvf-paper-bench: $(git -C "$REPO" rev-parse --short HEAD)$(git -C "$REPO" diff --quiet || echo ' (uncommitted changes)')"
+  echo "bvf-paper-bench: $(git -C "$REPO" rev-parse --short HEAD)$([ -z "$(git -C "$REPO" status --porcelain)" ] || echo ' (with uncommitted or untracked changes)')"
   echo "source: ${SOURCE#$REPO/}, nvcc command of ${ENTRY} from $BUILD/compile_commands.json"
   echo "protocol: $REPS timed compiles per TU after 1 discarded warm-up, round-robin over the TUs, one nvcc at a time" \
        "(no -j, no ccache), -c only, objects on tmpfs ($WORK); /usr/bin/time around nvcc and nvcc --time in the same" \
