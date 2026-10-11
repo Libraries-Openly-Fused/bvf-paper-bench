@@ -8,8 +8,8 @@ pipeline of the paper,
 
 on one 3840x2160 NV12 frame with N in {1, 4, 16, 50, 100} crops of 20x10, each resized (bilinear) to 64x32, padded
 with 16 black rows on top and bottom, normalized as (x * mul - sub) / div and written as float3 into an N plane tensor.
-The comparison of FKL with NVIDIA's NPPDx is in the separate repository
-[FKL-vs-NPPDx](https://github.com/Libraries-Openly-Fused/FKL-vs-NPPDx).
+The comparison of FKL with NVIDIA's NPPDx, one kernel in each library, is in [`fkl-vs-nppdx/`](fkl-vs-nppdx/README.md)
+(until October 2026 the separate repository FKL-vs-NPPDx), with its RTX 4090 results.
 
 ## GPU benchmark (`src/bvf_bench.cu`)
 
@@ -71,15 +71,14 @@ two-execution format, keyed by the source pixels of one region), `region_sweep_v
 `region_sweep_kernels.csv`, `region_sweep_kernel_breakdown.csv`, `region_sweep_cases.csv` (sizes and exact frame
 coverage), `region_sweep_buffers.csv` (the logical size of every buffer each implementation uses in global memory and
 the bytes it writes and reads there in one execution, from the sizes in the code) and `region_sweep_platform.txt`.
-NPPDx is in FKL-vs-NPPDx's `--region-sweep` mode. After both sweeps have run, `sudo scripts/ncu_region_sweep.sh`
+NPPDx is in the `--region-sweep` mode of [`fkl-vs-nppdx/`](fkl-vs-nppdx/README.md#region-size-sweep). After both sweeps have run, `sudo scripts/ncu_region_sweep.sh`
 profiles the memory traffic of every pipeline of both benchmarks for every case in one go (NPPDx in the tile and block
 its sweep chose); summarize it with `scripts/ncu_summarize.py region`.
 
 ### Memory traffic with Nsight Compute
 
 `scripts/ncu_dram.sh` (DRAM traffic, with cold and warm caches) and `scripts/ncu_l2.sh` (traffic between the SMs and
-L2) profile every pipeline with Nsight Compute through the `--ncu-target` mode of this benchmark and of
-FKL-vs-NPPDx's. They need root when the driver restricts the GPU performance counters to administrators
+L2) profile every pipeline with Nsight Compute through the `--ncu-target` mode of this benchmark and of the NPPDx one. They need root when the driver restricts the GPU performance counters to administrators
 (`RmProfilingAdminOnly=1`, the default); they change nothing on the system and give the reports back to the user who
 ran sudo. Summarize them afterwards, without sudo, with `scripts/ncu_summarize.py` (DRAM) or
 `scripts/ncu_summarize.py l2`.
@@ -94,23 +93,26 @@ comparison in FKL's two-execution format, plus `cpu_validation.csv` and `cpu_pla
 
 ## Requirements and layout
 
-- Linux, an NVIDIA GPU, CUDA 13 (with NPP, CUPTI and NVTX), CMake 3.28 and a C++20 compiler.
-- OpenCV 4.14 built with CUDA and the opencv_contrib modules `cudaarithm` and `cudawarping` (the CPU benchmark only
-  needs `core` and `imgproc`).
-- A FusedKernelLibrary checkout of `main`, by default next to this repository (set another one with
-  `-DFKL_DIR=<path>`), cloned with its `thread-pool` submodule
-  (`git clone --recursive https://github.com/Libraries-Openly-Fused/FusedKernelLibrary.git`). The benchmarks use the
-  `AddBorder` operation ([PR #370](https://github.com/Libraries-Openly-Fused/FusedKernelLibrary/pull/370)), and the
-  CPU benchmark the `CPU_MULTITHREAD` backend
-  ([PR #374](https://github.com/Libraries-Openly-Fused/FusedKernelLibrary/pull/374)), which needs the submodule.
+Each benchmark has its own requirements, besides a C++20 compiler:
 
-The default paths assume one directory that holds this repository, FusedKernelLibrary, FKL-vs-NPPDx (only for the
-Nsight Compute scripts) and a `results` directory:
+| Benchmark | Needs |
+|---|---|
+| GPU (`.`) | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.28, OpenCV 4.14 built with CUDA and the opencv_contrib modules `cudaarithm` and `cudawarping` |
+| CPU (`cpu`) | CMake 3.28 and OpenCV 4.14 with `core` and `imgproc`; no GPU or CUDA |
+| FKL vs NPPDx (`fkl-vs-nppdx`) | an NVIDIA GPU, CUDA 13.3 or newer with CUPTI and NVTX, CMake 3.30, a Linux x86_64 or Windows x64 machine (NPPDx's platforms); no OpenCV |
 
-    <workspace>/paper-bench
-    <workspace>/FusedKernelLibrary
-    <workspace>/FKL-vs-NPPDx
-    <workspace>/results
+The paper's results were measured on Linux; the CI also builds and runs every benchmark on Windows, and the CPU
+benchmark and the GPU one on ARM64.
+
+- FKL and NPPDx are the submodules `fkl` (FusedKernelLibrary main, with its own `thread-pool` submodule for the
+  `CPU_MULTITHREAD` backend) and `nppdx` (v0.1.2): clone with
+  `git clone --recursive https://github.com/Libraries-Openly-Fused/bvf-paper-bench.git`, or run
+  `git submodule update --init --recursive` in an existing clone. Every benchmark takes another FKL checkout with
+  `-DFKL_DIR=<path>`.
+
+There are three CMake projects, each with its own build folder: the GPU benchmark (`.`, in `build`), the CPU
+benchmark (`cpu`, in `build-cpu`) and FKL vs NPPDx (`fkl-vs-nppdx`, in `build-nppdx`). The Nsight Compute scripts
+expect those folders, and a `results` directory next to this repository.
 
 ## Build and run
 
@@ -121,10 +123,20 @@ Nsight Compute scripts) and a `results` directory:
     ./build/bvf_bench ../results/region_sweep --region-sweep
     ./build/bvf_types                                     # C++ type of the fused read operation for N = 100
 
+    # FKL vs NPPDx (Linux x86_64 or Windows x64), see fkl-vs-nppdx/README.md
+    cmake -S fkl-vs-nppdx -B build-nppdx -DCMAKE_BUILD_TYPE=Release
+    cmake --build build-nppdx -j
+    ./build-nppdx/benchmark_figure1_bvf ../results/nppdx
+    ./build-nppdx/benchmark_figure1_bvf ../results/region_sweep/nppdx --region-sweep
+
     # CPU benchmark, preferably with a recent clang; -march=native by default (CPU_ARCH_FLAGS)
     cmake -S cpu -B build-cpu -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++ -DOpenCV_DIR=<OpenCV>
     cmake --build build-cpu -j
     ./build-cpu/cpu_bench ../results/cpu
+
+`CUDA_ARCH` (default `native`, the GPU of the machine) selects the CUDA architectures of the GPU benchmarks.
+`BENCH_ITERATIONS` and `BENCH_WARMUP_ITERATIONS` (default 1000 and 100, as for the paper's results) set the timed and
+warm-up iterations of every benchmark in all three projects.
 
 ## AMD GPU and CPU: FKL vs RPP (`rocm/`)
 
@@ -197,7 +209,8 @@ thread pool, so that the idle gap before every timed run puts both pools to slee
   `apt-get download <package> && dpkg -x <package>.deb <prefix>` and set `ROCM_EXTRA=<prefix>/opt/rocm/core-10.1`.
 - FusedKernelLibrary at `b9f4281` (branch `bvf-paper-bench`, the paper's GPU commit) for the GPU benchmark, and at
   `b7f97b5` (the paper's CPU commit) with its `thread-pool` submodule for the CPU benchmark, by default in
-  `<workspace>/FusedKernelLibrary` and `<workspace>/FusedKernelLibrary-b7f97b5`.
+  `<workspace>/FusedKernelLibrary` and `<workspace>/FusedKernelLibrary-b7f97b5`. The repository's `fkl` submodule (FKL `main`) is
+  not used by `rocm/`: the AMD results must use the paper's FKL commits.
 
 ### Build and run
 
@@ -226,6 +239,27 @@ Or step by step:
           -DFKL_DIR=../FusedKernelLibrary-b7f97b5 -DRPP_ROOT=$ROCM_EXTRA
     cmake --build build-rocm-cpu
     ./build-rocm-cpu/rpp_cpu_bench ../results/rocm/cpu
+
+## Continuous integration
+
+[`.github/workflows/benchmarks.yml`](.github/workflows/benchmarks.yml) runs on pull requests to `main` from branches
+of this repository and by hand, on the self-hosted runners of FKL's CI with the toolchains of FKL's workflows (except
+CUDA 13.0 on Windows: the benchmarks need 13.3 or newer): Linux x86_64 and ARM64 for the CPU benchmark (g++-13 and
+clang++-23), Linux CUDA x86_64 and ARM64 for the GPU benchmarks (g++-13, CUDA 13.4), Windows x64 for the CPU benchmark
+(cl and clang-cl) and Windows CUDA for the GPU benchmarks (cl, CUDA 13.4). The Linux and Windows ROCm runners have no
+NVIDIA GPU and run the CPU benchmark only. FKL vs NPPDx runs on the x86_64 CUDA runners only, the CPUs NPPDx supports.
+
+Every job runs [`scripts/ci/run_benchmarks.cmake`](scripts/ci/run_benchmarks.cmake), which also runs on any machine
+(see its header). It builds OpenCV 4.14.0 with the modules the benchmarks use once per runner and configuration, in
+`~/bvf-paper-bench-deps` (so the first run on a runner takes much longer), builds the benchmarks with one timed
+iteration and no warm-up (`ITERATIONS` and `WARMUP_ITERATIONS` of the script), runs every mode except the Nsight
+Compute profiles (they need root), and fails if a benchmark fails or if FKL's outputs do not match their references
+(the baselines' errors are reported, not checked: OpenCV and NPP round and sample differently). The results and logs
+of every job are uploaded as artifacts. Times measured on shared CI runners are not the paper's numbers.
+
+The runners are persistent machines and this repository is public, so the workflow only runs trusted code: pull
+requests from forks are skipped (push their commits to a branch of this repository after reviewing them to test them),
+the checkout keeps no credentials, and the OpenCV sources that later jobs reuse are checked against their SHA-256.
 
 ## License
 
