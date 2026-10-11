@@ -24,7 +24,12 @@ find_library(RPP_LIBRARY rpp HINTS "${RPP_ROOT}/lib" NO_DEFAULT_PATH REQUIRED)
 find_path(ROCPROFILER_SDK_INCLUDE_DIR rocprofiler-sdk/rocprofiler.h HINTS "${ROCPROFILER_SDK_ROOT}/include" NO_DEFAULT_PATH REQUIRED)
 find_library(ROCPROFILER_SDK_LIBRARY rocprofiler-sdk HINTS "${ROCPROFILER_SDK_ROOT}/lib" NO_DEFAULT_PATH REQUIRED)
 
-execute_process(COMMAND git -C ${FKL_DIR} rev-parse --short HEAD OUTPUT_VARIABLE FKL_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE)
+# --dirty: a modified FKL tree shows up in platform.txt
+execute_process(COMMAND git -C ${FKL_DIR} describe --always --dirty --abbrev=7 OUTPUT_VARIABLE FKL_COMMIT
+                OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(NOT FKL_COMMIT MATCHES "^b9f4281")
+    message(WARNING "FKL_DIR (${FKL_DIR}) is at ${FKL_COMMIT}, not b9f4281 (the paper's GPU commit)")
+endif()
 execute_process(COMMAND git -C ${FKL_DIR} rev-parse --abbrev-ref HEAD OUTPUT_VARIABLE FKL_BRANCH OUTPUT_STRIP_TRAILING_WHITESPACE)
 
 # FKL's own HIP target options (cmake/libs/hip/target_generation.cmake, debug.cmake): HIP_STANDARD 20 (required),

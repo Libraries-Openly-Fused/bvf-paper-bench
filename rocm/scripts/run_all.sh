@@ -1,0 +1,155 @@
+#!/bin/bash
+# All the AMD benchmarks in one command, for the bare-metal run:   rocm/scripts/run_all.sh <results dir>
+#
+# In order: a platform snapshot, the builds, the prerequisite checks (kernel dispatch tracing, hardware counters), the
+# GPU benchmark (CPU + GPU pass, then in its profiling child process the kernel counts, GPU time only and GPU time only
+# with L2 + MALL flushed), RPP's resize convention, the hardware counter collection (Experiment 2) and the CPU
+# benchmark (RPP HOST vs FKL CPU). The region-size sweep only with RUN_REGION=1. Every step logs to <results dir>/logs.
+#
+# Environment (all optional):
+#   ROCM_PATH       ROCm installation (default /opt/rocm/core-10.1)
+#   ROCM_EXTRA      prefix with RPP, rocprofiler-sdk and amd-smi when they are not in ROCM_PATH (see env.sh)
+#   FKL_GPU_DIR     FusedKernelLibrary at b9f4281 (branch bvf-paper-bench), default <repo>/../FusedKernelLibrary
+#   FKL_CPU_DIR     FusedKernelLibrary at b7f97b5 with its thread-pool submodule, default <repo>/../FusedKernelLibrary-b7f97b5
+#   CXX_CPU         C++ compiler of the CPU benchmark (default: the newest clang++-NN found, else clang++)
+#   COUNTERS        hardware counters for Experiment 2 (default "FETCH_SIZE GL2C_EA_WRREQ_sum GL2C_EA_WRREQ_64B_sum":
+#                   rocprofiler-sdk 1.4.1 defines FETCH_SIZE for gfx12 but not WRITE_SIZE, which summarize_counters.py
+#                   derives from the two GL2C_EA write counters with WRITE_SIZE's gfx10/gfx11 formula)
+#   RUN_REGION=1    also run the region-size sweep (GPU benchmark and counters)
+#   BENCH_MALL_KIB  MALL (Infinity Cache) size in KiB, if rocminfo / amd-smi cannot report it
+# Development only (the results are then not the paper's): ALLOW_NO_KERNEL_TRACE=1, ALLOW_NO_COUNTERS=1, ALLOW_BUSY=1,
+# ALLOW_OTHER_FKL=1, SKIP_CPU=1
+set -uo pipefail
+
+OUT=$(realpath -m "${1:?usage: rocm/scripts/run_all.sh <results dir>}")
+REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+. "$REPO/rocm/scripts/env.sh"
+FKL_GPU_DIR=${FKL_GPU_DIR:-$REPO/../FusedKernelLibrary}
+FKL_CPU_DIR=${FKL_CPU_DIR:-$REPO/../FusedKernelLibrary-b7f97b5}
+if [ -z "${CXX_CPU:-}" ]; then
+    CXX_CPU=$(ls /usr/bin/clang++-[0-9]* 2>/dev/null | sort -t- -k2 -n | tail -1)
+    CXX_CPU=${CXX_CPU:-clang++}
+fi
+export COUNTERS=${COUNTERS:-"FETCH_SIZE GL2C_EA_WRREQ_sum GL2C_EA_WRREQ_64B_sum"}
+# RPP's HOST backend uses libomp, whose workers spin 200 ms after every parallel region by default: 100 us, like FKL's
+# thread pool, so that the CPU benchmark's idle gap puts them to sleep (rpp_cpu_bench sets the same default)
+export KMP_BLOCKTIME=${KMP_BLOCKTIME:-100us}
+BUILD_GPU=$REPO/build-rocm
+BUILD_CPU=$REPO/build-rocm-cpu
+mkdir -p "$OUT/logs"
+
+die() { echo -e "\nrun_all.sh: STOP: $*" >&2; exit 1; }
+step() {
+    local name=$1; shift
+    echo "=== $(date -u +%H:%M:%S) $name"
+    local t0=$(date +%s)
+    if ! "$@" > "$OUT/logs/$name.log" 2>&1; then
+        tail -20 "$OUT/logs/$name.log" >&2
+        die "step $name failed (log: $OUT/logs/$name.log)"
+    fi
+    echo "    done in $(( $(date +%s) - t0 )) s"
+}
+allowed() { [ "${!1:-0}" = 1 ]; }
+
+# ---------------------------------------------------------------- prerequisites
+[ -x "$ROCM_PATH/bin/amdclang++" ] || die "amdclang++ not found in $ROCM_PATH (set ROCM_PATH)"
+[ -f "$ROCM_EXTRA/include/rpp/rpp.h" ] && [ -e "$ROCM_EXTRA/lib/librpp.so" ] ||
+    die "RPP not found in $ROCM_EXTRA (install amdrocm-rpp-dev10.1 or set ROCM_EXTRA, see rocm/scripts/env.sh)"
+[ -f "$ROCM_EXTRA/include/rocprofiler-sdk/rocprofiler.h" ] && [ -e "$ROCM_EXTRA/lib/librocprofiler-sdk.so" ] ||
+    die "rocprofiler-sdk not found in $ROCM_EXTRA (install amdrocm-profiler-base10.1 or set ROCM_EXTRA)"
+command -v amd-smi > /dev/null || die "amd-smi not found (install amdrocm-amdsmi10.1)"
+command -v rocminfo > /dev/null || die "rocminfo not found"
+command -v rocprofv3 > /dev/null || die "rocprofv3 not found (install amdrocm-profiler10.1)"
+command -v "$CXX_CPU" > /dev/null || die "C++ compiler $CXX_CPU not found (set CXX_CPU)"
+FKL_GPU_COMMIT=$(git -C "$FKL_GPU_DIR" rev-parse --short=7 HEAD 2>/dev/null) || die "no FKL checkout in $FKL_GPU_DIR"
+FKL_CPU_COMMIT=$(git -C "$FKL_CPU_DIR" rev-parse --short=7 HEAD 2>/dev/null) || die "no FKL checkout in $FKL_CPU_DIR"
+[ "$FKL_GPU_COMMIT" = b9f4281 ] || allowed ALLOW_OTHER_FKL || die "FKL_GPU_DIR is at $FKL_GPU_COMMIT, not b9f4281"
+[ "$FKL_CPU_COMMIT" = b7f97b5 ] || allowed ALLOW_OTHER_FKL || die "FKL_CPU_DIR is at $FKL_CPU_COMMIT, not b7f97b5"
+for dir in "$FKL_GPU_DIR" "$FKL_CPU_DIR"; do
+    # Unmodified: no changes to tracked files, submodules at their recorded commits
+    [ -z "$(git -C "$dir" status --porcelain --untracked-files=no)" ] || allowed ALLOW_OTHER_FKL ||
+        die "$dir has local modifications (git -C $dir status)"
+    ! git -C "$dir" submodule status 2>/dev/null | grep -q '^[+-]' || allowed ALLOW_OTHER_FKL ||
+        die "$dir: a submodule is not at its recorded commit (git -C $dir submodule status)"
+done
+[ -n "$(ls -A "$FKL_CPU_DIR/thread-pool/include" 2>/dev/null)" ] ||
+    die "$FKL_CPU_DIR/thread-pool is empty (git -C $FKL_CPU_DIR submodule update --init)"
+
+# ---------------------------------------------------------------- platform snapshot, idle machine
+{
+    echo "run_all.sh started $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+    echo "--- uname"; uname -a
+    echo "--- os"; . /etc/os-release && echo "$PRETTY_NAME"
+    echo "--- environment"; grep -qi microsoft /proc/version && echo "WSL2" || echo "bare metal"
+    echo "--- uptime / load"; uptime
+    echo "--- CPU"; lscpu | sed -n '1,25p'
+    echo "--- ROCm"; cat "$ROCM_PATH/.info/version" 2>/dev/null; echo "ROCM_PATH=$ROCM_PATH ROCM_EXTRA=$ROCM_EXTRA"
+    echo "--- amd-smi static"; amd-smi static --gpu 0 2>&1
+    echo "--- amd-smi metric (clocks, power: performance level and clock lock state, not changed by this script)"
+    amd-smi metric --gpu 0 2>&1
+    echo "--- rocm-smi --showperflevel"; rocm-smi --showperflevel 2>&1 || echo "(rocm-smi not available)"
+    echo "--- GPU processes"; amd-smi process 2>&1 || true
+    echo "--- rocminfo (GPU agent)"; rocminfo 2>/dev/null | awk '/Device Type: *GPU/{g=1} g' | sed -n '1,80p'
+    echo "--- repository"; git -C "$REPO" log -1 --format='%H %s'; git -C "$REPO" status --short
+    echo "--- FKL GPU $FKL_GPU_DIR"; git -C "$FKL_GPU_DIR" log -1 --format='%H %d %s'
+    echo "--- FKL CPU $FKL_CPU_DIR"; git -C "$FKL_CPU_DIR" log -1 --format='%H %d %s'; git -C "$FKL_CPU_DIR" submodule status
+    echo "--- compilers"; "$ROCM_PATH/bin/amdclang++" --version | head -1; "$CXX_CPU" --version | head -1
+} > "$OUT/platform_prerun.txt" 2>&1
+echo "Platform snapshot: $OUT/platform_prerun.txt"
+LOAD=$(cut -d' ' -f1 /proc/loadavg)
+if awk "BEGIN{exit !($LOAD >= 0.5)}"; then
+    allowed ALLOW_BUSY || die "load average $LOAD >= 0.5: the machine is not idle (close everything else, or ALLOW_BUSY=1)"
+    echo "WARNING: load average $LOAD >= 0.5 (ALLOW_BUSY=1)"
+fi
+
+# ---------------------------------------------------------------- builds
+step build_gpu bash -c "cmake -S '$REPO/rocm' -B '$BUILD_GPU' -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CXX_COMPILER='$ROCM_PATH/bin/amdclang++' -DCMAKE_HIP_COMPILER='$ROCM_PATH/bin/amdclang++' \
+    -DROCM_PATH='$ROCM_PATH' -DFKL_DIR='$FKL_GPU_DIR' -DRPP_ROOT='$ROCM_EXTRA' -DROCPROFILER_SDK_ROOT='$ROCM_EXTRA' \
+    && cmake --build '$BUILD_GPU'"
+if ! allowed SKIP_CPU; then
+    step build_cpu bash -c "cmake -S '$REPO/rocm/cpu' -B '$BUILD_CPU' -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CXX_COMPILER='$CXX_CPU' -DROCM_PATH='$ROCM_PATH' -DFKL_DIR='$FKL_CPU_DIR' -DRPP_ROOT='$ROCM_EXTRA' \
+        && cmake --build '$BUILD_CPU'"
+fi
+BENCH=$BUILD_GPU/rocm_bench
+
+# ---------------------------------------------------------------- what the profiler supports here
+TRACING=1
+if ! BENCH_ROCPROFILER=1 "$BENCH" "$OUT/logs/tmp" --check-kernel-tracing > "$OUT/logs/check_kernel_tracing.log" 2>&1; then
+    TRACING=0
+    allowed ALLOW_NO_KERNEL_TRACE ||
+        die "rocprofiler-sdk delivers no kernel dispatch records here: GPU time only cannot be measured (WSL2? see $OUT/logs/check_kernel_tracing.log; ALLOW_NO_KERNEL_TRACE=1 to continue without)"
+    echo "WARNING: no kernel dispatch tracing: GPU time only will not be measured (ALLOW_NO_KERNEL_TRACE=1)"
+fi
+rocprofv3 -L > "$OUT/logs/rocprofv3_available_counters.txt" 2>&1 || true
+COUNTERS_OK=1
+for c in $COUNTERS; do
+    grep -qw "$c" "$OUT/logs/rocprofv3_available_counters.txt" || COUNTERS_OK=0
+done
+if [ $COUNTERS_OK = 0 ]; then
+    allowed ALLOW_NO_COUNTERS ||
+        die "rocprofv3 does not list the counters '$COUNTERS' for this GPU (list: $OUT/logs/rocprofv3_available_counters.txt): set COUNTERS to the DRAM read/write counters it lists, or ALLOW_NO_COUNTERS=1 to skip Experiment 2"
+    echo "WARNING: counters '$COUNTERS' not available: Experiment 2 skipped (ALLOW_NO_COUNTERS=1)"
+fi
+
+# ---------------------------------------------------------------- GPU
+step gpu_resize_convention "$BENCH" "$OUT/gpu" --resize-convention
+step gpu_main "$BENCH" "$OUT/gpu"
+allowed RUN_REGION && step gpu_region_sweep "$BENCH" "$OUT/gpu_region_sweep" --region-sweep
+if [ $COUNTERS_OK = 1 ]; then
+    # The counters of the RPP pipeline that the GPU benchmark's selection pass chose
+    BENCH_RPP_VARIANT=$(awk -F, '$10 == "yes" {print $3; exit}' "$OUT/gpu/rpp_selection.csv")
+    [ -n "$BENCH_RPP_VARIANT" ] || die "no chosen RPP variant in $OUT/gpu/rpp_selection.csv"
+    export BENCH_RPP_VARIANT
+    step gpu_counters "$REPO/rocm/scripts/rocprof_counters.sh" "$OUT/traffic" "$BENCH"
+fi
+
+# ---------------------------------------------------------------- CPU
+if ! allowed SKIP_CPU; then
+    step cpu_resize_convention "$BUILD_CPU/rpp_cpu_bench" "$OUT/cpu" --resize-convention
+    step cpu_main "$BUILD_CPU/rpp_cpu_bench" "$OUT/cpu"
+fi
+
+{ echo "run_all.sh finished $(date -u '+%Y-%m-%d %H:%M:%S UTC')"; uptime; amd-smi metric --gpu 0 2>&1; } > "$OUT/platform_postrun.txt"
+echo "All done: $OUT (kernel dispatch tracing: $TRACING, counters: $COUNTERS_OK)"
