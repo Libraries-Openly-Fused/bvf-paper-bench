@@ -1,0 +1,190 @@
+name: Benchmarks
+
+# Builds and runs every benchmark on the self-hosted runners of FKL's CI, with the toolchains of FKL's workflows
+# (FusedKernelLibrary/.github/workflows). The ROCm runners have no NVIDIA GPU, so they run the CPU benchmark only.
+# scripts/ci/run_benchmarks.cmake does the work: it builds OpenCV once per runner and configuration in
+# ~/bvf-paper-bench-deps (the first run on a runner takes much longer), builds the benchmarks, runs every mode except the
+# Nsight Compute profiles (they need root), and fails if FKL's outputs do not match their references. The results and
+# logs of every job are uploaded as artifacts. Times measured on shared CI runners are not the paper's numbers.
+
+on:
+  #push:
+  #  branches: [ $default-branch ]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmarks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.platform }} (${{ matrix.compiler }})
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: "CPU x86_64"
+            runner: [self-hosted, linux, x64]
+            benchmarks: cpu
+            compiler: "g++-13"
+            cmake: "cmake-4.4.2-linux-x86_64"
+            artifact: linux-cpu-x86_64-gcc
+          - platform: "CPU x86_64"
+            runner: [self-hosted, linux, x64]
+            benchmarks: cpu
+            compiler: "clang++-23"
+            cmake: "cmake-4.4.2-linux-x86_64"
+            artifact: linux-cpu-x86_64-clang
+          - platform: "CPU ARM64"
+            runner: [self-hosted, linux, arm64]
+            benchmarks: cpu
+            compiler: "g++-13"
+            cmake: "cmake-4.4.2-linux-aarch64"
+            artifact: linux-cpu-arm64-gcc
+          - platform: "CPU ARM64"
+            runner: [self-hosted, linux, arm64]
+            benchmarks: cpu
+            compiler: "clang++-23"
+            cmake: "cmake-4.4.2-linux-aarch64"
+            artifact: linux-cpu-arm64-clang
+          - platform: "CUDA x86_64"
+            runner: [self-hosted, linux, x64, cuda]
+            benchmarks: gpu
+            compiler: "g++-13"
+            cuda_toolkit: "13.4"
+            cmake: "cmake-4.4.2-linux-x86_64"
+            artifact: linux-cuda-x86_64
+          - platform: "CUDA ARM64"
+            runner: [self-hosted, linux, arm64, cuda]
+            benchmarks: gpu
+            compiler: "g++-13"
+            cuda_toolkit: "13.4"
+            cmake: "cmake-4.4.2-linux-aarch64"
+            artifact: linux-cuda-arm64
+          - platform: "ROCm x86_64, CPU benchmark only"
+            runner: [self-hosted, linux, x64, rocm]
+            benchmarks: cpu
+            compiler: "clang++-23"
+            cmake: "cmake-4.4.2-linux-x86_64"
+            artifact: linux-rocm-x86_64-cpu
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set path
+        run: echo "$HOME/${{ matrix.cmake }}/bin" >> "$GITHUB_PATH"
+
+      - name: Build and run the benchmarks
+        # OpenCV is built with g++-13 for every compiler of the benchmarks, as for the paper's results (GCC)
+        run: |
+          CUDA_OPTION=""
+          if [ -n "${{ matrix.cuda_toolkit }}" ]; then
+            CUDA_OPTION="-DCUDA_COMPILER=/usr/local/cuda-${{ matrix.cuda_toolkit }}/bin/nvcc"
+          fi
+          cmake -DBENCHMARKS=${{ matrix.benchmarks }} -DCXX_COMPILER=${{ matrix.compiler }} -DOPENCV_CXX_COMPILER=g++-13 \
+                $CUDA_OPTION -DOUT_DIR=${{ github.workspace }}/ci-results -P scripts/ci/run_benchmarks.cmake
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: results-${{ matrix.artifact }}
+          path: ci-results
+          if-no-files-found: ignore
+
+  windows:
+    name: Windows ${{ matrix.platform }} (${{ matrix.compiler }}, MSVC ${{ matrix.msvc_env_version }})
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: "CPU x64"
+            runner: [self-hosted, windows, x64]
+            benchmarks: cpu
+            compiler: "cl"
+            msvc_env_version: "14.51"
+            vswhere_latest: true
+            artifact: windows-cpu-x64-cl
+          - platform: "CPU x64"
+            runner: [self-hosted, windows, x64]
+            benchmarks: cpu
+            compiler: "clang-cl"
+            msvc_env_version: "14.51"
+            vswhere_latest: true
+            artifact: windows-cpu-x64-clang-cl
+          - platform: "CUDA x64"
+            runner: [self-hosted, windows, x64, cuda]
+            benchmarks: gpu
+            compiler: "cl"
+            msvc_env_version: "14.44"
+            cuda_version: "13.0"
+            vswhere_latest: true
+            artifact: windows-cuda-x64-cuda13.0
+          - platform: "CUDA x64"
+            runner: [self-hosted, windows, x64, cuda]
+            benchmarks: gpu
+            compiler: "cl"
+            msvc_env_version: "14.51"
+            cuda_version: "13.4"
+            vswhere_latest: true
+            artifact: windows-cuda-x64-cuda13.4
+          - platform: "ROCm x64, CPU benchmark only"
+            runner: [self-hosted, windows, x64, rocm]
+            benchmarks: cpu
+            compiler: "cl"
+            msvc_env_version: "14.44"  # the Visual Studio of FKL's Windows ROCm workflow
+            vswhere_latest: false
+            artifact: windows-rocm-x64-cpu
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Add clang-cl to the path
+        if: matrix.compiler == 'clang-cl'
+        run: |
+          echo "D:/clang+llvm-23.1.0-x86_64-pc-windows-msvc/bin/" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Detect visual studio installation
+        run: |
+          $vsWhere = "${Env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          if ("${{ matrix.vswhere_latest }}" -eq "true") {
+            $vsInstallationPath = & $vsWhere -products * -latest -property installationPath
+          } else {
+            $vsInstallationPath = & $vsWhere -products * -property installationPath
+          }
+          echo "VS_INSTALLATION_PATH=$vsInstallationPath" >> "$env:GITHUB_ENV"
+          echo "DEV_ARGS=-arch=x64 -vcvars_ver=${{matrix.msvc_env_version}}" >> "$env:GITHUB_ENV"
+
+      - name: Build and run the benchmarks
+        # OpenCV is built with cl for both compilers of the benchmarks
+        run: |
+          Import-Module (Get-ChildItem $env:VS_INSTALLATION_PATH -Recurse -File -Filter Microsoft.VisualStudio.DevShell.dll).FullName
+          Enter-VsDevShell -VsInstallPath $env:VS_INSTALLATION_PATH -SkipAutomaticLocation -DevCmdArguments $env:DEV_ARGS
+          $cudaOption = @()
+          if ("${{ matrix.cuda_version }}" -ne "") {
+            $cudaOption = @("-DCUDA_COMPILER=${env:ProgramFiles}\NVIDIA GPU Computing Toolkit\CUDA\v${{ matrix.cuda_version }}\bin\nvcc.exe")
+          }
+          cmake -DBENCHMARKS=${{ matrix.benchmarks }} -DCXX_COMPILER=${{ matrix.compiler }} -DOPENCV_CXX_COMPILER=cl `
+                @cudaOption "-DOUT_DIR=${{ github.workspace }}/ci-results" -P scripts/ci/run_benchmarks.cmake
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: results-${{ matrix.artifact }}
+          path: ci-results
+          if-no-files-found: ignore

@@ -130,6 +130,22 @@ expect those folders, and a `results` directory next to this repository.
 
 `CUDA_ARCH` (default `native`, the GPU of the machine) selects the CUDA architectures of the GPU benchmarks.
 
+## Continuous integration
+
+[`.github/workflows/benchmarks.yml`](.github/workflows/benchmarks.yml) runs on every pull request to `main` (and by
+hand), on the self-hosted runners of FKL's CI with the toolchains of FKL's workflows: Linux x86_64 and ARM64 for the
+CPU benchmark (g++-13 and clang++-23), Linux CUDA x86_64 and ARM64 for the GPU benchmarks (g++-13, CUDA 13.4),
+Windows x64 for the CPU benchmark (cl and clang-cl) and Windows CUDA for the GPU benchmarks (cl with CUDA 13.0 and
+13.4). The Linux and Windows ROCm runners have no NVIDIA GPU and run the CPU benchmark only. FKL vs NPPDx runs on the
+x86_64 CUDA runners only, the CPUs NPPDx supports.
+
+Every job runs [`scripts/ci/run_benchmarks.cmake`](scripts/ci/run_benchmarks.cmake), which also runs on any machine
+(see its header). It builds OpenCV 4.14.0 with the modules the benchmarks use once per runner and configuration, in
+`~/bvf-paper-bench-deps` (so the first run on a runner takes much longer), builds the benchmarks, runs every mode except
+the Nsight Compute profiles (they need root), and fails if a benchmark fails or if FKL's outputs do not match their
+references (the baselines' errors are reported, not checked: OpenCV and NPP round and sample differently). The results
+and logs of every job are uploaded as artifacts. Times measured on shared CI runners are not the paper's numbers.
+
 ## License
 
 Apache License 2.0, like FKL.
