@@ -18,7 +18,8 @@
 #   BUILD_DIR            build folders of the benchmarks (default <repo>/build-ci)
 #   OUT_DIR              results and logs (default <repo>/ci-results)
 #   GENERATOR            CMake generator (default Ninja)
-#   OPENCV_VERSION       default 4.14.0, the version of the paper's results
+#   OPENCV_VERSION       default 4.14.0, the version of the paper's results; another version needs the SHA-256 of its
+#                        source archives in OPENCV_SHA256 and OPENCV_CONTRIB_SHA256
 cmake_minimum_required(VERSION 3.28)
 
 get_filename_component(REPO "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
@@ -50,6 +51,14 @@ if(BENCHMARKS STREQUAL "gpu" AND NOT CUDA_COMPILER)
 endif()
 if(NOT OPENCV_CXX_COMPILER)
     set(OPENCV_CXX_COMPILER "${CXX_COMPILER}")
+endif()
+# The source archives are checked against these hashes (GitHub's archives of the 4.14.0 tags, identical to
+# `git archive` of the tags), so that a build in DEPS_DIR, which later jobs reuse, only ever comes from these sources
+if(OPENCV_VERSION STREQUAL "4.14.0")
+    set(OPENCV_SHA256 ee8fb9b30eb60850431b4656447080e3737b56e45719c92b67f245950609f86e)
+    set(OPENCV_CONTRIB_SHA256 4f17abd1bc7f88e19c3380c8de7cbf2d863aced5b5ee8d8934cc7902b67d42c9)
+elseif(NOT OPENCV_SHA256 OR NOT OPENCV_CONTRIB_SHA256)
+    message(FATAL_ERROR "Set OPENCV_SHA256 and OPENCV_CONTRIB_SHA256 for OpenCV ${OPENCV_VERSION}")
 endif()
 if(NOT OPENCV_C_COMPILER)
     get_filename_component(cxxName "${OPENCV_CXX_COMPILER}" NAME)
@@ -225,8 +234,14 @@ function(build_opencv RESULT)
     endif()
     foreach(repo IN LISTS repos)
         set(url "https://github.com/opencv/${repo}/archive/refs/tags/${OPENCV_VERSION}.tar.gz")
+        if(repo STREQUAL "opencv")
+            set(sha256 ${OPENCV_SHA256})
+        else()
+            set(sha256 ${OPENCV_CONTRIB_SHA256})
+        endif()
         message(STATUS "Downloading ${url}")
-        file(DOWNLOAD "${url}" "${work}/${repo}.tar.gz" STATUS status INACTIVITY_TIMEOUT 300 TLS_VERIFY ON)
+        file(DOWNLOAD "${url}" "${work}/${repo}.tar.gz" STATUS status INACTIVITY_TIMEOUT 300 TLS_VERIFY ON
+             EXPECTED_HASH SHA256=${sha256})
         list(GET status 0 code)
         if(NOT code EQUAL 0)
             message(FATAL_ERROR "Download of ${url} failed: ${status}")
