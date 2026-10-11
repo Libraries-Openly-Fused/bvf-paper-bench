@@ -1,0 +1,12 @@
+GPU: NVIDIA GeForce RTX 4090 (sm_89, 128 SMs)
+NVIDIA driver: 610.43.02
+CUDA runtime: 13.3
+Host compiler: GCC 15.2.0
+FKL: Beta-0.2.0-47-gb9f4281
+NPPDx: v0.1.2, operations for SM 890
+CPU: AMD Ryzen 9 5950X 16-Core Processor
+OS: Ubuntu 26.04.1 LTS
+Timing, two benchmarks: 100 warm-up and 1000 timed iterations, in each one NPPDx and then FKL, with a synchronization after each. CPU + GPU (benchmark_figure1_bvf_GPU_NVIDIA.csv): CUDA events around everything the host does to enqueue the kernel plus its execution. GPU only (benchmark_figure1_bvf_gpu_only_GPU_NVIDIA.csv): a second pass with CUPTI kernel tracing, the GPU execution time of the kernel. The speedup is computed per iteration and averaged. Times in the CSV are in ms.
+nvcc flags: -O3 -DNDEBUG -std=c++20 --threads 0 -rdc=false -split-compile=0 -ftemplate-depth=1000 -lineinfo --expt-relaxed-constexpr, CUDA_ARCHITECTURES native
+Correctness: FKL against FKL's CPU backend running the same chain (resize samples at dst * scale); NPPDx against the same chain with pixel-center sampling ((dst + 0.5) * scale - 0.5), which is the convention NPPDx's resize uses, and also against FKL's CPU backend.
+NPPDx configuration: the only valid tile for a 20x10 crop is 20x10 (tiles are multiples of 4x2 pixel cells and of the 5:16 resize ratio), so one thread block per crop; block sizes swept in benchmark_figure1_bvf_nppdx_block_sweep_GPU_NVIDIA.csv and the fastest correct one is used.
