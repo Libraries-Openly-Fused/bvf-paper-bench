@@ -437,8 +437,9 @@ int main(int argc, char** argv) {
       << "Workload: " << describe() << "\n"
       << "Pipeline: as the GPU benchmarks, with BT.601 limited range for NV12 -> RGB (the only NV12 conversion of "
          "OpenCV's CPU cvtColor)\n"
-      << "Regions: iteration t (warm-up iterations 0 to " << WARMUP_ITERS - 1 << ", timed ones " << WARMUP_ITERS
-      << " to " << WARMUP_ITERS + ITERS - 1 << ") runs both libraries on the regions of iteration t, generated before "
+      << "Regions: iteration t (the " << WARMUP_ITERS << " warm-up iterations are t in [0, " << WARMUP_ITERS << "), the "
+      << ITERS << " timed ones t in [" << WARMUP_ITERS << ", " << WARMUP_ITERS + ITERS
+      << ")) runs both libraries on the regions of iteration t, generated before "
       << "the loops and converted into each library's arguments before them too (statistics of the timed ones in "
       << "regions.csv); FKL's build() calls and fusion and OpenCV's per-region views and calls are timed.\n"
       << "Timing: steady_clock around each pipeline, " << WARMUP_ITERS << " warm-up and " << ITERS

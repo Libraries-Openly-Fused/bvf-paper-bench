@@ -698,9 +698,11 @@ int figure1Main(int argc, char** argv) {
                     "(0.229, 0.224, 0.225), float3 tensor of N planes " << OUT_W << "x" << OUT_H << "\n"
                  << P::label << " pipeline: " << P::description() << "\n"
                  << "FKL pipeline: one executeOperations call (Backwards Vertical Fusion), one kernel.\n"
-                 << "Regions: iteration t of every loop (warm-up iterations 0 to " << benchmark::WARMUP_ITERS - 1
-                 << ", timed ones " << benchmark::WARMUP_ITERS << " to " << benchmark::WARMUP_ITERS + benchmark::ITERS - 1
-                 << ") runs both pipelines on the regions of iteration t (all of one size, at positions that change every "
+                 << "Regions: iteration t of every loop (the " << benchmark::WARMUP_ITERS
+                 << " warm-up iterations are t in [0, " << benchmark::WARMUP_ITERS << "), the " << benchmark::ITERS
+                 << " timed ones t in [" << benchmark::WARMUP_ITERS << ", "
+                 << benchmark::WARMUP_ITERS + benchmark::ITERS
+                 << ")) runs both pipelines on the regions of iteration t (all of one size, at positions that change every "
                     "iteration), generated before the loops; NPPDx gets their origins as a kernel parameter and FKL "
                     "their rectangles in its build() calls, both converted before the loops (statistics of the timed "
                     "ones in regions.csv).\n"
