@@ -658,8 +658,10 @@ int main(int argc, char** argv) {
         }
         // --configs <csv>: the default benchmark with the NPPDx configuration of every batch size given in the CSV (in
         // the format of the configuration CSV this benchmark writes) instead of the fastest of NPPDX_CONFIGS
+        std::filesystem::path configsInput; // the CSV given with --configs, recorded in the platform file
         if (argc > 3 && std::string(argv[2]) == "--configs") {
-            pinnedConfig = readConfigs(argv[3]);
+            configsInput = argv[3];
+            pinnedConfig = readConfigs(configsInput);
         } else if (argc > 2) {
             // Any other argument is a mistake: running the default benchmark instead would overwrite its results
             throw std::runtime_error(std::string("Unknown mode: ") + argv[2] + " (see the modes in README.md)");
@@ -747,8 +749,9 @@ int main(int argc, char** argv) {
                          ? "For every batch size every configuration is validated and timed alone (" + name +
                                "_nppdx_block_sweep_" + parArch + ".csv), and the fastest correct one (" +
                                configCsv.filename().string() + ") is compared with FKL in all three benchmarks.\n"
-                         : "This run used the configurations given with --configs (" + configCsv.filename().string() +
-                               ") instead of choosing them.\n");
+                         : "This run used the configurations given with --configs " +
+                               std::filesystem::absolute(configsInput).string() + " instead of choosing them (copied to " +
+                               configCsv.filename().string() + ").\n");
         std::cout << "CSV files written to " << std::filesystem::absolute(outDir) << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "ERROR: " << e.what() << std::endl;
