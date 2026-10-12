@@ -89,14 +89,22 @@ inline int uniformInt(std::mt19937& gen, int lo, int hi) {
     return lo + static_cast<int>(product >> 32);
 }
 
-// The synthetic NV12 frame: uniform random bytes (seed FRAME_SEED) in row-major order, FRAME_H luma rows and then
-// FRAME_H / 2 rows of interleaved chroma. Calls set(x, y, value) for every byte.
+// Every benchmark converts NV12 to RGB with BT.601 in limited (video) range, the only NV12 conversion that every
+// library offers (OpenCV's CPU cvtColor has no other); its legal values are Y in [16, 235] and U, V in [16, 240]
+constexpr int LUMA_MIN = 16, LUMA_MAX = 235, CHROMA_MIN = 16, CHROMA_MAX = 240;
+
+// The synthetic NV12 frame: uniform random legal limited-range values (seed FRAME_SEED) in row-major order, FRAME_H
+// luma rows in [LUMA_MIN, LUMA_MAX] and then FRAME_H / 2 rows of interleaved chroma in [CHROMA_MIN, CHROMA_MAX], as in
+// real video, so that no library has to handle values outside the standard (OpenCV clamps Y below 16, the others do
+// not). Calls set(x, y, value) for every byte.
 template <typename Set>
 void generateFrame(Set&& set) {
     std::mt19937 gen(FRAME_SEED);
     for (int y = 0; y < FRAME_H * 3 / 2; ++y) {
+        const bool luma = y < FRAME_H;
         for (int x = 0; x < FRAME_W; ++x) {
-            set(x, y, static_cast<uint8_t>(uniformInt(gen, 0, 255)));
+            const int value = luma ? uniformInt(gen, LUMA_MIN, LUMA_MAX) : uniformInt(gen, CHROMA_MIN, CHROMA_MAX);
+            set(x, y, static_cast<uint8_t>(value));
         }
     }
 }
@@ -119,14 +127,21 @@ inline std::array<CropRect, MAX_BATCH> makeCrops() {
     return crops;
 }
 
+// The batch sizes, separated by sep (by spaces: what the --batches mode of the GPU benchmarks prints for the scripts)
+inline std::string batchList(const char* sep = " ") {
+    std::ostringstream os;
+    for (size_t i = 0; i < BATCHES.size(); ++i) {
+        os << (i ? sep : "") << BATCHES[i];
+    }
+    return os.str();
+}
+
 // The workload, for the platform files of every benchmark
 inline std::string describe() {
     std::ostringstream os;
-    os << FRAME_W << "x" << FRAME_H << " NV12 frame (uniform random bytes, seed " << FRAME_SEED << "), N in {";
-    for (size_t i = 0; i < BATCHES.size(); ++i) {
-        os << (i ? ", " : "") << BATCHES[i];
-    }
-    os << "} crops of " << CROP_W << "x" << CROP_H << " at uniform random even positions at least " << CROP_MARGIN
+    os << FRAME_W << "x" << FRAME_H << " NV12 frame (uniform random limited-range values, Y in [" << LUMA_MIN << ", "
+       << LUMA_MAX << "], U and V in [" << CHROMA_MIN << ", " << CHROMA_MAX << "], seed " << FRAME_SEED
+       << "), NV12->RGB BT.601 limited range, N in {" << batchList(", ") << "} crops of " << CROP_W << "x" << CROP_H << " at uniform random even positions at least " << CROP_MARGIN
        << " pixels from the frame edges (seed " << CROP_SEED << ", the first N of one sequence), bilinear resize to "
        << RES_W << "x" << RES_H << " (ratio " << RESIZE_J << ":" << RESIZE_K << "), " << BORDER_TOP
        << " black rows added on top and " << BORDER_BOTTOM << " at the bottom, output " << OUT_W << "x" << OUT_H

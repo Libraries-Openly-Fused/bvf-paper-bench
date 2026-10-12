@@ -1,50 +1,71 @@
 #!/usr/bin/env bash
-# Compile-time benchmark: compiles one source once per (IMPL, BATCH) translation unit with the exact nvcc command line of
-# a benchmark target, REPS times after one discarded warm-up, and records the wall, user and sys time and the max RSS
+# Compile-time benchmark: compiles the compile-time units of one benchmark (<benchmark>/src/compile_time.cu, with
+# common/compile_time_unit.h) once per (IMPL, BATCH) translation unit with the exact nvcc command line of the benchmark's
+# target, REPS times after one discarded warm-up, and records the wall, user and sys time and the max RSS
 # (/usr/bin/time), nvcc's per-phase times (--time) and, from one extra compile, the kernels' resource usage and the code
 # sizes. One nvcc at a time, objects on tmpfs, no ccache.
 #
-#     compile_time/run.sh <results directory>                 # src/bvf_bench.cu's command, compile_time/pipeline.cu
-#     SET=nppdx compile_time/run.sh <results directory>       # fkl-vs-nppdx: benchmark_figure1_bvf's command and
-#                                                             # fkl-vs-nppdx/benchmarks/compile_time_pipeline.cu
+#     SET=<set> scripts/compile_time.sh <results directory>
 #
-# BUILD is the CMake build folder of the benchmark target, configured with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON (default
-# build for SET=paper, build-nppdx for SET=nppdx); the geometry is the one it was configured with. REPS (default 10)
-# sets the timed compiles per TU. The script waits until the 1 minute load average is below MAX_LOAD (default 0.5)
-# before starting. SET=nppdx compiles the NPPDx kernel of every N in the configuration benchmark_figure1_bvf chose for
-# it: NPPDX_CONFIG is the benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv of its run (default
-# ../results/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv).
+#   SET=ablation      fkl-ablation: FKL's headers alone, FKL BVF, FKL BVF with CONDITIONAL_WITH_DEFAULT, FKL VF+HF
+#   SET=opencv-cuda   fkl-vs-opencv-cuda: the headers of FKL, OpenCV CUDA and NPP, the OpenCV pipeline, FKL BVF
+#   SET=npp           fkl-vs-npp: the headers of FKL and NPP, the NPP pipeline, FKL BVF
+#   SET=nppdx         fkl-vs-nppdx: the headers of FKL and NPPDx, the NPPDx kernel, FKL BVF
+#
+# BUILD is the CMake build folder of the benchmark, configured with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON (default
+# build-<set> in this repository); the geometry is the one it was configured with. REPS (default 10) sets the timed
+# compiles per TU. The script waits until the 1 minute load average is below MAX_LOAD (default 0.5) before starting.
+# SET=nppdx compiles the NPPDx kernel of every N in the configuration benchmark_nppdx chose for it: NPPDX_CONFIG is the
+# benchmark_nppdx_nppdx_config_GPU_NVIDIA.csv of its run (default fkl-vs-nppdx/ of BVF_RESULTS, the results folder of
+# the workload, by default ../results).
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 OUT=$(mkdir -p "${1:?results directory}" && cd "$1" && pwd)
-SET=${SET:-paper}
+SET=${SET:?SET=ablation, opencv-cuda, npp or nppdx}
 REPS=${REPS:-10}
 MAX_LOAD=${MAX_LOAD:-0.5}
 WORK=/dev/shm/bvf-compile-time-$SET
+BUILD=${BUILD:-$REPO/build-$SET}
 case "$SET" in
-  paper)
-    BUILD=${BUILD:-$REPO/build}
-    SOURCE=$REPO/compile_time/pipeline.cu
-    ENTRY=src/bvf_bench.cu
-    TUS=("HEADERS_FKL 1" "HEADERS_ALL 1" "OPENCV 100" "NPP 100"
+  ablation)
+    SOURCE=$REPO/fkl-ablation/src/compile_time.cu
+    ENTRY=fkl-ablation/src/benchmark_fkl_ablation.cu
+    TUS=("HEADERS 1"
          "VFHF 1" "VFHF 4" "VFHF 16" "VFHF 50" "VFHF 100"
          "BVF 1" "BVF 4" "BVF 16" "BVF 50" "BVF 100"
          "BVF_CWD 100")
     ;;
+  opencv-cuda)
+    SOURCE=$REPO/fkl-vs-opencv-cuda/src/compile_time.cu
+    ENTRY=fkl-vs-opencv-cuda/src/benchmark_opencv_cuda.cu
+    TUS=("HEADERS 1" "OPENCV 1" "OPENCV 100" "BVF 1" "BVF 100")
+    ;;
+  npp)
+    SOURCE=$REPO/fkl-vs-npp/src/compile_time.cu
+    ENTRY=fkl-vs-npp/src/benchmark_npp.cu
+    TUS=("HEADERS 1" "NPP 1" "NPP 100" "BVF 1" "BVF 100")
+    ;;
   nppdx)
-    BUILD=${BUILD:-$REPO/build-nppdx}
-    SOURCE=$REPO/fkl-vs-nppdx/benchmarks/compile_time_pipeline.cu
-    ENTRY=fkl-vs-nppdx/benchmarks/benchmark_figure1_bvf.cu
+    SOURCE=$REPO/fkl-vs-nppdx/benchmarks/compile_time.cu
+    ENTRY=fkl-vs-nppdx/benchmarks/benchmark_nppdx.cu
     TUS=("HEADERS 1"
          "NPPDX 1" "NPPDX 4" "NPPDX 16" "NPPDX 50" "NPPDX 100"
          "BVF 1" "BVF 4" "BVF 16" "BVF 50" "BVF 100")
-    NPPDX_CONFIG=${NPPDX_CONFIG:-$(dirname "$REPO")/results/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv}
+    NPPDX_CONFIG=${NPPDX_CONFIG:-${BVF_RESULTS:-$(dirname "$REPO")/results}/fkl-vs-nppdx/benchmark_nppdx_nppdx_config_GPU_NVIDIA.csv}
     if [ ! -f "$NPPDX_CONFIG" ]; then
-      echo "No NPPDx configuration file $NPPDX_CONFIG: run benchmark_figure1_bvf first, or set NPPDX_CONFIG" >&2
+      echo "No NPPDx configuration file $NPPDX_CONFIG: run benchmark_nppdx first, or set NPPDX_CONFIG" >&2
+      exit 1
+    fi
+    # The configurations must come from a run with the workload of this build (common/bench_geometry.h)
+    WORKLOAD=$("$BUILD/benchmark_nppdx" --workload)
+    NPPDX_PLATFORM=$(dirname "$NPPDX_CONFIG")/benchmark_nppdx_platform.txt
+    if [ ! -f "$NPPDX_PLATFORM" ] || ! grep -qF "Workload: $WORKLOAD" "$NPPDX_PLATFORM"; then
+      echo "$NPPDX_CONFIG does not come from a run with the workload of $BUILD (no matching Workload line in" \
+           "$NPPDX_PLATFORM)" >&2
       exit 1
     fi
     ;;
-  *) echo "SET must be paper or nppdx" >&2; exit 1 ;;
+  *) echo "SET must be ablation, opencv-cuda, npp or nppdx" >&2; exit 1 ;;
 esac
 if [ -n "${ONLY:-}" ]; then  # ONLY="BVF 100;VFHF 100" restricts the TUs (for checks; not for results)
   IFS=';' read -r -a TUS <<< "$ONLY"
@@ -184,4 +205,4 @@ done
   echo "nvcc command: $(cat "$OUT/nvcc_command.txt")"
 } > "$OUT/compile_time_platform.txt"
 rm -rf "$WORK"
-python3 "$REPO/compile_time/summarize.py" "$OUT"
+python3 "$REPO/scripts/compile_time_summarize.py" "$OUT"
