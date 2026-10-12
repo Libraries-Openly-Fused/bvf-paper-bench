@@ -6,12 +6,23 @@ against RPP (ROCm Performance Primitives), and FKL's CPU backends against RPP's 
 and timing protocol of the CUDA benchmarks ([`common/bench_gpu.h`](../common/bench_gpu.h)). No HIP graphs anywhere.
 The commands below run from the repository root.
 
+The regions change every iteration (20x10, 32x16 and 48x24 by turns, new positions every warm-up and timed
+iteration, all generated before the loops by `RegionSets`): iteration t of every loop runs every pipeline on the
+regions of iteration t (warm-up 0 to W - 1, timed W to W + T - 1). Every pipeline converts the regions of every
+iteration to its own arguments when it is created; inside the timed region there is only what each library needs to
+receive the regions of its iteration: for FKL, `build()` of its operations with the iteration's rectangles and the
+fusion, in every `executeOperations` call; for RPP, one `hipMemcpyAsync` of the iteration's ROIs from a pinned buffer
+to the device ROI tensors that its kernels read (the first operation of every RPP run, like NPP's descriptors in the
+CUDA benchmark). Region buffers (RPP's crop buffer, FKL VF+HF's crop tensor) have planes of the largest region,
+48x24; RPP's calls take each region's size from its ROI, and FKL VF+HF's resize reads each plane through a view of
+its region's size.
+
 ## GPU benchmark (`rocm/src/rocm_bench.hip`)
 
 | Implementation | What runs |
 |---|---|
 | `rpp` | the RPP pipeline of the benchmark: the fastest of the five RPP variants below, which are numerically equivalent (within 1e-5 of the RPP-convention reference); a selection pass validates and times all of them (CPU + GPU, interleaved, 20 warm-up + 200 timed iterations per N) and keeps the one with the lowest geometric mean of its medians over N (`rpp_selection.csv`); only that one is measured afterwards |
-| `rpp_per_op` (variant) | one RPP call per operation: `rppt_yuv_to_rgb` (NV12 to 8 bit RGB, BT.601 limited range: `RpptColorStandard_BT601`, `RpptColorRange_STUDIO`; it also uploads 8 constants with `hipMemcpyToSymbol` on every call), one batched `rppt_crop_mirror_normalize` 8u to 32f (all batch images alias the frame), `hipMemsetAsync` of the output (RPP has no constant border), one batched `rppt_resize` into the rows of the output planes below the top border, `rppt_multiply_scalar`, `rppt_tensor_subtract_tensor` and `rppt_tensor_divide_tensor` on the whole tensor |
+| `rpp_per_op` (variant) | the upload of the iteration's ROIs (every variant starts with it), then one RPP call per operation: `rppt_yuv_to_rgb` (NV12 to 8 bit RGB, BT.601 limited range: `RpptColorStandard_BT601`, `RpptColorRange_STUDIO`; it also uploads 8 constants with `hipMemcpyToSymbol` on every call), one batched `rppt_crop_mirror_normalize` 8u to 32f (all batch images alias the frame), `hipMemsetAsync` of the output (RPP has no constant border), one batched `rppt_resize` into the rows of the output planes below the top border, `rppt_multiply_scalar`, `rppt_tensor_subtract_tensor` and `rppt_tensor_divide_tensor` on the whole tensor |
 | `rpp_npp_like` (variant) | the same calls with exactly the intermediates of the paper's NPP pipeline: the resized crops in their own buffer, copied into the output rows by a batched `rppt_crop` |
 | `rpp_fused` (variant) | `rppt_yuv_to_rgb`, `hipMemsetAsync` of the top border rows of the first output plane, then RPP's fused `rppt_resize_mirror_normalize` (crop + 8u to 32f + resize + Mul; it zeroes everything from its destination pointer, which starts below that border, and synchronizes the stream itself), Sub and Div on the whole tensor (the border rows also need the normalization, which `rppt_resize_mirror_normalize` cannot apply to them) |
 | `rpp_normalize` (variant) | `rpp_per_op` with Mul + Sub + Div in one `rppt_normalize` |
@@ -29,27 +40,33 @@ not counted, like CUPTI's kernel records) and GPU time only with a flush kernel 
 every GPU operation (files named `l2_flushed` as in the CUDA benchmark). Kernel dispatch tracing and hardware
 counters are not available on WSL2 (ROCm runs on `/dev/dxg` there): on WSL2 the program measures CPU + GPU and the
 counts, and says that GPU time only was not measured; if the profiling child fails, the CPU + GPU results are still
-written. Validation, with the rules of every GPU benchmark ([`common/bench_validation.h`](../common/bench_validation.h):
+written. Validation, before the timing, on the timed iterations 0, 50, ..., 950 and 999 (every pipeline runs on the
+regions of that iteration into a NaN-poisoned output; `validation.csv` has one row per pipeline, N and iteration), with
+the rules of every GPU benchmark ([`common/bench_validation.h`](../common/bench_validation.h):
 1e-3 against a float reference, one level of 8 bit RGB more against an 8 bit one, at most one value in a thousand more
 than 1e-3 away; the program fails if an FKL output is outside its tolerance, and reports the RPP pipelines'): FKL VF+HF
 against FKL's CPU backend with the 8 bit RGB frame, FKL BVF against FKL's CPU backend in float; the RPP pipelines against a C++ reference built from RPP's own 8 bit RGB frame with RPP's
-sampling convention, measured with linear ramps (`--resize-convention`: pixel centers, clamped to [0, size - 2]), and
-against the paper's 8 bit reference (FKL's conversion rounded to 8 bit, FKL's sampling); in the CPU + GPU pass every
-pipeline is validated again after its timed iterations (the GPU time only passes of the profiling child run the same
-pipelines and check the kernel records of every execution, not the outputs). The RPP behaviour that the pipelines take into account (handle batch size, ROI
+sampling convention with each region's own scale, measured with linear ramps for every region size
+(`--resize-convention`: pixel centers, clamped to [0, size - 2]), and against the paper's 8 bit reference (FKL's
+conversion rounded to 8 bit, FKL's sampling); after the timed iterations of the CPU + GPU pass, every pipeline runs the
+first validated iteration again and must give the same output, every value within 1e-6 (the GPU time only passes of the
+profiling child run the same pipelines and check the kernel records of every execution, not the outputs). The RPP behaviour that the pipelines take into account (handle batch size, ROI
 formats converted in place, 8 pixel row padding, internal copies, memsets and synchronizations) is described in
 `platform.txt`.
 
 Modes, after the results directory: (none) the benchmark, `--validate`, `--resize-convention`
 (`rpp_resize_convention.csv`), `--rocprof-target <impl> <N>` (the target of `rocm/scripts/rocprof_counters.sh`),
 `--check-kernel-tracing`. Without a results directory, `rocm_bench --batches` prints the batch sizes (as
-the CUDA benchmarks' `--batches` does) and `rocm_bench --workload` the workload; `rpp_cpu_bench` has the same two.
+the CUDA benchmarks' `--batches` does), `rocm_bench --workload` the workload and `rocm_bench --regions <t>` the 100
+regions of iteration t as CSV; `rpp_cpu_bench` has `--batches` and `--workload`.
 
 Output files: those of the CUDA benchmark with `GPU_AMD` instead of `GPU_NVIDIA` (`latency.csv`, `validation.csv`,
 `kernels.csv`, `kernel_breakdown.csv`, `<baseline>_vs_fkl_bvf_[gpu_only_|gpu_only_l2_flushed_]GPU_AMD.csv`,
 `gpu_time.csv`, `gpu_time_l2_flushed.csv`, `platform.txt`), plus
-`kernel_counts_per_operation.csv`, `rpp_selection.csv` and `rpp_resize_convention.csv`; `validation.csv` has two more
-columns, the errors against the RPP-convention reference and against the paper's 8 bit reference, and `gpu_time*.csv` five more, the GPU time and dispatches of the HIP runtime's blit kernels (memsets, copies) of each execution, which the GPU time only sums leave out. `--validate` validates every RPP variant.
+`kernel_counts_per_operation.csv`, `rpp_selection.csv`, `rpp_resize_convention.csv` and `regions.csv` (the sizes and
+areas of the regions of the timed iterations per N, as in every results folder); the RPP pipelines' memcpy counts
+include the upload of the ROIs (9 per execution: that one and the 8 of `rppt_yuv_to_rgb`); `validation.csv` has an
+`iteration` column after N, and two more columns, the errors against the RPP-convention reference and against the paper's 8 bit reference, and `gpu_time*.csv` five more, the GPU time and dispatches of the HIP runtime's blit kernels (memsets, copies) of each execution, which the GPU time only sums leave out. `--validate` validates every RPP variant.
 
 ## CPU benchmark (`rocm/cpu/`)
 
@@ -58,23 +75,30 @@ against FKL's `ParArch::CPU`, and RPP with all hardware threads against FKL's `P
 protocol of [`fkl-vs-opencv-cpu/`](../fkl-vs-opencv-cpu/README.md). RPP's NV12 conversion is HIP only, so the RPP HOST pipelines
 get their 8 bit RGB frame from FKL's CPU conversion (one thread for the 1 thread runs, FKL's thread pool for the
 others), then one of the five RPP variants on the HOST backend: for each thread count, a selection pass validates all
-of them and times the ones numerically equivalent to `rpp_per_op` (10 warm-up + 100 iterations per N), and only the
-fastest is measured (`cpu_rpp_selection.csv`; outputs `benchmark_cpu_rpp_1thread_vs_fkl_bvf_CPU.csv` and
-`benchmark_cpu_rpp_<T>threads_vs_fkl_bvf_CPU_MULTITHREAD.csv`). The program fails if an FKL output is more than 1e-3
-from FKL's float reference, or if no RPP variant is numerically equivalent to `rpp_per_op` at every N for a thread
-count, in the benchmark and with `--validate`. RPP has no constant border: the variants that modify the border rows of
+of them (on the regions of iterations 0, 1, 2 and 0 again, so that every crop slot has held every size: the two outputs
+of iteration 0 must be identical) and times the ones numerically equivalent to `rpp_per_op` (10 warm-up + 100
+iterations per N, iteration i on the regions of iteration i), and only the fastest is measured (`cpu_rpp_selection.csv`; outputs `benchmark_cpu_rpp_1thread_vs_fkl_bvf_CPU.csv` and
+`benchmark_cpu_rpp_<T>threads_vs_fkl_bvf_CPU_MULTITHREAD.csv`). As on the GPU, the regions change every iteration:
+each pipeline converts the regions of every iteration when it is created (RPP: its XYWH ROIs; FKL: its rectangles),
+and inside the timed region RPP's calls get the ROI arrays of the iteration (host memory, read by RPP on the host) and
+FKL builds its operations with the iteration's rectangles and fuses them. Validation, before the timing of each N and
+on the same pipelines that are then timed, on the timed iterations 0, 50, ..., 950 and 999 (`cpu_validation.csv`, one
+row per N, implementation, thread count and iteration, with the error per region size): the program fails if an FKL
+output is more than 1e-3 from FKL's float reference in any of them, or if no RPP variant is numerically equivalent to
+`rpp_per_op` at every N for a thread count, in the benchmark and with `--validate`. RPP has no constant border: the variants that modify the border rows of
 the output in place (`rpp_per_op`, `rpp_npp_like`, `rpp_fused`) zero them with a memset in every run; the
 `rppt_normalize` variants never write the border rows of their input tensor, which is zeroed once when it is allocated.
 In the all-threads RPP pipeline, FKL's thread pool, which does the conversion, does not spin after it
 (`setSpinTime(0)` before every timed run of that pipeline, outside of the timing; FKL's default 100 us before FKL's
 runs), so that its workers do not compete with RPP's OpenMP team.
-RPP HOST's sampling positions are measured with ramps for this geometry (`rpp_host_sampling_positions.csv`) and used
-by its reference: its `rppt_resize` and `rppt_resize_mirror_normalize` treat the last columns and rows differently, so
-the two variants built on `rppt_resize_mirror_normalize` are not equivalent to `rpp_per_op` on the CPU. RPP 3.2.0's
-HOST `rppt_crop_mirror_normalize` (8u to 32f, packed RGB) writes one float (1.0) past the end of every row when the
-ROI width is a multiple of 16, as with the 32 pixel crops: in a tightly packed crop buffer the last row's lands on the
-first float of the next crop, which another OpenMP thread may have written already, so every crop is followed by a
-spare row. RPP's HOST backend parallelizes over the batch images with OpenMP: the
+RPP HOST's sampling positions are measured with ramps for every region size (`rpp_host_sampling_positions.csv`), in
+the benchmark's own crop-slot layout and with two different values outside the regions (the positions must not depend
+on them: RPP must not read outside a region), and used by its reference: its `rppt_resize` and
+`rppt_resize_mirror_normalize` treat the last columns and rows differently, so the two variants built on
+`rppt_resize_mirror_normalize` are not equivalent to `rpp_per_op` on the CPU. The crop buffer has slots of the largest
+region, 48x24, plus a spare row: RPP 3.2.0's HOST `rppt_crop_mirror_normalize` (8u to 32f, packed RGB) writes one
+float (1.0) past the end of every row when the ROI width is a multiple of 16, as with the 32 and 48 pixel regions, so
+the last row's would land on the next slot, which another OpenMP thread may have written already. RPP's HOST backend parallelizes over the batch images with OpenMP: the
 arithmetic calls see the output as N samples, and `KMP_BLOCKTIME` is 100 us (libomp's default is 200 ms), like FKL's
 thread pool, so that the idle gap before every timed run puts both pools to sleep.
 
@@ -134,14 +158,14 @@ suspected. Duration on the paper's machine (bare metal, Ubuntu 26.04, Ryzen 7 58
 `STABLE_STD`, builds up to date): 451 s, of which the GPU benchmark with its GPU time only passes 95 s, the counters
 61 s and the CPU benchmark 292 s.
 
-The workload is the one of `common/bench_geometry.h` with its default sizes; for other sizes, give the same CMake
-options as to the other projects in `BENCH_CMAKE_ARGS`, for example
-`BENCH_CMAKE_ARGS="-DBENCH_CROP_W=20 -DBENCH_CROP_H=10" rocm/scripts/run_all.sh ../results/rocm-20x10` (both builds get
-them; options cached in the build directories by earlier runs are reset first, and the script stops if the GPU and CPU
+The workload is the one of `common/bench_geometry.h`, with the three region sizes by turns (`BENCH_REGIONS=mixed`,
+the paper's); one size for every region, as the NPPDx builds use, is another CMake option in `BENCH_CMAKE_ARGS`, for
+example `BENCH_CMAKE_ARGS="-DBENCH_REGIONS=32x16" rocm/scripts/run_all.sh ../results/rocm-32x16` (both builds get it;
+options cached in the build directories by earlier runs are reset first, and the script stops if the GPU and CPU
 binaries report different workloads). `BENCH_ITERATIONS` and `BENCH_WARMUP_ITERATIONS` (default 1000 and 100, as in
 every benchmark of the repository) set the timed and warm-up iterations the same way, for example
 `BENCH_CMAKE_ARGS="-DBENCH_ITERATIONS=1 -DBENCH_WARMUP_ITERATIONS=0"` for a quick check; the RPP selection passes keep
-their own counts (20 + 200 on the GPU, 10 + 100 on the CPU). The CPU benchmark needs crop sides of at most 256 pixels:
+their own counts (20 + 200 on the GPU, 10 + 100 on the CPU). The CPU benchmark needs region sides of at most 256 pixels:
 it measures the sampling positions of RPP HOST's `rppt_resize_mirror_normalize` with 8 bit ramps.
 
 Or step by step (the cmake commands take the same `-DBENCH_*` options):

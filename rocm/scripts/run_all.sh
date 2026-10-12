@@ -4,8 +4,9 @@
 # In order: a platform snapshot, the builds, the prerequisite checks (kernel dispatch tracing, hardware counters), the
 # GPU benchmark (CPU + GPU pass, then in its profiling child process the kernel counts, GPU time only and GPU time only
 # with L2 + MALL flushed), RPP's resize convention, the hardware counter collection (Experiment 2) and the CPU
-# benchmark (RPP HOST vs FKL CPU). Every step logs to <results dir>/logs. The workload (crop and resize sizes, batch
-# sizes) is the one of common/bench_geometry.h; BENCH_CMAKE_ARGS passes other BENCH_CROP_W ... values to both builds.
+# benchmark (RPP HOST vs FKL CPU). Every step logs to <results dir>/logs. The workload (region sizes, batch sizes, the
+# regions of every iteration) is the one of common/bench_geometry.h; BENCH_CMAKE_ARGS passes another BENCH_REGIONS to
+# both builds.
 #
 # Environment (all optional):
 #   ROCM_PATH       ROCm installation (default /opt/rocm/core-10.1)
@@ -16,13 +17,15 @@
 #   COUNTERS        hardware counters for Experiment 2 (default "FETCH_SIZE GL2C_EA_WRREQ_sum GL2C_EA_WRREQ_64B_sum":
 #                   rocprofiler-sdk 1.4.1 defines FETCH_SIZE for gfx12 but not WRITE_SIZE, which summarize_counters.py
 #                   derives from the two GL2C_EA write counters with the GPU's write request size: 256 B on gfx12)
-#   BENCH_CMAKE_ARGS extra CMake arguments of both builds, e.g. "-DBENCH_CROP_W=32 -DBENCH_CROP_H=16" (default none)
+#   BENCH_CMAKE_ARGS extra CMake arguments of both builds, e.g. "-DBENCH_REGIONS=32x16" (default none: mixed sizes)
 #   BENCH_MALL_KIB  MALL (Infinity Cache) size in KiB, if rocminfo / amd-smi cannot report it
 # The hardware counter step needs counters that count: on gfx1200 only at a profiling performance level (at "auto" the
 # GL2C counters read 0; sudo amd-smi set -l STABLE_STD, which also pins the shader clock: 1494 MHz on the RX 9060). The
 # script checks it before the GPU benchmark with rocprof_counters.sh --check (FETCH_SIZE of a cache flush kernel) and
 # stops if they read 0. To time the benchmarks at another level, run with ALLOW_NO_COUNTERS=1 there and collect
 # Experiment 2 afterwards at a profiling level with the rocprof_counters.sh command that the script prints at the end.
+# SKIP_COUNTERS=1 skips Experiment 2 (the hardware counters) altogether, without checking them: for a run whose results
+# do not use AMD memory traffic.
 # Development only (the results are then not the paper's): ALLOW_NO_KERNEL_TRACE=1, ALLOW_NO_COUNTERS=1, ALLOW_BUSY=1,
 # ALLOW_OTHER_FKL=1, SKIP_CPU=1
 set -uo pipefail
@@ -120,7 +123,7 @@ fi
 # The geometry options are reset on every configure, so that values cached in an existing build directory (an earlier
 # run with BENCH_CMAKE_ARGS, a manual configure) never leak into this run: the defaults of common/bench_geometry.cmake
 # unless BENCH_CMAKE_ARGS sets them
-GEOMETRY_ARGS="-UBENCH_CROP_W -UBENCH_CROP_H -UBENCH_RESIZE_W -UBENCH_RESIZE_H -UBENCH_ITERATIONS -UBENCH_WARMUP_ITERATIONS ${BENCH_CMAKE_ARGS:-}"
+GEOMETRY_ARGS="-UBENCH_REGIONS -UBENCH_ITERATIONS -UBENCH_WARMUP_ITERATIONS ${BENCH_CMAKE_ARGS:-}"
 step build_gpu bash -c "cmake -S '$REPO/rocm' -B '$BUILD_GPU' -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER='$ROCM_PATH/bin/amdclang++' -DCMAKE_HIP_COMPILER='$ROCM_PATH/bin/amdclang++' \
     -DROCM_PATH='$ROCM_PATH' -DFKL_DIR='$FKL_GPU_DIR' -DRPP_ROOT='$ROCM_EXTRA' -DROCPROFILER_SDK_ROOT='$ROCM_EXTRA' \
@@ -133,7 +136,7 @@ fi
 BENCH=$BUILD_GPU/rocm_bench
 WORKLOAD=$("$BENCH" --workload) || die "$BENCH --workload failed"
 if ! allowed SKIP_CPU && [ "$WORKLOAD" != "$("$BUILD_CPU/rpp_cpu_bench" --workload)" ]; then
-    die "rocm_bench and rpp_cpu_bench have different workloads (sizes or batch sizes): build both from the same checkout and options"
+    die "rocm_bench and rpp_cpu_bench have different workloads (region sizes or batch sizes): build both from the same checkout and options"
 fi
 echo "Workload: $WORKLOAD"
 
@@ -147,31 +150,36 @@ if ! BENCH_ROCPROFILER=1 "$BENCH" "$OUT/logs/tmp" --check-kernel-tracing > "$OUT
 fi
 rocprofv3 -L > "$OUT/logs/rocprofv3_available_counters.txt" 2>&1 || true
 COUNTERS_OK=1
-for c in $COUNTERS; do
-    grep -qw "$c" "$OUT/logs/rocprofv3_available_counters.txt" || COUNTERS_OK=0
-done
-if [ $COUNTERS_OK = 0 ]; then
-    allowed ALLOW_NO_COUNTERS ||
-        die "rocprofv3 does not list the counters '$COUNTERS' for this GPU (list: $OUT/logs/rocprofv3_available_counters.txt): set COUNTERS to memory read/write traffic counters it lists, or ALLOW_NO_COUNTERS=1 to skip Experiment 2"
-    echo "WARNING: counters '$COUNTERS' not available: Experiment 2 skipped (ALLOW_NO_COUNTERS=1)"
-fi
-if [ $COUNTERS_OK = 1 ]; then
-    # Do the counters count at this performance level? (gfx1200: not at "auto", which leaves clock gating on)
-    CHECK_STATUS=0
-    "$REPO/rocm/scripts/rocprof_counters.sh" --check "$OUT/logs/counter_check" "$BENCH" \
-        > "$OUT/logs/counter_check.log" 2>&1 || CHECK_STATUS=$?
-    if [ $CHECK_STATUS != 0 ]; then
-        COUNTERS_OK=0
-        PERF_LEVEL=$(amd-smi metric --gpu 0 --perf-level 2>/dev/null | sed -n 's/^ *PERF_LEVEL: *//p' | head -1)
-        if [ $CHECK_STATUS = 3 ]; then
-            REASON="the hardware counters read 0 at performance level ${PERF_LEVEL:-unknown} (FETCH_SIZE of a cache flush kernel, see $OUT/logs/counter_check.log): set a profiling level, e.g. sudo amd-smi set -l STABLE_STD"
+if allowed SKIP_COUNTERS; then
+    COUNTERS_OK=0
+    echo "Experiment 2 (hardware counters) skipped (SKIP_COUNTERS=1)"
+else
+    for c in $COUNTERS; do
+        grep -qw "$c" "$OUT/logs/rocprofv3_available_counters.txt" || COUNTERS_OK=0
+    done
+    if [ $COUNTERS_OK = 0 ]; then
+        allowed ALLOW_NO_COUNTERS ||
+            die "rocprofv3 does not list the counters '$COUNTERS' for this GPU (list: $OUT/logs/rocprofv3_available_counters.txt): set COUNTERS to memory read/write traffic counters it lists, or ALLOW_NO_COUNTERS=1 to skip Experiment 2"
+        echo "WARNING: counters '$COUNTERS' not available: Experiment 2 skipped (ALLOW_NO_COUNTERS=1)"
+    fi
+    if [ $COUNTERS_OK = 1 ]; then
+        # Do the counters count at this performance level? (gfx1200: not at "auto", which leaves clock gating on)
+        CHECK_STATUS=0
+        "$REPO/rocm/scripts/rocprof_counters.sh" --check "$OUT/logs/counter_check" "$BENCH" \
+            > "$OUT/logs/counter_check.log" 2>&1 || CHECK_STATUS=$?
+        if [ $CHECK_STATUS != 0 ]; then
+            COUNTERS_OK=0
+            PERF_LEVEL=$(amd-smi metric --gpu 0 --perf-level 2>/dev/null | sed -n 's/^ *PERF_LEVEL: *//p' | head -1)
+            if [ $CHECK_STATUS = 3 ]; then
+                REASON="the hardware counters read 0 at performance level ${PERF_LEVEL:-unknown} (FETCH_SIZE of a cache flush kernel, see $OUT/logs/counter_check.log): set a profiling level, e.g. sudo amd-smi set -l STABLE_STD"
+            else
+                REASON="the hardware counter check failed (exit status $CHECK_STATUS, see $OUT/logs/counter_check.log)"
+            fi
+            allowed ALLOW_NO_COUNTERS || die "$REASON, or ALLOW_NO_COUNTERS=1 to skip Experiment 2"
+            echo "WARNING: $REASON: Experiment 2 skipped (ALLOW_NO_COUNTERS=1)"
         else
-            REASON="the hardware counter check failed (exit status $CHECK_STATUS, see $OUT/logs/counter_check.log)"
+            tail -1 "$OUT/logs/counter_check.log"
         fi
-        allowed ALLOW_NO_COUNTERS || die "$REASON, or ALLOW_NO_COUNTERS=1 to skip Experiment 2"
-        echo "WARNING: $REASON: Experiment 2 skipped (ALLOW_NO_COUNTERS=1)"
-    else
-        tail -1 "$OUT/logs/counter_check.log"
     fi
 fi
 
@@ -195,7 +203,7 @@ fi
 
 { echo "run_all.sh finished $(date -u '+%Y-%m-%d %H:%M:%S UTC')"; uptime; amd-smi metric --gpu 0 2>&1; } > "$OUT/platform_postrun.txt"
 echo "All done: $OUT (kernel dispatch tracing: $TRACING, counters: $COUNTERS_OK)"
-if [ $COUNTERS_OK = 0 ]; then
+if [ $COUNTERS_OK = 0 ] && ! allowed SKIP_COUNTERS; then
     echo "Experiment 2 (hardware counters) was NOT collected. At a performance level where the counters count" \
          "(e.g. sudo amd-smi set -l STABLE_STD):"
     echo "    COUNTERS='$COUNTERS' BENCH_RPP_VARIANT=$(awk -F, 'NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
