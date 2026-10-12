@@ -26,6 +26,9 @@ OUT=${OUT:-$RESULTS/ncu}
 METRICS=dram__bytes_read.sum,dram__bytes_write.sum,gpu__time_duration.sum
 
 mkdir -p "$OUT"
+# Only this invocation's reports: ncu_summarize.py merges every report of a pipeline, N and cache control in OUT, so a
+# report left by an earlier invocation (another REPEATS, another build) would be summarized with these
+rm -f "$OUT"/*.ncu-rep
 LOG=$OUT/ncu_dram.log
 : > "$LOG"
 failures=0

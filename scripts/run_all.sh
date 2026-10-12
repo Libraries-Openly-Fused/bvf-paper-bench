@@ -65,7 +65,9 @@ done
 declare -A FOLDER=([opencv-cuda]=fkl-vs-opencv-cuda [npp]=fkl-vs-npp [ablation]=fkl-ablation [nppdx]=fkl-vs-nppdx
                    [opencv-cpu]=fkl-vs-opencv-cpu)
 
-configure() { # <source> <build folder> <options...>: configures and builds a project
+# Configures and builds a project. BENCH_REGIONS is a cached CMake option, so every configure sets it (mixed, or the
+# NPPDx size): a build folder reused from an earlier configure with another value must not keep it.
+configure() { # <source> <build folder> <options...>
     local source=$1 build=$2
     shift 2
     mkdir -p "$build"
@@ -93,16 +95,17 @@ for step in opencv-cuda npp ablation opencv-cpu; do
     echo "  $folder ($build)"
     case "$step" in
         opencv-cuda)
-            configure "$REPO/$folder" "$build" -DOpenCV_DIR="$OpenCV_DIR"
+            configure "$REPO/$folder" "$build" -DBENCH_REGIONS=mixed -DOpenCV_DIR="$OpenCV_DIR"
             program=benchmark_opencv_cuda ;;
         npp)
-            configure "$REPO/$folder" "$build"
+            configure "$REPO/$folder" "$build" -DBENCH_REGIONS=mixed
             program=benchmark_npp ;;
         ablation)
-            configure "$REPO/$folder" "$build"
+            configure "$REPO/$folder" "$build" -DBENCH_REGIONS=mixed
             program=benchmark_fkl_ablation ;;
         opencv-cpu)
-            configure "$REPO/$folder" "$build" -DCMAKE_CXX_COMPILER="$CPU_CXX" -DOpenCV_DIR="$OpenCV_DIR"
+            configure "$REPO/$folder" "$build" -DBENCH_REGIONS=mixed -DCMAKE_CXX_COMPILER="$CPU_CXX" \
+                      -DOpenCV_DIR="$OpenCV_DIR"
             program=benchmark_opencv_cpu ;;
     esac
     run "$LOGS/$program.log" "$build/$program" "$out"
