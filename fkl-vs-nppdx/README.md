@@ -32,12 +32,11 @@ the same FKL pipeline:
   only what NPPDx and NPP provide, with no hand written pixel processing code. NPPDx has no host API, so its operations
   still run in a CUDA kernel written for them, with its launch configuration and the crop and batch given to NPPDx's
   ingest as image pointers, but the kernel only calls NPPDx operations, in the order of the pipeline (the same ones,
-  then NPPDx's 8 bit RGB write of the resized tile). NPP does the rest: `nppiSet_8u_C3R` makes the N 8 bit RGB output
-  planes black first (one call, the planes as one image; NPP has no batched border), the NPPDx kernel writes every
-  resized crop between the black rows of its plane, and `nppiConvert_8u32f_C3R`, `nppiMulC_32f_C3IR`,
-  `nppiSubC_32f_C3IR` and `nppiDivC_32f_C3IR` run on the N planes as one image (one NPP call per pipeline operation,
-  as in the GPU benchmark's NPP pipeline). Six kernels for every N, with the intermediates in memory, and the resized
-  RGB is rounded to 8 bits before the normalization.
+  then NPPDx's 8 bit RGB write of the resized tile). NPP does the rest with the function it offers for each step, as
+  in the GPU benchmark's NPP pipeline: `nppiCopyConstBorder_8u_C3R` adds the black rows, once per crop (NPP has no
+  batched border), then `nppiConvert_8u32f_C3R`, `nppiMulC_32f_C3IR`, `nppiSubC_32f_C3IR` and `nppiDivC_32f_C3IR` run
+  on the N planes as one image. N + 5 kernels, with the intermediates in memory, and the resized RGB is rounded to 8
+  bits before the normalization.
 
 The two benchmarks share everything but the NPPDx pipeline ([`benchmarks/figure1_common.h`](benchmarks/figure1_common.h)
 and [`benchmarks/nppdx_common.h`](benchmarks/nppdx_common.h)), and have the same modes and output files, with their

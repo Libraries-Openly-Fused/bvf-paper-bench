@@ -15,9 +15,9 @@ Model, per execution:
     float3 resized region, once each;
   - OpenCV's and NPP's three pointwise passes read the whole output three times;
   - NPPDx + NPP (nppdx_npp): its NPPDx kernel reads the NV12 source footprint of the regions (below), NPP's border
-    (nppiSet of the 8 bit RGB output) reads nothing, its 8u -> 32f conversion reads the 8 bit RGB output and its three
-    pointwise passes the float3 output three times; the per-launch terms of its six kernels are not modelled
-    (implied_fixed_term_KB is the measurement minus the model);
+    the 8 bit RGB resized regions, its 8u -> 32f conversion the 8 bit RGB output and its three pointwise passes the
+    float3 output three times; the per-launch terms of its N + 5 kernels are not modelled (implied_fixed_term_KB is
+    the measurement minus the model);
   - FKL BVF and NPPDx read a fixed per-launch term (code, constants, parameters), measured as the DRAM reads after a
     flush at the smallest N (N = 1) minus the footprint of its regions, plus the NV12 source footprint of the regions
     in 32 byte sectors: their luma rows and chroma rows, each sector counted once even where regions overlap (a cold
@@ -153,6 +153,7 @@ def main():
     frame = w["frame_w"] * w["frame_h"] * 3 // 2
     region8 = w["crop_w"] * w["crop_h"] * 3
     region32 = w["crop_w"] * w["crop_h"] * 12
+    resized8 = w["res_w"] * w["res_h"] * 3
     resized32 = w["res_w"] * w["res_h"] * 12
     output8 = w["out_w"] * w["out_h"] * 3
     output = w["out_w"] * w["out_h"] * 12
@@ -214,7 +215,7 @@ def main():
             elif impl == "fkl_vf_hf":
                 model = frame + n * (region8 + region32 + resized32)
             elif impl == "nppdx_npp":
-                model = sources(n) + n * output8 + 3 * n * output
+                model = sources(n) + n * (resized8 + output8) + 3 * n * output
             elif fixed is None:
                 model = None
             elif config(n) != config(anchor):
@@ -223,7 +224,7 @@ def main():
             else:
                 model = fixed + sources(n)
             if impl == "nppdx_npp":
-                sm_l2_compulsory = requested(n) + n * output8 + 3 * n * output
+                sm_l2_compulsory = requested(n) + n * (resized8 + output8) + 3 * n * output
             else:
                 sm_l2_compulsory = requested(n) if single else model
             cold = dram_cold(bench, impl, n)

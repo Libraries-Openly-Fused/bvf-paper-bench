@@ -16,11 +16,11 @@
 // provide. NPPDx has no host API, so its operations run inside a CUDA kernel written for them, but the kernel only
 // calls NPPDx operations, in the order of the pipeline (NV12 ingest of the crop, limited to full range, color
 // conversion BT.601, resize, 8 bit RGB write), one thread block per tile of a crop. NPPDx has no border operation and
-// no floating point output, so the rest is NPP: nppiSet makes the N 8 bit RGB output planes black (one call for all
-// of them, as one image), the NPPDx kernel then writes every resized crop between its black rows, and Convert 8u ->
-// 32f, MulC, SubC and DivC run on the N planes at once. Six kernels for every N, with the intermediates in memory, and
-// the resized RGB rounded to 8 bits before the normalization. The sizes are those of common/bench_geometry.h. Used by
-// benchmark_figure1_nppdx_npp.cu. nppdx_figure1.h has the single kernel version, with hand written CUDA code.
+// no floating point output, so the rest is NPP, with the function NPP offers for each step: CopyConstBorder for the
+// black rows, once per crop (NPP has no batched border), then Convert 8u -> 32f, MulC, SubC and DivC on the N planes
+// at once. N + 5 kernels, with the intermediates in memory, and the resized RGB rounded to 8 bits before the
+// normalization. The sizes are those of common/bench_geometry.h. Used by benchmark_figure1_nppdx_npp.cu.
+// nppdx_figure1.h has the single kernel version, with hand written CUDA code.
 
 #ifndef FIGURE1_NPPDX_NPP_FIGURE1_H
 #define FIGURE1_NPPDX_NPP_FIGURE1_H
@@ -32,13 +32,11 @@ namespace figure1 {
 
 // The NPPDx kernel: NPPDx operations only. Each thread block processes one tile of one crop: NPPDx takes the position
 // of the tile from blockIdx.x and blockIdx.y, and blockIdx.z selects the crop, which is given to NPPDx as an image of
-// CROP_W x CROP_H inside the frame. NPPDx writes the resized crop as 8 bit RGB into its output plane, from row
-// BORDER_TOP: a plane has the width of the resized crop, so its rows are those of NPPDx's 8 bit RGB image.
-static_assert(OUT_W == RES_W, "The border adds rows only, so a resized crop is an image inside its output plane");
+// CROP_W x CROP_H inside the frame. The resized crops are written one after the other as 8 bit RGB.
 template <typename Ingest, typename FromLimitedY, typename FromLimitedUV, typename Convert, typename Resize,
           typename Exgest, typename InputTile, typename OutputTile, typename TempTile, size_t N>
 __global__ void nppdxRgbKernel(const uint8_t* y, const uint8_t* uv, const int pitch, const CropOrigins<N> crops,
-                               uint8_t* planes) {
+                               uint8_t* resized) {
     extern __shared__ unsigned char smem[];
     auto tiles = nppdx::shared_memory::slice_into_tile_storage<InputTile, OutputTile, TempTile>(smem);
     auto inputTile = std::get<0>(tiles);
@@ -49,7 +47,7 @@ __global__ void nppdxRgbKernel(const uint8_t* y, const uint8_t* uv, const int pi
     const nppdx::ImageLayout<const uint8_t, 2> crop{{{y + static_cast<size_t>(o.y) * pitch + o.x,
                                                       uv + static_cast<size_t>(o.y / 2) * pitch + o.x}},
                                                     {{pitch, pitch}}};
-    uint8_t* resizedCrop = planes + (static_cast<size_t>(blockIdx.z) * OUT_H + BORDER_TOP) * OUT_W * 3;
+    uint8_t* resizedCrop = resized + static_cast<size_t>(blockIdx.z) * RES_W * RES_H * 3;
 
     Ingest().execute(crop, inputTile, CROP_W, CROP_H);
     FromLimitedY().execute(inputTile, CROP_W, CROP_H);
@@ -87,11 +85,10 @@ struct NppdxRgb : NppdxOps<Arch, BlockX, TileX, TileY> {
         }
     }
 
-    // Writes the N resized crops as 8 bit RGB into the N output planes (OUT_W x OUT_H each, one after the other), from
-    // row BORDER_TOP of each; the other rows are not written
+    // Writes the N resized crops, RES_W x RES_H 8 bit RGB each, one after the other in resized
     static void run(cudaStream_t stream, const uint8_t* y, const uint8_t* uv, int pitch, const CropOrigins<N>& crops,
-                    uint8_t* planes) {
-        kernel<<<grid, block, smem, stream>>>(y, uv, pitch, crops, planes);
+                    uint8_t* resized) {
+        kernel<<<grid, block, smem, stream>>>(y, uv, pitch, crops, resized);
         gpuErrchk(cudaGetLastError());
     }
 };
@@ -102,43 +99,42 @@ constexpr auto nppdxRgbConfigs() {
     return nppdxConfigs<Arch, true>();
 }
 
-// The NPP part of the pipeline and its 8 bit RGB planes: before the NPPDx kernel, border() makes the N planes black
-// (AddBorder: the kernel then writes the resized crops between the black rows; NPP has no batched border, but the N
-// planes are one image for nppiSet); after it, normalize() converts them to float and normalizes them, on the N planes
-// as one image of OUT_W x N * OUT_H. normalize() runs before() before every NPP call (the GPU only benchmark with the
-// L2 flushed flushes there).
-class NppParts {
+// The NPP part of the pipeline, after the NPPDx kernel, and its 8 bit RGB output planes: per crop the black rows
+// (CopyConstBorder; NPP has no batched border), then 8 bit -> float and the normalization on the N planes at once, as
+// one image of OUT_W x N * OUT_H. before() runs before every NPP call (the GPU only benchmark with the L2 flushed
+// flushes there).
+class NppTail {
 public:
-    explicit NppParts(size_t n) : m_n(n) { gpuErrchk(cudaMalloc(&m_planes, n * OUT_W * OUT_H * 3)); }
-    ~NppParts() { cudaFree(m_planes); }
-    NppParts(const NppParts&) = delete;
-    NppParts& operator=(const NppParts&) = delete;
-
-    uint8_t* planes() const { return m_planes; }
-
-    void border(const NppStreamContext& ctx) const {
-        static const Npp8u black[3] = {0, 0, 0};
-        NPP_CHECK(nppiSet_8u_C3R_Ctx(black, m_planes, OUT_W * 3, size(), ctx));
-    }
+    explicit NppTail(size_t n) : m_n(n) { gpuErrchk(cudaMalloc(&m_bordered, n * OUT_W * OUT_H * 3)); }
+    ~NppTail() { cudaFree(m_bordered); }
+    NppTail(const NppTail&) = delete;
+    NppTail& operator=(const NppTail&) = delete;
 
     template <typename Before>
-    void normalize(float* out, const Normalization& n, const NppStreamContext& ctx, Before&& before) const {
+    void run(const uint8_t* resized, float* out, const Normalization& n, const NppStreamContext& ctx,
+             Before&& before) const {
+        static const Npp8u black[3] = {0, 0, 0};
+        for (size_t i = 0; i < m_n; ++i) {
+            before();
+            NPP_CHECK(nppiCopyConstBorder_8u_C3R_Ctx(resized + i * RES_W * RES_H * 3, RES_W * 3, NppiSize{RES_W, RES_H},
+                                                     m_bordered + i * OUT_W * OUT_H * 3, OUT_W * 3,
+                                                     NppiSize{OUT_W, OUT_H}, BORDER_TOP, 0, black, ctx));
+        }
+        const NppiSize planes{OUT_W, static_cast<int>(m_n) * OUT_H};
         const int step = OUT_W * 3 * static_cast<int>(sizeof(float));
         before();
-        NPP_CHECK(nppiConvert_8u32f_C3R_Ctx(m_planes, OUT_W * 3, out, step, size(), ctx));
+        NPP_CHECK(nppiConvert_8u32f_C3R_Ctx(m_bordered, OUT_W * 3, out, step, planes, ctx));
         before();
-        NPP_CHECK(nppiMulC_32f_C3IR_Ctx(n.mul, out, step, size(), ctx));
+        NPP_CHECK(nppiMulC_32f_C3IR_Ctx(n.mul, out, step, planes, ctx));
         before();
-        NPP_CHECK(nppiSubC_32f_C3IR_Ctx(n.sub, out, step, size(), ctx));
+        NPP_CHECK(nppiSubC_32f_C3IR_Ctx(n.sub, out, step, planes, ctx));
         before();
-        NPP_CHECK(nppiDivC_32f_C3IR_Ctx(n.div, out, step, size(), ctx));
+        NPP_CHECK(nppiDivC_32f_C3IR_Ctx(n.div, out, step, planes, ctx));
     }
 
 private:
-    NppiSize size() const { return NppiSize{OUT_W, static_cast<int>(m_n) * OUT_H}; }
-
     size_t m_n{0};
-    uint8_t* m_planes{nullptr};
+    uint8_t* m_bordered{nullptr};
 };
 
 } // namespace figure1
