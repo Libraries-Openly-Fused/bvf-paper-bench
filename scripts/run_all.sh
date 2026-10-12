@@ -23,7 +23,8 @@
 #                performance counters open to every user); without it, their commands are printed at the end
 #   BUILD_ROOT   where the build folders go (default this repository): build-<step>, and build-nppdx-<size>
 #   CPU_CXX      C++ compiler of the CPU benchmark (default clang++; the README recommends a recent clang)
-#   CMAKE_ARGS   more options for every CMake project (for example -DBENCH_ITERATIONS=1 for a quick check)
+#   CMAKE_ARGS   more options for every CMake project (for example -DBENCH_ITERATIONS=1 for a quick check); not
+#                BENCH_REGIONS, which this script sets for every project (mixed, or the NPPDx sizes of NPPDX_SIZES)
 # Results: <results>/<benchmark folder>, FKL vs NPPDx in <results>/fkl-vs-nppdx/<size> (the runner-up configurations in
 # its runner-up/), logs in <results>/logs. The GPU benchmarks run one at a time; leave the GPU otherwise idle.
 set -euo pipefail
@@ -47,6 +48,14 @@ fi
 BUILD_ROOT=${BUILD_ROOT:-$REPO}
 CPU_CXX=${CPU_CXX:-clang++}
 read -r -a EXTRA <<< "${CMAKE_ARGS:-}"
+# The region sizes are set per project below and name the results folders, so CMAKE_ARGS must not override them
+for arg in "${EXTRA[@]}"; do
+    if [[ $arg == -DBENCH_REGIONS[=:]* ]]; then
+        echo "CMAKE_ARGS: $arg is not allowed: this script sets BENCH_REGIONS for every project (mixed, and the" \
+             "NPPDx sizes of NPPDX_SIZES)" >&2
+        exit 1
+    fi
+done
 GENERATOR=${GENERATOR:-"Unix Makefiles"}
 
 has_step() { [[ " $STEPS " == *" $1 "* ]]; }
