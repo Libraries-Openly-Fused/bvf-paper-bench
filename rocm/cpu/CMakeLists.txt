@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.28)
 # CPU benchmark of the Figure 1 pipeline: RPP's HOST backend vs FKL's CPU backends (BVF), the ROCm counterpart of
 # cpu/ (which compares with OpenCV). Meant to be built with a recent clang and the best SIMD of the CPU, for example:
 #   cmake -S rocm/cpu -B build-rocm-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++-23 \
-#         -DFKL_DIR=<FusedKernelLibrary at b7f97b5, with its thread-pool submodule> -DRPP_ROOT=<prefix with RPP>
+#         -DRPP_ROOT=<prefix with RPP>   (FKL: the repository's fkl submodule with its thread-pool, or -DFKL_DIR=<checkout>)
 project(bvf_rpp_cpu_bench LANGUAGES CXX)
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -11,7 +11,7 @@ endif()
 # The workload of every benchmark: BENCH_CROP_W, BENCH_CROP_H, BENCH_RESIZE_W, BENCH_RESIZE_H (common/bench_geometry.h)
 include(${CMAKE_CURRENT_SOURCE_DIR}/../../common/bench_geometry.cmake)
 
-set(FKL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../FusedKernelLibrary-b7f97b5" CACHE PATH "FusedKernelLibrary checkout (b7f97b5, the paper's CPU commit)")
+set(FKL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../fkl" CACHE PATH "FusedKernelLibrary checkout (default: the repository's fkl submodule, 63782f6)")
 set(ROCM_PATH "/opt/rocm/core-10.1" CACHE PATH "ROCm installation (HIP headers, which rpp.h includes)")
 set(RPP_ROOT "${ROCM_PATH}" CACHE PATH "Prefix with include/rpp/rpp.h and lib/librpp.so")
 # -march=native: every SIMD extension of this CPU (AVX2 and FMA on Zen 3, AVX-512 where available)
@@ -23,14 +23,14 @@ find_library(RPP_LIBRARY rpp HINTS "${RPP_ROOT}/lib" NO_DEFAULT_PATH REQUIRED)
 # --dirty: a modified FKL tree shows up in cpu_platform.txt
 execute_process(COMMAND git -C ${FKL_DIR} describe --always --dirty --abbrev=7 OUTPUT_VARIABLE FKL_COMMIT
                 OUTPUT_STRIP_TRAILING_WHITESPACE)
-if(NOT FKL_COMMIT MATCHES "^b7f97b5")
-    message(WARNING "FKL_DIR (${FKL_DIR}) is at ${FKL_COMMIT}, not b7f97b5 (the paper's CPU commit)")
+if(NOT FKL_COMMIT MATCHES "63782f6")
+    message(WARNING "FKL_DIR (${FKL_DIR}) is at ${FKL_COMMIT}, not 63782f6 (the paper's FKL commit)")
 endif()
 execute_process(COMMAND git -C ${FKL_DIR}/thread-pool rev-parse --short HEAD OUTPUT_VARIABLE THREAD_POOL_COMMIT
                 OUTPUT_STRIP_TRAILING_WHITESPACE)
 if(NOT EXISTS "${FKL_DIR}/thread-pool/include")
     message(FATAL_ERROR "${FKL_DIR}/thread-pool is empty: the CPU_MULTITHREAD backend needs FKL's thread-pool submodule "
-                        "(git submodule update --init)")
+                        "(git submodule update --init --recursive)")
 endif()
 find_package(Threads REQUIRED)
 

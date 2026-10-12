@@ -17,7 +17,7 @@ endif()
 # The workload of every benchmark: BENCH_CROP_W, BENCH_CROP_H, BENCH_RESIZE_W, BENCH_RESIZE_H (common/bench_geometry.h)
 include(${CMAKE_CURRENT_SOURCE_DIR}/../common/bench_geometry.cmake)
 
-set(FKL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../FusedKernelLibrary" CACHE PATH "FusedKernelLibrary checkout (branch bvf-paper-bench, b9f4281)")
+set(FKL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../fkl" CACHE PATH "FusedKernelLibrary checkout (default: the repository's fkl submodule, 63782f6)")
 set(ROCM_PATH "/opt/rocm/core-10.1" CACHE PATH "ROCm installation")
 set(RPP_ROOT "${ROCM_PATH}" CACHE PATH "Prefix with include/rpp/rpp.h and lib/librpp.so")
 set(ROCPROFILER_SDK_ROOT "${ROCM_PATH}" CACHE PATH "Prefix with include/rocprofiler-sdk and lib/librocprofiler-sdk.so")
@@ -30,8 +30,8 @@ find_library(ROCPROFILER_SDK_LIBRARY rocprofiler-sdk HINTS "${ROCPROFILER_SDK_RO
 # --dirty: a modified FKL tree shows up in platform.txt
 execute_process(COMMAND git -C ${FKL_DIR} describe --always --dirty --abbrev=7 OUTPUT_VARIABLE FKL_COMMIT
                 OUTPUT_STRIP_TRAILING_WHITESPACE)
-if(NOT FKL_COMMIT MATCHES "^b9f4281")
-    message(WARNING "FKL_DIR (${FKL_DIR}) is at ${FKL_COMMIT}, not b9f4281 (the paper's GPU commit)")
+if(NOT FKL_COMMIT MATCHES "63782f6")
+    message(WARNING "FKL_DIR (${FKL_DIR}) is at ${FKL_COMMIT}, not 63782f6 (the paper's FKL commit)")
 endif()
 execute_process(COMMAND git -C ${FKL_DIR} rev-parse --abbrev-ref HEAD OUTPUT_VARIABLE FKL_BRANCH OUTPUT_STRIP_TRAILING_WHITESPACE)
 

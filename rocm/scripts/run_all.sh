@@ -10,8 +10,8 @@
 # Environment (all optional):
 #   ROCM_PATH       ROCm installation (default /opt/rocm/core-10.1)
 #   ROCM_EXTRA      prefix with RPP, rocprofiler-sdk and amd-smi when they are not in ROCM_PATH (see env.sh)
-#   FKL_GPU_DIR     FusedKernelLibrary at b9f4281 (branch bvf-paper-bench), default <repo>/../FusedKernelLibrary
-#   FKL_CPU_DIR     FusedKernelLibrary at b7f97b5 with its thread-pool submodule, default <repo>/../FusedKernelLibrary-b7f97b5
+#   FKL_GPU_DIR     FusedKernelLibrary for the GPU benchmark, default <repo>/fkl (the submodule, 63782f6)
+#   FKL_CPU_DIR     FusedKernelLibrary with its thread-pool submodule for the CPU benchmark, default <repo>/fkl
 #   CXX_CPU         C++ compiler of the CPU benchmark (default: the newest clang++-NN found, else clang++)
 #   COUNTERS        hardware counters for Experiment 2 (default "FETCH_SIZE GL2C_EA_WRREQ_sum GL2C_EA_WRREQ_64B_sum":
 #                   rocprofiler-sdk 1.4.1 defines FETCH_SIZE for gfx12 but not WRITE_SIZE, which summarize_counters.py
@@ -25,8 +25,10 @@ set -uo pipefail
 OUT=$(realpath -m "${1:?usage: rocm/scripts/run_all.sh <results dir>}")
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 . "$REPO/rocm/scripts/env.sh"
-FKL_GPU_DIR=${FKL_GPU_DIR:-$REPO/../FusedKernelLibrary}
-FKL_CPU_DIR=${FKL_CPU_DIR:-$REPO/../FusedKernelLibrary-b7f97b5}
+# The paper's FKL commit, the one of the repository's fkl submodule, for every benchmark
+FKL_PAPER_COMMIT=63782f6
+FKL_GPU_DIR=${FKL_GPU_DIR:-$REPO/fkl}
+FKL_CPU_DIR=${FKL_CPU_DIR:-$REPO/fkl}
 if [ -z "${CXX_CPU:-}" ]; then
     CXX_CPU=$(ls /usr/bin/clang++-[0-9]* 2>/dev/null | sort -t- -k2 -n | tail -1)
     CXX_CPU=${CXX_CPU:-clang++}
@@ -62,10 +64,12 @@ command -v amd-smi > /dev/null || die "amd-smi not found (install amdrocm-amdsmi
 command -v rocminfo > /dev/null || die "rocminfo not found"
 command -v rocprofv3 > /dev/null || die "rocprofv3 not found (install amdrocm-profiler10.1)"
 command -v "$CXX_CPU" > /dev/null || die "C++ compiler $CXX_CPU not found (set CXX_CPU)"
-FKL_GPU_COMMIT=$(git -C "$FKL_GPU_DIR" rev-parse --short=7 HEAD 2>/dev/null) || die "no FKL checkout in $FKL_GPU_DIR"
-FKL_CPU_COMMIT=$(git -C "$FKL_CPU_DIR" rev-parse --short=7 HEAD 2>/dev/null) || die "no FKL checkout in $FKL_CPU_DIR"
-[ "$FKL_GPU_COMMIT" = b9f4281 ] || allowed ALLOW_OTHER_FKL || die "FKL_GPU_DIR is at $FKL_GPU_COMMIT, not b9f4281"
-[ "$FKL_CPU_COMMIT" = b7f97b5 ] || allowed ALLOW_OTHER_FKL || die "FKL_CPU_DIR is at $FKL_CPU_COMMIT, not b7f97b5"
+FKL_GPU_COMMIT=$(git -C "$FKL_GPU_DIR" rev-parse --short=7 HEAD 2>/dev/null) && [ -f "$FKL_GPU_DIR/CMakeLists.txt" ] ||
+    die "no FKL checkout in $FKL_GPU_DIR (git -C $REPO submodule update --init --recursive fkl)"
+FKL_CPU_COMMIT=$(git -C "$FKL_CPU_DIR" rev-parse --short=7 HEAD 2>/dev/null) && [ -f "$FKL_CPU_DIR/CMakeLists.txt" ] ||
+    die "no FKL checkout in $FKL_CPU_DIR (git -C $REPO submodule update --init --recursive fkl)"
+[ "$FKL_GPU_COMMIT" = $FKL_PAPER_COMMIT ] || allowed ALLOW_OTHER_FKL || die "FKL_GPU_DIR is at $FKL_GPU_COMMIT, not $FKL_PAPER_COMMIT"
+[ "$FKL_CPU_COMMIT" = $FKL_PAPER_COMMIT ] || allowed ALLOW_OTHER_FKL || die "FKL_CPU_DIR is at $FKL_CPU_COMMIT, not $FKL_PAPER_COMMIT"
 for dir in "$FKL_GPU_DIR" "$FKL_CPU_DIR"; do
     # Unmodified: no changes to tracked files, submodules at their recorded commits
     [ -z "$(git -C "$dir" status --porcelain --untracked-files=no)" ] || allowed ALLOW_OTHER_FKL ||

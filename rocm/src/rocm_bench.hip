@@ -1838,7 +1838,8 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << "RPP: " << RPP_VERSION_MAJOR << "." << RPP_VERSION_MINOR << "." << RPP_VERSION_PATCH
        << " (ROCm 10.1 package amdrocm-rpp10.1, prebuilt; HIP backend; " << BENCH_RPP_LIB << ")\n"
        << "rocprofiler-sdk: " << BENCH_ROCPROFILER_LIB << "\n"
-       << "FKL: branch " << BENCH_FKL_BRANCH << ", commit " << BENCH_FKL_COMMIT << "\n"
+       << "FKL: " << BENCH_FKL_COMMIT
+       << (std::string(BENCH_FKL_BRANCH) == "HEAD" ? std::string() : std::string(", branch ") + BENCH_FKL_BRANCH) << "\n"
        << "CPU: " << shell("lscpu | sed -n 's/^Model name: *//p'") << "\n"
        << "OS: " << osName << ", kernel " << shell("uname -r") << "\n"
        << "GPU clocks: not changed by the benchmark. rocm-smi performance level: "

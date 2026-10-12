@@ -240,10 +240,9 @@ thread pool, so that the idle gap before every timed run puts both pools to slee
 - The ROCm 10.1 packages `amdrocm-rpp-dev10.1` (RPP 3.2.0), `amdrocm-profiler-base10.1` and `amdrocm-profiler10.1`
   (rocprofiler-sdk, rocprofv3) and `amdrocm-amdsmi10.1`. Without root, unpack them with
   `apt-get download <package> && dpkg -x <package>.deb <prefix>` and set `ROCM_EXTRA=<prefix>/opt/rocm/core-10.1`.
-- FusedKernelLibrary at `b9f4281` (branch `bvf-paper-bench`, the paper's GPU commit) for the GPU benchmark, and at
-  `b7f97b5` (the paper's CPU commit) with its `thread-pool` submodule for the CPU benchmark, by default in
-  `<workspace>/FusedKernelLibrary` and `<workspace>/FusedKernelLibrary-b7f97b5`. The repository's `fkl` submodule (FKL `main`) is
-  not used by `rocm/`: the AMD results must use the paper's FKL commits.
+- FusedKernelLibrary at `63782f6`, the commit of every benchmark of this repository: by default the repository's `fkl`
+  submodule with its `thread-pool` submodule (`git submodule update --init --recursive fkl`), for both the GPU and the
+  CPU benchmark; `run_all.sh` takes other checkouts with `FKL_GPU_DIR` / `FKL_CPU_DIR` and checks the commit.
 
 ### Build and run
 
@@ -258,7 +257,7 @@ Before running it, on the bare-metal machine: nothing else running (`uptime` loa
 nothing else on the GPU (`amd-smi process`), and the performance level and clock lock state as they are: the script
 records them (`amd-smi metric`, `rocm-smi --showperflevel`) and does not change them. Hardware counters need access to
 the GPU's performance counters (membership of the `render` group). Duration on the development machine (WSL2,
-Ryzen 7 5800X3D, RX 9060): 404 s with the builds up to date (GPU benchmark 26 s, CPU benchmark 375 s; building both from scratch took 24 s in an earlier run), without the GPU time only passes and the counters, which WSL2 cannot run; on bare metal they add two more passes of 1,000 iterations per N (GPU time only, and with L2 + MALL flushed) and one rocprofv3 run per counter, pipeline and N.
+Ryzen 7 5800X3D, RX 9060): 431 s (builds 29 s, GPU benchmark 26 s, CPU benchmark 371 s), without the GPU time only passes and the counters, which WSL2 cannot run; on bare metal they add two more passes of 1,000 iterations per N (GPU time only, and with L2 + MALL flushed) and one rocprofv3 run per counter, pipeline and N.
 
 The workload is the one of `common/bench_geometry.h` with its default sizes; for other sizes, give the same CMake
 options as to the other projects in `BENCH_CMAKE_ARGS`, for example
@@ -276,7 +275,7 @@ Or step by step (the cmake commands take the same `-DBENCH_*` options):
     ./build-rocm/rocm_bench ../results/rocm/gpu
     BENCH_RPP_VARIANT=<chosen variant of rpp_selection.csv> rocm/scripts/rocprof_counters.sh ../results/rocm/traffic
     cmake -S rocm/cpu -B build-rocm-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++ \
-          -DFKL_DIR=../FusedKernelLibrary-b7f97b5 -DRPP_ROOT=$ROCM_EXTRA
+          -DRPP_ROOT=$ROCM_EXTRA
     cmake --build build-rocm-cpu
     ./build-rocm-cpu/rpp_cpu_bench ../results/rocm/cpu
 
