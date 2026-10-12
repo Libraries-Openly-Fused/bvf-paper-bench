@@ -42,13 +42,12 @@ differs between standard libraries: they are the same on every platform and comp
 | Implementation | What runs |
 |---|---|
 | `opencv_cuda` | NV12 to RGB of the whole frame, then per crop `cv::cuda` convertTo, resize and copyMakeBorder, then multiply, subtract and divide on the whole output tensor |
-| `npp` | NV12 to RGB of the whole frame, per crop `nppiConvert_8u32f`, one `nppiSet` that makes the output tensor black, one batched resize that writes every resized crop between the black rows of its plane (`nppiResize` for N = 1, since `nppiResizeBatch` rejects a batch of one), then `MulC`, `SubC` and `DivC` on the whole output tensor |
+| `npp` | the same steps with NPP (one batched resize; `nppiResize` for N = 1, since `nppiResizeBatch` rejects a batch of one) |
 | `fkl_vf_hf` | FKL with vertical and horizontal fusion but without BVF: four kernels, with the intermediates in memory |
 | `fkl_bvf` | FKL with BVF: one kernel for the whole chain |
 
-OpenCV and FKL VF+HF write the same intermediates (an 8 bit RGB frame, then float3 crops, resized crops and output),
-and NPP the same but for the resized crops, which its resize writes into the output; none writes a float RGB frame,
-because the libraries cannot; FKL BVF keeps float3 values in registers from the color
+OpenCV, NPP and FKL VF+HF write the same intermediates (an 8 bit RGB frame, then float3 crops, resized crops and
+output), because the libraries cannot write a float RGB frame; FKL BVF keeps float3 values in registers from the color
 conversion to the final write. Details of every implementation are at the top of `src/bvf_bench.cu`.
 
 In each of the 1000 timed iterations (after 100 warm-up ones) the implementations run one after the other, and FKL

@@ -11,9 +11,8 @@ columns that do not need them are written.
 
 Model, per execution:
   - a full-frame conversion reads the whole NV12 frame;
-  - per region, the crop stage reads the 8 bit RGB region, the resize stage the float3 region and (OpenCV, FKL VF+HF)
-    the border stage the float3 resized region, once each; NPP's resize writes into the output, whose black rows come
-    from a Set that reads nothing;
+  - per region, the crop stage reads the 8 bit RGB region, the resize stage the float3 region and the border stage the
+    float3 resized region, once each;
   - OpenCV's and NPP's three pointwise passes read the whole output three times;
   - NPPDx + NPP (nppdx_npp): its NPPDx kernel reads the NV12 source footprint of the regions (below), NPP's border
     (nppiSet of the 8 bit RGB output) reads nothing, its 8u -> 32f conversion reads the 8 bit RGB output and its three
@@ -210,10 +209,8 @@ def main():
                                     f"from the median over N ({median / 1e3:.3f} KB) by more than 1 KB")
         for n in w["batches"]:
             note = ""
-            if impl == "opencv_cuda":
+            if impl in ("opencv_cuda", "npp"):
                 model = frame + n * (region8 + region32 + resized32) + 3 * n * output
-            elif impl == "npp":
-                model = frame + n * (region8 + region32) + 3 * n * output
             elif impl == "fkl_vf_hf":
                 model = frame + n * (region8 + region32 + resized32)
             elif impl == "nppdx_npp":

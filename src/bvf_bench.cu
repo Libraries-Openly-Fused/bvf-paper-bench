@@ -6,13 +6,11 @@
 // Implementations:
 //   opencv_cuda        NPP NV12->RGB (OpenCV CUDA has no NV12 conversion), then per crop cv::cuda convertTo, resize,
 //                      copyMakeBorder, then multiply, subtract, divide on the whole output tensor
-//   npp                NV12->RGB, per crop 8u->32f, one Set that makes the output tensor black, one batched resize
-//                      that writes every resized crop between the black rows of its plane (nppiResize for N = 1,
-//                      since nppiResizeBatch rejects a batch of one), then MulC, SubC, DivC on the whole output
-//                      tensor
+//   npp                NV12->RGB, per crop 8u->32f, one batched resize (nppiResize for N = 1, since
+//                      nppiResizeBatch rejects a batch of one), per crop CopyConstBorder,
+//                      then MulC, SubC, DivC on the whole output tensor
 //   fkl_vf_hf          four FKL kernels with the intermediates in DRAM (VF + HF, no BVF), with the same
-//                      intermediates as OpenCV: 8 bit RGB frame, then float3 crops, resized crops and output (NPP
-//                      writes the resized crops into the output)
+//                      intermediates as OpenCV and NPP: 8 bit RGB frame, then float3 crops, resized crops and output
 //   fkl_bvf            one FKL kernel for the whole chain (BVF)
 
 #include <fused_kernel/fused_kernel.h>
@@ -237,8 +235,8 @@ std::array<fk::RawPtr<fk::ND::_2D, T>, N> planeViews(const fk::Tensor<T>& tensor
     return views;
 }
 
-// VF + HF without BVF: four kernels with the intermediates in DRAM, the same intermediates as the OpenCV pipeline
-// (and NPP's, except that NPP's resize writes into the output): an 8 bit RGB frame (NPP's NV12 -> RGB can only write 8 or 16 bit integers, and OpenCV CUDA has no
+// VF + HF without BVF: four kernels with the intermediates in DRAM, the same intermediates as the OpenCV and
+// NPP pipelines: an 8 bit RGB frame (NPP's NV12 -> RGB can only write 8 or 16 bit integers, and OpenCV CUDA has no
 // NV12 conversion), quantized as in the 8 bit reference (normalize, add half a level, __saturatef, denormalize),
 // then float3 crops (like their per crop convertTo / Convert_8u32f), float3 resized crops and the float3 output.
 template <size_t N>
@@ -355,6 +353,7 @@ struct NPPState {
     Npp8u* rgb8{nullptr};
     int rgbStep{0};
     Npp32f* cropped{nullptr};
+    Npp32f* resized{nullptr};
     Npp32f* tensor{nullptr};
     NppiImageDescriptor* srcDescriptors{nullptr};
     NppiImageDescriptor* dstDescriptors{nullptr};
@@ -363,6 +362,7 @@ struct NPPState {
     ~NPPState() {
         cudaFree(rgb8);
         cudaFree(cropped);
+        cudaFree(resized);
         cudaFree(tensor);
         cudaFree(srcDescriptors);
         cudaFree(dstDescriptors);
@@ -375,23 +375,21 @@ Implementation makeNPP(Context& ctx) {
     const int cropStep = CROP_W * 3 * sizeof(Npp32f);
     const int outStep = OUT_W * 3 * sizeof(Npp32f);
     const size_t cropFloats = static_cast<size_t>(CROP_W) * CROP_H * 3;
+    const size_t resizedFloats = static_cast<size_t>(RES_W) * RES_H * 3;
     const size_t outFloats = OUT_FLOATS;
-    // The border only adds rows (OUT_W == RES_W), so every resized crop is the image of RES_H rows that starts at row
-    // BORDER_TOP of its output plane: the resize writes it there, and the black rows come from one Set
-    static_assert(OUT_W == RES_W);
-    const size_t interior = static_cast<size_t>(BORDER_TOP) * OUT_W * 3;
     auto st = std::make_shared<NPPState>();
     size_t rgbPitch = 0;
     gpuErrchk(cudaMallocPitch(reinterpret_cast<void**>(&st->rgb8), &rgbPitch, FRAME_W * 3, FRAME_H));
     st->rgbStep = static_cast<int>(rgbPitch);
     gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->cropped), N * cropFloats * sizeof(Npp32f)));
+    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->resized), N * resizedFloats * sizeof(Npp32f)));
     gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->tensor), N * outFloats * sizeof(Npp32f)));
     // The batched resize descriptors live in device memory and are uploaded once, outside of the timing
     std::vector<NppiImageDescriptor> src(N), dst(N);
     std::vector<NppiResizeBatchROI_Advanced> rois(N);
     for (size_t i = 0; i < N; ++i) {
         src[i] = NppiImageDescriptor{st->cropped + i * cropFloats, cropStep, NppiSize{CROP_W, CROP_H}};
-        dst[i] = NppiImageDescriptor{st->tensor + i * outFloats + interior, outStep, NppiSize{RES_W, RES_H}};
+        dst[i] = NppiImageDescriptor{st->resized + i * resizedFloats, outStep, NppiSize{RES_W, RES_H}};
         rois[i] = NppiResizeBatchROI_Advanced{NppiRect{0, 0, CROP_W, CROP_H}, NppiRect{0, 0, RES_W, RES_H}};
         st->rects.push_back(ctx.crops[i]);
     }
@@ -413,24 +411,27 @@ Implementation makeNPP(Context& ctx) {
                                                 NppiSize{CROP_W, CROP_H}, ctx.npp));
         }
     });
-    impl.stages.emplace_back("3_set_output_black", [&ctx, st, outStep]() {
-        static const Npp32f zero[3] = {0.f, 0.f, 0.f};
-        beforeKernel();
-        NPP_CHECK(nppiSet_32f_C3R_Ctx(zero, st->tensor, outStep, NppiSize{OUT_W, static_cast<int>(N) * OUT_H},
-                                      ctx.npp));
-    });
-    impl.stages.emplace_back("4_resize_batch_into_output", [&ctx, st, cropStep, outStep, interior]() {
+    impl.stages.emplace_back("3_resize_batch", [&ctx, st, cropStep, outStep]() {
         if constexpr (N == 1) {
             // nppiResizeBatch rejects a batch of one image with NPP_BAD_ARGUMENT_ERROR
             beforeKernel();
             NPP_CHECK(nppiResize_32f_C3R_Ctx(st->cropped, cropStep, NppiSize{CROP_W, CROP_H},
-                                             NppiRect{0, 0, CROP_W, CROP_H}, st->tensor + interior, outStep,
+                                             NppiRect{0, 0, CROP_W, CROP_H}, st->resized, outStep,
                                              NppiSize{RES_W, RES_H}, NppiRect{0, 0, RES_W, RES_H},
                                              NPPI_INTER_LINEAR, ctx.npp));
         } else {
             beforeKernel();
             NPP_CHECK(nppiResizeBatch_32f_C3R_Advanced_Ctx(RES_W, RES_H, st->srcDescriptors, st->dstDescriptors, st->rois,
                                                            static_cast<unsigned int>(N), NPPI_INTER_LINEAR, ctx.npp));
+        }
+    });
+    impl.stages.emplace_back("4_per_crop_copy_const_border", [&ctx, st, resizedFloats, outFloats, outStep]() {
+        static const Npp32f zero[3] = {0.f, 0.f, 0.f};
+        for (size_t i = 0; i < N; ++i) {
+            beforeKernel();
+            NPP_CHECK(nppiCopyConstBorder_32f_C3R_Ctx(st->resized + i * resizedFloats, outStep, NppiSize{RES_W, RES_H},
+                                                      st->tensor + i * outFloats, outStep, NppiSize{OUT_W, OUT_H},
+                                                      BORDER_TOP, 0, zero, ctx.npp));
         }
     });
     impl.stages.emplace_back("5_mulc_subc_divc", [&ctx, st, outStep]() {
