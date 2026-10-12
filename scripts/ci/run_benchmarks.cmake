@@ -509,10 +509,16 @@ endif()
 # Every benchmark is built in BUILD_DIR/<benchmark> and run into OUT_DIR/<benchmark folder>, FKL vs NPPDx once per region
 # size, in BUILD_DIR/nppdx_<size> and OUT_DIR/fkl-vs-nppdx/<size> (for example build-ci/npp and ci-results/fkl-vs-npp)
 string(REPLACE " " ";" nppdxSizes "${NPPDX_SIZES}")
+# Every size has its own build and results folders and run names, so a size listed twice would overwrite the first run
+set(seenSizes "")
 foreach(size IN LISTS nppdxSizes)
     if(NOT size MATCHES "^(20x10|32x16|48x24)$")
         message(FATAL_ERROR "NPPDX_SIZES: ${size} is not one of the region sizes 20x10, 32x16 and 48x24")
     endif()
+    if(size IN_LIST seenSizes)
+        message(FATAL_ERROR "NPPDX_SIZES: ${size} is listed twice; its second run would overwrite the first one's results")
+    endif()
+    list(APPEND seenSizes "${size}")
 endforeach()
 if(BENCHMARKS STREQUAL "cpu")
     # BENCH_REGIONS is cached: set it explicitly, so that a reused build folder cannot keep another value

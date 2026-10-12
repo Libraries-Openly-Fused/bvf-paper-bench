@@ -54,11 +54,18 @@ if { has_step opencv-cuda || has_step opencv-cpu; } && [ -z "${OpenCV_DIR:-}" ];
     echo "Set OpenCV_DIR to the OpenCV build or install folder (the OpenCV benchmarks need it)" >&2
     exit 1
 fi
+# Every size has its own build, results and log paths, so a size listed twice would overwrite its first measurements
+seen=" "
 for size in $NPPDX_SIZES; do
     if [[ ! $size =~ ^(20x10|32x16|48x24)$ ]]; then
         echo "NPPDX_SIZES: $size is not one of the region sizes 20x10, 32x16 and 48x24" >&2
         exit 1
     fi
+    if [[ $seen == *" $size "* ]]; then
+        echo "NPPDX_SIZES: $size is listed twice; its second run would overwrite the first one's results" >&2
+        exit 1
+    fi
+    seen+="$size "
 done
 
 # The source folder of every step
