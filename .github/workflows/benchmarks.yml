@@ -1,7 +1,7 @@
 name: Benchmarks
 
 # Builds and runs every benchmark on the self-hosted runners of FKL's CI, with the toolchains of FKL's workflows
-# (FusedKernelLibrary/.github/workflows). The Linux ROCm runner has no NVIDIA GPU, so it runs the CPU benchmark only;
+# (FusedKernelLibrary/.github/workflows). The Linux ROCm runner has no NVIDIA GPU: it runs every Linux x86_64 CPU job;
 # no job runs on the Windows ROCm runner.
 # scripts/ci/run_benchmarks.cmake does the work: it builds OpenCV once per runner and configuration in
 # ~/bvf-paper-bench-deps (the first run on a runner takes much longer), builds the benchmarks with one timed iteration
@@ -38,13 +38,13 @@ jobs:
       matrix:
         include:
           - platform: "CPU x86_64"
-            runner: [self-hosted, linux, x64]
+            runner: [self-hosted, linux, x64, rocm]  # the native Linux machine runs every Linux x86_64 CPU job
             benchmarks: cpu
             compiler: "g++-13"
             cmake: "cmake-4.4.2-linux-x86_64"
             artifact: linux-cpu-x86_64-gcc
           - platform: "CPU x86_64"
-            runner: [self-hosted, linux, x64]
+            runner: [self-hosted, linux, x64, rocm]  # the native Linux machine runs every Linux x86_64 CPU job
             benchmarks: cpu
             compiler: "clang++-23"
             cmake: "cmake-4.4.2-linux-x86_64"

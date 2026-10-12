@@ -196,7 +196,7 @@ of this repository and by hand, on the self-hosted runners of FKL's CI with the 
 CUDA 13.0 on Windows: the benchmarks need 13.3 or newer): Linux x86_64 and ARM64 for the CPU benchmark (g++-13 and
 clang++-23), Linux CUDA x86_64 and ARM64 for the GPU benchmarks (g++-13, CUDA 13.4), Windows x64 for the CPU benchmark
 (cl and clang-cl) and Windows CUDA for the GPU benchmarks (cl, CUDA 13.4). The Linux ROCm runner has no NVIDIA GPU
-and runs the CPU benchmark only; no job runs on the Windows ROCm runner. FKL vs NPPDx runs on the x86_64 CUDA runners
+and runs every Linux x86_64 CPU job; no job runs on the Windows ROCm runner. FKL vs NPPDx runs on the x86_64 CUDA runners
 only, the CPUs NPPDx supports.
 
 Every job runs [`scripts/ci/run_benchmarks.cmake`](scripts/ci/run_benchmarks.cmake), which also runs on any machine
