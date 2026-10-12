@@ -1075,8 +1075,9 @@ void writePlatform(const std::filesystem::path& outDir, const std::vector<std::s
        << OUT_H << "\n"
        << "FKL BVF: one executeOperations call, one kernel: no intermediates in memory, float3 from the color "
           "conversion to the write.\n"
-       << "Regions: iteration t of every loop (warm-up iterations 0 to " << WARMUP_ITERS - 1 << ", timed ones "
-       << WARMUP_ITERS << " to " << WARMUP_ITERS + TIMED_ITERS - 1 << ") runs every pipeline on the regions of "
+       << "Regions: iteration t of every loop (the " << WARMUP_ITERS << " warm-up iterations are t in [0, " << WARMUP_ITERS
+       << "), the " << TIMED_ITERS << " timed ones t in [" << WARMUP_ITERS << ", " << WARMUP_ITERS + TIMED_ITERS
+       << ")) runs every pipeline on the regions of "
        << "iteration t, generated before the loops and the same for every implementation, program and machine "
        << "(statistics of the timed ones in regions.csv). Each pipeline converts them into its library's arguments "
        << "before the loops; inside the timed region is what the library needs to receive the regions of the "

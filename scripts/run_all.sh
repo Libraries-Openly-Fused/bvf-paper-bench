@@ -48,13 +48,16 @@ fi
 BUILD_ROOT=${BUILD_ROOT:-$REPO}
 CPU_CXX=${CPU_CXX:-clang++}
 read -r -a EXTRA <<< "${CMAKE_ARGS:-}"
-# The region sizes are set per project below and name the results folders, so CMAKE_ARGS must not override them
+# The region sizes are set per project below and name the results folders, so CMAKE_ARGS must not override them, in
+# CMake's joined (-DBENCH_REGIONS=...) or split (-D BENCH_REGIONS=...) form
+previous=""
 for arg in "${EXTRA[@]}"; do
-    if [[ $arg == -DBENCH_REGIONS[=:]* ]]; then
-        echo "CMAKE_ARGS: $arg is not allowed: this script sets BENCH_REGIONS for every project (mixed, and the" \
-             "NPPDx sizes of NPPDX_SIZES)" >&2
+    if [[ $arg == -DBENCH_REGIONS[=:]* || ( $previous == -D && $arg == BENCH_REGIONS[=:]* ) ]]; then
+        echo "CMAKE_ARGS: setting BENCH_REGIONS ($arg) is not allowed: this script sets it for every project (mixed," \
+             "and the NPPDx sizes of NPPDX_SIZES)" >&2
         exit 1
     fi
+    previous=$arg
 done
 GENERATOR=${GENERATOR:-"Unix Makefiles"}
 
