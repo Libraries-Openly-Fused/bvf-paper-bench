@@ -78,7 +78,7 @@ allowed() { [ "${!1:-0}" = 1 ]; }
     die "rocprofiler-sdk not found in $ROCM_EXTRA (install amdrocm-profiler-base10.1 or set ROCM_EXTRA)"
 command -v amd-smi > /dev/null || die "amd-smi not found (install amdrocm-amdsmi10.1)"
 command -v rocminfo > /dev/null || die "rocminfo not found"
-command -v rocprofv3 > /dev/null || die "rocprofv3 not found (install amdrocm-profiler-base10.1)"
+allowed SKIP_COUNTERS || command -v rocprofv3 > /dev/null || die "rocprofv3 not found (install amdrocm-profiler-base10.1)"
 command -v "$CXX_CPU" > /dev/null || die "C++ compiler $CXX_CPU not found (set CXX_CPU)"
 FKL_GPU_COMMIT=$(git -C "$FKL_GPU_DIR" rev-parse --short=7 HEAD 2>/dev/null) && [ -f "$FKL_GPU_DIR/CMakeLists.txt" ] ||
     die "no FKL checkout in $FKL_GPU_DIR (git -C $REPO submodule update --init --recursive fkl)"
@@ -154,12 +154,13 @@ if ! BENCH_ROCPROFILER=1 "$BENCH" "$OUT/logs/tmp" --check-kernel-tracing > "$OUT
         die "rocprofiler-sdk delivers no kernel dispatch records here: GPU time only cannot be measured (WSL2? see $OUT/logs/check_kernel_tracing.log; ALLOW_NO_KERNEL_TRACE=1 to continue without)"
     echo "WARNING: no kernel dispatch tracing: GPU time only will not be measured (ALLOW_NO_KERNEL_TRACE=1)"
 fi
-rocprofv3 -L > "$OUT/logs/rocprofv3_available_counters.txt" 2>&1 || true
 COUNTERS_OK=1
 if allowed SKIP_COUNTERS; then
+    # Neither rocprofv3 nor any counter query runs
     COUNTERS_OK=0
     echo "Experiment 2 (hardware counters) skipped (SKIP_COUNTERS=1)"
 else
+    rocprofv3 -L > "$OUT/logs/rocprofv3_available_counters.txt" 2>&1 || true
     for c in $COUNTERS; do
         grep -qw "$c" "$OUT/logs/rocprofv3_available_counters.txt" || COUNTERS_OK=0
     done
