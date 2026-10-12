@@ -405,6 +405,8 @@ void compareWithFKL(Workload& w, const CropOrigins<N>& origins, const std::array
                     const std::vector<float>& pixelCenters, std::vector<benchmark::TwoExecutionsResult>& results,
                     std::vector<Validation>& checks) {
     using Nppdx = NppdxKernel<NPPDX_SM, N, C>;
+    // The sweep initializes every configuration it tries, but --configs skips it
+    Nppdx::init();
     constexpr size_t outFloats = N * OUT_FLOATS;
     gpuErrchk(cudaMemset(nppdxOut, 0xFF, outFloats * sizeof(float)));
     gpuErrchk(cudaMemset(fklOut.ptr().data, 0xFF, outFloats * sizeof(float)));
