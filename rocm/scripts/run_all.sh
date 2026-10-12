@@ -33,6 +33,12 @@ set -uo pipefail
 # The usage check in this shell: inside $(...) a failed ${1:?} would only end the subshell
 : "${1:?usage: rocm/scripts/run_all.sh <results dir>}"
 OUT=$(realpath -m "$1")
+# A new or empty results directory: files of an earlier run (counters, GPU time only, CPU results that this run might
+# not write) must never sit next to this run's
+if [ -e "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then
+    echo "run_all.sh: STOP: $OUT is not empty: give a new or empty results directory" >&2
+    exit 1
+fi
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 . "$REPO/rocm/scripts/env.sh"
 # The paper's FKL commit, the one of the repository's fkl submodule, for every benchmark
@@ -120,16 +126,16 @@ if awk "BEGIN{exit !($LOAD >= 0.5)}"; then
 fi
 
 # ---------------------------------------------------------------- builds
-# The geometry options are reset on every configure, so that values cached in an existing build directory (an earlier
-# run with BENCH_CMAKE_ARGS, a manual configure) never leak into this run: the defaults of common/bench_geometry.cmake
-# unless BENCH_CMAKE_ARGS sets them
-GEOMETRY_ARGS="-UBENCH_REGIONS -UBENCH_ITERATIONS -UBENCH_WARMUP_ITERATIONS ${BENCH_CMAKE_ARGS:-}"
-step build_gpu bash -c "cmake -S '$REPO/rocm' -B '$BUILD_GPU' -G Ninja -DCMAKE_BUILD_TYPE=Release \
+# Every configure starts from an empty CMake cache (cmake --fresh), so that no value cached in an existing build
+# directory by an earlier run or a manual configure (BENCH_REGIONS, the iteration counts, compiler flags, architecture
+# flags) leaks into this run: the defaults of the CMake projects, unless BENCH_CMAKE_ARGS sets them
+GEOMETRY_ARGS="${BENCH_CMAKE_ARGS:-}"
+step build_gpu bash -c "cmake --fresh -S '$REPO/rocm' -B '$BUILD_GPU' -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER='$ROCM_PATH/bin/amdclang++' -DCMAKE_HIP_COMPILER='$ROCM_PATH/bin/amdclang++' \
     -DROCM_PATH='$ROCM_PATH' -DFKL_DIR='$FKL_GPU_DIR' -DRPP_ROOT='$ROCM_EXTRA' -DROCPROFILER_SDK_ROOT='$ROCM_EXTRA' \
     $GEOMETRY_ARGS && cmake --build '$BUILD_GPU'"
 if ! allowed SKIP_CPU; then
-    step build_cpu bash -c "cmake -S '$REPO/rocm/cpu' -B '$BUILD_CPU' -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    step build_cpu bash -c "cmake --fresh -S '$REPO/rocm/cpu' -B '$BUILD_CPU' -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CXX_COMPILER='$CXX_CPU' -DROCM_PATH='$ROCM_PATH' -DFKL_DIR='$FKL_CPU_DIR' -DRPP_ROOT='$ROCM_EXTRA' \
         $GEOMETRY_ARGS && cmake --build '$BUILD_CPU'"
 fi

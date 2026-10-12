@@ -125,7 +125,9 @@ GL2C_EA_WRREQ_64B_sum`, since rocprofiler-sdk 1.4.1 defines no `WRITE_SIZE` for 
 
     rocm/scripts/run_all.sh ../results/rocm
 
-Before running it, on the bare-metal machine: nothing else running (`uptime` load below 0.5, which the script checks),
+The results directory must be new or empty (the script stops otherwise), so that no file of an earlier run sits next
+to this run's, and both builds are configured from an empty CMake cache (`cmake --fresh`, a full rebuild), so that no
+option cached by an earlier configure applies. Before running it, on the bare-metal machine: nothing else running (`uptime` load below 0.5, which the script checks),
 nothing else on the GPU (`amd-smi process`), and the performance level and clock lock state as they are: the script
 records them (`amd-smi metric`, including `--perf-level`) and does not change them. Hardware counters need access to
 the GPU's performance counters (membership of the `render` group) and, on gfx1200, a profiling performance level: at
@@ -155,13 +157,14 @@ measured execution exceeds the smallest of its three warm-up executions (the sam
 flushed) by more than 2 % and 256 KiB of traffic, up to `MAX_REPEATS` (3) rounds; the rejected profiles stay in
 `raw_rejected/` and `traffic_repeats.csv`, and `traffic.csv` has their count per row and whether a leak is still
 suspected. Duration on the paper's machine (bare metal, Ubuntu 26.04, Ryzen 7 5800X3D, RX 9060, performance level
-`STABLE_STD`, builds up to date): 451 s, of which the GPU benchmark with its GPU time only passes 95 s, the counters
-61 s and the CPU benchmark 292 s.
+`STABLE_STD`), the paper run with `SKIP_COUNTERS=1`: 436 s, of which the builds 32 s, the GPU benchmark with
+its GPU time only passes 103 s and the CPU benchmark 299 s (the counters took 61 s in an earlier run with one region
+size).
 
 The workload is the one of `common/bench_geometry.h`, with the three region sizes by turns (`BENCH_REGIONS=mixed`,
 the paper's); one size for every region, as the NPPDx builds use, is another CMake option in `BENCH_CMAKE_ARGS`, for
 example `BENCH_CMAKE_ARGS="-DBENCH_REGIONS=32x16" rocm/scripts/run_all.sh ../results/rocm-32x16` (both builds get it;
-options cached in the build directories by earlier runs are reset first, and the script stops if the GPU and CPU
+no option cached in the build directories by earlier runs applies, and the script stops if the GPU and CPU
 binaries report different workloads). `BENCH_ITERATIONS` and `BENCH_WARMUP_ITERATIONS` (default 1000 and 100, as in
 every benchmark of the repository) set the timed and warm-up iterations the same way, for example
 `BENCH_CMAKE_ARGS="-DBENCH_ITERATIONS=1 -DBENCH_WARMUP_ITERATIONS=0"` for a quick check; the RPP selection passes keep

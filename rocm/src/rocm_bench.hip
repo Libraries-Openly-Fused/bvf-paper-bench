@@ -2274,6 +2274,8 @@ bool runProfilingChild(const std::filesystem::path& outDir, std::vector<Result>&
     const std::string command = "BENCH_ROCPROFILER=1 BENCH_RPP_VARIANT=" + quote(selectedRpp) + " " + quote(exe) + " " +
                                 quote(outDir.string()) + " --profile-pass " + quote(file.string());
     std::cout << "=== Profiling pass in a child process: " << command << std::endl;
+    // Only the rows of this child: never a file left by an earlier run
+    std::filesystem::remove(file);
     if (std::system(command.c_str()) != 0) {
         throw std::runtime_error("The profiling pass failed");
     }
@@ -2447,6 +2449,17 @@ int main(int argc, char** argv) {
             std::cerr << "ERROR in the profiling pass: " << profilingError << std::endl;
         }
 
+        // The GPU time only files of an earlier run in this directory, which this run does not rewrite without tracing
+        if (!tracing) {
+            for (const std::string& baseline : BASELINES) {
+                for (const std::string suffix : {"gpu_only_", "gpu_only_l2_flushed_"}) {
+                    std::filesystem::remove(outDir / (baseline + "_vs_fkl_bvf_" + suffix +
+                                                      std::string(fk::toStrView(fk::defaultParArch)) + ".csv"));
+                }
+            }
+            std::filesystem::remove(outDir / "gpu_time.csv");
+            std::filesystem::remove(outDir / "gpu_time_l2_flushed.csv");
+        }
         std::ofstream latency(outDir / "latency.csv");
         latency << "implementation,N,median_us,p10_us,p90_us,iterations,max_abs_err,kernels_launched,mean_us,"
                    "fkl_bvf_mean_speedup\n";
