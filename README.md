@@ -140,11 +140,12 @@ The results of the RTX 4090 machine for FKL vs NPPDx are in `fkl-vs-nppdx/result
 
 ## CPU benchmark (`cpu/`)
 
-The same pipeline on the CPU: OpenCV (with 1 thread and with all hardware threads) against FKL's CPU backends with
-BVF, on one thread (`ParArch::CPU`) and on FKL's thread pool (`ParArch::CPU_MULTITHREAD`). The color conversion is
-BT.601 limited range in both, because that is the only NV12 conversion of OpenCV's CPU `cvtColor`. Every timed run
-follows a 1 ms idle gap, so that both libraries' thread pools are asleep when it starts. Each run writes one CSV per
-comparison in FKL's two-execution format, plus `cpu_validation.csv` and `cpu_platform.txt`.
+The same pipeline on the CPU: OpenCV against FKL's CPU backends with BVF, with the same number of threads on both
+sides: OpenCV with 1 thread against FKL on one thread (`ParArch::CPU`), and OpenCV with all hardware threads against
+FKL on its thread pool (`ParArch::CPU_MULTITHREAD`). The color conversion is BT.601 limited range in both, because
+that is the only NV12 conversion of OpenCV's CPU `cvtColor`. Every timed run follows a 1 ms idle gap, so that both
+libraries' thread pools are asleep when it starts. Each run writes one CSV per comparison in FKL's two-execution
+format, plus `cpu_validation.csv` and `cpu_platform.txt`.
 
 ## Requirements and layout
 

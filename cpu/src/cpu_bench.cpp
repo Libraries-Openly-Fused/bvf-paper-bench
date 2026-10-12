@@ -9,11 +9,14 @@
 //
 //   opencv: cvtColor(COLOR_YUV2RGB_NV12) on the full frame (8 bit RGB), then per crop convertTo(CV_32F), resize and
 //           copyMakeBorder, then multiply, subtract and divide on the whole tensor. OpenCV uses its own SIMD dispatch
-//           (up to AVX2 here) and its thread pool; it is timed with 1 thread and with all the hardware threads.
+//           (up to AVX2 here) and its thread pool.
 //   fkl:    one executeOperations<TransformDPP<ParArch::CPU>> call with the whole chain (BVF). FKL's CPU backend runs
 //           on one thread, compiled with -march=native.
 //   fkl mt: the same call with TransformDPP<ParArch::CPU_MULTITHREAD>: the stream enqueues the execution in FKL's shared
 //           thread pool (one worker per hardware thread), in chunks of one output row of one crop, and sync() waits.
+//
+// Two comparisons, each with the same number of threads on both sides: OpenCV with 1 thread against fkl, and OpenCV
+// with all the hardware threads against fkl mt.
 //
 // Both libraries' thread pools spin for a while after finishing before their workers go to sleep, so every timed run
 // is preceded by an idle gap that lets them fall asleep: neither steals cores from the other, and both start from
@@ -316,8 +319,8 @@ struct Check {
 };
 
 template <size_t N>
-void runBatch(Workload& w, std::vector<Row>& singleThread, std::vector<Row>& multiThread,
-              std::vector<Row>& multiThreadFkl, std::vector<Check>& checks, int hardwareThreads) {
+void runBatch(Workload& w, std::vector<Row>& singleThread, std::vector<Row>& multiThread, std::vector<Check>& checks,
+              int hardwareThreads) {
     OpenCVCpu opencv(w, N);
     FklCpu<N> fkl(w);
     FklCpu<N, fk::ParArch::CPU_MULTITHREAD> fklMT(w);
@@ -333,19 +336,16 @@ void runBatch(Workload& w, std::vector<Row>& singleThread, std::vector<Row>& mul
 
     singleThread.push_back(timeTwo(N, [&]() { opencv.run(); }, [&]() { fkl.run(); }));
     cv::setNumThreads(hardwareThreads);
-    multiThread.push_back(timeTwo(N, [&]() { opencv.run(); }, [&]() { fkl.run(); }));
-    multiThreadFkl.push_back(timeTwo(N, [&]() { opencv.run(); }, [&]() { fklMT.run(); }));
+    multiThread.push_back(timeTwo(N, [&]() { opencv.run(); }, [&]() { fklMT.run(); }));
     cv::setNumThreads(1);
     const Row& s = singleThread.back();
     const Row& m = multiThread.back();
-    const Row& mt = multiThreadFkl.back();
-    std::printf("N %3zu | OpenCV 1 thread %8.1f us, OpenCV %d threads %8.1f us, FKL CPU %8.1f us, FKL CPU_MULTITHREAD "
-                "%8.1f us | mean speedup: FKL CPU vs OpenCV 1 thread %6.2fx, FKL CPU vs OpenCV %d threads %6.2fx, FKL "
-                "CPU_MULTITHREAD vs OpenCV %d threads %6.2fx | max err: FKL vs reference %.2e, OpenCV vs "
+    std::printf("N %3zu | OpenCV 1 thread %8.1f us, FKL CPU %8.1f us, mean speedup %6.2fx | OpenCV %d threads %8.1f us, "
+                "FKL CPU_MULTITHREAD %8.1f us, mean speedup %6.2fx | max err: FKL vs reference %.2e, OpenCV vs "
                 "OpenCV-convention reference %.2e, OpenCV vs FKL %.2e, FKL CPU_MULTITHREAD vs FKL CPU %.2e\n",
-                N, s.opencv.median * 1000., hardwareThreads, m.opencv.median * 1000., s.fkl.median * 1000.,
-                mt.fkl.median * 1000., s.meanSpeedup, hardwareThreads, m.meanSpeedup, hardwareThreads, mt.meanSpeedup,
-                c.fklVsReference, c.opencvVsReference, c.opencvVsFkl, c.fklMultithreadVsFkl);
+                N, s.opencv.median * 1000., s.fkl.median * 1000., s.meanSpeedup, hardwareThreads,
+                m.opencv.median * 1000., m.fkl.median * 1000., m.meanSpeedup, c.fklVsReference, c.opencvVsReference,
+                c.opencvVsFkl, c.fklMultithreadVsFkl);
 }
 
 } // namespace cpubench
@@ -358,18 +358,16 @@ int main(int argc, char** argv) {
 
     Workload w;
     initWorkload(w);
-    std::vector<Row> singleThread, multiThread, multiThreadFkl;
+    std::vector<Row> singleThread, multiThread;
     std::vector<Check> checks;
     [&]<size_t... Is>(std::index_sequence<Is...>) {
-        (runBatch<BATCHES[Is]>(w, singleThread, multiThread, multiThreadFkl, checks, hardwareThreads), ...);
+        (runBatch<BATCHES[Is]>(w, singleThread, multiThread, checks, hardwareThreads), ...);
     }(std::make_index_sequence<BATCHES.size()>{});
 
     writeCSV(outDir / "benchmark_cpu_opencv_1thread_vs_fkl_bvf_CPU.csv", "OpenCV 1 thread", singleThread);
-    writeCSV(outDir / ("benchmark_cpu_opencv_" + std::to_string(hardwareThreads) + "threads_vs_fkl_bvf_CPU.csv"),
-             "OpenCV " + std::to_string(hardwareThreads) + " threads", multiThread);
     writeCSV(outDir / ("benchmark_cpu_opencv_" + std::to_string(hardwareThreads) +
                        "threads_vs_fkl_bvf_CPU_MULTITHREAD.csv"),
-             "OpenCV " + std::to_string(hardwareThreads) + " threads", multiThreadFkl, "FKL CPU_MULTITHREAD");
+             "OpenCV " + std::to_string(hardwareThreads) + " threads", multiThread, "FKL CPU_MULTITHREAD");
     std::ofstream v(outDir / "cpu_validation.csv");
     v << "Batch size, FKL MaxAbsError vs FKL-convention reference, OpenCV MaxAbsError vs OpenCV-convention reference, "
          "OpenCV vs FKL MaxAbsDifference, FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference" << std::endl;
