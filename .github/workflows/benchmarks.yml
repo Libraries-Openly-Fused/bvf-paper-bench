@@ -1,7 +1,8 @@
 name: Benchmarks
 
 # Builds and runs every benchmark on the self-hosted runners of FKL's CI, with the toolchains of FKL's workflows
-# (FusedKernelLibrary/.github/workflows). The ROCm runners have no NVIDIA GPU, so they run the CPU benchmark only.
+# (FusedKernelLibrary/.github/workflows). The Linux ROCm runner has no NVIDIA GPU, so it runs the CPU benchmark only;
+# no job runs on the Windows ROCm runner.
 # scripts/ci/run_benchmarks.cmake does the work: it builds OpenCV once per runner and configuration in
 # ~/bvf-paper-bench-deps (the first run on a runner takes much longer), builds the benchmarks with one timed iteration
 # and no warm-up (the CI checks results, it does not measure), runs every mode except the Nsight Compute profiles (they
@@ -118,14 +119,14 @@ jobs:
       matrix:
         include:
           - platform: "CPU x64"
-            runner: [self-hosted, windows, x64]
+            runner: [self-hosted, windows, x64, cuda]  # the CUDA machine: no job runs on the Windows ROCm runner
             benchmarks: cpu
             compiler: "cl"
             msvc_env_version: "14.51"
             vswhere_latest: true
             artifact: windows-cpu-x64-cl
           - platform: "CPU x64"
-            runner: [self-hosted, windows, x64]
+            runner: [self-hosted, windows, x64, cuda]  # the CUDA machine: no job runs on the Windows ROCm runner
             benchmarks: cpu
             compiler: "clang-cl"
             msvc_env_version: "14.51"
@@ -139,13 +140,6 @@ jobs:
             cuda_version: "13.4"
             vswhere_latest: true
             artifact: windows-cuda-x64-cuda13.4
-          - platform: "ROCm x64, CPU benchmark only"
-            runner: [self-hosted, windows, x64, rocm]
-            benchmarks: cpu
-            compiler: "cl"
-            msvc_env_version: "14.44"  # the Visual Studio of FKL's Windows ROCm workflow
-            vswhere_latest: false
-            artifact: windows-rocm-x64-cpu
 
     steps:
       - uses: actions/checkout@v6
