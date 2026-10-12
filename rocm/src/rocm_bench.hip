@@ -2001,9 +2001,9 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << "\nWorkload: " << describe() << ". AddBorder (black), then Mul "
        << "(1/255), Sub (0.485, 0.456, 0.406), Div (0.229, 0.224, 0.225), float3 tensor of N planes " << OUT_W << "x"
        << OUT_H << "\n";
-    os << "Timing: " << WARMUP_ITERS << " warm-up then " << TIMED_ITERS << " timed iterations; iteration t (warm-up "
-       << "iterations 0 to " << WARMUP_ITERS - 1 << ", timed " << WARMUP_ITERS << " to " << WARMUP_ITERS + TIMED_ITERS - 1
-       << ") runs every implementation on the regions of iteration t (" << REGION_ITERATIONS << " iterations of "
+    os << "Timing: " << WARMUP_ITERS << " warm-up then " << TIMED_ITERS << " timed iterations; iteration t (the "
+       << "warm-up iterations are t in [0, " << WARMUP_ITERS << "), the timed ones t in [" << WARMUP_ITERS << ", "
+       << WARMUP_ITERS + TIMED_ITERS << ")) runs every implementation on the regions of iteration t (" << REGION_ITERATIONS << " iterations of "
        << "regions generated before any loop). In every iteration "
        << "the RPP pipeline (rpp), FKL VF+HF and FKL BVF run one after the other, each timed with HIP events on one "
        << "stream "
