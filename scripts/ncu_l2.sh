@@ -31,14 +31,22 @@ OUT=${OUT:-$ROOT/results/ncu_l2}
 OWNER=${SUDO_USER:-$(id -un)}
 METRICS=lts__t_sectors_srcunit_tex_op_read.sum,lts__t_sectors_srcunit_tex_op_write.sum,lts__t_bytes.sum,dram__bytes_read.sum,dram__bytes_write.sum,gpu__time_duration.sum
 
-# The batch sizes, from the benchmarks themselves (common/bench_geometry.h)
-BATCHES=$("$PAPER_BENCH" --batches) || exit 1
-if [ "$BATCHES" != "$("$NPPDX_BENCH" --batches)" ]; then
-    echo "$PAPER_BENCH and $NPPDX_BENCH have different batch sizes: build both from the same checkout" >&2
+# The workload (frame, sizes, batch sizes, crop positions of common/bench_geometry.h) must be the same in both
+# benchmarks and in the run that chose the NPPDx configurations; the batch sizes come from the benchmarks themselves
+WORKLOAD=$("$PAPER_BENCH" --workload) || exit 1
+if [ "$WORKLOAD" != "$("$NPPDX_BENCH" --workload)" ]; then
+    echo "$PAPER_BENCH and $NPPDX_BENCH were built for different workloads: configure both with the same" \
+         "BENCH_CROP_W, BENCH_CROP_H, BENCH_RESIZE_W and BENCH_RESIZE_H" >&2
     exit 1
 fi
+BATCHES=$("$PAPER_BENCH" --batches) || exit 1
 if [ ! -f "$NPPDX_CONFIG" ]; then
     echo "No NPPDx configuration file $NPPDX_CONFIG: run benchmark_figure1_bvf first, or set NPPDX_CONFIG" >&2
+    exit 1
+fi
+NPPDX_PLATFORM=$(dirname "$NPPDX_CONFIG")/benchmark_figure1_bvf_platform.txt
+if [ ! -f "$NPPDX_PLATFORM" ] || ! grep -qF "Workload: $WORKLOAD" "$NPPDX_PLATFORM"; then
+    echo "$NPPDX_CONFIG does not come from a run with this workload (no matching Workload line in $NPPDX_PLATFORM)" >&2
     exit 1
 fi
 nppdx_config() { # <N>: the tile and requested block chosen for N (columns Batch size, Tile, Requested BlockDim)

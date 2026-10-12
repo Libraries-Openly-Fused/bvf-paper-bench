@@ -1391,6 +1391,11 @@ int main(int argc, char** argv) {
             std::cout << std::endl;
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--workload") {
+            // The workload this binary was built for, so that scripts can check that binaries and results match
+            std::cout << describe() << std::endl;
+            return 0;
+        }
         std::filesystem::path outDir = argc > 1 ? argv[1] : "results";
         std::filesystem::create_directories(outDir);
 

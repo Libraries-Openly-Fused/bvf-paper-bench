@@ -63,7 +63,8 @@ Other modes, selected with a second argument:
 | `--host-overhead` | host time to enqueue the FKL pipelines |
 | `--ncu-target <impl> <N>` | runs one execution of one pipeline inside the NVTX range `measure`, for Nsight Compute |
 
-`bvf_bench --batches` (with no results directory) prints the batch sizes, for the Nsight Compute scripts.
+`bvf_bench --batches` and `bvf_bench --workload` (with no results directory) print the batch sizes and the whole
+workload the binary was built for, for the scripts; `benchmark_figure1_bvf` has the same two modes.
 
 No CUDA Graphs are used anywhere.
 
@@ -76,7 +77,9 @@ each kernel or stage of the multi-kernel pipelines), `validation.csv`, `kernels.
 
 `scripts/ncu_dram.sh` (DRAM traffic, with cold and warm caches) and `scripts/ncu_l2.sh` (traffic between the SMs and
 L2) profile every pipeline for every batch size with Nsight Compute through the `--ncu-target` mode of this benchmark
-and of the NPPDx one. They take the batch sizes from the benchmarks (`--batches`) and NPPDx's tile and block for every
+and of the NPPDx one. They stop unless both benchmarks were built for the same workload (`--workload`) and the
+NPPDx configuration file comes from a run with that workload (the `Workload` line of the platform file next to it).
+They take the batch sizes from the benchmarks (`--batches`) and NPPDx's tile and block for every
 N from the configuration file of the NPPDx benchmark's run (`../results/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv`,
 or `NPPDX_CONFIG`), so run that one first. They need root when the driver restricts the GPU performance counters to
 administrators (`RmProfilingAdminOnly=1`, the default); they change nothing on the system and give the reports back to
@@ -93,7 +96,8 @@ headers only (`HEADERS_FKL`) and every header of the other TUs (`HEADERS_ALL`). 
 `fkl-vs-nppdx/benchmarks/compile_time_pipeline.cu` does the same for the NPPDx kernel of `nppdx_figure1.h` and FKL's
 `runFKL` (`HEADERS`, `NPPDX`, `BVF`). The NPPDx kernel of every N is compiled in the tile and block size the NPPDx
 benchmark chose for that N, read from its configuration file (`NPPDX_CONFIG`, default
-`../results/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv`). The geometry only enters the other TUs as
+`../results/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv`), which must come from a run with the workload
+of the build (`run.sh` checks it as the Nsight Compute scripts do). The geometry only enters the other TUs as
 run-time values (sizes and rectangles), never as template arguments.
 
 `compile_time/run.sh` compiles every TU with the nvcc command line of the benchmark target (read from

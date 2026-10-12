@@ -43,6 +43,14 @@ case "$SET" in
       echo "No NPPDx configuration file $NPPDX_CONFIG: run benchmark_figure1_bvf first, or set NPPDX_CONFIG" >&2
       exit 1
     fi
+    # The configurations must come from a run with the workload of this build (common/bench_geometry.h)
+    WORKLOAD=$("$BUILD/benchmark_figure1_bvf" --workload)
+    NPPDX_PLATFORM=$(dirname "$NPPDX_CONFIG")/benchmark_figure1_bvf_platform.txt
+    if [ ! -f "$NPPDX_PLATFORM" ] || ! grep -qF "Workload: $WORKLOAD" "$NPPDX_PLATFORM"; then
+      echo "$NPPDX_CONFIG does not come from a run with the workload of $BUILD (no matching Workload line in" \
+           "$NPPDX_PLATFORM)" >&2
+      exit 1
+    fi
     ;;
   *) echo "SET must be paper or nppdx" >&2; exit 1 ;;
 esac
