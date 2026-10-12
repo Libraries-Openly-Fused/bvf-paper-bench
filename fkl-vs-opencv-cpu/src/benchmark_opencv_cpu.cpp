@@ -1,4 +1,4 @@
-// Exploratory CPU benchmark of the Figure 1 pipeline: OpenCV on the CPU vs FKL's CPU backend (BVF).
+// FKL vs OpenCV on the CPU, Figure 1 pipeline: OpenCV's CPU functions vs FKL's CPU backends (BVF).
 //   ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
 // One 3840x2160 NV12 frame in host memory and N crops, with the sizes and positions of common/bench_geometry.h (by
 // default 32x16 crops resized to 64x32), bilinear resize, black rows added on top and bottom up to a square, then
@@ -352,7 +352,7 @@ void runBatch(Workload& w, std::vector<Row>& singleThread, std::vector<Row>& mul
 
 int main(int argc, char** argv) {
     using namespace cpubench;
-    const std::filesystem::path outDir = argc > 1 ? argv[1] : "results/cpu";
+    const std::filesystem::path outDir = argc > 1 ? argv[1] : "results";
     std::filesystem::create_directories(outDir);
     // OpenCV runs on as many threads as FKL's thread pool has workers (std::thread::hardware_concurrency()), which can
     // differ from cv::getNumberOfCPUs() under an affinity mask or a CPU quota

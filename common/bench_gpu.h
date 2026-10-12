@@ -1,17 +1,34 @@
-// Latency and correctness benchmark for the Backwards Vertical Fusion paper, Figure 1 pipeline:
-// ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
-// with the frame, sizes, batch sizes and crop positions of common/bench_geometry.h.
-// The color conversion is NV12 -> RGB with BT.601 in limited range in every implementation (common/bench_geometry.h).
+/* Copyright 2026 Oscar Amoros Huguet
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License. */
+
+// The harness of the GPU benchmarks that compare a library's pipeline with FKL's (fkl-vs-opencv-cuda, fkl-vs-npp,
+// fkl-ablation): the workload in device memory, FKL BVF (the paper's Listing 2), the references and the validation,
+// the interleaved timing (CPU + GPU, GPU only, GPU only with the L2 flushed), the kernel counts and per-kernel times,
+// the Nsight Compute target, the CSV and platform files, and main(). Figure 1 pipeline:
+//   ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
+// with the frame, sizes, batch sizes and crop positions of common/bench_geometry.h, and NV12 -> RGB in BT.601 limited
+// range in every implementation.
 //
-// Implementations:
-//   opencv_cuda        NPP NV12->RGB (OpenCV CUDA has no NV12 conversion), then per crop cv::cuda convertTo, resize,
-//                      copyMakeBorder, then multiply, subtract, divide on the whole output tensor
-//   npp                NV12->RGB, per crop 8u->32f, one batched resize (nppiResize for N = 1, since
-//                      nppiResizeBatch rejects a batch of one), per crop CopyConstBorder,
-//                      then MulC, SubC, DivC on the whole output tensor
-//   fkl_vf_hf          four FKL kernels with the intermediates in DRAM (VF + HF, no BVF), with the same
-//                      intermediates as OpenCV and NPP: 8 bit RGB frame, then float3 crops, resized crops and output
-//   fkl_bvf            one FKL kernel for the whole chain (BVF)
+// A benchmark describes what it compares with a Program type and calls gpuBenchMain<Program>(argc, argv):
+//   title                                 what it compares, for the output and the platform file
+//   implementations<N>(ctx)               the baseline pipelines for N crops; FKL BVF is added after them
+//   describe(os, outDir)                  library versions and pipelines, for the platform file
+//   diagnostic(ctx)                       anything worth recording about the libraries (or an empty string)
+//   extraMode(ctx, mode, outDir)          handles a mode of its own (true) or not (false)
+
+#ifndef BVF_BENCH_GPU_H
+#define BVF_BENCH_GPU_H
 
 #include <fused_kernel/fused_kernel.h>
 #include <fused_kernel/algorithms/basic_ops/arithmetic.h>
@@ -23,37 +40,31 @@
 #include <fused_kernel/algorithms/image_processing/image.h>
 #include <fused_kernel/algorithms/image_processing/resize.h>
 
-#include <opencv2/core.hpp>
-#include <opencv2/core/cuda.hpp>
-#include <opencv2/core/cuda_stream_accessor.hpp>
-#include <opencv2/cudaarithm.hpp>
-#include <opencv2/cudawarping.hpp>
-
-#include <npp.h>
-
 #include <cupti.h>
 #include <nvtx3/nvToolsExt.h>
 
 #include "bench_geometry.h"
 #include "bench_npp.h"
-#include "bench_validation.h"
 #include "bench_platform.h"
+#include "bench_validation.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
-#include <cstring>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -84,15 +95,14 @@ using NV12Image = fk::Image<fk::PixelFormat::NV12>;
 // FKL's NV12 -> RGB conversion: BT.601, limited range
 using YUVToRGB = fk::ConvertYUVToRGB<fk::ColorDepth::p8bit, fk::ColorRange::Limited, fk::ColorPrimitives::bt601>;
 
-const fk::float3 mulValue{MUL[0], MUL[1], MUL[2]};
-const fk::float3 subValue{SUB[0], SUB[1], SUB[2]};
-const fk::float3 divValue{DIV[0], DIV[1], DIV[2]};
-const fk::float3 black{0.f, 0.f, 0.f};
+inline const fk::float3 mulValue{MUL[0], MUL[1], MUL[2]};
+inline const fk::float3 subValue{SUB[0], SUB[1], SUB[2]};
+inline const fk::float3 divValue{DIV[0], DIV[1], DIV[2]};
+inline const fk::float3 black{0.f, 0.f, 0.f};
 
 struct Context {
     cudaStream_t stream{};
     std::unique_ptr<fk::Stream> fkStream;
-    cv::cuda::Stream cvStream;
     NppStreamContext npp{};
     std::unique_ptr<NV12Image> frameDevice;
     std::unique_ptr<NV12Image> frameHost;
@@ -102,10 +112,9 @@ struct Context {
     std::array<fk::Rect, MAX_BATCH> crops{};
 };
 
-void initContext(Context& ctx) {
+inline void initContext(Context& ctx) {
     gpuErrchk(cudaStreamCreateWithFlags(&ctx.stream, cudaStreamNonBlocking));
     ctx.fkStream = std::make_unique<fk::Stream>(ctx.stream);
-    ctx.cvStream = cv::cuda::StreamAccessor::wrapStream(ctx.stream);
     ctx.npp = npp::streamContext(ctx.stream);
 
     // Synthetic NV12 frame (legal limited-range values), identical for every implementation
@@ -159,7 +168,7 @@ struct L2Flusher {
     cudaStream_t stream{};
     int blocks{0};
 };
-L2Flusher* activeFlusher = nullptr;
+inline L2Flusher* activeFlusher = nullptr;
 
 inline void beforeKernel() {
     if (activeFlusher) {
@@ -168,8 +177,9 @@ inline void beforeKernel() {
     }
 }
 
-// NPP's NV12 -> 8 bit RGB, BT.601 limited range (common/bench_npp.h)
-void nv12ToRgb8(const Context& ctx, Npp8u* dst, int dstStep) {
+// NPP's NV12 -> 8 bit RGB, BT.601 limited range (common/bench_npp.h): the first step of the pipelines with an 8 bit
+// RGB frame, OpenCV's (OpenCV CUDA has no NV12 conversion) and NPP's
+inline void nv12ToRgb8(const Context& ctx, Npp8u* dst, int dstStep) {
     beforeKernel();
     npp::nv12ToRgb8Bt601Limited(ctx.y, ctx.uv, ctx.pitch, dst, dstStep, NppiSize{FRAME_W, FRAME_H}, ctx.npp);
 }
@@ -202,7 +212,7 @@ struct Implementation {
     std::vector<std::pair<std::string, std::function<void()>>> stages;
 };
 
-std::vector<float> downloadDevice(const void* data, size_t floats) {
+inline std::vector<float> downloadDevice(const void* data, size_t floats) {
     std::vector<float> host(floats);
     gpuErrchk(cudaMemcpy(host.data(), data, floats * sizeof(float), cudaMemcpyDeviceToHost));
     return host;
@@ -215,6 +225,7 @@ std::array<fk::Rect, N> firstCrops(const Context& ctx) {
     return crops;
 }
 
+// FKL with Backwards Vertical Fusion: one executeOperations call, one kernel for the whole chain (the paper's Listing 2)
 template <size_t N>
 Implementation makeFklBvf(Context& ctx) {
     auto out = std::make_shared<fk::Tensor<fk::float3>>(OUT_W, OUT_H, N, 1, fk::MemType::Device);
@@ -238,240 +249,17 @@ Implementation makeFklBvf(Context& ctx) {
     return impl;
 }
 
-template <size_t N, typename T>
-std::array<fk::RawPtr<fk::ND::_2D, T>, N> planeViews(const fk::Tensor<T>& tensor, int width, int height) {
-    const auto raw = tensor.ptr();
-    if (raw.dims.pitch != width * sizeof(T)) {
-        throw std::runtime_error("Expected a contiguous Tensor");
-    }
-    std::array<fk::RawPtr<fk::ND::_2D, T>, N> views{};
-    for (size_t i = 0; i < N; ++i) {
-        views[i].data = raw.data + i * width * height;
-        views[i].dims = fk::PtrDims<fk::ND::_2D>(width, height, width * sizeof(T));
-    }
-    return views;
-}
-
-// VF + HF without BVF: four kernels with the intermediates in DRAM, the same intermediates as the OpenCV and
-// NPP pipelines: an 8 bit RGB frame (NPP's NV12 -> RGB can only write 8 or 16 bit integers, and OpenCV CUDA has no
-// NV12 conversion), quantized as in the 8 bit reference (normalize, add half a level, __saturatef, denormalize),
-// then float3 crops (like their per crop convertTo / Convert_8u32f), float3 resized crops and the float3 output.
-template <size_t N>
-Implementation makeFklVfHf(Context& ctx) {
-    auto rgb = std::make_shared<fk::Ptr2D<fk::uchar3>>(FRAME_W, FRAME_H, 0, fk::MemType::Device);
-    auto cropped = std::make_shared<fk::Tensor<fk::float3>>(CROP_W, CROP_H, N, 1, fk::MemType::Device);
-    auto resized = std::make_shared<fk::Tensor<fk::float3>>(RES_W, RES_H, N, 1, fk::MemType::Device);
-    auto out = std::make_shared<fk::Tensor<fk::float3>>(OUT_W, OUT_H, N, 1, fk::MemType::Device);
-    const auto crops = firstCrops<N>(ctx);
-    const auto croppedViews = planeViews<N>(*cropped, CROP_W, CROP_H);
-    const auto resizedViews = planeViews<N>(*resized, RES_W, RES_H);
-    Implementation impl{"fkl_vf_hf", Reference::Fkl8bit};
-    impl.stages.emplace_back("1_nv12_to_rgb8_full_frame", [&ctx, rgb]() {
-        beforeKernel();
-        fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
-            fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
-            YUVToRGB::build(),
-            fk::NormalizePixel<fk::float3, fk::ColorDepth::p8bit>::build(),
-            fk::Add<fk::float3>::build(fk::make_set<fk::float3>(QUANTIZATION_OFFSET)),
-            fk::SaturateDenormalizePixel<fk::float3, fk::uchar3, fk::ColorDepth::p8bit>::build(),
-            fk::PerThreadWrite<fk::ND::_2D, fk::uchar3>::build(rgb->ptr()));
-    });
-    impl.stages.emplace_back("2_crop_to_float3", [&ctx, rgb, cropped, crops]() {
-        beforeKernel();
-        fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
-            fk::PerThreadRead<fk::ND::_2D, fk::uchar3>::build(rgb->ptr()),
-            fk::Crop<>::build(crops),
-            fk::Cast<fk::uchar3, fk::float3>::build(),
-            fk::TensorWrite<fk::float3>::build(cropped->ptr()));
-    });
-    impl.stages.emplace_back("3_resize", [&ctx, resized, croppedViews]() {
-        beforeKernel();
-        fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
-            fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(croppedViews),
-            fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(RES_W, RES_H)),
-            fk::TensorWrite<fk::float3>::build(resized->ptr()));
-    });
-    impl.stages.emplace_back("4_addborder_mul_sub_div_write", [&ctx, out, resizedViews]() {
-        beforeKernel();
-        fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
-            fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(resizedViews),
-            fk::AddBorder<>::build(BORDER_TOP, BORDER_BOTTOM, 0, 0, black),
-            fk::Mul<fk::float3>::build(mulValue),
-            fk::Sub<fk::float3>::build(subValue),
-            fk::Div<fk::float3>::build(divValue),
-            fk::TensorWrite<fk::float3>::build(out->ptr()));
-    });
-    impl.run = [stages = impl.stages]() {
+// The stages of a multi-kernel pipeline, run one after the other
+inline std::function<void()> runStages(const std::vector<std::pair<std::string, std::function<void()>>>& stages) {
+    return [stages]() {
         for (const auto& stage : stages) {
             stage.second();
         }
     };
-    impl.download = [out]() { return downloadDevice(out->ptr().data, N * OUT_FLOATS); };
-    impl.fillNaN = [out]() { gpuErrchk(cudaMemset(out->ptr().data, 0xFF, N * OUT_FLOATS * sizeof(float))); };
-    return impl;
-}
-
-struct OpenCVState {
-    cv::cuda::GpuMat rgb8;
-    std::vector<cv::Rect> rects;
-    std::vector<cv::cuda::GpuMat> cropped;
-    std::vector<cv::cuda::GpuMat> resized;
-    cv::cuda::GpuMat tensor;
-};
-
-template <size_t N>
-Implementation makeOpenCV(Context& ctx, std::shared_ptr<OpenCVState>& stateOut) {
-    auto st = std::make_shared<OpenCVState>();
-    st->rgb8.create(FRAME_H, FRAME_W, CV_8UC3);
-    for (size_t i = 0; i < N; ++i) {
-        const fk::Rect& r = ctx.crops[i];
-        st->rects.emplace_back(r.x, r.y, r.width, r.height);
-        st->cropped.emplace_back(CROP_H, CROP_W, CV_32FC3);
-        st->resized.emplace_back(RES_H, RES_W, CV_32FC3);
-    }
-    cv::cuda::createContinuous(static_cast<int>(N) * OUT_H, OUT_W, CV_32FC3, st->tensor);
-    stateOut = st;
-    Implementation impl{"opencv_cuda", Reference::Fkl8bit};
-    impl.stages.emplace_back("1_nv12_to_rgb8_full_frame_npp", [&ctx, st]() {
-        nv12ToRgb8(ctx, st->rgb8.data, static_cast<int>(st->rgb8.step));
-    });
-    impl.stages.emplace_back("2_per_crop_convertTo_resize_copyMakeBorder", [&ctx, st]() {
-        for (size_t i = 0; i < N; ++i) {
-            beforeKernel();
-            st->rgb8(st->rects[i]).convertTo(st->cropped[i], CV_32F, ctx.cvStream);
-            beforeKernel();
-            cv::cuda::resize(st->cropped[i], st->resized[i], cv::Size(RES_W, RES_H), 0., 0., cv::INTER_LINEAR,
-                             ctx.cvStream);
-            cv::cuda::GpuMat plane = st->tensor.rowRange(static_cast<int>(i) * OUT_H, static_cast<int>(i + 1) * OUT_H);
-            beforeKernel();
-            cv::cuda::copyMakeBorder(st->resized[i], plane, BORDER_TOP, BORDER_BOTTOM, 0, 0, cv::BORDER_CONSTANT,
-                                     cv::Scalar(0., 0., 0.), ctx.cvStream);
-        }
-    });
-    impl.stages.emplace_back("3_multiply_subtract_divide", [&ctx, st]() {
-        beforeKernel();
-        cv::cuda::multiply(st->tensor, cv::Scalar(MUL[0], MUL[1], MUL[2]), st->tensor, 1., -1, ctx.cvStream);
-        beforeKernel();
-        cv::cuda::subtract(st->tensor, cv::Scalar(SUB[0], SUB[1], SUB[2]), st->tensor, cv::noArray(), -1, ctx.cvStream);
-        beforeKernel();
-        cv::cuda::divide(st->tensor, cv::Scalar(DIV[0], DIV[1], DIV[2]), st->tensor, 1., -1, ctx.cvStream);
-    });
-    impl.run = [stages = impl.stages]() {
-        for (const auto& stage : stages) {
-            stage.second();
-        }
-    };
-    impl.download = [st]() { return downloadDevice(st->tensor.data, N * OUT_FLOATS); };
-    impl.fillNaN = [st]() { gpuErrchk(cudaMemset(st->tensor.data, 0xFF, N * OUT_FLOATS * sizeof(float))); };
-    return impl;
-}
-
-struct NPPState {
-    Npp8u* rgb8{nullptr};
-    int rgbStep{0};
-    Npp32f* cropped{nullptr};
-    Npp32f* resized{nullptr};
-    Npp32f* tensor{nullptr};
-    NppiImageDescriptor* srcDescriptors{nullptr};
-    NppiImageDescriptor* dstDescriptors{nullptr};
-    NppiResizeBatchROI_Advanced* rois{nullptr};
-    std::vector<fk::Rect> rects;
-    ~NPPState() {
-        cudaFree(rgb8);
-        cudaFree(cropped);
-        cudaFree(resized);
-        cudaFree(tensor);
-        cudaFree(srcDescriptors);
-        cudaFree(dstDescriptors);
-        cudaFree(rois);
-    }
-};
-
-template <size_t N>
-Implementation makeNPP(Context& ctx) {
-    const int cropStep = CROP_W * 3 * sizeof(Npp32f);
-    const int outStep = OUT_W * 3 * sizeof(Npp32f);
-    const size_t cropFloats = static_cast<size_t>(CROP_W) * CROP_H * 3;
-    const size_t resizedFloats = static_cast<size_t>(RES_W) * RES_H * 3;
-    const size_t outFloats = OUT_FLOATS;
-    auto st = std::make_shared<NPPState>();
-    size_t rgbPitch = 0;
-    gpuErrchk(cudaMallocPitch(reinterpret_cast<void**>(&st->rgb8), &rgbPitch, FRAME_W * 3, FRAME_H));
-    st->rgbStep = static_cast<int>(rgbPitch);
-    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->cropped), N * cropFloats * sizeof(Npp32f)));
-    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->resized), N * resizedFloats * sizeof(Npp32f)));
-    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->tensor), N * outFloats * sizeof(Npp32f)));
-    // The batched resize descriptors live in device memory and are uploaded once, outside of the timing
-    std::vector<NppiImageDescriptor> src(N), dst(N);
-    std::vector<NppiResizeBatchROI_Advanced> rois(N);
-    for (size_t i = 0; i < N; ++i) {
-        src[i] = NppiImageDescriptor{st->cropped + i * cropFloats, cropStep, NppiSize{CROP_W, CROP_H}};
-        dst[i] = NppiImageDescriptor{st->resized + i * resizedFloats, outStep, NppiSize{RES_W, RES_H}};
-        rois[i] = NppiResizeBatchROI_Advanced{NppiRect{0, 0, CROP_W, CROP_H}, NppiRect{0, 0, RES_W, RES_H}};
-        st->rects.push_back(ctx.crops[i]);
-    }
-    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->srcDescriptors), N * sizeof(NppiImageDescriptor)));
-    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->dstDescriptors), N * sizeof(NppiImageDescriptor)));
-    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->rois), N * sizeof(NppiResizeBatchROI_Advanced)));
-    gpuErrchk(cudaMemcpy(st->srcDescriptors, src.data(), N * sizeof(NppiImageDescriptor), cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(st->dstDescriptors, dst.data(), N * sizeof(NppiImageDescriptor), cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(st->rois, rois.data(), N * sizeof(NppiResizeBatchROI_Advanced), cudaMemcpyHostToDevice));
-
-    Implementation impl{"npp", Reference::NppSampling8bit};
-    impl.stages.emplace_back("1_nv12_to_rgb8_full_frame", [&ctx, st]() { nv12ToRgb8(ctx, st->rgb8, st->rgbStep); });
-    impl.stages.emplace_back("2_per_crop_convert_8u32f", [&ctx, st, cropFloats, cropStep]() {
-        for (size_t i = 0; i < N; ++i) {
-            const fk::Rect& r = st->rects[i];
-            const Npp8u* cropSrc = st->rgb8 + static_cast<size_t>(r.y) * st->rgbStep + r.x * 3;
-            beforeKernel();
-            NPP_CHECK(nppiConvert_8u32f_C3R_Ctx(cropSrc, st->rgbStep, st->cropped + i * cropFloats, cropStep,
-                                                NppiSize{CROP_W, CROP_H}, ctx.npp));
-        }
-    });
-    impl.stages.emplace_back("3_resize_batch", [&ctx, st, cropStep, outStep]() {
-        if constexpr (N == 1) {
-            // nppiResizeBatch rejects a batch of one image with NPP_BAD_ARGUMENT_ERROR
-            beforeKernel();
-            NPP_CHECK(nppiResize_32f_C3R_Ctx(st->cropped, cropStep, NppiSize{CROP_W, CROP_H},
-                                             NppiRect{0, 0, CROP_W, CROP_H}, st->resized, outStep,
-                                             NppiSize{RES_W, RES_H}, NppiRect{0, 0, RES_W, RES_H},
-                                             NPPI_INTER_LINEAR, ctx.npp));
-        } else {
-            beforeKernel();
-            NPP_CHECK(nppiResizeBatch_32f_C3R_Advanced_Ctx(RES_W, RES_H, st->srcDescriptors, st->dstDescriptors, st->rois,
-                                                           static_cast<unsigned int>(N), NPPI_INTER_LINEAR, ctx.npp));
-        }
-    });
-    impl.stages.emplace_back("4_per_crop_copy_const_border", [&ctx, st, resizedFloats, outFloats, outStep]() {
-        static const Npp32f zero[3] = {0.f, 0.f, 0.f};
-        for (size_t i = 0; i < N; ++i) {
-            beforeKernel();
-            NPP_CHECK(nppiCopyConstBorder_32f_C3R_Ctx(st->resized + i * resizedFloats, outStep, NppiSize{RES_W, RES_H},
-                                                      st->tensor + i * outFloats, outStep, NppiSize{OUT_W, OUT_H},
-                                                      BORDER_TOP, 0, zero, ctx.npp));
-        }
-    });
-    impl.stages.emplace_back("5_mulc_subc_divc", [&ctx, st, outStep]() {
-        const NppiSize tensorSize{OUT_W, static_cast<int>(N) * OUT_H};
-        beforeKernel();
-        NPP_CHECK(nppiMulC_32f_C3IR_Ctx(MUL, st->tensor, outStep, tensorSize, ctx.npp));
-        beforeKernel();
-        NPP_CHECK(nppiSubC_32f_C3IR_Ctx(SUB, st->tensor, outStep, tensorSize, ctx.npp));
-        beforeKernel();
-        NPP_CHECK(nppiDivC_32f_C3IR_Ctx(DIV, st->tensor, outStep, tensorSize, ctx.npp));
-    });
-    impl.run = [stages = impl.stages]() {
-        for (const auto& stage : stages) {
-            stage.second();
-        }
-    };
-    impl.download = [st, outFloats]() { return downloadDevice(st->tensor, N * outFloats); };
-    impl.fillNaN = [st, outFloats]() { gpuErrchk(cudaMemset(st->tensor, 0xFF, N * outFloats * sizeof(Npp32f))); };
-    return impl;
 }
 
 // References on FKL's CPU backend. The float reference is the Figure 1 chain itself. The 8 bit reference
-// quantizes the RGB values to 8 bit right after the color conversion, like the OpenCV and NPP pipelines do.
+// quantizes the RGB values to 8 bit right after the color conversion, like the 8 bit RGB frame pipelines do.
 template <size_t N, bool EIGHT_BIT>
 std::vector<float> cpuReference(const Context& ctx) {
     const auto crops = firstCrops<N>(ctx);
@@ -556,19 +344,71 @@ std::vector<float> nppConventionReference8bit(const Context& ctx) {
     return out;
 }
 
+// The reference of batch N with the given conventions
+template <size_t N>
+std::vector<float> referenceOutput(const Context& ctx, Reference r) {
+    switch (r) {
+        case Reference::FklFloat: return cpuReference<N, false>(ctx);
+        case Reference::Fkl8bit: return cpuReference<N, true>(ctx);
+        default: return nppConventionReference8bit<N>(ctx);
+    }
+}
+
+// Compares NPP's 8 bit NV12->RGB with FKL's float conversion, to show how NPP rounds (for the pipelines that use it)
+inline std::string nppConversionDiagnostic(const Context& ctx) {
+    Npp8u* rgb8 = nullptr;
+    size_t pitch = 0;
+    gpuErrchk(cudaMallocPitch(reinterpret_cast<void**>(&rgb8), &pitch, FRAME_W * 3, FRAME_H));
+    nv12ToRgb8(ctx, rgb8, static_cast<int>(pitch));
+    std::vector<Npp8u> host(static_cast<size_t>(FRAME_W) * 3 * FRAME_H);
+    gpuErrchk(cudaMemcpy2DAsync(host.data(), FRAME_W * 3, rgb8, pitch, FRAME_W * 3, FRAME_H, cudaMemcpyDeviceToHost,
+                                ctx.stream));
+    gpuErrchk(cudaStreamSynchronize(ctx.stream));
+    gpuErrchk(cudaFree(rgb8));
+    size_t diffRound = 0, diffTrunc = 0, total = 0;
+    int maxRound = 0, maxTrunc = 0;
+    for (int y = 0; y < FRAME_H; ++y) {
+        const Npp8u* row = host.data() + static_cast<size_t>(y) * FRAME_W * 3;
+        for (int x = 0; x < FRAME_W; ++x) {
+            const fk::uchar3 yuv = ctx.frameHost->readAt(fk::Point{x, y, 0});
+            const fk::float3 rgb = YUVToRGB::exec(yuv);
+            const float channels[3] = {rgb.x, rgb.y, rgb.z};
+            for (int c = 0; c < 3; ++c) {
+                const float clamped = std::min(255.f, std::max(0.f, channels[c]));
+                const int rounded = static_cast<int>(std::floor(clamped + 0.5f));
+                const int truncated = static_cast<int>(clamped);
+                const int npp = row[3 * x + c];
+                diffRound += npp != rounded;
+                diffTrunc += npp != truncated;
+                maxRound = std::max(maxRound, std::abs(npp - rounded));
+                maxTrunc = std::max(maxTrunc, std::abs(npp - truncated));
+                total++;
+            }
+        }
+    }
+    std::ostringstream os;
+    os << "NPP NV12->RGB (ColorTwist32f with the BT.601 limited range matrix of the standard, bench_npp.h) vs FKL's "
+          "float BT.601 limited range conversion:\n"
+       << "  vs round-to-nearest of FKL: " << diffRound << " of " << total << " channel values differ, max "
+       << maxRound << " levels\n"
+       << "  vs truncation of FKL:       " << diffTrunc << " of " << total << " channel values differ, max "
+       << maxTrunc << " levels\n";
+    return os.str();
+}
+
 // Statistics of a set of timed executions, in microseconds
 struct TimingStats {
     double mean{0.}, variance{0.}, max{0.}, min{0.}, median{0.}, p10{0.}, p90{0.};
 };
 
-double percentile(const std::vector<float>& sorted, double p) {
+inline double percentile(const std::vector<float>& sorted, double p) {
     const double pos = p * static_cast<double>(sorted.size() - 1);
     const size_t lo = static_cast<size_t>(std::floor(pos));
     const size_t hi = std::min(lo + 1, sorted.size() - 1);
     return sorted[lo] + (pos - static_cast<double>(lo)) * (sorted[hi] - sorted[lo]);
 }
 
-TimingStats computeStats(std::vector<float> ms) {
+inline TimingStats computeStats(std::vector<float> ms) {
     TimingStats t;
     double sum = 0.;
     for (const float v : ms) {
@@ -593,7 +433,7 @@ TimingStats computeStats(std::vector<float> ms) {
 // implementations run one after the other, each one between two CUDA events on the same stream (everything the
 // host does to enqueue it is included) and followed by a synchronization. Inputs are already in device memory.
 // Returns the TIMED_ITERS execution times of each implementation, in ms, in iteration order.
-std::vector<std::vector<float>> measureInterleaved(const Context& ctx, const std::vector<Implementation>& impls) {
+inline std::vector<std::vector<float>> measureInterleaved(const Context& ctx, const std::vector<Implementation>& impls) {
     cudaEvent_t start, stop;
     gpuErrchk(cudaEventCreate(&start));
     gpuErrchk(cudaEventCreate(&stop));
@@ -614,8 +454,6 @@ std::vector<std::vector<float>> measureInterleaved(const Context& ctx, const std
     return ms;
 }
 
-// Kernel, memset and memcpy counts of one pipeline, from CUPTI activity tracing (no hardware counters,
-// so it works without admin rights). It runs in a separate pass after all the timings.
 // Time of each kernel of a multi-kernel pipeline: CUDA events between its kernels on the same stream
 struct StageTiming {
     std::string name;
@@ -623,9 +461,9 @@ struct StageTiming {
     std::string stage;
     TimingStats timing;
 };
-std::vector<StageTiming> breakdown;
+inline std::vector<StageTiming> breakdown;
 
-void measureStages(const Context& ctx, const Implementation& impl, int batch) {
+inline void measureStages(const Context& ctx, const Implementation& impl, int batch) {
     const size_t numStages = impl.stages.size();
     std::vector<cudaEvent_t> events(numStages + 1);
     for (auto& e : events) {
@@ -660,6 +498,8 @@ void measureStages(const Context& ctx, const Implementation& impl, int batch) {
     breakdown.push_back({impl.name, batch, "total", computeStats(total)});
 }
 
+// Kernel, memset and memcpy counts of one pipeline, from CUPTI activity tracing (no hardware counters, so it works
+// without admin rights). It runs in a separate pass after all the timings.
 struct LaunchCounts {
     size_t kernels{0}, memsets{0}, memcpys{0};
 };
@@ -671,9 +511,9 @@ struct KernelRecord {
 };
 
 namespace cupti {
-LaunchCounts counts;
-bool keepKernels = false;
-std::vector<KernelRecord> kernels;
+inline LaunchCounts counts;
+inline bool keepKernels = false;
+inline std::vector<KernelRecord> kernels;
 
 #define CUPTI_CHECK(expr)                                                                                    \
     do {                                                                                                     \
@@ -685,14 +525,14 @@ std::vector<KernelRecord> kernels;
         }                                                                                                    \
     } while (0)
 
-void CUPTIAPI bufferRequested(uint8_t** buffer, size_t* size, size_t* maxNumRecords) {
+inline void CUPTIAPI bufferRequested(uint8_t** buffer, size_t* size, size_t* maxNumRecords) {
     *size = 8 << 20;
     // CUPTI needs 8 byte alignment, which malloc guarantees (std::aligned_alloc does not exist on Windows)
     *buffer = static_cast<uint8_t*>(std::malloc(*size));
     *maxNumRecords = 0;
 }
 
-void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer, size_t, size_t validSize) {
+inline void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer, size_t, size_t validSize) {
     CUpti_Activity* record = nullptr;
     while (cuptiActivityGetNextRecord(buffer, validSize, &record) == CUPTI_SUCCESS) {
         if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL || record->kind == CUPTI_ACTIVITY_KIND_KERNEL) {
@@ -715,12 +555,12 @@ void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer, size_t, size
     std::free(buffer);
 }
 
-void init() {
+inline void init() {
     CUPTI_CHECK(cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted));
 }
 } // namespace cupti
 
-LaunchCounts countLaunches(const Context& ctx, const Implementation& impl) {
+inline LaunchCounts countLaunches(const Context& ctx, const Implementation& impl) {
     gpuErrchk(cudaDeviceSynchronize());
     CUPTI_CHECK(cuptiActivityFlushAll(0));
     cupti::counts = LaunchCounts{};
@@ -754,13 +594,13 @@ struct PipelineProfile {
     std::vector<KernelProfile> kernels;
 };
 
-double medianOf(std::vector<double> v) {
+inline double medianOf(std::vector<double> v) {
     std::sort(v.begin(), v.end());
     const size_t n = v.size();
     return n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
 }
 
-PipelineProfile profilePipeline(const Context& ctx, const Implementation& impl, int batch) {
+inline PipelineProfile profilePipeline(const Context& ctx, const Implementation& impl, int batch) {
     for (int i = 0; i < 10; ++i) {
         impl.run();
     }
@@ -805,7 +645,7 @@ PipelineProfile profilePipeline(const Context& ctx, const Implementation& impl, 
     return profile;
 }
 
-std::vector<PipelineProfile> profiles;
+inline std::vector<PipelineProfile> profiles;
 
 struct Result {
     std::string name;
@@ -821,36 +661,44 @@ struct Result {
     double meanGpuFlushedSpeedupOfBvf{NAN};
     ErrorStats errorVsOwnReference;
     ErrorStats errorVsFloatReference;
-    ErrorStats errorVsNppConventionReference;
     Reference reference{Reference::FklFloat};
     LaunchCounts launches;
     float tolerance() const { return toleranceOf(reference); }
     bool withinTolerance() const { return validation::withinTolerance(errorVsOwnReference, tolerance()); }
 };
 
-// The implementations in the comparison, all with the same intermediates (8 bit RGB frame, then float3), and FKL BVF
-// last, which has no intermediates in memory and keeps float3 from the color conversion to the write
-template <size_t N>
-std::vector<Implementation> makeImplementations(Context& ctx, std::shared_ptr<OpenCVState>& ocvState) {
-    std::vector<Implementation> impls;
-    impls.push_back(makeOpenCV<N>(ctx, ocvState));
-    impls.push_back(makeNPP<N>(ctx));
-    impls.push_back(makeFklVfHf<N>(ctx));
+// The implementations of a program for batch N: its baselines, then FKL BVF, which has no intermediates in memory and
+// keeps float3 from the color conversion to the write
+template <typename P, size_t N>
+std::vector<Implementation> implementationsOf(Context& ctx) {
+    auto impls = P::template implementations<N>(ctx);
     impls.push_back(makeFklBvf<N>(ctx));
     return impls;
 }
 
-// Validation, interleaved timing with per-execution speedups, and per kernel breakdown, for batch N. With timing false,
-// validation only.
-template <size_t N>
-void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
+// The names of a program's baselines (every implementation but FKL BVF)
+template <typename P>
+std::vector<std::string> baselineNames(Context& ctx) {
+    std::vector<std::string> names;
+    for (const auto& impl : P::template implementations<BATCHES[0]>(ctx)) {
+        names.push_back(impl.name);
+    }
+    return names;
+}
+
+// Validation, interleaved timing with per-execution speedups, and per kernel breakdown, for batch N
+template <typename P, size_t N>
+void runBatch(Context& ctx, std::vector<Result>& results) {
     std::cout << "=== N = " << N << std::endl;
-    const auto refFloat = cpuReference<N, false>(ctx);
-    const auto ref8bit = cpuReference<N, true>(ctx);
-    const auto refNppConvention = nppConventionReference8bit<N>(ctx);
-    std::shared_ptr<OpenCVState> ocvState;
-    const auto impls = makeImplementations<N>(ctx, ocvState);
+    const auto impls = implementationsOf<P, N>(ctx);
     const size_t bvf = impls.size() - 1;
+    std::map<Reference, std::vector<float>> references;
+    const auto referenceFor = [&](Reference r) -> const std::vector<float>& {
+        if (!references.count(r)) {
+            references[r] = referenceOutput<N>(ctx, r);
+        }
+        return references.at(r);
+    };
     std::vector<Result> batchResults;
     for (const auto& impl : impls) {
         Result r;
@@ -860,24 +708,11 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
         impl.run();
         gpuErrchk(cudaStreamSynchronize(ctx.stream));
         const auto output = impl.download();
-        // Every pipeline against the reference of its own conventions
+        // Every pipeline against the reference of its own conventions, and against the float one
         r.reference = impl.reference;
-        r.errorVsOwnReference = compare(output, impl.reference == Reference::FklFloat ? refFloat
-                                                : impl.reference == Reference::Fkl8bit ? ref8bit
-                                                                                       : refNppConvention);
-        r.errorVsFloatReference = compare(output, refFloat);
-        r.errorVsNppConventionReference = compare(output, refNppConvention);
+        r.errorVsOwnReference = compare(output, referenceFor(impl.reference));
+        r.errorVsFloatReference = compare(output, referenceFor(Reference::FklFloat));
         batchResults.push_back(r);
-    }
-    if (!timing) {
-        for (const Result& r : batchResults) {
-            std::cout << std::left << std::setw(12) << r.name << std::right << "  max err " << std::scientific
-                      << std::setprecision(2) << r.errorVsOwnReference.max() << " (" << referenceName(r.reference) << "), vs float "
-                      << r.errorVsFloatReference.max() << ", vs NPP sampling " << r.errorVsNppConventionReference.max()
-                      << std::defaultfloat << std::endl;
-            results.push_back(r);
-        }
-        return;
     }
     const auto ms = measureInterleaved(ctx, impls);
     for (size_t k = 0; k < impls.size(); ++k) {
@@ -909,10 +744,9 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
 }
 
 // Kernel counts of every implementation for batch N, after all the timings
-template <size_t N>
+template <typename P, size_t N>
 void countBatch(Context& ctx, std::vector<Result>& results) {
-    std::shared_ptr<OpenCVState> ocvState;
-    for (const auto& impl : makeImplementations<N>(ctx, ocvState)) {
+    for (const auto& impl : implementationsOf<P, N>(ctx)) {
         const LaunchCounts launches = countLaunches(ctx, impl);
         for (auto& r : results) {
             if (r.name == impl.name && r.batch == static_cast<int>(N)) {
@@ -925,101 +759,9 @@ void countBatch(Context& ctx, std::vector<Result>& results) {
     }
 }
 
-// Compares NPP's 8 bit NV12->RGB with FKL's float conversion, to show how NPP rounds and samples chroma
-void conversionDiagnostic(const Context& ctx, std::ostream& os) {
-    cv::cuda::GpuMat rgb8(FRAME_H, FRAME_W, CV_8UC3);
-    nv12ToRgb8(ctx, rgb8.data, static_cast<int>(rgb8.step));
-    gpuErrchk(cudaStreamSynchronize(ctx.stream));
-    cv::Mat host;
-    rgb8.download(host);
-    size_t diffRound = 0, diffTrunc = 0, total = 0;
-    int maxRound = 0, maxTrunc = 0;
-    for (int y = 0; y < FRAME_H; ++y) {
-        const uchar* row = host.ptr<uchar>(y);
-        for (int x = 0; x < FRAME_W; ++x) {
-            const fk::uchar3 yuv = ctx.frameHost->readAt(fk::Point{x, y, 0});
-            const fk::float3 rgb = YUVToRGB::exec(yuv);
-            const float channels[3] = {rgb.x, rgb.y, rgb.z};
-            for (int c = 0; c < 3; ++c) {
-                const float clamped = std::min(255.f, std::max(0.f, channels[c]));
-                const int rounded = static_cast<int>(std::floor(clamped + 0.5f));
-                const int truncated = static_cast<int>(clamped);
-                const int npp = row[3 * x + c];
-                diffRound += npp != rounded;
-                diffTrunc += npp != truncated;
-                maxRound = std::max(maxRound, std::abs(npp - rounded));
-                maxTrunc = std::max(maxTrunc, std::abs(npp - truncated));
-                total++;
-            }
-        }
-    }
-    os << "NPP NV12->RGB (ColorTwist32f with the BT.601 limited range matrix of the standard, bench_npp.h) vs FKL's "
-          "float BT.601 limited range conversion:\n"
-       << "  vs round-to-nearest of FKL: " << diffRound << " of " << total << " channel values differ, max "
-       << maxRound << " levels\n"
-       << "  vs truncation of FKL:       " << diffTrunc << " of " << total << " channel values differ, max "
-       << maxTrunc << " levels\n";
-}
-
-// System, versions, workload and protocol of a run
-void writePlatform(const std::filesystem::path& path, const Context& ctx, const std::string& diagnostic) {
-    int device = 0, runtime = 0, driver = 0;
-    gpuErrchk(cudaGetDevice(&device));
-    cudaDeviceProp prop{};
-    gpuErrchk(cudaGetDeviceProperties(&prop, device));
-    gpuErrchk(cudaRuntimeGetVersion(&runtime));
-    gpuErrchk(cudaDriverGetVersion(&driver));
-    const NppLibraryVersion* npp = nppGetLibVersion();
-    const std::string opencvBuild = cv::getBuildInformation();
-    std::ofstream(path.parent_path() / "opencv_build_information.txt") << opencvBuild;
-    std::ofstream os(path);
-    os << "GPU: " << prop.name << " (sm_" << prop.major << prop.minor << ", " << prop.multiProcessorCount << " SMs, "
-       << (prop.totalGlobalMem >> 20) << " MiB)\n"
-       << "NVIDIA driver: " << bench::shell("nvidia-smi --query-gpu=driver_version --format=csv,noheader") << "\n"
-       << "CUDA runtime: " << runtime / 1000 << "." << (runtime % 1000) / 10 << ", CUDA driver API: " << driver / 1000
-       << "." << (driver % 1000) / 10 << "\n"
-       << "nvcc: " << BENCH_NVCC_VERSION << "\n"
-       << "nvcc flags: " << BENCH_NVCC_FLAGS << "\n"
-       << "Host compiler: " << bench::hostCompiler() << "\n"
-       << "OpenCV: " << cv::getVersionString() << " (opencv_contrib "
-       << bench::buildInfoValue(opencvBuild, "Version control (extra):") << ", CUDA_ARCH_BIN "
-       << bench::buildInfoValue(opencvBuild, "NVIDIA GPU arch:") << ", C++ compiler "
-       << bench::buildInfoValue(opencvBuild, "C++ Compiler:") << "; full configuration in opencv_build_information.txt)\n"
-       << "NPP: " << npp->major << "." << npp->minor << "." << npp->build << "\n"
-       << "FKL: branch " << BENCH_FKL_BRANCH << ", commit " << BENCH_FKL_COMMIT << "\n"
-       << "NPPDx: compared in fkl-vs-nppdx/ of this repository\n"
-       << "CPU: " << bench::cpuName() << "\n"
-       << "OS: " << bench::osName() << ", kernel " << bench::kernelVersion() << "\n"
-       << "GPU clocks: not locked (locking needs root); application clocks as reported by nvidia-smi: "
-       << bench::shell("nvidia-smi --query-gpu=clocks.max.sm,clocks.max.mem --format=csv,noheader") << "\n"
-       << "\nWorkload: " << geometry::describe() << ". AddBorder (black), then Mul "
-       << "(1/255), Sub (0.485, 0.456, 0.406), Div (0.229, 0.224, 0.225), float3 tensor of N planes " << OUT_W << "x"
-       << OUT_H << "\n";
-    os << "Timing: " << WARMUP_ITERS << " warm-up then " << TIMED_ITERS << " timed iterations. In every iteration "
-       << "OpenCV, NPP, FKL VF+HF and FKL BVF run one after the other, each timed with CUDA events on one stream "
-       << "around the complete pipeline (all host enqueue work included) and followed by a synchronization. "
-       << "FKL BVF's speedup over each baseline is computed per iteration (baseline time / BVF time) and averaged "
-       << "(mean speedup, FKL's two-execution convention). Median, p10, p90 with linear interpolation.\n"
-       << "Intermediates: OpenCV, NPP and FKL VF+HF all write an 8 bit RGB frame (NPP's NV12->RGB only outputs 8 or "
-       << "16 bit integers and OpenCV CUDA has no NV12 conversion), then float3 crops, float3 resized crops and the "
-       << "float3 output. FKL BVF has no intermediates in memory: float3 from the color conversion to the write.\n"
-       << "GPU time only: a second pass with the same interleaved iterations and CUPTI kernel tracing on; the GPU "
-       << "time of one execution is the sum of the execution times of its kernels (no host work, no launch gaps), "
-       << "and FKL BVF's speedups are again computed per execution and averaged.\n"
-       << "Kernel counts: CUPTI activity tracing of one pipeline, in a separate pass after all timings\n"
-       << "\n" << diagnostic;
-}
-
-template <size_t... Is>
-void runAllBatches(Context& ctx, std::vector<Result>& results, std::index_sequence<Is...>) {
-    (runBatch<BATCHES[Is]>(ctx, results), ...);
-}
-
-template <size_t N>
+template <typename P, size_t N>
 void profileBatch(Context& ctx) {
-    std::shared_ptr<OpenCVState> ocvState;
-    const auto impls = makeImplementations<N>(ctx, ocvState);
-    for (const auto& impl : impls) {
+    for (const auto& impl : implementationsOf<P, N>(ctx)) {
         profiles.push_back(profilePipeline(ctx, impl, static_cast<int>(N)));
         const auto& p = profiles.back();
         std::cout << std::left << std::setw(24) << p.name << " N " << std::right << std::setw(3) << N << "  kernels "
@@ -1029,97 +771,18 @@ void profileBatch(Context& ctx) {
     }
 }
 
-// Host time of enqueuing the FKL pipelines (std::chrono, median over TIMED_ITERS iterations, synchronizing after
-// each one). FKL BVF is split into building the nine IOps, BackFuser::fuse_back and executeOperations, which then
-// only launches; FKL VF+HF is split per kernel, enqueued back to back as in its run().
-struct HostTiming {
-    std::string name;
-    int batch{0};
-    std::string step;
-    TimingStats timing;
-};
-std::vector<HostTiming> hostTimings;
-
-template <size_t N>
-void hostOverheadBatch(Context& ctx) {
-    using Clock = std::chrono::steady_clock;
-    const auto us = [](Clock::time_point a, Clock::time_point b) {
-        return std::chrono::duration<float, std::milli>(b - a).count();
-    };
-    const auto crops = firstCrops<N>(ctx);
-    fk::Tensor<fk::float3> out(OUT_W, OUT_H, N, 1, fk::MemType::Device);
-    std::vector<float> build, fuse, launch, total;
-    for (int i = 0; i < WARMUP_ITERS + TIMED_ITERS; ++i) {
-        const auto t0 = Clock::now();
-        const auto read = fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice);
-        const auto convert = YUVToRGB::build();
-        const auto crop = fk::Crop<>::build(crops);
-        const auto resize =
-            fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(RES_W, RES_H));
-        const auto border = fk::AddBorder<>::build(BORDER_TOP, BORDER_BOTTOM, 0, 0, black);
-        const auto mul = fk::Mul<fk::float3>::build(mulValue);
-        const auto sub = fk::Sub<fk::float3>::build(subValue);
-        const auto div = fk::Div<fk::float3>::build(divValue);
-        const auto write = fk::TensorWrite<fk::float3>::build(out.ptr());
-        const auto t1 = Clock::now();
-        const auto fused = fk::BackFuser::fuse_back(read, convert, crop, resize, border, mul, sub, div, write);
-        const auto t2 = Clock::now();
-        fk::apply([&](const auto&... iOps) { fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream, iOps...); }, fused);
-        const auto t3 = Clock::now();
-        gpuErrchk(cudaStreamSynchronize(ctx.stream));
-        if (i >= WARMUP_ITERS) {
-            build.push_back(us(t0, t1));
-            fuse.push_back(us(t1, t2));
-            launch.push_back(us(t2, t3));
-            total.push_back(us(t0, t3));
-        }
-    }
-    hostTimings.push_back({"fkl_bvf", static_cast<int>(N), "1_build_iops", computeStats(build)});
-    hostTimings.push_back({"fkl_bvf", static_cast<int>(N), "2_fuse_back", computeStats(fuse)});
-    hostTimings.push_back({"fkl_bvf", static_cast<int>(N), "3_launch", computeStats(launch)});
-    hostTimings.push_back({"fkl_bvf", static_cast<int>(N), "total_host_enqueue", computeStats(total)});
-
-    const auto vfhf = makeFklVfHf<N>(ctx);
-    std::vector<std::vector<float>> stageTimes(vfhf.stages.size());
-    std::vector<float> vfhfTotal;
-    for (int i = 0; i < WARMUP_ITERS + TIMED_ITERS; ++i) {
-        Clock::time_point t = Clock::now();
-        const Clock::time_point first = t;
-        for (size_t k = 0; k < vfhf.stages.size(); ++k) {
-            vfhf.stages[k].second();
-            const Clock::time_point next = Clock::now();
-            if (i >= WARMUP_ITERS) {
-                stageTimes[k].push_back(us(t, next));
-            }
-            t = next;
-        }
-        if (i >= WARMUP_ITERS) {
-            vfhfTotal.push_back(us(first, t));
-        }
-        gpuErrchk(cudaStreamSynchronize(ctx.stream));
-    }
-    for (size_t k = 0; k < vfhf.stages.size(); ++k) {
-        hostTimings.push_back({vfhf.name, static_cast<int>(N), "enqueue_" + vfhf.stages[k].first, computeStats(stageTimes[k])});
-    }
-    hostTimings.push_back({vfhf.name, static_cast<int>(N), "total_host_enqueue", computeStats(vfhfTotal)});
-    for (const auto& h : hostTimings) {
-        if (h.batch == static_cast<int>(N)) {
-            std::cout << std::left << std::setw(10) << h.name << " N " << std::right << std::setw(3) << N << "  "
-                      << std::left << std::setw(48) << h.step << std::right << std::fixed << std::setprecision(2)
-                      << std::setw(7) << h.timing.median << " us" << std::defaultfloat << std::endl;
-        }
-    }
-}
-
 // Target for Nsight Compute: warms up one pipeline, then runs it once more inside the NVTX range "measure", so that
 // ncu --nvtx --nvtx-include "measure/" profiles exactly one execution of it
-template <size_t N>
+template <typename P, size_t N>
 void ncuTarget(Context& ctx, const std::string& name) {
-    std::shared_ptr<OpenCVState> ocvState;
-    const auto impls = makeImplementations<N>(ctx, ocvState);
+    const auto impls = implementationsOf<P, N>(ctx);
     const auto impl = std::find_if(impls.begin(), impls.end(), [&](const Implementation& i) { return i.name == name; });
     if (impl == impls.end()) {
-        throw std::runtime_error("Unknown implementation " + name);
+        std::string valid;
+        for (const auto& i : impls) {
+            valid += " " + i.name;
+        }
+        throw std::runtime_error("Unknown implementation " + name + ", this benchmark has:" + valid);
     }
     for (int i = 0; i < 3; ++i) {
         impl->run();
@@ -1131,31 +794,11 @@ void ncuTarget(Context& ctx, const std::string& name) {
     nvtxRangePop();
 }
 
-template <size_t... Is>
-void ncuTargetDispatch(Context& ctx, const std::string& name, size_t batch, std::index_sequence<Is...>) {
-    bool found = false;
-    ((BATCHES[Is] == batch ? (ncuTarget<BATCHES[Is]>(ctx, name), found = true) : false), ...);
-    if (!found) {
-        throw std::runtime_error("Batch size " + std::to_string(batch) + " is not one of the benchmarked ones");
-    }
-}
-
-template <size_t... Is>
-void hostOverheadAllBatches(Context& ctx, std::index_sequence<Is...>) {
-    (hostOverheadBatch<BATCHES[Is]>(ctx), ...);
-}
-
-template <size_t... Is>
-void profileAllBatches(Context& ctx, std::index_sequence<Is...>) {
-    (profileBatch<BATCHES[Is]>(ctx), ...);
-}
-
 // GPU time only benchmark: the same interleaved iterations as the CPU + GPU one, with CUPTI kernel tracing on. The
 // GPU time of one execution is the sum of the execution times of its kernels: no host work and no launch gaps.
-template <size_t N>
+template <typename P, size_t N>
 void gpuOnlyBatch(Context& ctx, std::vector<Result>& results, L2Flusher* flusher = nullptr) {
-    std::shared_ptr<OpenCVState> ocvState;
-    const auto impls = makeImplementations<N>(ctx, ocvState);
+    const auto impls = implementationsOf<P, N>(ctx);
     const size_t bvf = impls.size() - 1;
     std::vector<size_t> kernelsPerRun(impls.size());
     for (size_t k = 0; k < impls.size(); ++k) {
@@ -1241,18 +884,30 @@ void gpuOnlyBatch(Context& ctx, std::vector<Result>& results, L2Flusher* flusher
     }
 }
 
-template <size_t... Is>
-void gpuOnlyAllBatches(Context& ctx, std::vector<Result>& results, std::index_sequence<Is...>,
-                       L2Flusher* flusher = nullptr) {
-    (gpuOnlyBatch<BATCHES[Is]>(ctx, results, flusher), ...);
+// Calls f.template operator()<BATCHES[i]>() for every batch size, in order
+template <typename F>
+void forEachBatch(F&& f) {
+    [&]<size_t... Is>(std::index_sequence<Is...>) {
+        (f.template operator()<BATCHES[Is]>(), ...);
+    }(std::make_index_sequence<BATCHES.size()>{});
 }
 
-template <size_t... Is>
-void countAllBatches(Context& ctx, std::vector<Result>& results, std::index_sequence<Is...>) {
-    (countBatch<BATCHES[Is]>(ctx, results), ...);
+// Calls f.template operator()<N>() for the batch size N == batch, or throws
+template <typename F>
+void withBatch(size_t batch, F&& f) {
+    bool found = false;
+    forEachBatch([&]<size_t N>() {
+        if (N == batch) {
+            f.template operator()<N>();
+            found = true;
+        }
+    });
+    if (!found) {
+        throw std::runtime_error("Batch size " + std::to_string(batch) + " is not one of the benchmarked ones");
+    }
 }
 
-L2Flusher makeL2Flusher(const Context& ctx) {
+inline L2Flusher makeL2Flusher(const Context& ctx) {
     int device = 0;
     gpuErrchk(cudaGetDevice(&device));
     cudaDeviceProp prop{};
@@ -1269,13 +924,13 @@ L2Flusher makeL2Flusher(const Context& ctx) {
     return flusher;
 }
 
-void freeL2Flusher(L2Flusher& flusher) {
+inline void freeL2Flusher(L2Flusher& flusher) {
     gpuErrchk(cudaFree(flusher.buffer));
     gpuErrchk(cudaFree(flusher.sink));
 }
 
 // FKL's two-execution CSV format (times in ms): one row per value of the first column
-void writeTwoExecutionHeader(std::ostream& two, const std::string& firstColumn, const std::string& baseline) {
+inline void writeTwoExecutionHeader(std::ostream& two, const std::string& firstColumn, const std::string& baseline) {
     two << firstColumn;
     for (const std::string label : {baseline, std::string("fkl_bvf")}) {
         two << ", " << label << " MeanTime, " << label << " TimeVariance, " << label << " MaxTime, " << label
@@ -1288,8 +943,8 @@ void writeTwoExecutionHeader(std::ostream& two, const std::string& firstColumn, 
     two << std::endl;
 }
 
-void writeTwoExecutionRow(std::ostream& two, long long key, const TimingStats& tb, const TimingStats& tf,
-                          double speedup) {
+inline void writeTwoExecutionRow(std::ostream& two, long long key, const TimingStats& tb, const TimingStats& tf,
+                                 double speedup) {
     two << key;
     for (const TimingStats* t : std::array<const TimingStats*, 2>{&tb, &tf}) {
         two << ", " << t->mean / 1000. << ", " << t->variance / 1e6 << ", " << t->max / 1000. << ", " << t->min / 1000.;
@@ -1301,10 +956,80 @@ void writeTwoExecutionRow(std::ostream& two, long long key, const TimingStats& t
     two << std::endl;
 }
 
-} // namespace bench
+// One CSV per baseline in FKL's two-execution format: <baseline>_vs_fkl_bvf_<suffix><ParArch>.csv
+template <typename Field>
+void writeTwoExecutionFiles(const std::filesystem::path& outDir, const std::vector<std::string>& baselines,
+                            const std::vector<Result>& results, const std::string& suffix, Field&& field) {
+    const std::string parArch(fk::toStrView(fk::defaultParArch));
+    for (const std::string& baseline : baselines) {
+        std::ofstream two(outDir / (baseline + "_vs_fkl_bvf_" + suffix + parArch + ".csv"));
+        writeTwoExecutionHeader(two, "Batch size", baseline);
+        for (const auto& b : results) {
+            if (b.name != baseline) {
+                continue;
+            }
+            const auto f = std::find_if(results.begin(), results.end(), [&](const Result& r) {
+                return r.name == "fkl_bvf" && r.batch == b.batch;
+            });
+            const auto [baseTiming, bvfTiming, speedup] = field(b, *f);
+            writeTwoExecutionRow(two, b.batch, baseTiming, bvfTiming, speedup);
+        }
+    }
+}
 
-int main(int argc, char** argv) {
-    using namespace bench;
+// System, versions, workload and protocol of a run
+template <typename P>
+void writePlatform(const std::filesystem::path& outDir, const std::vector<std::string>& baselines,
+                   const std::string& diagnostic) {
+    int device = 0, runtime = 0, driver = 0;
+    gpuErrchk(cudaGetDevice(&device));
+    cudaDeviceProp prop{};
+    gpuErrchk(cudaGetDeviceProperties(&prop, device));
+    gpuErrchk(cudaRuntimeGetVersion(&runtime));
+    gpuErrchk(cudaDriverGetVersion(&driver));
+    std::string names;
+    for (const auto& b : baselines) {
+        names += b + ", ";
+    }
+    std::ofstream os(outDir / "platform.txt");
+    os << "Benchmark: " << P::title << "\n"
+       << "GPU: " << prop.name << " (sm_" << prop.major << prop.minor << ", " << prop.multiProcessorCount << " SMs, "
+       << (prop.totalGlobalMem >> 20) << " MiB)\n"
+       << "NVIDIA driver: " << bench::shell("nvidia-smi --query-gpu=driver_version --format=csv,noheader") << "\n"
+       << "CUDA runtime: " << runtime / 1000 << "." << (runtime % 1000) / 10 << ", CUDA driver API: " << driver / 1000
+       << "." << (driver % 1000) / 10 << "\n"
+       << "nvcc: " << BENCH_NVCC_VERSION << "\n"
+       << "nvcc flags: " << BENCH_NVCC_FLAGS << "\n"
+       << "Host compiler: " << bench::hostCompiler() << "\n"
+       << "FKL: branch " << BENCH_FKL_BRANCH << ", commit " << BENCH_FKL_COMMIT << "\n";
+    P::describe(os, outDir);
+    os << "CPU: " << bench::cpuName() << "\n"
+       << "OS: " << bench::osName() << ", kernel " << bench::kernelVersion() << "\n"
+       << "GPU clocks: not locked (locking needs root); application clocks as reported by nvidia-smi: "
+       << bench::shell("nvidia-smi --query-gpu=clocks.max.sm,clocks.max.mem --format=csv,noheader") << "\n"
+       << "\nWorkload: " << geometry::describe() << ". AddBorder (black), then Mul "
+       << "(1/255), Sub (0.485, 0.456, 0.406), Div (0.229, 0.224, 0.225), float3 tensor of N planes " << OUT_W << "x"
+       << OUT_H << "\n"
+       << "FKL BVF: one executeOperations call, one kernel: no intermediates in memory, float3 from the color "
+          "conversion to the write.\n"
+       << "Timing: " << WARMUP_ITERS << " warm-up then " << TIMED_ITERS << " timed iterations. In every iteration "
+       << names << "then FKL BVF run one after the other, each timed with CUDA events on one stream around the "
+       << "complete pipeline (all host enqueue work included) and followed by a synchronization. FKL BVF's speedup "
+       << "over each baseline is computed per iteration (baseline time / BVF time) and averaged (mean speedup, FKL's "
+       << "two-execution convention). Median, p10, p90 with linear interpolation.\n"
+       << "GPU time only: a second pass with the same interleaved iterations and CUPTI kernel tracing on; the GPU "
+       << "time of one execution is the sum of the execution times of its kernels (no host work, no launch gaps), "
+       << "and FKL BVF's speedups are again computed per execution and averaged.\n"
+       << "Kernel counts: CUPTI activity tracing of one pipeline, in a separate pass after all timings\n";
+    if (!diagnostic.empty()) {
+        os << "\n" << diagnostic;
+    }
+}
+
+// The program: <outDir> [--gpu-only-l2-flushed | --profile-kernels | --ncu-target <impl> <N> | a mode of P], or
+// --batches / --workload alone
+template <typename P>
+int gpuBenchMain(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--batches") {
             // The batch sizes, for the Nsight Compute scripts
@@ -1321,6 +1046,7 @@ int main(int argc, char** argv) {
 
         Context ctx;
         initContext(ctx);
+        const auto baselines = baselineNames<P>(ctx);
 
         if (argc > 2 && std::string(argv[2]) == "--gpu-only-l2-flushed") {
             // GPU time only with the L2 flushed before every kernel of every pipeline (no intermediate result or
@@ -1328,7 +1054,7 @@ int main(int argc, char** argv) {
             L2Flusher flusher = makeL2Flusher(ctx);
             cupti::init();
             std::vector<Result> flushed;
-            gpuOnlyAllBatches(ctx, flushed, std::make_index_sequence<BATCHES.size()>{}, &flusher);
+            forEachBatch([&]<size_t N>() { gpuOnlyBatch<P, N>(ctx, flushed, &flusher); });
             std::ofstream csv(outDir / "gpu_time_l2_flushed.csv");
             csv << "implementation,N,gpu_median_us,gpu_p10_us,gpu_p90_us,gpu_mean_us,iterations,kernels_launched,"
                    "fkl_bvf_mean_gpu_speedup\n";
@@ -1341,43 +1067,22 @@ int main(int argc, char** argv) {
                 }
                 csv << "\n";
             }
-            const std::string parArch(fk::toStrView(fk::defaultParArch));
-            for (const std::string baseline : {"opencv_cuda", "npp", "fkl_vf_hf"}) {
-                std::ofstream two(outDir / (baseline + "_vs_fkl_bvf_gpu_only_l2_flushed_" + parArch + ".csv"));
-                writeTwoExecutionHeader(two, "Batch size", baseline);
-                for (const auto& b : flushed) {
-                    if (b.name != baseline) {
-                        continue;
-                    }
-                    const auto f = std::find_if(flushed.begin(), flushed.end(), [&](const Result& r) {
-                        return r.name == "fkl_bvf" && r.batch == b.batch;
-                    });
-                    writeTwoExecutionRow(two, b.batch, b.gpuFlushedTiming, f->gpuFlushedTiming,
-                                         b.meanGpuFlushedSpeedupOfBvf);
-                }
-            }
+            writeTwoExecutionFiles(outDir, baselines, flushed, "gpu_only_l2_flushed_", [](const Result& b, const Result& f) {
+                return std::make_tuple(b.gpuFlushedTiming, f.gpuFlushedTiming, b.meanGpuFlushedSpeedupOfBvf);
+            });
             freeL2Flusher(flusher);
             std::cout << "Results written to " << std::filesystem::absolute(outDir) << std::endl;
             return 0;
         }
         if (argc > 4 && std::string(argv[2]) == "--ncu-target") {
-            ncuTargetDispatch(ctx, argv[3], std::stoul(argv[4]), std::make_index_sequence<BATCHES.size()>{});
-            return 0;
-        }
-        if (argc > 2 && std::string(argv[2]) == "--host-overhead") {
-            hostOverheadAllBatches(ctx, std::make_index_sequence<BATCHES.size()>{});
-            std::ofstream csv(outDir / "host_overhead.csv");
-            csv << "implementation,N,step,host_median_us,host_p10_us,host_p90_us\n";
-            for (const auto& h : hostTimings) {
-                csv << h.name << "," << h.batch << "," << h.step << "," << std::fixed << std::setprecision(2)
-                    << h.timing.median << "," << h.timing.p10 << "," << h.timing.p90 << "\n";
-            }
+            const std::string name = argv[3];
+            withBatch(std::stoul(argv[4]), [&]<size_t N>() { ncuTarget<P, N>(ctx, name); });
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "--profile-kernels") {
             // GPU execution time of every kernel (CUPTI), without touching the latency results
             cupti::init();
-            profileAllBatches(ctx, std::make_index_sequence<BATCHES.size()>{});
+            forEachBatch([&]<size_t N>() { profileBatch<P, N>(ctx); });
             std::ofstream summary(outDir / "kernel_gpu_times.csv");
             summary << "implementation,N,kernels_per_pipeline,gpu_busy_us,first_kernel_start_to_last_kernel_end_us\n";
             std::ofstream details(outDir / "kernel_gpu_times_fkl.csv");
@@ -1398,33 +1103,36 @@ int main(int argc, char** argv) {
             std::cout << "Kernel profiles written to " << std::filesystem::absolute(outDir) << std::endl;
             return 0;
         }
-
+        if (argc > 2 && P::extraMode(ctx, std::string(argv[2]), outDir)) {
+            return 0;
+        }
         if (argc > 2) {
             throw std::runtime_error(std::string("Unknown mode or missing arguments: ") + argv[2] +
-                                     " (see the modes in README.md)");
+                                     " (see the modes in the README of this benchmark)");
         }
 
-        std::ostringstream diagnostic;
-        conversionDiagnostic(ctx, diagnostic);
-        std::cout << diagnostic.str();
+        std::cout << "=== " << P::title << std::endl;
+        const std::string diagnostic = P::diagnostic(ctx);
+        std::cout << diagnostic;
 
         std::vector<Result> results;
-        runAllBatches(ctx, results, std::make_index_sequence<BATCHES.size()>{});
-        std::cout << "=== Kernel counts (CUPTI activity tracing, after all timings)" << std::endl;
+        forEachBatch([&]<size_t N>() { runBatch<P, N>(ctx, results); });
         cupti::init();
         std::cout << "=== GPU time only (CUPTI kernel execution times, after all CPU + GPU timings)" << std::endl;
-        gpuOnlyAllBatches(ctx, results, std::make_index_sequence<BATCHES.size()>{});
-        countAllBatches(ctx, results, std::make_index_sequence<BATCHES.size()>{});
+        forEachBatch([&]<size_t N>() { gpuOnlyBatch<P, N>(ctx, results); });
+        std::cout << "=== Kernel counts (CUPTI activity tracing, after all timings)" << std::endl;
+        forEachBatch([&]<size_t N>() { countBatch<P, N>(ctx, results); });
 
         std::ofstream latency(outDir / "latency.csv");
         latency << "implementation,N,median_us,p10_us,p90_us,iterations,max_abs_err,kernels_launched,mean_us,"
                    "fkl_bvf_mean_speedup\n";
         std::ofstream validation(outDir / "validation.csv");
         validation << "implementation,N,reference,max_abs_err_r,max_abs_err_g,max_abs_err_b,mean_abs_err,"
-                      "non_finite_values,max_abs_err_vs_float_reference,max_abs_err_vs_npp_sampling_8bit_reference,"
-                      "values_beyond_1e-3,values,tolerance,within_tolerance\n";
+                      "non_finite_values,max_abs_err_vs_float_reference,values_beyond_1e-3,values,tolerance,"
+                      "within_tolerance\n";
         std::ofstream kernels(outDir / "kernels.csv");
         kernels << "implementation,N,kernels,memsets,memcpys\n";
+        bool failed = false;
         for (const auto& r : results) {
             latency << r.name << "," << r.batch << "," << std::fixed << std::setprecision(2) << r.timing.median << ","
                     << r.timing.p10 << "," << r.timing.p90 << "," << TIMED_ITERS << "," << std::scientific
@@ -1438,31 +1146,22 @@ int main(int argc, char** argv) {
             validation << r.name << "," << r.batch << "," << referenceName(r.reference) << "," << std::scientific
                        << std::setprecision(3) << e.maxPerChannel[0] << "," << e.maxPerChannel[1] << ","
                        << e.maxPerChannel[2] << "," << e.mean << "," << e.nonFinite << ","
-                       << r.errorVsFloatReference.max() << "," << r.errorVsNppConventionReference.max() << ","
-                       << e.beyond << "," << e.values << "," << r.tolerance() << ","
-                       << (r.withinTolerance() ? "yes" : "no") << "\n";
+                       << r.errorVsFloatReference.max() << "," << e.beyond << "," << e.values << "," << r.tolerance()
+                       << "," << (r.withinTolerance() ? "yes" : "no") << "\n";
             kernels << r.name << "," << r.batch << "," << r.launches.kernels << "," << r.launches.memsets << ","
                     << r.launches.memcpys << "\n";
+            // FKL's outputs must be within their tolerance; the libraries' are reported (they depend on the library
+            // build and version of each machine)
+            failed = failed || (r.name.rfind("fkl_", 0) == 0 && !r.withinTolerance());
         }
         // One CSV per baseline in FKL's two-execution format (times in ms), for both benchmarks:
         // <baseline>_vs_fkl_bvf_GPU_NVIDIA.csv (CPU + GPU) and <baseline>_vs_fkl_bvf_gpu_only_GPU_NVIDIA.csv
-        const std::string parArch(fk::toStrView(fk::defaultParArch));
-        for (const bool gpuOnly : {false, true}) {
-            for (const std::string baseline : {"opencv_cuda", "npp", "fkl_vf_hf"}) {
-                std::ofstream two(outDir / (baseline + "_vs_fkl_bvf_" + (gpuOnly ? "gpu_only_" : "") + parArch + ".csv"));
-                writeTwoExecutionHeader(two, "Batch size", baseline);
-                for (const auto& b : results) {
-                    if (b.name != baseline) {
-                        continue;
-                    }
-                    const auto f = std::find_if(results.begin(), results.end(), [&](const Result& r) {
-                        return r.name == "fkl_bvf" && r.batch == b.batch;
-                    });
-                    writeTwoExecutionRow(two, b.batch, gpuOnly ? b.gpuTiming : b.timing, gpuOnly ? f->gpuTiming : f->timing,
-                                         gpuOnly ? b.meanGpuSpeedupOfBvf : b.meanSpeedupOfBvf);
-                }
-            }
-        }
+        writeTwoExecutionFiles(outDir, baselines, results, "", [](const Result& b, const Result& f) {
+            return std::make_tuple(b.timing, f.timing, b.meanSpeedupOfBvf);
+        });
+        writeTwoExecutionFiles(outDir, baselines, results, "gpu_only_", [](const Result& b, const Result& f) {
+            return std::make_tuple(b.gpuTiming, f.gpuTiming, b.meanGpuSpeedupOfBvf);
+        });
         std::ofstream gpuTime(outDir / "gpu_time.csv");
         gpuTime << "implementation,N,gpu_median_us,gpu_p10_us,gpu_p90_us,gpu_mean_us,iterations,kernels_launched,"
                    "fkl_bvf_mean_gpu_speedup\n";
@@ -1481,11 +1180,19 @@ int main(int argc, char** argv) {
             stages << b.name << "," << b.batch << "," << b.stage << "," << std::fixed << std::setprecision(2)
                    << b.timing.median << "," << b.timing.p10 << "," << b.timing.p90 << "\n";
         }
-        writePlatform(outDir / "platform.txt", ctx, diagnostic.str());
+        writePlatform<P>(outDir, baselines, diagnostic);
         std::cout << "Results written to " << std::filesystem::absolute(outDir) << std::endl;
+        if (failed) {
+            std::cerr << "ERROR: an FKL output is not within its tolerance, see validation.csv" << std::endl;
+            return 1;
+        }
     } catch (const std::exception& e) {
         std::cerr << "ERROR: " << e.what() << std::endl;
         return 1;
     }
     return 0;
 }
+
+} // namespace bench
+
+#endif // BVF_BENCH_GPU_H

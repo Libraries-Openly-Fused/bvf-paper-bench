@@ -62,12 +62,12 @@ function(add_benchmark TARGET_NAME SOURCE)
                                ${BENCH_GEOMETRY_DEFINITIONS}
                                FKL_VERSION="${FKL_VERSION}" NPPDX_GIT_VERSION="${NPPDX_GIT_VERSION}"
                                CUDA_ARCHITECTURES_STR="${CUDA_ARCH}")
-    # NPP: the border and the normalization after the NPPDx kernel of benchmark_figure1_nppdx_npp (nppdx_npp_figure1.h)
+    # NPP: the border and the normalization after the NPPDx kernel of benchmark_nppdx_npp (nppdx_npp_figure1.h)
     target_link_libraries(${TARGET_NAME} PRIVATE nppdx::nppdx CUDA::cudart CUDA::cupti CUDA::nvtx3 CUDA::nppc
                                                  CUDA::nppidei CUDA::nppial)
     # Like FKL, benchmarks are registered as tests; they write their CSV files to results/ in the build folder
     add_test(NAME ${TARGET_NAME} COMMAND ${TARGET_NAME} ${CMAKE_CURRENT_BINARY_DIR}/results)
 endfunction()
 
-add_benchmark(benchmark_figure1_bvf benchmarks/benchmark_figure1_bvf.cu)
-add_benchmark(benchmark_figure1_nppdx_npp benchmarks/benchmark_figure1_nppdx_npp.cu)
+add_benchmark(benchmark_nppdx benchmarks/benchmark_nppdx.cu)
+add_benchmark(benchmark_nppdx_npp benchmarks/benchmark_nppdx_npp.cu)

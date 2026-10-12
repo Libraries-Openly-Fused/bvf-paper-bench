@@ -15,7 +15,7 @@
 // Figure 1 pipeline of the Backwards Vertical Fusion paper with NPPDx and NPP, without hand written pixel processing
 // code, and with FKL:
 //   ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
-// The workload of benchmark_figure1_bvf.cu (common/bench_geometry.h; NV12->RGB BT.601 limited range, bilinear resize,
+// The workload of benchmark_nppdx.cu (common/bench_geometry.h; NV12->RGB BT.601 limited range, bilinear resize,
 // black rows added on top and bottom up to a square, then (x * mul - sub) / div, written as float3 into a tensor of N
 // planes).
 //
@@ -39,7 +39,7 @@ namespace figure1 {
 struct NppdxNppPipeline {
     static constexpr const char* implementation = "nppdx_npp";
     static constexpr const char* label = "NPPDx+NPP";
-    static constexpr const char* name = "benchmark_figure1_nppdx_npp";
+    static constexpr const char* name = "benchmark_nppdx_npp";
     // Every configuration tried: the candidate tiles NPPDx supports for these crops (with the 8 bit RGB write), each
     // with NPPDx's recommended block (block 0) and with BlockDim 64, 128, 256 and 512
     static constexpr auto configs = nppdxRgbConfigs<NPPDX_SM>();

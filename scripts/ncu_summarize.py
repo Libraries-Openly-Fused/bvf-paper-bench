@@ -18,7 +18,8 @@ import sys
 # Override with the environment variables NCU and BVF_RESULTS; by default results/ is next to this repository
 NCU = os.environ.get("NCU") or shutil.which("ncu") or "/usr/local/cuda/bin/ncu"
 RESULTS = pathlib.Path(os.environ.get("BVF_RESULTS", pathlib.Path(__file__).resolve().parents[2] / "results"))
-REPORT_NAME = re.compile(r"^(?P<repo>nppdxrepo_)?(?P<impl>.+)_N(?P<n>\d+)_cache-(?P<cache>all|none)$")
+# <benchmark folder>__<implementation>_N<N>_cache-<all|none> (scripts/ncu_common.sh)
+REPORT_NAME = re.compile(r"^(?P<bench>[a-z-]+)__(?P<impl>.+)_N(?P<n>\d+)_cache-(?P<cache>all|none)$")
 SECTOR_BYTES = 32
 
 MODES = {
@@ -78,20 +79,21 @@ def row_for(mode, totals):
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "dram"
     cfg = MODES[mode]
-    # The pipelines the profiling scripts profile, in the order of the summary
+    # The benchmarks and pipelines the profiling scripts profile, in the order of the summary
+    benches = ["fkl-vs-opencv-cuda", "fkl-vs-npp", "fkl-ablation", "fkl-vs-nppdx"]
     order = ["opencv_cuda", "npp", "nppdx_npp", "nppdx", "fkl_vf_hf", "fkl_bvf"]
     summary = []
     for report in sorted((RESULTS / cfg["dir"]).glob("*.ncu-rep")):
         match = REPORT_NAME.match(report.stem)
         if not match:
             continue
-        if match["impl"] not in order:
+        if match["impl"] not in order or match["bench"] not in benches:
             print(f"Skipping {report.name}: not a pipeline the profiling scripts profile (a report of an earlier run?)")
             continue
         totals, kernels = totals_of(report, cfg["metrics"])
         summary.append({
             "implementation": match["impl"],
-            "benchmark": "FKL-vs-NPPDx" if match["repo"] else "paper-bench",
+            "benchmark": match["bench"],
             "N": int(match["n"]),
             "cache_control": "cold (flush before every kernel)" if match["cache"] == "all" else "warm (no flush)",
             "kernels": kernels,
@@ -99,7 +101,8 @@ def main():
         })
     if not summary:
         sys.exit(f"No reports of the profiled pipelines in {RESULTS / cfg['dir']}: run the profiling script first")
-    summary.sort(key=lambda s: (s["cache_control"], s["N"], s["benchmark"], order.index(s["implementation"])))
+    summary.sort(key=lambda s: (s["cache_control"], s["N"], benches.index(s["benchmark"]),
+                                order.index(s["implementation"])))
     with open(RESULTS / cfg["csv"], "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(summary[0].keys()))
         writer.writeheader()
@@ -108,7 +111,7 @@ def main():
             writer.writerow({k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in s.items()})
     for s in summary:
         values = "  ".join(f"{k} {v:9.3f}" for k, v in s.items() if isinstance(v, float) and "time" not in k)
-        print(f"{s['cache_control'][:4]} N={s['N']:3d} {s['benchmark']:12s} {s['implementation']:24s} "
+        print(f"{s['cache_control'][:4]} N={s['N']:3d} {s['benchmark']:18s} {s['implementation']:24s} "
               f"kernels {s['kernels']:3d}  {values}")
     print(f"Written {RESULTS / cfg['csv']}")
 

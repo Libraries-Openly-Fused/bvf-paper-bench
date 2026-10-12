@@ -12,7 +12,7 @@
    See the License for the specific language governing permissions and
    limitations under the License. */
 
-// How the GPU benchmarks (src/bvf_bench.cu and fkl-vs-nppdx) check an output against its reference: the errors in
+// How the GPU benchmarks (common/bench_gpu.h and fkl-vs-nppdx) check an output against its reference: the errors in
 // normalized units, the tolerances, and the rule that decides whether an output is within its tolerance.
 
 #ifndef BVF_BENCH_VALIDATION_H

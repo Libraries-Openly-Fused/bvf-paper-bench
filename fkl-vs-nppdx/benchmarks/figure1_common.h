@@ -12,8 +12,8 @@
    See the License for the specific language governing permissions and
    limitations under the License. */
 
-// What the two FKL vs NPPDx benchmarks share (benchmark_figure1_bvf.cu: NPPDx as one kernel with a hand written end;
-// benchmark_figure1_nppdx_npp.cu: NPPDx and NPP without hand written pixel processing code): the workload, the FKL
+// What the two FKL vs NPPDx benchmarks share (benchmark_nppdx.cu: NPPDx as one kernel with a hand written end;
+// benchmark_nppdx_npp.cu: NPPDx and NPP without hand written pixel processing code): the workload, the FKL
 // pipeline, the references, the validation, the choice of the NPPDx configuration, the three comparisons with FKL and
 // the program itself. A benchmark describes its NPPDx pipeline with a Pipeline type:
 //   implementation, label, name    its implementation name (Nsight Compute target), CSV label and file name prefix

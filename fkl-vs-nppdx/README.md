@@ -23,12 +23,12 @@ the same FKL pipeline:
 
 - **FKL**: one `executeOperations` call with the nine operations (Backwards Vertical Fusion), from the `fkl`
   submodule of this repository (FKL main, which has `AddBorder`). One kernel.
-- **NPPDx** (`benchmark_figure1_bvf`, [`benchmarks/nppdx_figure1.h`](benchmarks/nppdx_figure1.h)): one CUDA kernel
+- **NPPDx** (`benchmark_nppdx`, [`benchmarks/nppdx_figure1.h`](benchmarks/nppdx_figure1.h)): one CUDA kernel
   built from NPPDx operations, one thread block per tile of a crop: NV12 ingest of the tile, `FromLimitedLuma` and
   `FromLimitedChroma` (NPPDx's color conversion is full range), `ColorConvert<yuv_bt601, rgb>` and
   `Resize<1, 2, bilinear>` (the J:K ratio of the geometry) on the shared memory tile. AddBorder, Mul, Sub, Div and the
   float3 write are written by hand in the same kernel. One kernel, with hand written CUDA code.
-- **NPPDx+NPP** (`benchmark_figure1_nppdx_npp`, [`benchmarks/nppdx_npp_figure1.h`](benchmarks/nppdx_npp_figure1.h)):
+- **NPPDx+NPP** (`benchmark_nppdx_npp`, [`benchmarks/nppdx_npp_figure1.h`](benchmarks/nppdx_npp_figure1.h)):
   only what NPPDx and NPP provide, with no hand written pixel processing code. NPPDx has no host API, so its operations
   still run in a CUDA kernel written for them, with its launch configuration and the crop and batch given to NPPDx's
   ingest as image pointers, but the kernel only calls NPPDx operations, in the order of the pipeline (the same ones,
@@ -47,8 +47,9 @@ own names.
 **These results are from the previous workload and will be replaced:** the tables below and the files in
 [`results/RTX4090`](results/RTX4090) and [`results/RTX4090-20x10`](results/RTX4090-20x10) were measured with NV12 to
 RGB in BT.2020 full range on a frame of uniform random bytes (see their platform files), before the BT.601 limited
-range workload described above and before the NPPDx+NPP benchmark existed. Their configuration files do not match the
-current workload, so the scripts that check the workload refuse them.
+range workload described above and before the NPPDx+NPP benchmark existed, by `benchmark_nppdx` under its earlier
+name, `benchmark_figure1_bvf` (the prefix of their files). Their configuration files do not match the current
+workload, so the scripts that check the workload refuse them.
 
 Three benchmarks, with the same iterations: 1000 timed after 100 warm-up ones, NPPDx and FKL one after the other in
 each, and FKL's mean speedup computed per iteration (NPPDx time / FKL time) and averaged, as in FKL's and
@@ -80,7 +81,7 @@ microseconds:
 **GPU only, L2 flushed**: like GPU only, but the L2 cache is flushed (a kernel reads twice the L2 size) before every
 kernel, as on a GPU that runs other kernels in between, so that the input cannot be assumed to be in L2 (for
 NPPDx+NPP, its intermediates between its kernels either). Run with
-`benchmark_figure1_bvf <dir> --gpu-only-l2-flushed` after the run without a mode into the same directory, whose NPPDx
+`benchmark_nppdx <dir> --gpu-only-l2-flushed` after the run without a mode into the same directory, whose NPPDx
 configurations it uses. Median in microseconds:
 
 | N | NPPDx (us) | FKL (us) | Speedup |
@@ -93,7 +94,8 @@ configurations it uses. Median in microseconds:
 
 FKL's kernel is faster at every N, but end to end NPPDx is faster from N = 50: most of the difference between the
 two benchmarks for FKL is host work, building and back-fusing the chain of operations for N crops and launching a
-kernel with their parameters (about 1.7 us at N = 1 and 6.7 us at N = 100, `bvf_bench --host-overhead`), while
+kernel with their parameters (about 1.7 us at N = 1 and 6.7 us at N = 100, `benchmark_fkl_ablation --host-overhead`
+in [`fkl-ablation`](../fkl-ablation/README.md)), while
 NPPDx launches a kernel configured at compile time.
 
 The CSV files and the platform description are in [`results/RTX4090`](results/RTX4090): NVIDIA GeForce RTX 4090,
@@ -107,7 +109,7 @@ workload, with crop positions from the same generator), to show what NPPDx's com
 5:16 the only valid tile is the whole 20x10 crop, one thread block per crop.
 
 **DRAM traffic** (Nsight Compute, `dram__bytes_read.sum` and `dram__bytes_write.sum` of one execution, see
-`benchmark_figure1_bvf_dram_traffic_GPU_NVIDIA.csv`). With the L2 cache flushed before the kernel, NPPDx reads 35,
+`benchmark_figure1_bvf_dram_traffic_GPU_NVIDIA.csv`, from the program's earlier name). With the L2 cache flushed before the kernel, NPPDx reads 35,
 70 and 182 KB from DRAM for N = 1, 16 and 100, and FKL 10, 32 and 158 KB. With a warm cache both read nothing from
 DRAM, and neither writes to DRAM while the kernel runs: the RTX 4090's 72 MB L2 is write-back and holds the
 whole working set (the 12.4 MB NV12 frame and an output of at most 4.9 MB). Collected with
@@ -162,20 +164,24 @@ fails (as it does when FKL's output is not). Every configuration tried is in
 
 ## Build and run
 
-Requirements: Linux x86_64 or Windows x64 (the platforms of NPPDx), CUDA 13.3 or newer, CMake 3.30, a C++20 host compiler, and
+Requirements: Linux x86_64 or Windows x64 (the platforms of NPPDx), CUDA 13.3 or newer with NPP, CMake 3.30, a C++20 host compiler, and
 an NVIDIA GPU (sm_75 or newer). FKL and NPPDx are the `fkl` and `nppdx` submodules of this repository. From its root:
 
     git clone --recursive https://github.com/Libraries-Openly-Fused/bvf-paper-bench.git
     cd bvf-paper-bench
     cmake -S fkl-vs-nppdx -B build-nppdx -DCMAKE_BUILD_TYPE=Release
     cmake --build build-nppdx
-    ./build-nppdx/benchmark_figure1_bvf results/my_gpu/nppdx            # NPPDx, one kernel
-    ./build-nppdx/benchmark_figure1_nppdx_npp results/my_gpu/nppdx_npp  # NPPDx+NPP
+    ./build-nppdx/benchmark_nppdx ../results/fkl-vs-nppdx        # NPPDx, one kernel
+    ./build-nppdx/benchmark_nppdx_npp ../results/fkl-vs-nppdx    # NPPDx+NPP
     # or: ctest --test-dir build-nppdx (both, writing to build-nppdx/results)
 
 `CUDA_ARCH` (default `native`) selects the CUDA architectures, and `NPPDX_SM` (detected with `nvidia-smi`) the
 SM version the NPPDx operations are specialized for, for example `-DNPPDX_SM=890` for compute capability 8.9.
 `FKL_DIR` and `NPPDX_DIR` select other FKL and NPPDx checkouts.
+
+The compile-time units are in [`benchmarks/compile_time.cu`](benchmarks/compile_time.cu) (`HEADERS`, `NPPDX`, `BVF`;
+with `SET=nppdx scripts/compile_time.sh` after a run of `benchmark_nppdx`, see the
+[main README](../README.md#compile-time)).
 
 ## Output files
 

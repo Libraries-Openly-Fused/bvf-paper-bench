@@ -12,16 +12,16 @@
    See the License for the specific language governing permissions and
    limitations under the License. */
 
-// One pipeline of the paper's Figure 1 per translation unit, for measuring nvcc compile time (compile_time/run.sh with
-// SET=nppdx). Select with exactly one of:
+// The compile-time units of FKL vs NPPDx: one pipeline of the paper's Figure 1 per translation unit, for measuring nvcc
+// compile time (scripts/compile_time.sh with SET=nppdx). Select with exactly one of:
 //   -DIMPL_HEADERS  the headers of the other two variants (FKL, NPPDx, nppdx_figure1.h, NVTX: the ones of
-//                   benchmark_figure1_bvf.cu without its benchmark scaffolding), no pipeline
-//   -DIMPL_NPPDX    the NPPDx kernel in the configuration benchmark_figure1_bvf chose for this N, given with
+//                   benchmark_nppdx.cu without its benchmark scaffolding), no pipeline
+//   -DIMPL_NPPDX    the NPPDx kernel in the configuration benchmark_nppdx chose for this N, given with
 //                   -DCT_NPPDX_TILE_X, -DCT_NPPDX_TILE_Y and -DCT_NPPDX_BLOCK (the requested block, 0 for NPPDx's
-//                   recommended one; run.sh reads them from benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv);
+//                   recommended one; compile_time.sh reads them from benchmark_nppdx_nppdx_config_GPU_NVIDIA.csv);
 //                   CropOrigins<N> is a kernel parameter, so it is instantiated for every N
-//   -DIMPL_BVF      FKL, the runFKL<N> call of benchmark_figure1_bvf.cu (in figure1_common.h)
-// and -DCT_BATCH=<N> (number of crops). It is compiled with the nvcc command line of benchmark_figure1_bvf (NPPDX_SM,
+//   -DIMPL_BVF      FKL, the runFKL<N> call of benchmark_nppdx.cu (in figure1_common.h)
+// and -DCT_BATCH=<N> (number of crops). It is compiled with the nvcc command line of benchmark_nppdx (NPPDX_SM,
 // NPPDx's include path, the geometry definitions) and never executed: main() calls the pipeline only when it gets an
 // argument.
 
@@ -58,7 +58,7 @@ using NV12Image = fk::Image<fk::PixelFormat::NV12>;
 using YUVToRGB = fk::ConvertYUVToRGB<fk::ColorDepth::p8bit, fk::ColorRange::Limited, fk::ColorPrimitives::bt601>;
 
 #if defined(IMPL_BVF)
-// runFKL of benchmark_figure1_bvf.cu (figure1_common.h), with the stream and the frame of its Workload as arguments
+// runFKL of benchmark_nppdx.cu (figure1_common.h), with the stream and the frame of its Workload as arguments
 template <size_t N>
 void runFKL(fk::Stream& stream, const NV12Image& frame, const std::array<fk::Rect, N>& crops,
             fk::Tensor<fk::float3>& out) {

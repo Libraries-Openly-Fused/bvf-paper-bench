@@ -19,7 +19,7 @@
 // no floating point output, so the rest is NPP, with the function NPP offers for each step: CopyConstBorder for the
 // black rows, once per crop (NPP has no batched border), then Convert 8u -> 32f, MulC, SubC and DivC on the N planes
 // at once. N + 5 kernels, with the intermediates in memory, and the resized RGB rounded to 8 bits before the
-// normalization. The sizes are those of common/bench_geometry.h. Used by benchmark_figure1_nppdx_npp.cu.
+// normalization. The sizes are those of common/bench_geometry.h. Used by benchmark_nppdx_npp.cu.
 // nppdx_figure1.h has the single kernel version, with hand written CUDA code.
 
 #ifndef FIGURE1_NPPDX_NPP_FIGURE1_H

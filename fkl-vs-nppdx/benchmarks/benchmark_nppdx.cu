@@ -26,7 +26,7 @@
 //          validated and timed, and the fastest correct one is compared with FKL.
 //   FKL:   one executeOperations call (Backwards Vertical Fusion), the paper's Listing 2.
 //
-// benchmark_figure1_nppdx_npp.cu compares FKL with the same pipeline in NPPDx and NPP without hand written pixel
+// benchmark_nppdx_npp.cu compares FKL with the same pipeline in NPPDx and NPP without hand written pixel
 // processing code.
 // The shared parts (FKL, references, validation, choice of the NPPDx configuration, timing, modes) are in
 // figure1_common.h.
@@ -63,7 +63,7 @@ __global__ void nppdxConvertOnlyKernel(const uint8_t* y, const uint8_t* uv, cons
 struct NppdxPipeline {
     static constexpr const char* implementation = "nppdx";
     static constexpr const char* label = "NPPDx";
-    static constexpr const char* name = "benchmark_figure1_bvf";
+    static constexpr const char* name = "benchmark_nppdx";
     // Every configuration tried: the candidate tiles NPPDx supports for these crops, each with NPPDx's recommended
     // block (block 0) and with BlockDim 64, 128, 256 and 512
     static constexpr auto configs = nppdxFigure1Configs<NPPDX_SM>();

@@ -16,7 +16,7 @@
 // tile of the crop), built from NPPDx operations (NV12 ingest, limited to full range, color conversion BT.601,
 // resize), with the border, the normalization and the float3 write written by hand, since NPPDx has no border
 // operation and no floating point output (and its affine channel map takes integer parameters only). The sizes are
-// those of common/bench_geometry.h. Used by benchmark_figure1_bvf.cu and compile_time_pipeline.cu.
+// those of common/bench_geometry.h. Used by benchmark_nppdx.cu and compile_time.cu.
 // nppdx_npp_figure1.h has the version without hand written pixel processing code.
 
 #ifndef FIGURE1_NPPDX_FIGURE1_H

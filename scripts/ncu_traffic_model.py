@@ -5,7 +5,7 @@ Run without sudo after ncu_dram.sh and ncu_l2.sh and the two ncu_summarize.py mo
     ncu_traffic_model.py        BVF_RESULTS (default results/ next to this repository) -> traffic_model.csv in it
 
 The workload (frame, crop, resize and border sizes, batch sizes, seed and margin of the crops) is read from the
-Workload line of the NPPDx benchmark's platform file in BVF_RESULTS/nppdx, and the crop positions are generated as
+Workload line of the platform file of FKL's ablation in BVF_RESULTS/fkl-ablation, and the crop positions are generated as
 common/bench_geometry.h's makeCrops() does. Without measurements (dram_traffic.csv, l2_traffic.csv) only the model
 columns that do not need them are written.
 
@@ -23,7 +23,7 @@ Model, per execution:
     in 32 byte sectors: their luma rows and chroma rows, each sector counted once even where regions overlap (a cold
     execution reads it from DRAM once). Both resizes only read inside the region (FKL samples
     at dst * scale and NPPDx at pixel centers, both clamped to the region). The NPPDx benchmarks may choose a different
-    kernel configuration (tile, block) for every N (<impl>/<benchmark>_nppdx_config_GPU_NVIDIA.csv), with its own
+    kernel configuration (tile, block) for every N (fkl-vs-nppdx/<benchmark>_nppdx_config_GPU_NVIDIA.csv), with its own
     fixed term: the NPPDx model is only given for the N whose configuration is that of the smallest N. For every N,
     implied_fixed_term_KB is the measurement minus the footprint, to see how constant the fixed term is.
   - Reads between the SMs and L2 (lts__t_sectors_srcunit_tex_op_read) only see data loads, not the fixed term, so for
@@ -47,11 +47,12 @@ import sys
 
 RESULTS = pathlib.Path(os.environ.get("BVF_RESULTS", pathlib.Path(__file__).resolve().parents[2] / "results"))
 SECTOR = 32
-PIPELINES = [("paper-bench", "opencv_cuda"), ("paper-bench", "npp"), ("paper-bench", "fkl_vf_hf"),
-             ("paper-bench", "fkl_bvf"), ("FKL-vs-NPPDx", "nppdx_npp"), ("FKL-vs-NPPDx", "nppdx"),
-             ("FKL-vs-NPPDx", "fkl_bvf")]
-# The benchmark program of each NPPDx implementation; its results are in BVF_RESULTS/<implementation>
-NPPDX_BENCHMARKS = {"nppdx": "benchmark_figure1_bvf", "nppdx_npp": "benchmark_figure1_nppdx_npp"}
+# (benchmark folder, implementation) of every profiled pipeline (scripts/ncu_common.sh)
+PIPELINES = [("fkl-vs-opencv-cuda", "opencv_cuda"), ("fkl-vs-npp", "npp"), ("fkl-ablation", "fkl_vf_hf"),
+             ("fkl-ablation", "fkl_bvf"), ("fkl-vs-nppdx", "nppdx_npp"), ("fkl-vs-nppdx", "nppdx"),
+             ("fkl-vs-nppdx", "fkl_bvf")]
+# The benchmark program of each NPPDx implementation; its results are in BVF_RESULTS/fkl-vs-nppdx
+NPPDX_BENCHMARKS = {"nppdx": "benchmark_nppdx", "nppdx_npp": "benchmark_nppdx_npp"}
 
 
 class MT19937:
@@ -92,8 +93,8 @@ def uniform_int(gen, lo, hi):
 
 
 def workload():
-    """The workload of BVF_RESULTS, from the Workload line of the NPPDx benchmark's platform file."""
-    platform = RESULTS / "nppdx" / "benchmark_figure1_bvf_platform.txt"
+    """The workload of BVF_RESULTS, from the Workload line of the platform file of FKL's ablation."""
+    platform = RESULTS / "fkl-ablation" / "platform.txt"
     line = next((l for l in open(platform) if l.startswith("Workload: ")), None)
     if line is None:
         sys.exit(f"No Workload line in {platform}")
@@ -140,7 +141,7 @@ def load(name):
 
 def nppdx_configs(impl):
     """The NPPDx configuration (tile, requested block) and blocks per crop of every N, if the NPPDx run wrote them."""
-    path = RESULTS / impl / f"{NPPDX_BENCHMARKS[impl]}_nppdx_config_GPU_NVIDIA.csv"
+    path = RESULTS / "fkl-vs-nppdx" / f"{NPPDX_BENCHMARKS[impl]}_nppdx_config_GPU_NVIDIA.csv"
     if not path.exists():
         return {}
     rows = list(csv.reader(open(path), skipinitialspace=True))[1:]
@@ -259,7 +260,7 @@ def main():
           f"{w['out_w']}x{w['out_h']}, N in {w['batches']}"
           + ("" if dram or l2 else "; no measurements yet, so no FKL BVF or NPPDx model (it needs a measurement)"))
     for r in rows:
-        print(f"{r['benchmark']:12s} {r['implementation']:24s} N={r['N']:3d}  model {r['model_compulsory_read_MB'] or '-':>9} MB"
+        print(f"{r['benchmark']:18s} {r['implementation']:24s} N={r['N']:3d}  model {r['model_compulsory_read_MB'] or '-':>9} MB"
               f"  DRAM cold {r['measured_dram_read_cold_MB'] or '-':>9} ({r['measured_dram_read_cold_over_model'] or '-'})"
               f"  SM->L2 {r['measured_sm_to_l2_read_MB'] or '-':>9} ({r['measured_sm_to_l2_read_over_compulsory'] or '-'})"
               + (f"  implied fixed {r['implied_fixed_term_KB']} KB" if r['implied_fixed_term_KB'] else "")
