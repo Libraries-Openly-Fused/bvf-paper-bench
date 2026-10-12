@@ -2,3 +2,5 @@ build/
 build-*/
 ci-results/
 __pycache__/
+build*/
+.rocprofv3/
