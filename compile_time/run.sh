@@ -13,7 +13,7 @@
 # sets the timed compiles per TU. The script waits until the 1 minute load average is below MAX_LOAD (default 0.5)
 # before starting. SET=nppdx compiles the NPPDx kernel of every N in the configuration benchmark_figure1_bvf chose for
 # it: NPPDX_CONFIG is the benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv of its run (default
-# ../results/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv).
+# ../results/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv, or nppdx/ of BVF_RESULTS).
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 OUT=$(mkdir -p "${1:?results directory}" && cd "$1" && pwd)
@@ -38,7 +38,7 @@ case "$SET" in
     TUS=("HEADERS 1"
          "NPPDX 1" "NPPDX 4" "NPPDX 16" "NPPDX 50" "NPPDX 100"
          "BVF 1" "BVF 4" "BVF 16" "BVF 50" "BVF 100")
-    NPPDX_CONFIG=${NPPDX_CONFIG:-$(dirname "$REPO")/results/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv}
+    NPPDX_CONFIG=${NPPDX_CONFIG:-${BVF_RESULTS:-$(dirname "$REPO")/results}/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv}
     if [ ! -f "$NPPDX_CONFIG" ]; then
       echo "No NPPDx configuration file $NPPDX_CONFIG: run benchmark_figure1_bvf first, or set NPPDX_CONFIG" >&2
       exit 1

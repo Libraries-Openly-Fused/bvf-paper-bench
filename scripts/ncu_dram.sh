@@ -5,9 +5,12 @@
 #     sudo scripts/ncu_dram.sh
 #
 # Paths default to the layout described in README.md (the build and build-nppdx folders of this repository, and
-# results/ next to it) and can be overridden with the environment variables NCU, PAPER_BENCH, NPPDX_BENCH, NPPDX_CONFIG
-# and OUT, e.g.
+# results/ next to it) and can be overridden with the environment variables NCU, PAPER_BENCH, NPPDX_BENCH, BVF_RESULTS
+# (the results folder of one workload: the NPPDx run in nppdx/, the reports in ncu/), NPPDX_CONFIG and OUT, e.g.
 #     sudo NCU=/usr/local/cuda-13.3/bin/ncu scripts/ncu_dram.sh
+# or, for benchmarks built with other BENCH_CROP_*/BENCH_RESIZE_* options (see README.md),
+#     sudo PAPER_BENCH=build-20x10/bvf_bench NPPDX_BENCH=build-nppdx-20x10/benchmark_figure1_bvf \
+#          BVF_RESULTS=../results/20x10 scripts/ncu_dram.sh
 #
 # For every pipeline and every batch size N of the benchmarks, profiles one execution (the NVTX range "measure" of the
 # --ncu-target mode of the benchmarks) twice: with the caches flushed before every kernel (--cache-control all, cold) and without
@@ -26,8 +29,9 @@ NCU=${NCU:-/usr/local/cuda/bin/ncu}
 PAPER_BENCH=${PAPER_BENCH:-$REPO/build/bvf_bench}
 NPPDX_BENCH=${NPPDX_BENCH:-$REPO/build-nppdx/benchmark_figure1_bvf}
 # The NPPDx configuration (tile and block) the NPPDx benchmark chose for every N, from its run without a mode
-NPPDX_CONFIG=${NPPDX_CONFIG:-$ROOT/results/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv}
-OUT=${OUT:-$ROOT/results/ncu}
+RESULTS=${BVF_RESULTS:-$ROOT/results}
+NPPDX_CONFIG=${NPPDX_CONFIG:-$RESULTS/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv}
+OUT=${OUT:-$RESULTS/ncu}
 OWNER=${SUDO_USER:-$(id -un)}
 METRICS=dram__bytes_read.sum,dram__bytes_write.sum,gpu__time_duration.sum
 

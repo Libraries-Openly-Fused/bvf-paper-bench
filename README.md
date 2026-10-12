@@ -86,6 +86,19 @@ administrators (`RmProfilingAdminOnly=1`, the default); they change nothing on t
 the user who ran sudo. Summarize them afterwards, without sudo, with `scripts/ncu_summarize.py` (DRAM) or
 `scripts/ncu_summarize.py l2`.
 
+To profile another workload, for example the earlier 20x10 crops resized 5:16, build both benchmarks with the same
+options into their own folders, run the NPPDx benchmark into a results folder of that workload, and point the scripts
+and the summary at them (`BVF_RESULTS` is the folder of the workload, with the NPPDx run in `nppdx/` and the reports in
+`ncu/` and `ncu_l2/`):
+
+    G="-DBENCH_CROP_W=20 -DBENCH_CROP_H=10 -DBENCH_RESIZE_W=64 -DBENCH_RESIZE_H=32"
+    cmake -S . -B build-20x10 -DCMAKE_BUILD_TYPE=Release -DOpenCV_DIR=<OpenCV> $G && cmake --build build-20x10 -j
+    cmake -S fkl-vs-nppdx -B build-nppdx-20x10 -DCMAKE_BUILD_TYPE=Release $G && cmake --build build-nppdx-20x10 -j
+    ./build-nppdx-20x10/benchmark_figure1_bvf ../results/20x10/nppdx
+    sudo PAPER_BENCH=build-20x10/bvf_bench NPPDX_BENCH=build-nppdx-20x10/benchmark_figure1_bvf \
+         BVF_RESULTS=../results/20x10 scripts/ncu_dram.sh        # and the same for scripts/ncu_l2.sh
+    BVF_RESULTS=../results/20x10 scripts/ncu_summarize.py        # and scripts/ncu_summarize.py l2
+
 ### Compile time (`compile_time/`)
 
 How long nvcc takes to compile the pipelines. `compile_time/pipeline.cu` holds one pipeline per translation unit (TU),
