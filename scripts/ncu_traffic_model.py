@@ -15,14 +15,17 @@ Model, per execution:
     stage the float3 region and the border stage the float3 resized region, once each;
   - OpenCV's and NPP's three pointwise passes read the whole output three times;
   - FKL BVF and NPPDx read a fixed per-launch term (code, constants, parameters), measured as the DRAM reads after a
-    flush at the smallest N (N = 1) minus the footprint of its regions, plus the NV12 source footprint of every region
-    rounded up to 32 byte sectors: its luma rows and chroma rows. Both resizes only read inside the region (FKL samples
+    flush at the smallest N (N = 1) minus the footprint of its regions, plus the NV12 source footprint of the regions
+    in 32 byte sectors: their luma rows and chroma rows, each sector counted once even where regions overlap (a cold
+    execution reads it from DRAM once). Both resizes only read inside the region (FKL samples
     at dst * scale and NPPDx at pixel centers, both clamped to the region). The NPPDx benchmark may choose a different
     kernel configuration (tile, block) for every N (nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv), with its
     own fixed term: the NPPDx model is only given for the N whose configuration is that of the smallest N. For every
     N, implied_fixed_term_KB is the measurement minus the footprint, to see how constant the fixed term is.
   - Reads between the SMs and L2 (lts__t_sectors_srcunit_tex_op_read) only see data loads, not the fixed term, so for
-    FKL BVF and NPPDx they are compared with the region footprint alone (sm_to_l2_model_MB).
+    FKL BVF and NPPDx they are compared with the region footprint alone (sm_to_l2_model_MB). That is the sum over the
+    regions, without removing overlaps: each region is loaded by its own thread blocks, which request a shared sector
+    from L2 once each.
 Measured DRAM reads: both scripts profile every pipeline with the caches flushed before every kernel, and both collect
 dram__bytes_read.sum. The DRAM counters are device-wide (a GPU that also drives a display adds traffic of other
 processes), so the smaller of the two measurements is used, and both are kept. The summaries must have byte precision
@@ -147,8 +150,16 @@ def main():
         sectors_per_row = (x + w["crop_w"] - 1) // SECTOR - x // SECTOR + 1
         return (w["crop_h"] + w["crop_h"] // 2) * sectors_per_row * SECTOR
 
-    def sources(n):
+    def requested(n):  # the footprints of the first n regions, summed: what their loads request from L2
         return sum(footprint(x) for x, _ in crops[:n])
+
+    def sources(n):  # the NV12 sectors of the first n regions, each once: what a cold execution reads from DRAM
+        sectors = set()
+        for x, y in crops[:n]:
+            columns = range(x // SECTOR, (x + w["crop_w"] - 1) // SECTOR + 1)
+            sectors.update(("Y", row, c) for row in range(y, y + w["crop_h"]) for c in columns)
+            sectors.update(("UV", row, c) for row in range(y // 2, y // 2 + w["crop_h"] // 2) for c in columns)
+        return len(sectors) * SECTOR
 
     dram, l2 = load("dram_traffic.csv"), load("l2_traffic.csv")
     configs = nppdx_configs()
@@ -198,7 +209,7 @@ def main():
                 note = f"NPPDx configuration {config(n)} differs from {config(anchor)} at N = {anchor}"
             else:
                 model = fixed + sources(n)
-            sm_l2_model = sources(n) if single else model
+            sm_l2_model = requested(n) if single else model
             cold = dram_cold(bench, impl, n)
             sm_l2 = measured(l2, bench, impl, n, "cold", "sm_to_l2_read_MB")
             ratio = lambda v, m: f"{v / m:.4f}" if v is not None and m else ""
