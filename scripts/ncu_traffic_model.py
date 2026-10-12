@@ -23,9 +23,12 @@ Model, per execution:
     own fixed term: the NPPDx model is only given for the N whose configuration is that of the smallest N. For every
     N, implied_fixed_term_KB is the measurement minus the footprint, to see how constant the fixed term is.
   - Reads between the SMs and L2 (lts__t_sectors_srcunit_tex_op_read) only see data loads, not the fixed term, so for
-    FKL BVF and NPPDx they are compared with the region footprint alone (sm_to_l2_model_MB). That is the sum over the
-    regions, without removing overlaps: each region is loaded by its own thread blocks, which request a shared sector
-    from L2 once each.
+    FKL BVF and NPPDx they are compared with the compulsory part alone, the region footprint (sm_to_l2_compulsory_MB):
+    the sum over the regions, without removing overlaps, since each region is loaded by its own thread blocks. It is
+    not a model of the requests: measured_sm_to_l2_read_over_compulsory above 1 is the re-requested part. FKL BVF's
+    bilinear taps request some sectors more than once. NPPDx splits a region into nppdx_blocks_per_crop tiles, and
+    every block loads its tile plus the resize halo, so neighboring tiles request the sectors of their shared edges
+    again; with one block per crop it requests each sector of the region once.
 Measured DRAM reads: both scripts profile every pipeline with the caches flushed before every kernel, and both collect
 dram__bytes_read.sum. The DRAM counters are device-wide (a GPU that also drives a display adds traffic of other
 processes), so the smaller of the two measurements is used, and both are kept. The summaries must have byte precision
@@ -129,12 +132,12 @@ def load(name):
 
 
 def nppdx_configs():
-    """The NPPDx configuration (tile, requested block) of every N, if the NPPDx run wrote it."""
+    """The NPPDx configuration (tile, requested block) and blocks per crop of every N, if the NPPDx run wrote them."""
     path = RESULTS / "nppdx" / "benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv"
     if not path.exists():
         return {}
     rows = list(csv.reader(open(path), skipinitialspace=True))[1:]
-    return {int(r[0]): f"{r[1]} block {r[2]}" for r in rows if r and r[0].isdigit()}
+    return {int(r[0]): (f"{r[1]} block {r[2]}", r[4]) for r in rows if r and r[0].isdigit()}
 
 
 def main():
@@ -177,7 +180,8 @@ def main():
     rows = []
     for bench, impl in PIPELINES:
         single = impl in ("fkl_bvf", "nppdx")
-        config = (lambda n: configs.get(n, "")) if impl == "nppdx" else (lambda n: "")
+        config = (lambda n: configs.get(n, ("", ""))[0]) if impl == "nppdx" else (lambda n: "")
+        blocks = (lambda n: configs.get(n, ("", ""))[1]) if impl == "nppdx" else (lambda n: "")
         fixed, anchor = None, None
         if single:
             measured_ns = [n for n in w["batches"] if dram_cold(bench, impl, n) is not None]
@@ -209,22 +213,23 @@ def main():
                 note = f"NPPDx configuration {config(n)} differs from {config(anchor)} at N = {anchor}"
             else:
                 model = fixed + sources(n)
-            sm_l2_model = requested(n) if single else model
+            sm_l2_compulsory = requested(n) if single else model
             cold = dram_cold(bench, impl, n)
             sm_l2 = measured(l2, bench, impl, n, "cold", "sm_to_l2_read_MB")
             ratio = lambda v, m: f"{v / m:.4f}" if v is not None and m else ""
             mb = lambda v: f"{v / 1e6:.6f}" if v is not None else ""
             rows.append({
                 "benchmark": bench, "implementation": impl, "N": n, "nppdx_configuration": config(n),
+                "nppdx_blocks_per_crop": blocks(n),
                 "model_compulsory_read_MB": mb(model),
                 "region_source_footprint_MB": mb(sources(n)) if single else "",
                 "fixed_term_KB": f"{fixed / 1e3:.3f}" if fixed is not None and model is not None else "",
                 "implied_fixed_term_KB": f"{(cold - sources(n)) / 1e3:.3f}" if single and cold is not None else "",
                 "measured_dram_read_cold_MB": mb(cold),
                 "measured_dram_read_cold_over_model": ratio(cold, model),
-                "sm_to_l2_model_MB": mb(sm_l2_model),
+                "sm_to_l2_compulsory_MB": mb(sm_l2_compulsory),
                 "measured_sm_to_l2_read_MB": mb(sm_l2),
-                "measured_sm_to_l2_read_over_model": ratio(sm_l2, sm_l2_model),
+                "measured_sm_to_l2_read_over_compulsory": ratio(sm_l2, sm_l2_compulsory),
                 "dram_read_cold_dram_pass_MB": mb(measured(dram, bench, impl, n, "cold", "dram_read_MB")),
                 "dram_read_cold_l2_pass_MB": mb(measured(l2, bench, impl, n, "cold", "dram_read_MB")),
                 "measured_dram_read_warm_MB": mb(measured(dram, bench, impl, n, "warm", "dram_read_MB")),
@@ -242,7 +247,7 @@ def main():
     for r in rows:
         print(f"{r['benchmark']:12s} {r['implementation']:24s} N={r['N']:3d}  model {r['model_compulsory_read_MB'] or '-':>9} MB"
               f"  DRAM cold {r['measured_dram_read_cold_MB'] or '-':>9} ({r['measured_dram_read_cold_over_model'] or '-'})"
-              f"  SM->L2 {r['measured_sm_to_l2_read_MB'] or '-':>9} ({r['measured_sm_to_l2_read_over_model'] or '-'})"
+              f"  SM->L2 {r['measured_sm_to_l2_read_MB'] or '-':>9} ({r['measured_sm_to_l2_read_over_compulsory'] or '-'})"
               + (f"  implied fixed {r['implied_fixed_term_KB']} KB" if r['implied_fixed_term_KB'] else "")
               + (f"  [{r['note']}]" if r['note'] else ""))
     for warning in warnings:
