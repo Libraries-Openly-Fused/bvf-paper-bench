@@ -214,11 +214,10 @@ void runPipeline() {
     const int cropStep = CROP_W * 3 * sizeof(Npp32f);
     const int outStep = OUT_W * 3 * sizeof(Npp32f);
     const size_t cropFloats = static_cast<size_t>(CROP_W) * CROP_H * 3;
-    const size_t resizedFloats = static_cast<size_t>(RES_W) * RES_H * 3;
     const size_t outFloats = static_cast<size_t>(OUT_W) * OUT_H * 3;
+    const size_t interior = static_cast<size_t>(BORDER_TOP) * OUT_W * 3;
     Npp8u* rgb8 = nullptr;
     Npp32f* cropped = nullptr;
-    Npp32f* resized = nullptr;
     Npp32f* tensor = nullptr;
     NppiImageDescriptor* srcDescriptors = nullptr;
     NppiImageDescriptor* dstDescriptors = nullptr;
@@ -227,14 +226,13 @@ void runPipeline() {
     gpuErrchk(cudaMallocPitch(reinterpret_cast<void**>(&rgb8), &rgbPitch, FRAME_W * 3, FRAME_H));
     const int rgbStep = static_cast<int>(rgbPitch);
     gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&cropped), N * cropFloats * sizeof(Npp32f)));
-    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&resized), N * resizedFloats * sizeof(Npp32f)));
     gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&tensor), N * outFloats * sizeof(Npp32f)));
     std::vector<NppiImageDescriptor> src(N), dst(N);
     std::vector<NppiResizeBatchROI_Advanced> roisHost(N);
     const auto crops = someCrops();
     for (size_t i = 0; i < N; ++i) {
         src[i] = NppiImageDescriptor{cropped + i * cropFloats, cropStep, NppiSize{CROP_W, CROP_H}};
-        dst[i] = NppiImageDescriptor{resized + i * resizedFloats, outStep, NppiSize{RES_W, RES_H}};
+        dst[i] = NppiImageDescriptor{tensor + i * outFloats + interior, outStep, NppiSize{RES_W, RES_H}};
         roisHost[i] = NppiResizeBatchROI_Advanced{NppiRect{0, 0, CROP_W, CROP_H}, NppiRect{0, 0, RES_W, RES_H}};
     }
     gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&srcDescriptors), N * sizeof(NppiImageDescriptor)));
@@ -253,23 +251,19 @@ void runPipeline() {
         NPP_CHECK(nppiConvert_8u32f_C3R_Ctx(cropSrc, rgbStep, cropped + i * cropFloats, cropStep,
                                             NppiSize{CROP_W, CROP_H}, st.npp));
     }
-    // 3_resize_batch
+    // 3_set_output_black
+    static const Npp32f zero[3] = {0.f, 0.f, 0.f};
+    NPP_CHECK(nppiSet_32f_C3R_Ctx(zero, tensor, outStep, NppiSize{OUT_W, static_cast<int>(N) * OUT_H}, st.npp));
+    // 4_resize_batch_into_output
     if constexpr (N == 1) {
         // nppiResizeBatch rejects a batch of one image with NPP_BAD_ARGUMENT_ERROR
         NPP_CHECK(nppiResize_32f_C3R_Ctx(cropped, cropStep, NppiSize{CROP_W, CROP_H},
-                                         NppiRect{0, 0, CROP_W, CROP_H}, resized, outStep,
+                                         NppiRect{0, 0, CROP_W, CROP_H}, tensor + interior, outStep,
                                          NppiSize{RES_W, RES_H}, NppiRect{0, 0, RES_W, RES_H},
                                          NPPI_INTER_LINEAR, st.npp));
     } else {
         NPP_CHECK(nppiResizeBatch_32f_C3R_Advanced_Ctx(RES_W, RES_H, srcDescriptors, dstDescriptors, rois,
                                                        static_cast<unsigned int>(N), NPPI_INTER_LINEAR, st.npp));
-    }
-    // 4_per_crop_copy_const_border
-    static const Npp32f zero[3] = {0.f, 0.f, 0.f};
-    for (size_t i = 0; i < N; ++i) {
-        NPP_CHECK(nppiCopyConstBorder_32f_C3R_Ctx(resized + i * resizedFloats, outStep, NppiSize{RES_W, RES_H},
-                                                  tensor + i * outFloats, outStep, NppiSize{OUT_W, OUT_H},
-                                                  BORDER_TOP, 0, zero, st.npp));
     }
     // 5_mulc_subc_divc
     const NppiSize tensorSize{OUT_W, static_cast<int>(N) * OUT_H};
@@ -278,7 +272,6 @@ void runPipeline() {
     NPP_CHECK(nppiDivC_32f_C3IR_Ctx(DIV, tensor, outStep, tensorSize, st.npp));
     cudaFree(rgb8);
     cudaFree(cropped);
-    cudaFree(resized);
     cudaFree(tensor);
     cudaFree(srcDescriptors);
     cudaFree(dstDescriptors);
