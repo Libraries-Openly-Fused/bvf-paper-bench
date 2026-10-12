@@ -28,7 +28,12 @@ set(NPPDX_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../nppdx" CACHE PATH "NPPDx checkout 
 # Timed and warm-up iterations of every benchmark: 1000 and 100 for the paper's results; the CI runs 1 and 0
 set(BENCH_ITERATIONS 1000 CACHE STRING "Timed iterations of every benchmark (at least 1)")
 set(BENCH_WARMUP_ITERATIONS 100 CACHE STRING "Warm-up iterations before the timed ones")
+# NPPDx kernels are compiled for one region size: these benchmarks are built for one of the workload's sizes at a time
+set(BENCH_REGIONS 32x16 CACHE STRING "Region size of the NPPDx benchmarks: 20x10, 32x16 or 48x24")
 include(${CMAKE_CURRENT_SOURCE_DIR}/../common/bench_geometry.cmake)
+if(BENCH_REGIONS STREQUAL "mixed")
+    message(FATAL_ERROR "The NPPDx kernels are compiled for one region size: set BENCH_REGIONS to 20x10, 32x16 or 48x24")
+endif()
 
 find_package(CUDAToolkit REQUIRED)
 list(APPEND CMAKE_PREFIX_PATH "${NPPDX_DIR}")

@@ -10,10 +10,13 @@ Two comparisons, each with the same number of threads on both sides:
 - OpenCV with as many threads as FKL's thread pool has workers (one per hardware thread) against FKL on its thread
   pool (`ParArch::CPU_MULTITHREAD`).
 
-OpenCV runs `cvtColor` on the whole frame (8 bit RGB), then per crop `convertTo`, `resize` and `copyMakeBorder`, then
-multiply, subtract and divide on the whole tensor; FKL runs one `executeOperations` call. Every timed run follows a
-1 ms idle gap, so that both libraries' thread pools are asleep when it starts. Each run writes one CSV per comparison in
-FKL's two-execution format, plus `cpu_validation.csv` and `cpu_platform.txt`.
+OpenCV runs `cvtColor` on the whole frame (8 bit RGB), then per region `convertTo` (into a buffer of the largest region
+size, through a view of the region's size), `resize` and `copyMakeBorder`, then multiply, subtract and divide on the
+whole tensor; FKL runs one `executeOperations` call. Both run on the regions of the iteration, which change every
+iteration ([workload](../README.md#workload)). Every timed run follows a 1 ms idle gap, so that both libraries' thread
+pools are asleep when it starts. Each run writes one CSV per comparison in FKL's two-execution format, plus
+`cpu_validation.csv` (before the timing, on the regions of the first, every 50th and the last timed iteration, one row
+per iteration), `regions.csv` and `cpu_platform.txt`.
 
 ## Build and run
 

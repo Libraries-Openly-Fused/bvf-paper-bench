@@ -18,9 +18,9 @@
 #   DEPS_DIR             where OpenCV is built once and reused by later runs (default <home>/bvf-paper-bench-deps)
 #   BUILD_DIR            build folders of the benchmarks (default <repo>/build-ci)
 #   OUT_DIR              results and logs (default <repo>/ci-results)
-#   GEOMETRIES           the workloads every benchmark is built and run for, separated by spaces, as
-#                        <crop W>x<crop H>:<resize W>x<resize H> (default "32x16:64x32 20x10:64x32", the paper's two);
-#                        the results of one go to OUT_DIR/<crop W>x<crop H>
+#   NPPDX_SIZES          the region sizes FKL vs NPPDx is built and run for, separated by spaces (default
+#                        "20x10 32x16 48x24"; its kernels are compiled for one size); every other benchmark runs the
+#                        paper's workload, the three sizes by turns (common/bench_geometry.h)
 #   GENERATOR            CMake generator (default Ninja)
 #   ITERATIONS           timed iterations of every benchmark (default 1: the CI checks the results, it does not
 #                        measure; 1000 for the paper's numbers)
@@ -38,7 +38,7 @@ else()
     set(EXE "")
 endif()
 foreach(default IN ITEMS "GENERATOR=Ninja" "OPENCV_VERSION=4.14.0" "NPPDX=AUTO" "ITERATIONS=1" "WARMUP_ITERATIONS=0"
-                         "GEOMETRIES=32x16:64x32 20x10:64x32"
+                         "NPPDX_SIZES=20x10 32x16 48x24"
                          "DEPS_DIR=${HOME_DIR}/bvf-paper-bench-deps"
                          "BUILD_DIR=${REPO}/build-ci" "OUT_DIR=${REPO}/ci-results")
     string(FIND "${default}" "=" eq)
@@ -506,36 +506,22 @@ if(BENCHMARKS STREQUAL "gpu")
     endif()
 endif()
 
-# Every benchmark is built and run for every workload of GEOMETRIES, each in BUILD_DIR/<benchmark>_<crop> with its
-# results in OUT_DIR/<crop>/<benchmark folder> (for example build-ci/npp_32x16 and ci-results/32x16/fkl-vs-npp)
-string(REPLACE " " ";" geometries "${GEOMETRIES}")
-# Every workload's builds and results are in folders named after its crop size, so two workloads cannot share one
-set(crops "")
-foreach(geometry IN LISTS geometries)
-    string(REGEX REPLACE ":.*" "" crop "${geometry}")
-    if(crop IN_LIST crops)
-        message(FATAL_ERROR "GEOMETRIES: two workloads with ${crop} crops would share their build and results folders")
+# Every benchmark is built in BUILD_DIR/<benchmark> and run into OUT_DIR/<benchmark folder>, FKL vs NPPDx once per region
+# size, in BUILD_DIR/nppdx_<size> and OUT_DIR/fkl-vs-nppdx/<size> (for example build-ci/npp and ci-results/fkl-vs-npp)
+string(REPLACE " " ";" nppdxSizes "${NPPDX_SIZES}")
+foreach(size IN LISTS nppdxSizes)
+    if(NOT size MATCHES "^(20x10|32x16|48x24)$")
+        message(FATAL_ERROR "NPPDX_SIZES: ${size} is not one of the region sizes 20x10, 32x16 and 48x24")
     endif()
-    list(APPEND crops "${crop}")
 endforeach()
-foreach(geometry IN LISTS geometries)
-    if(NOT geometry MATCHES "^([0-9]+)x([0-9]+):([0-9]+)x([0-9]+)$")
-        message(FATAL_ERROR "GEOMETRIES: ${geometry} is not <crop W>x<crop H>:<resize W>x<resize H>")
-    endif()
-    set(geometryOptions -DBENCH_CROP_W=${CMAKE_MATCH_1} -DBENCH_CROP_H=${CMAKE_MATCH_2}
-                        -DBENCH_RESIZE_W=${CMAKE_MATCH_3} -DBENCH_RESIZE_H=${CMAKE_MATCH_4})
-    set(g "${CMAKE_MATCH_1}x${CMAKE_MATCH_2}")
-    set(out "${OUT_DIR}/${g}")
-    message(STATUS "Workload ${g} crops resized to ${CMAKE_MATCH_3}x${CMAKE_MATCH_4}")
-    if(BENCHMARKS STREQUAL "cpu")
-        build_benchmark(opencv-cpu_${g} "${REPO}/fkl-vs-opencv-cpu" ${geometryOptions})
-        set(bench "${BUILD_DIR}/opencv-cpu_${g}/benchmark_opencv_cpu${EXE}")
-        find_dlls("${bench}")
-        run(benchmark_opencv_cpu_${g} COMMAND "${bench}" "${out}/fkl-vs-opencv-cpu")
-        check_csv("${out}/fkl-vs-opencv-cpu/cpu_validation.csv" "FKL MaxAbsError vs FKL-convention reference" 1e-3)
-        check_csv("${out}/fkl-vs-opencv-cpu/cpu_validation.csv" "FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference" 1e-3)
-        continue()
-    endif()
+if(BENCHMARKS STREQUAL "cpu")
+    build_benchmark(opencv-cpu "${REPO}/fkl-vs-opencv-cpu")
+    set(bench "${BUILD_DIR}/opencv-cpu/benchmark_opencv_cpu${EXE}")
+    find_dlls("${bench}")
+    run(benchmark_opencv_cpu COMMAND "${bench}" "${OUT_DIR}/fkl-vs-opencv-cpu")
+    check_csv("${OUT_DIR}/fkl-vs-opencv-cpu/cpu_validation.csv" "FKL MaxAbsError vs FKL-convention reference" 1e-3)
+    check_csv("${OUT_DIR}/fkl-vs-opencv-cpu/cpu_validation.csv" "FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference" 1e-3)
+else()
     # The benchmarks on common/bench_gpu.h: <build name>:<folder>:<program>
     foreach(entry IN ITEMS "opencv-cuda:fkl-vs-opencv-cuda:benchmark_opencv_cuda" "npp:fkl-vs-npp:benchmark_npp"
                            "ablation:fkl-ablation:benchmark_fkl_ablation")
@@ -543,49 +529,53 @@ foreach(geometry IN LISTS geometries)
         list(GET entry 0 buildName)
         list(GET entry 1 folder)
         list(GET entry 2 program)
-        build_benchmark(${buildName}_${g} "${REPO}/${folder}" ${cudaOptions} ${geometryOptions})
-        set(bench "${BUILD_DIR}/${buildName}_${g}/${program}${EXE}")
+        build_benchmark(${buildName} "${REPO}/${folder}" ${cudaOptions})
+        set(bench "${BUILD_DIR}/${buildName}/${program}${EXE}")
+        set(out "${OUT_DIR}/${folder}")
         find_dlls("${bench}")
-        run(${program}_${g} COMMAND "${bench}" "${out}/${folder}")
-        run(${program}_l2_flushed_${g} COMMAND "${bench}" "${out}/${folder}" --gpu-only-l2-flushed)
-        run(${program}_profile_kernels_${g} COMMAND "${bench}" "${out}/${folder}" --profile-kernels)
+        run(${program} COMMAND "${bench}" "${out}")
+        run(${program}_l2_flushed COMMAND "${bench}" "${out}" --gpu-only-l2-flushed)
+        run(${program}_profile_kernels COMMAND "${bench}" "${out}" --profile-kernels)
         # FKL's pipelines must match FKL's CPU backend (the program also fails if they do not); the libraries' outputs
         # are in validation.csv but not required: they depend on the library build and version of each runner
-        check_csv("${out}/${folder}/validation.csv" within_tolerance yes FILTER_COLUMN implementation FILTER "^fkl_")
-        check_csv("${out}/${folder}/validation.csv" non_finite_values 0)
+        check_csv("${out}/validation.csv" within_tolerance yes FILTER_COLUMN implementation FILTER "^fkl_")
+        check_csv("${out}/validation.csv" non_finite_values 0)
         if(buildName STREQUAL "ablation")
-            find_dlls("${BUILD_DIR}/${buildName}_${g}/bvf_types${EXE}")
-            run(bvf_types_${g} COMMAND "${BUILD_DIR}/${buildName}_${g}/bvf_types${EXE}")
-            run(${program}_host_overhead_${g} COMMAND "${bench}" "${out}/${folder}" --host-overhead)
+            find_dlls("${BUILD_DIR}/${buildName}/bvf_types${EXE}")
+            run(bvf_types COMMAND "${BUILD_DIR}/${buildName}/bvf_types${EXE}")
+            run(${program}_host_overhead COMMAND "${bench}" "${out}" --host-overhead)
         endif()
     endforeach()
-    if(NOT NPPDX)
-        continue()
-    endif()
-    build_benchmark(nppdx_${g} "${REPO}/fkl-vs-nppdx" ${cudaOptions} ${geometryOptions})
-    # The two NPPDx comparisons, both with results in fkl-vs-nppdx/: NPPDx as one kernel with a hand written end
-    # (benchmark_nppdx) and NPPDx + NPP without hand written pixel processing code (benchmark_nppdx_npp)
-    foreach(nppdxName IN ITEMS benchmark_nppdx benchmark_nppdx_npp)
-        set(nppdx "${BUILD_DIR}/nppdx_${g}/${nppdxName}${EXE}")
-        set(nppdxOut "${out}/fkl-vs-nppdx")
-        find_dlls("${nppdx}")
-        run(${nppdxName}_${g} COMMAND "${nppdx}" "${nppdxOut}")
-        run(${nppdxName}_l2_flushed_${g} COMMAND "${nppdx}" "${nppdxOut}" --gpu-only-l2-flushed)
-        run(${nppdxName}_analyze_${g} COMMAND "${nppdx}" "${nppdxOut}" --analyze)
-        # The same comparison with the configurations pinned to those the run above chose (--configs), into its own
-        # folder: the configuration file's parsing, the pinned dispatch and the pinned kernel's initialization
-        set(pinnedOut "${out}/fkl-vs-nppdx-configs")
-        run(${nppdxName}_configs_${g} COMMAND "${nppdx}" "${pinnedOut}" --configs
-            "${nppdxOut}/${nppdxName}_nppdx_config_GPU_NVIDIA.csv")
-        # FKL against FKL's CPU backend, NPPDx against its own reference (its sampling convention; for NPPDx + NPP also
-        # its rounding to 8 bits), each with the tolerance written in the CSV
-        foreach(validation IN ITEMS "${nppdxOut}/${nppdxName}_validation_GPU_NVIDIA.csv"
-                                    "${pinnedOut}/${nppdxName}_validation_GPU_NVIDIA.csv")
-            check_csv("${validation}" "FKL within tolerance" yes)
-            check_csv("${validation}" "NPPDx within tolerance" yes)
+    if(NPPDX)
+        foreach(size IN LISTS nppdxSizes)
+            build_benchmark(nppdx_${size} "${REPO}/fkl-vs-nppdx" ${cudaOptions} -DBENCH_REGIONS=${size})
+            # The two NPPDx comparisons, both with results in fkl-vs-nppdx/<size>: NPPDx as one kernel with a hand
+            # written end (benchmark_nppdx) and NPPDx + NPP without hand written pixel processing code
+            # (benchmark_nppdx_npp)
+            foreach(nppdxName IN ITEMS benchmark_nppdx benchmark_nppdx_npp)
+                set(nppdx "${BUILD_DIR}/nppdx_${size}/${nppdxName}${EXE}")
+                set(nppdxOut "${OUT_DIR}/fkl-vs-nppdx/${size}")
+                find_dlls("${nppdx}")
+                run(${nppdxName}_${size} COMMAND "${nppdx}" "${nppdxOut}")
+                run(${nppdxName}_l2_flushed_${size} COMMAND "${nppdx}" "${nppdxOut}" --gpu-only-l2-flushed)
+                run(${nppdxName}_analyze_${size} COMMAND "${nppdx}" "${nppdxOut}" --analyze)
+                # The same comparison with the configurations pinned to those the run above chose (--configs), into
+                # its own folder: the configuration file's parsing, the pinned dispatch and the pinned kernel's
+                # initialization
+                set(pinnedOut "${OUT_DIR}/fkl-vs-nppdx-configs/${size}")
+                run(${nppdxName}_configs_${size} COMMAND "${nppdx}" "${pinnedOut}" --configs
+                    "${nppdxOut}/${nppdxName}_nppdx_config_GPU_NVIDIA.csv")
+                # FKL against FKL's CPU backend, NPPDx against its own reference (its sampling convention; for NPPDx +
+                # NPP also its rounding to 8 bits), each with the tolerance written in the CSV
+                foreach(validation IN ITEMS "${nppdxOut}/${nppdxName}_validation_GPU_NVIDIA.csv"
+                                            "${pinnedOut}/${nppdxName}_validation_GPU_NVIDIA.csv")
+                    check_csv("${validation}" "FKL within tolerance" yes)
+                    check_csv("${validation}" "NPPDx within tolerance" yes)
+                endforeach()
+            endforeach()
         endforeach()
-    endforeach()
-endforeach()
+    endif()
+endif()
 
 if(FAILURES)
     list(JOIN FAILURES "\n  " failures)

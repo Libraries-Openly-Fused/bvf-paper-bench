@@ -42,17 +42,18 @@ void runPipeline() {
     std::vector<cv::Rect> rects;
     std::vector<cv::cuda::GpuMat> cropped, resized;
     cv::cuda::GpuMat tensor;
-    for (size_t i = 0; i < N; ++i) {
-        rects.emplace_back(static_cast<int>(i), static_cast<int>(i), CROP_W, CROP_H);
-        cropped.emplace_back(CROP_H, CROP_W, CV_32FC3);
+    for (const fk::Rect& r : someCrops()) {
+        rects.emplace_back(static_cast<int>(r.x), static_cast<int>(r.y), r.width, r.height);
+        cropped.emplace_back(MAX_REGION_H, MAX_REGION_W, CV_32FC3);
         resized.emplace_back(RES_H, RES_W, CV_32FC3);
     }
     cv::cuda::createContinuous(static_cast<int>(N) * OUT_H, OUT_W, CV_32FC3, tensor);
     bench::npp::nv12ToRgb8Bt601Limited(y, uv, pitch, rgb8.data, static_cast<int>(rgb8.step),
                                        NppiSize{FRAME_W, FRAME_H}, npp);
     for (size_t i = 0; i < N; ++i) {
-        rgb8(rects[i]).convertTo(cropped[i], CV_32F, stream);
-        cv::cuda::resize(cropped[i], resized[i], cv::Size(RES_W, RES_H), 0., 0., cv::INTER_LINEAR, stream);
+        cv::cuda::GpuMat crop = cropped[i](cv::Rect(0, 0, rects[i].width, rects[i].height));
+        rgb8(rects[i]).convertTo(crop, CV_32F, stream);
+        cv::cuda::resize(crop, resized[i], cv::Size(RES_W, RES_H), 0., 0., cv::INTER_LINEAR, stream);
         cv::cuda::GpuMat plane = tensor.rowRange(static_cast<int>(i) * OUT_H, static_cast<int>(i + 1) * OUT_H);
         cv::cuda::copyMakeBorder(resized[i], plane, BORDER_TOP, BORDER_BOTTOM, 0, 0, cv::BORDER_CONSTANT,
                                  cv::Scalar(0., 0., 0.), stream);

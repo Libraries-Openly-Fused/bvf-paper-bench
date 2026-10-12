@@ -43,7 +43,8 @@ int main() {
     constexpr size_t N = MAX_BATCH;
     std::array<fk::Rect, N> crops{};
     for (size_t i = 0; i < N; ++i) {
-        crops[i] = fk::Rect(static_cast<int>(i), static_cast<int>(i), CROP_W, CROP_H);
+        const RegionSize s = regionSize(0, i);
+        crops[i] = fk::Rect(static_cast<int>(i), static_cast<int>(i), s.width, s.height);
     }
     const fk::Image<fk::PixelFormat::NV12> frame(FRAME_W, FRAME_H);
     const fk::Tensor<fk::float3> output(OUT_W, OUT_H, N);

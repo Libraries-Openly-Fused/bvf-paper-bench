@@ -24,12 +24,13 @@
 #if defined(IMPL_VFHF)
 // ---------------------------------------------------------------- VF+HF: four kernels, 8 bit RGB frame
 template <typename T>
-std::array<fk::RawPtr<fk::ND::_2D, T>, ct::N> planeViews(const fk::Tensor<T>& tensor, int width, int height) {
+std::array<fk::RawPtr<fk::ND::_2D, T>, ct::N> planeViews(const fk::Tensor<T>& tensor, int planeWidth, int planeHeight,
+                                                         const std::array<fk::Size, ct::N>& sizes) {
     const auto raw = tensor.ptr();
     std::array<fk::RawPtr<fk::ND::_2D, T>, ct::N> views{};
     for (size_t i = 0; i < ct::N; ++i) {
-        views[i].data = raw.data + i * width * height;
-        views[i].dims = fk::PtrDims<fk::ND::_2D>(width, height, width * sizeof(T));
+        views[i].data = raw.data + i * planeWidth * planeHeight;
+        views[i].dims = fk::PtrDims<fk::ND::_2D>(sizes[i].width, sizes[i].height, planeWidth * sizeof(T));
     }
     return views;
 }
@@ -40,12 +41,17 @@ void runPipeline() {
     fk::Stream stream;
     NV12Image frame(FRAME_W, FRAME_H);
     fk::Ptr2D<RGB> rgb(FRAME_W, FRAME_H, 0, fk::MemType::Device);
-    fk::Tensor<fk::float3> cropped(CROP_W, CROP_H, N, 1, fk::MemType::Device);
+    fk::Tensor<fk::float3> cropped(MAX_REGION_W, MAX_REGION_H, N, 1, fk::MemType::Device);
     fk::Tensor<fk::float3> resized(RES_W, RES_H, N, 1, fk::MemType::Device);
     fk::Tensor<fk::float3> out(OUT_W, OUT_H, N, 1, fk::MemType::Device);
     const auto crops = someCrops();
-    const auto croppedViews = planeViews(cropped, CROP_W, CROP_H);
-    const auto resizedViews = planeViews(resized, RES_W, RES_H);
+    std::array<fk::Size, N> cropSizes{}, resizedSizes{};
+    for (size_t i = 0; i < N; ++i) {
+        cropSizes[i] = fk::Size(crops[i].width, crops[i].height);
+        resizedSizes[i] = fk::Size(RES_W, RES_H);
+    }
+    const auto croppedViews = planeViews(cropped, MAX_REGION_W, MAX_REGION_H, cropSizes);
+    const auto resizedViews = planeViews(resized, RES_W, RES_H, resizedSizes);
     // 1: full frame NV12 -> 8 bit RGB, quantized as in the 8 bit reference
     fk::executeOperations<fk::TransformDPP<>>(stream,
         fk::ReadYUV<fk::PixelFormat::NV12>::build(frame),

@@ -5,7 +5,7 @@ the [workload](../README.md#workload) of every benchmark of this repository (NV1
 
 | Implementation | What runs |
 |---|---|
-| `opencv_cuda` | NV12 to RGB of the whole frame with NPP (OpenCV's CUDA modules have no NV12 conversion) into an 8 bit RGB frame, then per crop `cv::cuda` `convertTo` (float3 crop), `resize` (float3 resized crop) and `copyMakeBorder` (into its output plane), then `multiply`, `subtract` and `divide` on the whole float3 output: 3N + 4 kernels |
+| `opencv_cuda` | NV12 to RGB of the whole frame with NPP (OpenCV's CUDA modules have no NV12 conversion) into an 8 bit RGB frame, then per region `cv::cuda` `convertTo` (float3 crop, into a buffer of the largest region size through a view of the region's size), `resize` (float3 resized crop) and `copyMakeBorder` (into its output plane), then `multiply`, `subtract` and `divide` on the whole float3 output: 3N + 4 kernels. The `GpuMat` views of every region (of the RGB frame and of its crop buffer) are made in the iteration, inside the timed region |
 | `fkl_bvf` | FKL with BVF: one `executeOperations` call, one kernel for the whole chain, with no intermediates in memory |
 
 OpenCV is checked against the chain on FKL's CPU backend with the RGB rounded to 8 bits, like its 8 bit RGB frame

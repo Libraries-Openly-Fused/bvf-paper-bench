@@ -15,7 +15,9 @@
 // What the two NPPDx implementations of the Figure 1 pipeline share (nppdx_figure1.h: one kernel with a hand written
 // end; nppdx_npp_figure1.h: an NPPDx-only kernel followed by NPP): the NPPDx operations of one tile configuration
 // (NV12 ingest of the crop, limited to full range, color conversion BT.601, bilinear resize, 8 bit RGB write) and the
-// tile and block configurations NPPDx supports for the sizes of common/bench_geometry.h.
+// tile and block configurations NPPDx supports for the sizes of common/bench_geometry.h. NPPDx kernels are compiled for
+// one region size and resize ratio, so these benchmarks are built for one of the region sizes (BENCH_REGIONS 20x10,
+// 32x16 or 48x24); the positions still change every iteration.
 
 #ifndef FIGURE1_NPPDX_COMMON_H
 #define FIGURE1_NPPDX_COMMON_H
@@ -38,6 +40,18 @@
 namespace figure1 {
 
 using namespace bench::geometry;
+
+static_assert(!MIXED_SIZES, "NPPDx kernels are compiled for one region size: configure with -DBENCH_REGIONS=20x10, "
+                            "32x16 or 48x24");
+// The size of every region of this build
+constexpr int CROP_W = REGION_SIZES[0].width;
+constexpr int CROP_H = REGION_SIZES[0].height;
+// The resize ratio as NPPDx expresses it: J source pixels become K output pixels. NPPDx takes one ratio for both
+// dimensions, so the region and the resized region have the same aspect ratio (2:1 for every size of the workload).
+constexpr unsigned RESIZE_J = static_cast<unsigned>(CROP_W / std::gcd(CROP_W, RES_W));
+constexpr unsigned RESIZE_K = static_cast<unsigned>(RES_W / std::gcd(CROP_W, RES_W));
+static_assert(CROP_W * RESIZE_K == RES_W * RESIZE_J && CROP_H * RESIZE_K == RES_H * RESIZE_J,
+              "The resize must have the same ratio in both dimensions (NPPDx's Resize<J, K>)");
 
 // ImageNet normalization of 8 bit RGB
 struct Normalization {

@@ -5,7 +5,8 @@ Run without sudo after the profiling script:
     ncu_summarize.py        after ncu_dram.sh: results/ncu/*.ncu-rep  -> results/dram_traffic.csv
     ncu_summarize.py l2     after ncu_l2.sh:   results/ncu_l2/*.ncu-rep -> results/l2_traffic.csv
 
-For every pipeline, N and cache control it writes the number of kernels and the bytes summed over all of them.
+For every pipeline, N and cache control it writes the number of kernels and the bytes summed over all of them. Every
+profile is one execution on the regions of iteration 0 (scripts/ncu_common.sh).
 """
 import csv
 import os
@@ -80,8 +81,8 @@ def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "dram"
     cfg = MODES[mode]
     # The benchmarks and pipelines the profiling scripts profile, in the order of the summary
-    benches = ["fkl-vs-opencv-cuda", "fkl-vs-npp", "fkl-ablation", "fkl-vs-nppdx"]
-    order = ["opencv_cuda", "npp", "nppdx_npp", "nppdx", "fkl_vf_hf", "fkl_bvf"]
+    benches = ["fkl-vs-opencv-cuda", "fkl-vs-npp", "fkl-ablation"]
+    order = ["opencv_cuda", "npp", "fkl_vf_hf", "fkl_bvf"]
     summary = []
     for report in sorted((RESULTS / cfg["dir"]).glob("*.ncu-rep")):
         match = REPORT_NAME.match(report.stem)
