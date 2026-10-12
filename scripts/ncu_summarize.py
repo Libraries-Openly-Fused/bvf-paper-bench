@@ -6,7 +6,10 @@ Run without sudo after the profiling script:
     ncu_summarize.py l2     after ncu_l2.sh:   results/ncu_l2/*.ncu-rep -> results/l2_traffic.csv
 
 For every pipeline, N and cache control it writes the number of kernels and the bytes summed over all of them. Every
-profile is one execution on the regions of iteration 0 (scripts/ncu_common.sh).
+profile is one execution on the regions of iteration 0 (scripts/ncu_common.sh). ncu_dram.sh takes every profile more
+than once (the DRAM counters are device-wide, so a display on the same GPU adds traffic to some of them): the row of a
+pipeline, N and cache control is its profile with the fewest DRAM bytes read, with the number of profiles and the
+largest DRAM read among them next to it.
 """
 import csv
 import os
@@ -19,8 +22,8 @@ import sys
 # Override with the environment variables NCU and BVF_RESULTS; by default results/ is next to this repository
 NCU = os.environ.get("NCU") or shutil.which("ncu") or "/usr/local/cuda/bin/ncu"
 RESULTS = pathlib.Path(os.environ.get("BVF_RESULTS", pathlib.Path(__file__).resolve().parents[2] / "results"))
-# <benchmark folder>__<implementation>_N<N>_cache-<all|none> (scripts/ncu_common.sh)
-REPORT_NAME = re.compile(r"^(?P<bench>[a-z-]+)__(?P<impl>.+)_N(?P<n>\d+)_cache-(?P<cache>all|none)$")
+# <benchmark folder>__<implementation>_N<N>_cache-<all|none>[-<repeat>] (scripts/ncu_common.sh, ncu_dram.sh)
+REPORT_NAME = re.compile(r"^(?P<bench>[a-z-]+)__(?P<impl>.+)_N(?P<n>\d+)_cache-(?P<cache>all|none)(?:-(?P<repeat>\d+))?$")
 SECTOR_BYTES = 32
 
 MODES = {
@@ -92,14 +95,24 @@ def main():
             print(f"Skipping {report.name}: not a pipeline the profiling scripts profile (a report of an earlier run?)")
             continue
         totals, kernels = totals_of(report, cfg["metrics"])
-        summary.append({
+        row = {
             "implementation": match["impl"],
             "benchmark": match["bench"],
             "N": int(match["n"]),
             "cache_control": "cold (flush before every kernel)" if match["cache"] == "all" else "warm (no flush)",
             "kernels": kernels,
             **row_for(mode, totals),
-        })
+        }
+        key = (row["benchmark"], row["implementation"], row["N"], row["cache_control"])
+        same = next((s for s in summary if (s["benchmark"], s["implementation"], s["N"], s["cache_control"]) == key), None)
+        if same is None:
+            summary.append({**row, "profiles": 1, "dram_read_max_of_profiles_MB": row["dram_read_MB"]})
+            continue
+        # Several profiles of the same execution: keep the one with the fewest DRAM bytes read
+        profiles, largest = same["profiles"] + 1, max(same["dram_read_max_of_profiles_MB"], row["dram_read_MB"])
+        if row["dram_read_MB"] < same["dram_read_MB"]:
+            same.update(row)
+        same.update({"profiles": profiles, "dram_read_max_of_profiles_MB": largest})
     if not summary:
         sys.exit(f"No reports of the profiled pipelines in {RESULTS / cfg['dir']}: run the profiling script first")
     summary.sort(key=lambda s: (s["cache_control"], s["N"], benches.index(s["benchmark"]),

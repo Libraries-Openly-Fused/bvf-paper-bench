@@ -125,7 +125,9 @@ the validated iterations.
 NPP, FKL VF+HF and FKL BVF pipelines with Nsight Compute, through the `--ncu-target` modes: one execution on the
 regions of iteration 0, the same for every pipeline. `ncu_dram.sh` profiles every batch size with the caches flushed
 before every kernel (cold), and N = 1 and 100 without flushing (warm: L2 holds what the executions on iterations 1 to
-3 left there, as in the timed loop, where every iteration has new regions); `ncu_l2.sh` profiles N = 1 and 100 (cold).
+3 left there, as in the timed loop, where every iteration has new regions), each profile twice (`REPEATS`): the DRAM
+counters are device-wide, so a display on the same GPU adds other processes' traffic to some profiles, and the summary
+keeps the smallest of them. `ncu_l2.sh` profiles N = 1 and 100 (cold).
 They stop unless every benchmark was built for the same workload (`--workload`), take the batch sizes from the
 benchmarks (`--batches`), and write the regions of iteration 0 to `ncu_regions.csv` in the results folder
 (`--regions 0`) for the traffic model. The paths and their environment variables are at the top of

@@ -14,7 +14,9 @@
 # NVTX range "measure" of the --ncu-target mode of the benchmarks) with the caches flushed before every kernel
 # (--cache-control all, cold) at every batch size N, and without flushing (--cache-control none, warm: L2 keeps what
 # the executions before it, on the regions of iterations 1 to 3, left there, as in the timed loop) at the batch sizes
-# of WARM_BATCHES (default 1 and 100). Reports go to results/ncu and are given back to
+# of WARM_BATCHES (default 1 and 100). Every profile is taken REPEATS times (default 2; report names end in -<k> after
+# the first), because the DRAM counters are device-wide: a GPU that also drives a display adds other processes' traffic
+# to some profiles, and ncu_summarize.py keeps the smallest measurement of every pipeline, N and cache control. Reports go to results/ncu and are given back to
 # the user who ran sudo. Nothing on the system is changed. Summarize afterwards, without sudo, with ncu_summarize.py.
 set -u
 
@@ -29,8 +31,9 @@ LOG=$OUT/ncu_dram.log
 failures=0
 total=0
 
-profile() { # <report name> <benchmark binary> <implementation> <N>, with the cache control of the loop below
-    local name=$1_cache-$cache bin=$2 impl=$3 n=$4
+REPEATS=${REPEATS:-2}
+profile() { # <report name> <benchmark binary> <implementation> <N>, with the cache control and repeat of the loop below
+    local name=$1_cache-$cache$suffix bin=$2 impl=$3 n=$4
     total=$((total + 1))
     echo "[$total] $name $*" | tee -a "$LOG"
     if ! "$NCU" --nvtx --nvtx-include "measure/" --metrics "$METRICS" --cache-control "$cache" \
@@ -41,13 +44,16 @@ profile() { # <report name> <benchmark binary> <implementation> <N>, with the ca
     fi
 }
 
-cache=all
-for n in $BATCHES; do
-    profile_pipelines "$n"
-done
-cache=none
-for n in $WARM_BATCHES; do
-    profile_pipelines "$n"
+for repeat in $(seq "$REPEATS"); do
+    suffix=$([ "$repeat" = 1 ] && echo "" || echo "-$repeat")
+    cache=all
+    for n in $BATCHES; do
+        profile_pipelines "$n"
+    done
+    cache=none
+    for n in $WARM_BATCHES; do
+        profile_pipelines "$n"
+    done
 done
 
 rm -rf "$OUT/scratch"
