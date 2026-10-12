@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-# ROCm port of the GPU benchmark (src/bvf_bench.cu): FKL's HIP backend against RPP, on an AMD GPU.
+# ROCm port of the GPU benchmarks of common/bench_gpu.h: FKL's HIP backend against RPP, on an AMD GPU.
 # Configure with amdclang++ as both the C++ and the HIP compiler, as FKL's ROCm CI does, for example:
 #   cmake -S rocm -B build-rocm -G Ninja -DCMAKE_BUILD_TYPE=Release \
 #         -DCMAKE_CXX_COMPILER=/opt/rocm/core-10.1/bin/amdclang++ -DCMAKE_HIP_COMPILER=/opt/rocm/core-10.1/bin/amdclang++ \

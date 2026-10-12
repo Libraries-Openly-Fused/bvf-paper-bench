@@ -1,4 +1,4 @@
-// ROCm port of src/bvf_bench.cu: latency and correctness benchmark for the Backwards Vertical Fusion paper, Figure 1
+// ROCm port of the GPU benchmarks of common/bench_gpu.h: latency and correctness benchmark for the Backwards Vertical Fusion paper, Figure 1
 // pipeline on an AMD GPU:
 // ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
 // with the frame, sizes, batch sizes and crop positions of common/bench_geometry.h.
@@ -43,6 +43,7 @@
 #include <rocprofiler-sdk/rocprofiler.h>
 
 #include "bench_geometry.h"
+#include "bench_validation.h"
 
 #include <algorithm>
 #include <array>
@@ -88,10 +89,14 @@ namespace bench {
 using namespace geometry;
 constexpr int WARMUP_ITERS = 100;
 constexpr int TIMED_ITERS = 1000;
-constexpr float TOLERANCE = 1e-3f;
+// How outputs are checked against their references: the rules of every GPU benchmark (common/bench_validation.h)
+using validation::TOLERANCE;
+using validation::TOLERANCE_8BIT;
+using ErrorStats = validation::Errors;
+using validation::compare;
 // RPP variants within this max abs error (normalized units) of the RPP-convention reference are numerically
-// equivalent; the fastest of them is the benchmark's RPP pipeline (selection pass). One 8 bit level is
-// (1/255) / 0.229 = 0.017.
+// equivalent; the fastest of them is the benchmark's RPP pipeline (selection pass). One 8 bit level is at most
+// (1/255) / 0.224 = 0.0175.
 constexpr float RPP_EQUIVALENCE = 1e-5f;
 
 // Pointwise tail: ImageNet normalization of 8 bit RGB
@@ -266,7 +271,7 @@ std::array<fk::RawPtr<fk::ND::_2D, T>, N> planeViews(const fk::Tensor<T>& tensor
 
 // VF + HF without BVF: four kernels with the intermediates in memory, the same intermediates as the paper's OpenCV
 // and NPP pipelines: an 8 bit RGB frame, quantized as in the 8 bit reference (normalize, add half a level, saturate,
-// denormalize), then float3 crops, float3 resized crops and the float3 output. Unchanged from bvf_bench.cu.
+// denormalize), then float3 crops, float3 resized crops and the float3 output. Unchanged from common/bench_gpu.h.
 // With EIGHT_BIT_FRAME = false the frame is float3 instead; that variant is only used for the per kernel breakdown.
 template <size_t N, bool EIGHT_BIT_FRAME>
 Implementation makeFklVfHf(Context& ctx) {
@@ -811,29 +816,6 @@ std::vector<float> rppConventionReference8bit(const Context& ctx) {
     return out;
 }
 
-struct ErrorStats {
-    std::array<float, 3> maxPerChannel{0.f, 0.f, 0.f};
-    double mean{0.};
-    size_t nonFinite{0};
-    float max() const { return std::max({maxPerChannel[0], maxPerChannel[1], maxPerChannel[2]}); }
-};
-
-ErrorStats compare(const std::vector<float>& output, const std::vector<float>& reference) {
-    ErrorStats stats;
-    double sum = 0.;
-    for (size_t i = 0; i < output.size(); ++i) {
-        const float err = std::abs(output[i] - reference[i]);
-        if (!std::isfinite(err)) {
-            stats.nonFinite++;
-            stats.maxPerChannel[i % 3] = INFINITY;
-            continue;
-        }
-        stats.maxPerChannel[i % 3] = std::max(stats.maxPerChannel[i % 3], err);
-        sum += err;
-    }
-    stats.mean = sum / static_cast<double>(output.size());
-    return stats;
-}
 
 // Statistics of a set of timed executions, in microseconds
 struct TimingStats {
@@ -939,7 +921,7 @@ void measureStages(const Context& ctx, const Implementation& impl, int batch) {
 }
 
 // ------------------------------------------------------------------------------------------------
-// rocprofiler-sdk, in process (the counterpart of CUPTI in bvf_bench.cu):
+// rocprofiler-sdk, in process (the counterpart of CUPTI in common/bench_gpu.h):
 //  - HIP runtime API callback tracing: kernel launches, memsets and memcpys of one pipeline (works on WSL2)
 //  - kernel dispatch buffer tracing: GPU start and end timestamps of every kernel, for the GPU time only benchmark
 //    (on WSL2 the SDK delivers no kernel dispatch records; kernelTracingAvailable() detects it)
@@ -1044,7 +1026,7 @@ bool isFlushKernel(uint64_t kernelId) {
 }
 
 // The HIP runtime executes hipMemset* (and some hipMemcpy*) with its own blit kernels; like CUPTI's kernel records in
-// bvf_bench.cu, the GPU time only benchmark counts the kernels the pipelines launch, not memsets and copies
+// common/bench_gpu.h, the GPU time only benchmark counts the kernels the pipelines launch, not memsets and copies
 bool isRuntimeBlitKernel(uint64_t kernelId) {
     const auto it = kernelNames.find(kernelId);
     return it != kernelNames.end() && it->second.rfind("__amd_rocclr_", 0) == 0;
@@ -1129,7 +1111,16 @@ struct Result {
     ErrorStats errorVs8bitReference;
     std::string reference;
     LaunchCounts launches;
+    // 1e-3 against the float reference, one level of 8 bit RGB against the 8 bit ones (common/bench_validation.h)
+    float tolerance() const { return reference == "fkl_cpu_float" ? TOLERANCE : TOLERANCE_8BIT; }
+    bool withinTolerance() const { return validation::withinTolerance(errorVsOwnReference, tolerance()); }
 };
+
+// FKL's outputs must be within their tolerance; the RPP pipelines' are reported (they depend on the RPP build)
+bool fklOutsideTolerance(const std::vector<Result>& results) {
+    return std::any_of(results.begin(), results.end(),
+                       [](const Result& r) { return r.name.rfind("fkl_", 0) == 0 && !r.withinTolerance(); });
+}
 
 // The RPP variants, all numerically equivalent on the HIP backend. The benchmark's RPP pipeline ("rpp") is the fastest
 // of them, chosen by the selection pass (selectRpp) or given with BENCH_RPP_VARIANT (profiling child, counter targets);
@@ -1260,7 +1251,8 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
             std::cout << std::left << std::setw(12) << r.name << std::right << "  max err " << std::scientific
                       << std::setprecision(2) << r.errorVsOwnReference.max() << " (" << r.reference << "), vs float "
                       << r.errorVsFloatReference.max() << ", vs RPP sampling " << r.errorVsRppConventionReference.max()
-                      << ", vs 8 bit (FKL sampling) " << r.errorVs8bitReference.max() << std::defaultfloat << std::endl;
+                      << ", vs 8 bit (FKL sampling) " << r.errorVs8bitReference.max() << std::defaultfloat
+                      << (r.withinTolerance() ? "" : "  NOT within its tolerance") << std::endl;
             results.push_back(r);
         }
         checkFloat3Frame(makeFklVfHf<N, false>(ctx));
@@ -1511,7 +1503,7 @@ void gpuOnlyBatch(Context& ctx, std::vector<Result>& results, CacheFlusher* flus
         }
     }
     // The GPU time of an execution is the sum of the execution times of its kernels; the HIP runtime's blit kernels
-    // (memsets, copies) are summed separately, like CUPTI's kernel records in bvf_bench.cu, which have no memsets
+    // (memsets, copies) are summed separately, like CUPTI's kernel records in common/bench_gpu.h, which have no memsets
     std::vector<std::vector<float>> ms(impls.size(), std::vector<float>(TIMED_ITERS, 0.f));
     std::vector<std::vector<float>> blitMs(impls.size(), std::vector<float>(TIMED_ITERS, 0.f));
     std::vector<std::vector<float>> blitCount(impls.size(), std::vector<float>(TIMED_ITERS, 0.f));
@@ -1896,7 +1888,7 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << "allocated with " << BORDER_TOP << " rows of slack after its last plane, and only the first plane's top "
        << "border rows are left to the memset) and then calls hipStreamSynchronize inside the call (library behaviour, "
        << "kept).\n"
-       << "Outside the timed region (once, like NPP's batch descriptors in bvf_bench.cu): rppCreate (one handle per "
+       << "Outside the timed region (once, like NPP's batch descriptors in fkl-vs-npp): rppCreate (one handle per "
        << "pipeline with its batch size N, on the timing stream: RPP sizes its grids with the handle's batch size), all "
        << "buffers, the RPP descriptors, the ROI tensors (device memory; XYWH for rppt_crop and "
        << "rppt_crop_mirror_normalize, LTRB for rppt_resize and rppt_resize_mirror_normalize, the formats those calls "
@@ -2129,11 +2121,13 @@ void profilePass(Context& ctx, const std::filesystem::path& outDir, const std::f
 }
 
 void writeValidationRow(std::ostream& validation, const Result& r) {
+    // The columns of common/bench_gpu.h's validation.csv, then the errors against the other two references
     const auto& e = r.errorVsOwnReference;
     validation << r.name << "," << r.batch << "," << r.reference << "," << std::scientific << std::setprecision(3)
                << e.maxPerChannel[0] << "," << e.maxPerChannel[1] << "," << e.maxPerChannel[2] << "," << e.mean << ","
-               << e.nonFinite << "," << r.errorVsFloatReference.max() << "," << r.errorVsRppConventionReference.max()
-               << "," << (e.max() <= TOLERANCE ? "yes" : "no") << "," << r.errorVs8bitReference.max() << std::defaultfloat
+               << e.nonFinite << "," << r.errorVsFloatReference.max() << "," << e.beyond << "," << e.values << ","
+               << r.tolerance() << "," << (r.withinTolerance() ? "yes" : "no") << ","
+               << r.errorVsRppConventionReference.max() << "," << r.errorVs8bitReference.max() << std::defaultfloat
                << "\n";
 }
 
@@ -2241,6 +2235,10 @@ int main(int argc, char** argv) {
         if (validateOnly) {
             allRppVariants = true;
             validateAllBatches(ctx, results, std::make_index_sequence<BATCHES.size()>{});
+            if (fklOutsideTolerance(results)) {
+                std::cerr << "ERROR: an FKL output is not within its tolerance" << std::endl;
+                return 1;
+            }
             return 0;
         }
         measureEventFloor(ctx);
@@ -2263,8 +2261,9 @@ int main(int argc, char** argv) {
                    "fkl_bvf_mean_speedup\n";
         std::ofstream validation(outDir / "validation.csv");
         validation << "implementation,N,reference,max_abs_err_r,max_abs_err_g,max_abs_err_b,mean_abs_err,"
-                      "non_finite_values,max_abs_err_vs_float_reference,max_abs_err_vs_rpp_sampling_8bit_reference,"
-                      "within_tolerance_1e-3,max_abs_err_vs_8bit_reference_fkl_sampling\n";
+                      "non_finite_values,max_abs_err_vs_float_reference,values_beyond_1e-3,values,tolerance,"
+                      "within_tolerance,max_abs_err_vs_rpp_sampling_8bit_reference,"
+                      "max_abs_err_vs_8bit_reference_fkl_sampling\n";
         writeSelection(outDir / "rpp_selection.csv");
         std::ofstream kernels(outDir / "kernels.csv");
         kernels << "implementation,N,kernels,memsets,memcpys\n";
@@ -2342,6 +2341,10 @@ int main(int argc, char** argv) {
         }
         writePlatform(outDir / "platform.txt", diagnostic.str(), tracing, profilingError);
         std::cout << "Results written to " << std::filesystem::absolute(outDir) << std::endl;
+        if (fklOutsideTolerance(results)) {
+            std::cerr << "ERROR: an FKL output is not within its tolerance, see validation.csv" << std::endl;
+            return 1;
+        }
         if (!profilingError.empty()) {
             std::cerr << "ERROR: the profiling pass failed; the CPU + GPU results were written" << std::endl;
             return 2;

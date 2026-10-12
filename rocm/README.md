@@ -29,8 +29,10 @@ not counted, like CUPTI's kernel records) and GPU time only with a flush kernel 
 every GPU operation (files named `l2_flushed` as in the CUDA benchmark). Kernel dispatch tracing and hardware
 counters are not available on WSL2 (ROCm runs on `/dev/dxg` there): on WSL2 the program measures CPU + GPU and the
 counts, and says that GPU time only was not measured; if the profiling child fails, the CPU + GPU results are still
-written. Validation: FKL VF+HF against FKL's CPU backend with the 8 bit RGB frame, FKL BVF against FKL's CPU backend
-(max abs error below 2e-6); the RPP pipelines against a C++ reference built from RPP's own 8 bit RGB frame with RPP's
+written. Validation, with the rules of every GPU benchmark ([`common/bench_validation.h`](../common/bench_validation.h):
+1e-3 against a float reference, one level of 8 bit RGB more against an 8 bit one, at most one value in a thousand more
+than 1e-3 away; the program fails if an FKL output is outside its tolerance, and reports the RPP pipelines'): FKL VF+HF
+against FKL's CPU backend with the 8 bit RGB frame, FKL BVF against FKL's CPU backend in float; the RPP pipelines against a C++ reference built from RPP's own 8 bit RGB frame with RPP's
 sampling convention, measured with linear ramps (`--resize-convention`: pixel centers, clamped to [0, size - 2]), and
 against the paper's 8 bit reference (FKL's conversion rounded to 8 bit, FKL's sampling); every pipeline is validated
 again after its timed iterations. The RPP behaviour that the pipelines take into account (handle batch size, ROI
@@ -45,18 +47,19 @@ the CUDA benchmarks' `--batches` does) and `rocm_bench --workload` the workload;
 Output files: those of the CUDA benchmark with `GPU_AMD` instead of `GPU_NVIDIA` (`latency.csv`, `validation.csv`,
 `kernels.csv`, `kernel_breakdown.csv`, `<baseline>_vs_fkl_bvf_[gpu_only_|gpu_only_l2_flushed_]GPU_AMD.csv`,
 `gpu_time.csv`, `gpu_time_l2_flushed.csv`, `platform.txt`), plus
-`kernel_counts_per_operation.csv`, `rpp_selection.csv` and `rpp_resize_convention.csv`; `validation.csv` has one more
-column, the error against the paper's 8 bit reference, and `gpu_time*.csv` five more, the GPU time and dispatches of the HIP runtime's blit kernels (memsets, copies) of each execution, which the GPU time only sums leave out. `--validate` validates every RPP variant.
+`kernel_counts_per_operation.csv`, `rpp_selection.csv` and `rpp_resize_convention.csv`; `validation.csv` has two more
+columns, the errors against the RPP-convention reference and against the paper's 8 bit reference, and `gpu_time*.csv` five more, the GPU time and dispatches of the HIP runtime's blit kernels (memsets, copies) of each execution, which the GPU time only sums leave out. `--validate` validates every RPP variant.
 
 ## CPU benchmark (`rocm/cpu/`)
 
-RPP's HOST backend (with 1 thread and with all hardware threads) against FKL's `ParArch::CPU` and
-`ParArch::CPU_MULTITHREAD`, with the protocol of [`fkl-vs-opencv-cpu/`](../fkl-vs-opencv-cpu/README.md). RPP's NV12 conversion is HIP only, so the RPP HOST pipelines
+RPP's HOST backend against FKL's CPU backends, with the same number of threads on both sides: RPP with 1 thread
+against FKL's `ParArch::CPU`, and RPP with all hardware threads against FKL's `ParArch::CPU_MULTITHREAD`, with the
+protocol of [`fkl-vs-opencv-cpu/`](../fkl-vs-opencv-cpu/README.md). RPP's NV12 conversion is HIP only, so the RPP HOST pipelines
 get their 8 bit RGB frame from FKL's CPU conversion (one thread for the 1 thread runs, FKL's thread pool for the
 others), then one of the five RPP variants on the HOST backend: for each thread count, a selection pass validates all
 of them and times the ones numerically equivalent to `rpp_per_op` (10 warm-up + 100 iterations per N), and only the
-fastest is measured (`cpu_rpp_selection.csv`; outputs `benchmark_cpu_rpp_1thread_vs_fkl_bvf_CPU.csv`,
-`benchmark_cpu_rpp_<T>threads_vs_fkl_bvf_CPU.csv` and `benchmark_cpu_rpp_<T>threads_vs_fkl_bvf_CPU_MULTITHREAD.csv`).
+fastest is measured (`cpu_rpp_selection.csv`; outputs `benchmark_cpu_rpp_1thread_vs_fkl_bvf_CPU.csv` and
+`benchmark_cpu_rpp_<T>threads_vs_fkl_bvf_CPU_MULTITHREAD.csv`).
 RPP HOST's sampling positions are measured with ramps for this geometry (`rpp_host_sampling_positions.csv`) and used
 by its reference: its `rppt_resize` and `rppt_resize_mirror_normalize` treat the last columns and rows differently, so
 the two variants built on `rppt_resize_mirror_normalize` are not equivalent to `rpp_per_op` on the CPU. RPP 3.2.0's

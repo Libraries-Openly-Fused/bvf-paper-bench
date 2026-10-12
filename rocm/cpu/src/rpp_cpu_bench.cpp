@@ -1,5 +1,5 @@
 // CPU benchmark of the Figure 1 pipeline: RPP's HOST backend vs FKL's CPU backends (BVF), the ROCm counterpart of
-// cpu/src/cpu_bench.cpp (which compares with OpenCV).
+// fkl-vs-opencv-cpu/src/benchmark_opencv_cpu.cpp (which compares with OpenCV).
 //   ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
 // The workload of common/bench_geometry.h: one 3840x2160 NV12 frame in host memory, N crops, each resized (bilinear)
 // and given black rows on top and bottom, then (x * mul - sub) / div written as float3 into an N-plane tensor. BT.601
@@ -19,12 +19,14 @@
 //             rpp_fused_normalize memset, rppt_resize_mirror_normalize (crop + 8u -> 32f + resize), rppt_normalize
 //           RPP's HOST backend parallelizes over the batch images with OpenMP; it is timed with 1 thread and with all
 //           the hardware threads (numThreads of rppCreate).
+// Two comparisons, each with the same number of threads on both sides, as in fkl-vs-opencv-cpu: RPP with 1 thread
+// against fkl, and RPP with all the hardware threads against fkl mt.
 //   fkl:    one executeOperations<TransformDPP<ParArch::CPU>> call with the whole chain (BVF), on one thread.
 //   fkl mt: the same call with TransformDPP<ParArch::CPU_MULTITHREAD> on FKL's thread pool (one worker per hardware
 //           thread), in chunks of one output row of one crop.
 //
 // Both libraries' thread pools spin for a while after finishing before their workers go to sleep, so every timed run
-// is preceded by an idle gap that lets them fall asleep, as in cpu/src/cpu_bench.cpp.
+// is preceded by an idle gap that lets them fall asleep, as in fkl-vs-opencv-cpu/src/benchmark_opencv_cpu.cpp.
 
 // rpp.h includes HIP's headers, which declare uchar3, float3... in the global namespace: included first, so that FKL
 // does not export its own vector types there (this file uses fk:: vector types only)
@@ -616,9 +618,10 @@ void writeCSV(const std::filesystem::path& path, const std::string& rppLabel, co
     }
 }
 
-// The three comparisons of cpu/src/cpu_bench.cpp: RPP 1 thread vs FKL CPU, RPP all threads vs FKL CPU, RPP all threads
-// vs FKL CPU_MULTITHREAD, each with the RPP pipeline that the selection pass chose for that thread count
-enum Pairing { ONE_THREAD_VS_CPU, ALL_THREADS_VS_CPU, ALL_THREADS_VS_MT, PAIRINGS };
+// The two comparisons of fkl-vs-opencv-cpu, each with the same number of threads on both sides: RPP 1 thread vs FKL
+// CPU, RPP all threads vs FKL CPU_MULTITHREAD, each with the RPP pipeline that the selection pass chose for that thread
+// count
+enum Pairing { ONE_THREAD_VS_CPU, ALL_THREADS_VS_MT, PAIRINGS };
 
 struct Check {
     size_t batch;
@@ -758,7 +761,7 @@ Variant chooseRpp(const std::vector<SelectionRow>& rows, unsigned threads) {
     return VARIANTS[best];
 }
 
-// The three comparisons for batch N, with the chosen RPP pipelines
+// The two comparisons for batch N, with the chosen RPP pipelines
 template <size_t N>
 void runBatch(Workload& w, std::array<std::vector<Row>, PAIRINGS>& rows, unsigned hardwareThreads, Variant oneThread,
               Variant allThreads) {
@@ -767,15 +770,12 @@ void runBatch(Workload& w, std::array<std::vector<Row>, PAIRINGS>& rows, unsigne
     RppHost<fk::ParArch::CPU> rpp1(w, N, oneThread, 1);
     RppHost<fk::ParArch::CPU_MULTITHREAD> rppAll(w, N, allThreads, hardwareThreads);
     rows[ONE_THREAD_VS_CPU].push_back(timeTwo(N, [&]() { rpp1.run(); }, [&]() { fkl.run(); }));
-    rows[ALL_THREADS_VS_CPU].push_back(timeTwo(N, [&]() { rppAll.run(); }, [&]() { fkl.run(); }));
     rows[ALL_THREADS_VS_MT].push_back(timeTwo(N, [&]() { rppAll.run(); }, [&]() { fklMT.run(); }));
     const Row& a = rows[ONE_THREAD_VS_CPU].back();
-    const Row& b = rows[ALL_THREADS_VS_CPU].back();
     const Row& c = rows[ALL_THREADS_VS_MT].back();
     std::printf("N %3zu | RPP 1 thread %9.1f us vs FKL CPU %8.1f us (BVF mean speedup %6.2fx) | RPP %u threads %9.1f us vs "
-                "FKL CPU %8.1f us (%6.2fx), vs FKL CPU_MULTITHREAD %8.1f us (%6.2fx)\n", N, a.rpp.median * 1000.,
-                a.fkl.median * 1000., a.meanSpeedup, hardwareThreads, b.rpp.median * 1000., b.fkl.median * 1000.,
-                b.meanSpeedup, c.fkl.median * 1000., c.meanSpeedup);
+                "FKL CPU_MULTITHREAD %8.1f us (%6.2fx)\n", N, a.rpp.median * 1000., a.fkl.median * 1000., a.meanSpeedup,
+                hardwareThreads, c.rpp.median * 1000., c.fkl.median * 1000., c.meanSpeedup);
 }
 
 std::string shell(const std::string& command) {
@@ -923,8 +923,6 @@ int main(int argc, char** argv) {
         const std::string all = std::to_string(hardwareThreads) + "threads";
         writeCSV(outDir / "benchmark_cpu_rpp_1thread_vs_fkl_bvf_CPU.csv", "RPP HOST 1 thread", rows[ONE_THREAD_VS_CPU],
                  "FKL CPU");
-        writeCSV(outDir / ("benchmark_cpu_rpp_" + all + "_vs_fkl_bvf_CPU.csv"), "RPP HOST " + all,
-                 rows[ALL_THREADS_VS_CPU], "FKL CPU");
         writeCSV(outDir / ("benchmark_cpu_rpp_" + all + "_vs_fkl_bvf_CPU_MULTITHREAD.csv"), "RPP HOST " + all,
                  rows[ALL_THREADS_VS_MT], "FKL CPU_MULTITHREAD");
         std::ofstream plat(outDir / "cpu_platform.txt");
