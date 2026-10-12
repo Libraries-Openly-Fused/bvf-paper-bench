@@ -1,0 +1,149 @@
+// FKL vs NPP, Figure 1 pipeline of the Backwards Vertical Fusion paper:
+// ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
+// with the frame, sizes, batch sizes and crop positions of common/bench_geometry.h and NV12 -> RGB in BT.601 limited
+// range. The harness (validation, timing, modes, output files) is common/bench_gpu.h.
+//
+//   npp       NV12->RGB of the whole frame (color twist with the BT.601 limited range matrix, common/bench_npp.h), per
+//             crop 8u->32f, one batched resize (nppiResize for N = 1, since nppiResizeBatch rejects a batch of one),
+//             per crop CopyConstBorder (NPP has no batched border), then MulC, SubC, DivC on the whole output tensor:
+//             2N + 5 kernels, with an 8 bit RGB frame, float3 crops, float3 resized crops and the float3 output in
+//             memory
+//   fkl_bvf   one FKL kernel for the whole chain (BVF)
+
+#include <npp.h>
+
+#include "bench_gpu.h"
+
+namespace bench {
+
+struct NPPState {
+    Npp8u* rgb8{nullptr};
+    int rgbStep{0};
+    Npp32f* cropped{nullptr};
+    Npp32f* resized{nullptr};
+    Npp32f* tensor{nullptr};
+    NppiImageDescriptor* srcDescriptors{nullptr};
+    NppiImageDescriptor* dstDescriptors{nullptr};
+    NppiResizeBatchROI_Advanced* rois{nullptr};
+    std::vector<fk::Rect> rects;
+    ~NPPState() {
+        cudaFree(rgb8);
+        cudaFree(cropped);
+        cudaFree(resized);
+        cudaFree(tensor);
+        cudaFree(srcDescriptors);
+        cudaFree(dstDescriptors);
+        cudaFree(rois);
+    }
+};
+
+template <size_t N>
+Implementation makeNPP(Context& ctx) {
+    const int cropStep = CROP_W * 3 * sizeof(Npp32f);
+    const int outStep = OUT_W * 3 * sizeof(Npp32f);
+    const size_t cropFloats = static_cast<size_t>(CROP_W) * CROP_H * 3;
+    const size_t resizedFloats = static_cast<size_t>(RES_W) * RES_H * 3;
+    const size_t outFloats = OUT_FLOATS;
+    auto st = std::make_shared<NPPState>();
+    size_t rgbPitch = 0;
+    gpuErrchk(cudaMallocPitch(reinterpret_cast<void**>(&st->rgb8), &rgbPitch, FRAME_W * 3, FRAME_H));
+    st->rgbStep = static_cast<int>(rgbPitch);
+    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->cropped), N * cropFloats * sizeof(Npp32f)));
+    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->resized), N * resizedFloats * sizeof(Npp32f)));
+    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->tensor), N * outFloats * sizeof(Npp32f)));
+    // The batched resize descriptors live in device memory and are uploaded once, outside of the timing
+    std::vector<NppiImageDescriptor> src(N), dst(N);
+    std::vector<NppiResizeBatchROI_Advanced> rois(N);
+    for (size_t i = 0; i < N; ++i) {
+        src[i] = NppiImageDescriptor{st->cropped + i * cropFloats, cropStep, NppiSize{CROP_W, CROP_H}};
+        dst[i] = NppiImageDescriptor{st->resized + i * resizedFloats, outStep, NppiSize{RES_W, RES_H}};
+        rois[i] = NppiResizeBatchROI_Advanced{NppiRect{0, 0, CROP_W, CROP_H}, NppiRect{0, 0, RES_W, RES_H}};
+        st->rects.push_back(ctx.crops[i]);
+    }
+    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->srcDescriptors), N * sizeof(NppiImageDescriptor)));
+    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->dstDescriptors), N * sizeof(NppiImageDescriptor)));
+    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->rois), N * sizeof(NppiResizeBatchROI_Advanced)));
+    gpuErrchk(cudaMemcpy(st->srcDescriptors, src.data(), N * sizeof(NppiImageDescriptor), cudaMemcpyHostToDevice));
+    gpuErrchk(cudaMemcpy(st->dstDescriptors, dst.data(), N * sizeof(NppiImageDescriptor), cudaMemcpyHostToDevice));
+    gpuErrchk(cudaMemcpy(st->rois, rois.data(), N * sizeof(NppiResizeBatchROI_Advanced), cudaMemcpyHostToDevice));
+
+    Implementation impl{"npp", Reference::NppSampling8bit};
+    impl.stages.emplace_back("1_nv12_to_rgb8_full_frame", [&ctx, st]() { nv12ToRgb8(ctx, st->rgb8, st->rgbStep); });
+    impl.stages.emplace_back("2_per_crop_convert_8u32f", [&ctx, st, cropFloats, cropStep]() {
+        for (size_t i = 0; i < N; ++i) {
+            const fk::Rect& r = st->rects[i];
+            const Npp8u* cropSrc = st->rgb8 + static_cast<size_t>(r.y) * st->rgbStep + r.x * 3;
+            beforeKernel();
+            NPP_CHECK(nppiConvert_8u32f_C3R_Ctx(cropSrc, st->rgbStep, st->cropped + i * cropFloats, cropStep,
+                                                NppiSize{CROP_W, CROP_H}, ctx.npp));
+        }
+    });
+    impl.stages.emplace_back("3_resize_batch", [&ctx, st, cropStep, outStep]() {
+        if constexpr (N == 1) {
+            // nppiResizeBatch rejects a batch of one image with NPP_BAD_ARGUMENT_ERROR
+            beforeKernel();
+            NPP_CHECK(nppiResize_32f_C3R_Ctx(st->cropped, cropStep, NppiSize{CROP_W, CROP_H},
+                                             NppiRect{0, 0, CROP_W, CROP_H}, st->resized, outStep,
+                                             NppiSize{RES_W, RES_H}, NppiRect{0, 0, RES_W, RES_H},
+                                             NPPI_INTER_LINEAR, ctx.npp));
+        } else {
+            beforeKernel();
+            NPP_CHECK(nppiResizeBatch_32f_C3R_Advanced_Ctx(RES_W, RES_H, st->srcDescriptors, st->dstDescriptors, st->rois,
+                                                           static_cast<unsigned int>(N), NPPI_INTER_LINEAR, ctx.npp));
+        }
+    });
+    impl.stages.emplace_back("4_per_crop_copy_const_border", [&ctx, st, resizedFloats, outFloats, outStep]() {
+        static const Npp32f zero[3] = {0.f, 0.f, 0.f};
+        for (size_t i = 0; i < N; ++i) {
+            beforeKernel();
+            NPP_CHECK(nppiCopyConstBorder_32f_C3R_Ctx(st->resized + i * resizedFloats, outStep, NppiSize{RES_W, RES_H},
+                                                      st->tensor + i * outFloats, outStep, NppiSize{OUT_W, OUT_H},
+                                                      BORDER_TOP, 0, zero, ctx.npp));
+        }
+    });
+    impl.stages.emplace_back("5_mulc_subc_divc", [&ctx, st, outStep]() {
+        const NppiSize tensorSize{OUT_W, static_cast<int>(N) * OUT_H};
+        beforeKernel();
+        NPP_CHECK(nppiMulC_32f_C3IR_Ctx(MUL, st->tensor, outStep, tensorSize, ctx.npp));
+        beforeKernel();
+        NPP_CHECK(nppiSubC_32f_C3IR_Ctx(SUB, st->tensor, outStep, tensorSize, ctx.npp));
+        beforeKernel();
+        NPP_CHECK(nppiDivC_32f_C3IR_Ctx(DIV, st->tensor, outStep, tensorSize, ctx.npp));
+    });
+    impl.run = runStages(impl.stages);
+    impl.download = [st, outFloats]() { return downloadDevice(st->tensor, N * outFloats); };
+    impl.fillNaN = [st, outFloats]() { gpuErrchk(cudaMemset(st->tensor, 0xFF, N * outFloats * sizeof(Npp32f))); };
+    return impl;
+}
+
+struct NppVsFkl {
+    static constexpr const char* title = "FKL vs NPP (fkl-vs-npp)";
+
+    template <size_t N>
+    static std::vector<Implementation> implementations(Context& ctx) {
+        std::vector<Implementation> impls;
+        impls.push_back(makeNPP<N>(ctx));
+        return impls;
+    }
+
+    static void describe(std::ostream& os, const std::filesystem::path&) {
+        const NppLibraryVersion* npp = nppGetLibVersion();
+        os << "NPP: " << npp->major << "." << npp->minor << "." << npp->build << "\n"
+           << "NPP pipeline: nppiNV12ToRGB_8u_ColorTwist32f_P2C3R (BT.601 limited range matrix) of the whole frame into "
+              "an 8 bit RGB frame, then per crop nppiConvert_8u32f_C3R (float3 crop), one nppiResizeBatch_32f_C3R_"
+              "Advanced (nppiResize_32f_C3R for N = 1) into float3 resized crops, per crop nppiCopyConstBorder_32f_C3R "
+              "(NPP has no batched border) into its output plane, then nppiMulC, nppiSubC and nppiDivC_32f_C3IR on the "
+              "whole float3 output: 2N + 5 kernels. NPP samples its bilinear resize at dst * scale - 0.25 (measured), "
+              "so it is checked against a reference with that sampling.\n";
+    }
+
+    static std::string diagnostic(const Context& ctx) { return nppConversionDiagnostic(ctx); }
+
+    static bool extraMode(Context&, const std::string&, const std::filesystem::path&) { return false; }
+};
+
+} // namespace bench
+
+int main(int argc, char** argv) {
+    return bench::gpuBenchMain<bench::NppVsFkl>(argc, argv);
+}

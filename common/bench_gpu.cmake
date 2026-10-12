@@ -1,5 +1,6 @@
-cmake_minimum_required(VERSION 3.28)
-project(bvf_paper_bench LANGUAGES CXX CUDA)
+# The common part of the GPU benchmark projects built on common/bench_gpu.h (fkl-vs-opencv-cuda, fkl-vs-npp,
+# fkl-ablation): CUDA architectures, FKL, iterations, the workload, the nvcc options and add_bench_target(), which
+# builds one benchmark with them. Include it right after project().
 
 # Same default as FKL: the GPU of this machine (sm_89 on the RTX 4090 of the paper)
 set(CUDA_ARCH "native" CACHE STRING "CUDA architectures to build, passed verbatim to CUDA_ARCHITECTURES")
@@ -13,14 +14,13 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(FKL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/fkl" CACHE PATH "FusedKernelLibrary checkout (default: the fkl submodule)")
+set(BENCH_COMMON_DIR "${CMAKE_CURRENT_LIST_DIR}")
+set(FKL_DIR "${BENCH_COMMON_DIR}/../fkl" CACHE PATH "FusedKernelLibrary checkout (default: the fkl submodule)")
 # Timed and warm-up iterations of every benchmark: 1000 and 100 for the paper's results; the CI runs 1 and 0
 set(BENCH_ITERATIONS 1000 CACHE STRING "Timed iterations of every benchmark (at least 1)")
 set(BENCH_WARMUP_ITERATIONS 100 CACHE STRING "Warm-up iterations before the timed ones")
+include(${BENCH_COMMON_DIR}/bench_geometry.cmake)
 find_package(CUDAToolkit REQUIRED)
-# OpenCVConfig.cmake still calls find_package(CUDA), which needs the legacy FindCUDA module
-cmake_policy(SET CMP0146 OLD)
-find_package(OpenCV 4.14 REQUIRED COMPONENTS core cudaarithm cudawarping)
 
 execute_process(COMMAND git -C ${FKL_DIR} rev-parse --short HEAD OUTPUT_VARIABLE FKL_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE)
 execute_process(COMMAND git -C ${FKL_DIR} rev-parse --abbrev-ref HEAD OUTPUT_VARIABLE FKL_BRANCH OUTPUT_STRIP_TRAILING_WHITESPACE)
@@ -36,19 +36,18 @@ set(BENCH_NVCC_FLAGS "${CMAKE_CUDA_FLAGS} ${CMAKE_CUDA_FLAGS_RELEASE} -std=c++20
 # The flags become a string literal: CMake's Windows defaults have double quotes (-Xcompiler=" /GR /EHsc")
 string(REPLACE "\"" "'" BENCH_NVCC_FLAGS "${BENCH_NVCC_FLAGS}")
 
+# A benchmark executable from SOURCE, with FKL, common/ and the CUDA libraries every benchmark uses; the libraries of
+# the compared pipeline are added with target_link_libraries
 function(add_bench_target TARGET_NAME SOURCE)
     add_executable(${TARGET_NAME} ${SOURCE})
     set_target_properties(${TARGET_NAME} PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON
                                                     CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
-    target_include_directories(${TARGET_NAME} PRIVATE ${FKL_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/common)
+    target_include_directories(${TARGET_NAME} PRIVATE ${FKL_DIR}/include ${BENCH_COMMON_DIR})
     target_compile_options(${TARGET_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${BENCH_CUDA_OPTIONS}>)
     target_compile_definitions(${TARGET_NAME} PRIVATE
         BENCH_FKL_COMMIT="${FKL_COMMIT}" BENCH_FKL_BRANCH="${FKL_BRANCH}"
         BENCH_ITERATIONS=${BENCH_ITERATIONS} BENCH_WARMUP_ITERATIONS=${BENCH_WARMUP_ITERATIONS}
+        ${BENCH_GEOMETRY_DEFINITIONS}
         BENCH_NVCC_VERSION="${CMAKE_CUDA_COMPILER_VERSION}" BENCH_NVCC_FLAGS="${BENCH_NVCC_FLAGS}")
-    target_link_libraries(${TARGET_NAME} PRIVATE CUDA::cudart CUDA::nppc CUDA::nppicc CUDA::nppig CUDA::nppial
-                                                 CUDA::nppidei CUDA::cupti CUDA::nvtx3 opencv_core opencv_cudaarithm opencv_cudawarping)
+    target_link_libraries(${TARGET_NAME} PRIVATE CUDA::cudart CUDA::cupti CUDA::nvtx3)
 endfunction()
-
-add_bench_target(bvf_bench src/bvf_bench.cu)
-add_bench_target(bvf_types src/bvf_types.cu)

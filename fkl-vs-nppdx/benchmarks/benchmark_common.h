@@ -253,7 +253,8 @@ private:
 };
 
 // Same iterations as runTwoExecutions, but each execution is timed by the sum of its kernels' GPU execution times.
-// With a flusher, the L2 is flushed before every execution (each implementation here is a single kernel).
+// With a flusher, the L2 is flushed before every execution; a pipeline of several kernels flushes before its other
+// kernels itself (figure1_common.h passes a flush to its run()).
 inline TwoExecutionsResult runTwoExecutionsGpuOnly(cudaStream_t stream, const int variableDimensionValue,
                                                    const std::function<void()>& firstRun,
                                                    const std::function<void()>& secondRun,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Summary of a compile-time run of compile_time/run.sh.
+"""Summary of a compile-time run of scripts/compile_time.sh.
 
-    compile_time/summarize.py <results directory>
+    scripts/compile_time_summarize.py <results directory>
 
 Reads compile_time.csv (the warm-up compiles, rep 0, are left out), the phases_<IMPL>_<BATCH>.csv files written by
 nvcc --time and the keep_<IMPL>_<BATCH> folders of the untimed -Xptxas -v --keep compiles, and writes

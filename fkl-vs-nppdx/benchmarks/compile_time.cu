@@ -12,15 +12,18 @@
    See the License for the specific language governing permissions and
    limitations under the License. */
 
-// One pipeline of the paper's Figure 1 per translation unit, for measuring nvcc compile time (compile_time/run.sh with
-// SET=nppdx). Select with exactly one of:
+// The compile-time units of FKL vs NPPDx: one pipeline of the paper's Figure 1 per translation unit, for measuring nvcc
+// compile time (scripts/compile_time.sh with SET=nppdx). Select with exactly one of:
 //   -DIMPL_HEADERS  the headers of the other two variants (FKL, NPPDx, nppdx_figure1.h, NVTX: the ones of
-//                   benchmark_figure1_bvf.cu without its benchmark scaffolding), no pipeline
-//   -DIMPL_NPPDX    the NPPDx kernel of the paper: NppdxFigure1<NPPDX_SM, N, 256, 20, 10> (256 threads per block, one
-//                   20x10 tile per crop); CropOrigins<N> is a kernel parameter, so it is instantiated for every N
-//   -DIMPL_BVF      FKL, the runFKL<N> call of benchmark_figure1_bvf.cu
-// and -DCT_BATCH=<N> (number of crops). It is compiled with the nvcc command line of benchmark_figure1_bvf (NPPDX_SM,
-// NPPDx's include path) and never executed: main() calls the pipeline only when it gets an argument.
+//                   benchmark_nppdx.cu without its benchmark scaffolding), no pipeline
+//   -DIMPL_NPPDX    the NPPDx kernel in the configuration benchmark_nppdx chose for this N, given with
+//                   -DCT_NPPDX_TILE_X, -DCT_NPPDX_TILE_Y and -DCT_NPPDX_BLOCK (the requested block, 0 for NPPDx's
+//                   recommended one; compile_time.sh reads them from benchmark_nppdx_nppdx_config_GPU_NVIDIA.csv);
+//                   CropOrigins<N> is a kernel parameter, so it is instantiated for every N
+//   -DIMPL_BVF      FKL, the runFKL<N> call of benchmark_nppdx.cu (in figure1_common.h)
+// and -DCT_BATCH=<N> (number of crops). It is compiled with the nvcc command line of benchmark_nppdx (NPPDX_SM,
+// NPPDx's include path, the geometry definitions) and never executed: main() calls the pipeline only when it gets an
+// argument.
 
 #include <fused_kernel/fused_kernel.h>
 #include <fused_kernel/algorithms/basic_ops/arithmetic.h>
@@ -47,25 +50,23 @@
 namespace figure1 {
 namespace {
 
-[[maybe_unused]] constexpr int FRAME_W = 3840;
-[[maybe_unused]] constexpr int FRAME_H = 2160;
 [[maybe_unused]] constexpr size_t N = CT_BATCH;
-// ImageNet normalization (Normalization is in nppdx_figure1.h)
+// ImageNet normalization (Normalization is in nppdx_common.h)
 [[maybe_unused]] constexpr Normalization norm{};
 
 using NV12Image = fk::Image<fk::PixelFormat::NV12>;
-using YUVToRGB = fk::ConvertYUVToRGB<fk::ColorDepth::p8bit, fk::ColorRange::Full, fk::ColorPrimitives::bt2020>;
+using YUVToRGB = fk::ConvertYUVToRGB<fk::ColorDepth::p8bit, fk::ColorRange::Limited, fk::ColorPrimitives::bt601>;
 
 #if defined(IMPL_BVF)
-// runFKL of benchmark_figure1_bvf.cu, with the stream and the frame of its Workload as arguments
-template <size_t N, typename G = MainGeometry>
+// runFKL of benchmark_nppdx.cu (figure1_common.h), with the stream and the frame of its Workload as arguments
+template <size_t N>
 void runFKL(fk::Stream& stream, const NV12Image& frame, const std::array<fk::Rect, N>& crops,
             fk::Tensor<fk::float3>& out) {
     fk::executeOperations<fk::TransformDPP<>>(stream,
         fk::ReadYUV<fk::PixelFormat::NV12>::build(frame),
         YUVToRGB::build(),
         fk::Crop<>::build(crops),
-        fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(G::resW, G::resH)),
+        fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(RES_W, RES_H)),
         fk::AddBorder<>::build(BORDER_TOP, BORDER_BOTTOM, 0, 0, fk::float3{0.f, 0.f, 0.f}),
         fk::Mul<fk::float3>::build(fk::float3{norm.mul[0], norm.mul[1], norm.mul[2]}),
         fk::Sub<fk::float3>::build(fk::float3{norm.sub[0], norm.sub[1], norm.sub[2]}),
@@ -85,9 +86,12 @@ void runPipeline() {
 }
 
 #elif defined(IMPL_NPPDX)
-// The NPPDx kernel in the configuration of the paper, launched as the benchmark does
+#if !defined(CT_NPPDX_TILE_X) || !defined(CT_NPPDX_TILE_Y) || !defined(CT_NPPDX_BLOCK)
+#error "Define -DCT_NPPDX_TILE_X, -DCT_NPPDX_TILE_Y and -DCT_NPPDX_BLOCK (the configuration chosen for this N)"
+#endif
+// The NPPDx kernel in the configuration the benchmark chose for this N, launched as the benchmark does
 void runPipeline() {
-    using Nppdx = NppdxFigure1<NPPDX_SM, N, 256, CROP_W, CROP_H>;
+    using Nppdx = NppdxFigure1<NPPDX_SM, N, CT_NPPDX_BLOCK, CT_NPPDX_TILE_X, CT_NPPDX_TILE_Y>;
     Nppdx::init();
     const uint8_t* y = nullptr;
     const uint8_t* uv = nullptr;

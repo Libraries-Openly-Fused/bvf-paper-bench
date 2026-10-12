@@ -1,12 +1,18 @@
-date: 2026-10-11T21:53:52+02:00 to 2026-10-11T22:06:24+02:00
-load average before start: 0.49 0.96 0.87 1/1010 835649; machine CPU time outside the benchmark's nvcc per round in the summary
+date: 2026-10-12T12:31:47+02:00 to 2026-10-12T12:44:39+02:00
+load average before start: 0.45 0.95 1.11 1/1012 896347; machine CPU time outside the benchmark's nvcc per round in the summary
 nvcc: Cuda compilation tools, release 13.3, V13.3.73 Build cuda_13.3.r13.3/compiler.38244171_0 
 host compiler: gcc (Ubuntu 15.2.0-16ubuntu1) 15.2.0
 CPU: AMD Ryzen 9 5950X 16-Core Processor, 32 hardware threads, governor: performance
 OS: Ubuntu 26.04.1 LTS, kernel 7.0.0-38-generic
-FKL: /home/oscar/bvf-bench/FusedKernelLibrary-b9f4281 at b9f4281 (HEAD)
-NPPDx: /home/oscar/bvf-bench/paper-bench-compile-time/nppdx at v0.1.2
-bvf-paper-bench: 364c601
-source: fkl-vs-nppdx/benchmarks/compile_time_pipeline.cu, nvcc command of fkl-vs-nppdx/benchmarks/benchmark_figure1_bvf.cu from /home/oscar/bvf-bench/builds/ct-nppdx/compile_commands.json
+FKL: /home/oscar/bvf-bench/paper-bench-geometry/fkl-vs-nppdx/../fkl at 63782f6 (HEAD)
+NPPDx: /home/oscar/bvf-bench/paper-bench-geometry/fkl-vs-nppdx/../nppdx at v0.1.2
+bvf-paper-bench: 6bf0502 (with uncommitted or untracked changes)
+source: fkl-vs-nppdx/benchmarks/compile_time_pipeline.cu, nvcc command of fkl-vs-nppdx/benchmarks/benchmark_figure1_bvf.cu from /home/oscar/bvf-bench/builds/geom-nppdx/compile_commands.json
+geometry: BENCH_CROP_W=32 BENCH_CROP_H=16 BENCH_RESIZE_W=64 BENCH_RESIZE_H=32 (common/bench_geometry.h)
+NPPDx configuration for N = 1: -DCT_NPPDX_TILE_X=8 -DCT_NPPDX_TILE_Y=8 -DCT_NPPDX_BLOCK=256 (from /home/oscar/bvf-bench/results/g2/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv)
+NPPDx configuration for N = 4: -DCT_NPPDX_TILE_X=8 -DCT_NPPDX_TILE_Y=8 -DCT_NPPDX_BLOCK=256 (from /home/oscar/bvf-bench/results/g2/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv)
+NPPDx configuration for N = 16: -DCT_NPPDX_TILE_X=16 -DCT_NPPDX_TILE_Y=8 -DCT_NPPDX_BLOCK=256 (from /home/oscar/bvf-bench/results/g2/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv)
+NPPDx configuration for N = 50: -DCT_NPPDX_TILE_X=16 -DCT_NPPDX_TILE_Y=16 -DCT_NPPDX_BLOCK=128 (from /home/oscar/bvf-bench/results/g2/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv)
+NPPDx configuration for N = 100: -DCT_NPPDX_TILE_X=32 -DCT_NPPDX_TILE_Y=16 -DCT_NPPDX_BLOCK=256 (from /home/oscar/bvf-bench/results/g2/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv)
 protocol: 10 timed compiles per TU after 1 discarded warm-up, round-robin over the TUs, one nvcc at a time (no -j, no ccache), -c only, objects on tmpfs (/dev/shm/bvf-compile-time-nppdx); /usr/bin/time around nvcc and nvcc --time in the same compile; one more untimed compile per TU with -Xptxas -v --keep for the kernel facts and sizes
-nvcc command: /usr/local/cuda-13.3/bin/nvcc -forward-unknown-to-host-compiler -DBENCH_ITERATIONS=1000 -DBENCH_WARMUP_ITERATIONS=100 -DCUDA_ARCHITECTURES_STR=\"native\" -DFKL_VERSION=\"Beta-0.2.0-47-gb9f4281\" -DNPPDX_GIT_VERSION=\"v0.1.2\" -DNPPDX_SM=890 -I/home/oscar/bvf-bench/FusedKernelLibrary-b9f4281/include -I/home/oscar/bvf-bench/paper-bench-compile-time/fkl-vs-nppdx -I/home/oscar/bvf-bench/paper-bench-compile-time/fkl-vs-nppdx/../common -isystem /home/oscar/bvf-bench/paper-bench-compile-time/nppdx/include -isystem /usr/local/cuda-13.3/targets/x86_64-linux/include -isystem /usr/local/cuda-13.3/targets/x86_64-linux/include/cccl -O3 -DNDEBUG -std=c++20 -arch=native --threads 0 -rdc=false -split-compile=0 -ftemplate-depth=1000 -lineinfo --expt-relaxed-constexpr -x cu 
+nvcc command: /usr/local/cuda-13.3/bin/nvcc -forward-unknown-to-host-compiler -DBENCH_CROP_H=16 -DBENCH_CROP_W=32 -DBENCH_ITERATIONS=1000 -DBENCH_RESIZE_H=32 -DBENCH_RESIZE_W=64 -DBENCH_WARMUP_ITERATIONS=100 -DCUDA_ARCHITECTURES_STR=\"native\" -DFKL_VERSION=\"Beta-0.2.0-78-g63782f6\" -DNPPDX_GIT_VERSION=\"v0.1.2\" -DNPPDX_SM=890 -I/home/oscar/bvf-bench/paper-bench-geometry/fkl-vs-nppdx/../fkl/include -I/home/oscar/bvf-bench/paper-bench-geometry/fkl-vs-nppdx -I/home/oscar/bvf-bench/paper-bench-geometry/fkl-vs-nppdx/../common -isystem /home/oscar/bvf-bench/paper-bench-geometry/nppdx/include -isystem /usr/local/cuda-13.3/targets/x86_64-linux/include -isystem /usr/local/cuda-13.3/targets/x86_64-linux/include/cccl -O3 -DNDEBUG -std=c++20 -arch=native --threads 0 -rdc=false -split-compile=0 -ftemplate-depth=1000 -lineinfo --expt-relaxed-constexpr -x cu 

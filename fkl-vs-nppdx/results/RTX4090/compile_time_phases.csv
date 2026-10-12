@@ -1,89 +1,89 @@
 impl,batch,phase,category,median_s
-HEADERS,1,cicc,cicc,1.4342
-HEADERS,1,cudafe++,cudafe,1.7969
-HEADERS,1,fatbinary,fatbinary,0.0016
-HEADERS,1,gcc (compiling),host_compiler,1.4988
-HEADERS,1,gcc (preprocessing 1),host_compiler,0.3561
-HEADERS,1,gcc (preprocessing 4),host_compiler,0.3497
+HEADERS,1,cicc,cicc,1.5056
+HEADERS,1,cudafe++,cudafe,1.8854
+HEADERS,1,fatbinary,fatbinary,0.0015
+HEADERS,1,gcc (compiling),host_compiler,1.5479
+HEADERS,1,gcc (preprocessing 1),host_compiler,0.3575
+HEADERS,1,gcc (preprocessing 4),host_compiler,0.3511
 HEADERS,1,nvcc (driver),other,0.0001
 HEADERS,1,ptxas,ptxas,0.0118
-NPPDX,1,cicc,cicc,2.2255
-NPPDX,1,cudafe++,cudafe,2.2303
-NPPDX,1,fatbinary,fatbinary,0.0038
-NPPDX,1,gcc (compiling),host_compiler,1.8032
-NPPDX,1,gcc (preprocessing 1),host_compiler,0.3545
-NPPDX,1,gcc (preprocessing 4),host_compiler,0.3465
+NPPDX,1,cicc,cicc,2.2263
+NPPDX,1,cudafe++,cudafe,2.3054
+NPPDX,1,fatbinary,fatbinary,0.0027
+NPPDX,1,gcc (compiling),host_compiler,1.8512
+NPPDX,1,gcc (preprocessing 1),host_compiler,0.3603
+NPPDX,1,gcc (preprocessing 4),host_compiler,0.3511
 NPPDX,1,nvcc (driver),other,0.0001
-NPPDX,1,ptxas,ptxas,0.1584
-NPPDX,4,cicc,cicc,2.2249
-NPPDX,4,cudafe++,cudafe,2.2248
-NPPDX,4,fatbinary,fatbinary,0.0036
-NPPDX,4,gcc (compiling),host_compiler,1.8030
-NPPDX,4,gcc (preprocessing 1),host_compiler,0.3538
-NPPDX,4,gcc (preprocessing 4),host_compiler,0.3460
+NPPDX,1,ptxas,ptxas,0.0832
+NPPDX,4,cicc,cicc,2.2261
+NPPDX,4,cudafe++,cudafe,2.3077
+NPPDX,4,fatbinary,fatbinary,0.0027
+NPPDX,4,gcc (compiling),host_compiler,1.8518
+NPPDX,4,gcc (preprocessing 1),host_compiler,0.3585
+NPPDX,4,gcc (preprocessing 4),host_compiler,0.3520
 NPPDX,4,nvcc (driver),other,0.0001
-NPPDX,4,ptxas,ptxas,0.1592
-NPPDX,16,cicc,cicc,2.2237
-NPPDX,16,cudafe++,cudafe,2.2277
-NPPDX,16,fatbinary,fatbinary,0.0038
-NPPDX,16,gcc (compiling),host_compiler,1.8042
-NPPDX,16,gcc (preprocessing 1),host_compiler,0.3534
-NPPDX,16,gcc (preprocessing 4),host_compiler,0.3449
-NPPDX,16,nvcc (driver),other,0.0001
-NPPDX,16,ptxas,ptxas,0.1616
-NPPDX,50,cicc,cicc,2.2212
-NPPDX,50,cudafe++,cudafe,2.2255
-NPPDX,50,fatbinary,fatbinary,0.0038
-NPPDX,50,gcc (compiling),host_compiler,1.8025
-NPPDX,50,gcc (preprocessing 1),host_compiler,0.3543
-NPPDX,50,gcc (preprocessing 4),host_compiler,0.3480
+NPPDX,4,ptxas,ptxas,0.0845
+NPPDX,16,cicc,cicc,2.2267
+NPPDX,16,cudafe++,cudafe,2.3093
+NPPDX,16,fatbinary,fatbinary,0.0030
+NPPDX,16,gcc (compiling),host_compiler,1.8524
+NPPDX,16,gcc (preprocessing 1),host_compiler,0.3591
+NPPDX,16,gcc (preprocessing 4),host_compiler,0.3504
+NPPDX,16,nvcc (driver),other,0.0002
+NPPDX,16,ptxas,ptxas,0.0971
+NPPDX,50,cicc,cicc,2.2268
+NPPDX,50,cudafe++,cudafe,2.3105
+NPPDX,50,fatbinary,fatbinary,0.0028
+NPPDX,50,gcc (compiling),host_compiler,1.8550
+NPPDX,50,gcc (preprocessing 1),host_compiler,0.3590
+NPPDX,50,gcc (preprocessing 4),host_compiler,0.3508
 NPPDX,50,nvcc (driver),other,0.0001
-NPPDX,50,ptxas,ptxas,0.1592
-NPPDX,100,cicc,cicc,2.2240
-NPPDX,100,cudafe++,cudafe,2.2356
-NPPDX,100,fatbinary,fatbinary,0.0036
-NPPDX,100,gcc (compiling),host_compiler,1.8061
-NPPDX,100,gcc (preprocessing 1),host_compiler,0.3550
-NPPDX,100,gcc (preprocessing 4),host_compiler,0.3492
+NPPDX,50,ptxas,ptxas,0.0828
+NPPDX,100,cicc,cicc,2.2293
+NPPDX,100,cudafe++,cudafe,2.3109
+NPPDX,100,fatbinary,fatbinary,0.0028
+NPPDX,100,gcc (compiling),host_compiler,1.8493
+NPPDX,100,gcc (preprocessing 1),host_compiler,0.3588
+NPPDX,100,gcc (preprocessing 4),host_compiler,0.3506
 NPPDX,100,nvcc (driver),other,0.0001
-NPPDX,100,ptxas,ptxas,0.1590
-BVF,1,cicc,cicc,1.6822
-BVF,1,cudafe++,cudafe,1.8064
+NPPDX,100,ptxas,ptxas,0.0828
+BVF,1,cicc,cicc,1.7579
+BVF,1,cudafe++,cudafe,1.8960
 BVF,1,fatbinary,fatbinary,0.0022
-BVF,1,gcc (compiling),host_compiler,1.8863
-BVF,1,gcc (preprocessing 1),host_compiler,0.3527
-BVF,1,gcc (preprocessing 4),host_compiler,0.3461
+BVF,1,gcc (compiling),host_compiler,1.9731
+BVF,1,gcc (preprocessing 1),host_compiler,0.3579
+BVF,1,gcc (preprocessing 4),host_compiler,0.3516
 BVF,1,nvcc (driver),other,0.0001
-BVF,1,ptxas,ptxas,0.0247
-BVF,4,cicc,cicc,1.6852
-BVF,4,cudafe++,cudafe,1.8093
-BVF,4,fatbinary,fatbinary,0.0022
-BVF,4,gcc (compiling),host_compiler,1.9429
-BVF,4,gcc (preprocessing 1),host_compiler,0.3531
-BVF,4,gcc (preprocessing 4),host_compiler,0.3467
+BVF,1,ptxas,ptxas,0.0248
+BVF,4,cicc,cicc,1.7539
+BVF,4,cudafe++,cudafe,1.9004
+BVF,4,fatbinary,fatbinary,0.0021
+BVF,4,gcc (compiling),host_compiler,2.0347
+BVF,4,gcc (preprocessing 1),host_compiler,0.3569
+BVF,4,gcc (preprocessing 4),host_compiler,0.3489
 BVF,4,nvcc (driver),other,0.0001
 BVF,4,ptxas,ptxas,0.0251
-BVF,16,cicc,cicc,1.6887
-BVF,16,cudafe++,cudafe,1.8091
+BVF,16,cicc,cicc,1.7618
+BVF,16,cudafe++,cudafe,1.8980
 BVF,16,fatbinary,fatbinary,0.0022
-BVF,16,gcc (compiling),host_compiler,1.9823
-BVF,16,gcc (preprocessing 1),host_compiler,0.3546
-BVF,16,gcc (preprocessing 4),host_compiler,0.3492
-BVF,16,nvcc (driver),other,0.0001
+BVF,16,gcc (compiling),host_compiler,2.0768
+BVF,16,gcc (preprocessing 1),host_compiler,0.3581
+BVF,16,gcc (preprocessing 4),host_compiler,0.3498
+BVF,16,nvcc (driver),other,0.0002
 BVF,16,ptxas,ptxas,0.0253
-BVF,50,cicc,cicc,1.7087
-BVF,50,cudafe++,cudafe,1.8093
+BVF,50,cicc,cicc,1.7803
+BVF,50,cudafe++,cudafe,1.8974
 BVF,50,fatbinary,fatbinary,0.0022
-BVF,50,gcc (compiling),host_compiler,1.9168
-BVF,50,gcc (preprocessing 1),host_compiler,0.3546
-BVF,50,gcc (preprocessing 4),host_compiler,0.3451
+BVF,50,gcc (compiling),host_compiler,2.0114
+BVF,50,gcc (preprocessing 1),host_compiler,0.3577
+BVF,50,gcc (preprocessing 4),host_compiler,0.3493
 BVF,50,nvcc (driver),other,0.0001
-BVF,50,ptxas,ptxas,0.0250
-BVF,100,cicc,cicc,1.7314
-BVF,100,cudafe++,cudafe,1.8112
-BVF,100,fatbinary,fatbinary,0.0022
-BVF,100,gcc (compiling),host_compiler,1.9129
-BVF,100,gcc (preprocessing 1),host_compiler,0.3537
-BVF,100,gcc (preprocessing 4),host_compiler,0.3487
+BVF,50,ptxas,ptxas,0.0252
+BVF,100,cicc,cicc,1.8042
+BVF,100,cudafe++,cudafe,1.8976
+BVF,100,fatbinary,fatbinary,0.0023
+BVF,100,gcc (compiling),host_compiler,2.0085
+BVF,100,gcc (preprocessing 1),host_compiler,0.3584
+BVF,100,gcc (preprocessing 4),host_compiler,0.3501
 BVF,100,nvcc (driver),other,0.0001
-BVF,100,ptxas,ptxas,0.0250
+BVF,100,ptxas,ptxas,0.0254

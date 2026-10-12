@@ -16,6 +16,8 @@
 #include <cxxabi.h>
 #endif
 
+#include "bench_geometry.h"
+
 #include <array>
 #include <cstdlib>
 #include <iostream>
@@ -37,21 +39,22 @@ std::string demangled() {
 }
 
 int main() {
-    constexpr size_t N = 100;
+    using namespace bench::geometry;
+    constexpr size_t N = MAX_BATCH;
     std::array<fk::Rect, N> crops{};
     for (size_t i = 0; i < N; ++i) {
-        crops[i] = fk::Rect(static_cast<int>(i), static_cast<int>(i), 20, 10);
+        crops[i] = fk::Rect(static_cast<int>(i), static_cast<int>(i), CROP_W, CROP_H);
     }
-    const fk::Image<fk::PixelFormat::NV12> frame(3840, 2160);
-    const fk::Tensor<fk::float3> output(64, 64, N);
+    const fk::Image<fk::PixelFormat::NV12> frame(FRAME_W, FRAME_H);
+    const fk::Tensor<fk::float3> output(OUT_W, OUT_H, N);
     const fk::float3 black{0.f, 0.f, 0.f};
 
     const auto fused = fk::BackFuser::fuse_back(
         fk::ReadYUV<fk::PixelFormat::NV12>::build(frame),
-        fk::ConvertYUVToRGB<fk::ColorDepth::p8bit, fk::ColorRange::Full, fk::ColorPrimitives::bt2020>::build(),
+        fk::ConvertYUVToRGB<fk::ColorDepth::p8bit, fk::ColorRange::Limited, fk::ColorPrimitives::bt601>::build(),
         fk::Crop<>::build(crops),
-        fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(64, 32)),
-        fk::AddBorder<>::build(16, 16, 0, 0, black),
+        fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(RES_W, RES_H)),
+        fk::AddBorder<>::build(BORDER_TOP, BORDER_BOTTOM, 0, 0, black),
         fk::Mul<fk::float3>::build(fk::float3{1.f, 1.f, 1.f}),
         fk::Sub<fk::float3>::build(fk::float3{0.f, 0.f, 0.f}),
         fk::Div<fk::float3>::build(fk::float3{1.f, 1.f, 1.f}),

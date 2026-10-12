@@ -1,18 +1,22 @@
-// Exploratory CPU benchmark of the Figure 1 pipeline: OpenCV on the CPU vs FKL's CPU backend (BVF).
+// FKL vs OpenCV on the CPU, Figure 1 pipeline: OpenCV's CPU functions vs FKL's CPU backends (BVF).
 //   ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
-// One 3840x2160 NV12 frame in host memory, N crops of 20x10, bilinear resize to 64x32, 16 black rows on top and
-// bottom, then (x * mul - sub) / div written as float3 into an N-plane tensor.
+// One 3840x2160 NV12 frame in host memory and N crops, with the sizes and positions of common/bench_geometry.h (by
+// default 32x16 crops resized to 64x32), bilinear resize, black rows added on top and bottom up to a square, then
+// (x * mul - sub) / div written as float3 into an N-plane tensor.
 //
 // The color conversion is BT.601 limited range in both, because OpenCV's CPU cvtColor only implements that one for
-// NV12 (the GPU benchmarks use BT.2020 full range).
+// NV12; every benchmark of this repository uses it (common/bench_geometry.h).
 //
 //   opencv: cvtColor(COLOR_YUV2RGB_NV12) on the full frame (8 bit RGB), then per crop convertTo(CV_32F), resize and
 //           copyMakeBorder, then multiply, subtract and divide on the whole tensor. OpenCV uses its own SIMD dispatch
-//           (up to AVX2 here) and its thread pool; it is timed with 1 thread and with all the hardware threads.
+//           (up to AVX2 here) and its thread pool.
 //   fkl:    one executeOperations<TransformDPP<ParArch::CPU>> call with the whole chain (BVF). FKL's CPU backend runs
 //           on one thread, compiled with -march=native.
 //   fkl mt: the same call with TransformDPP<ParArch::CPU_MULTITHREAD>: the stream enqueues the execution in FKL's shared
 //           thread pool (one worker per hardware thread), in chunks of one output row of one crop, and sync() waits.
+//
+// Two comparisons, each with the same number of threads on both sides: OpenCV with 1 thread against fkl, and OpenCV
+// with as many threads as FKL's thread pool has workers (one per hardware thread) against fkl mt.
 //
 // Both libraries' thread pools spin for a while after finishing before their workers go to sleep, so every timed run
 // is preceded by an idle gap that lets them fall asleep: neither steals cores from the other, and both start from
@@ -31,6 +35,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include "bench_geometry.h"
 #include "bench_platform.h"
 
 #include <algorithm>
@@ -42,32 +47,19 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
-#include <random>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace cpubench {
 
-constexpr int FRAME_W = 3840;
-constexpr int FRAME_H = 2160;
-constexpr int CROP_W = 20;
-constexpr int CROP_H = 10;
-constexpr int RES_W = 64;
-constexpr int RES_H = 32;
-constexpr int BORDER_TOP = 16;
-constexpr int BORDER_BOTTOM = 16;
-constexpr int OUT_W = RES_W;
-constexpr int OUT_H = RES_H + BORDER_TOP + BORDER_BOTTOM;
-constexpr int MAX_BATCH = 100;
-constexpr std::array<size_t, 5> BATCHES{1, 4, 16, 50, 100};
+// Frame, crop, resize, border and output sizes, batch sizes, seeds and crop positions, shared by every benchmark
+using namespace bench::geometry;
 // BENCH_WARMUP_ITERATIONS and BENCH_ITERATIONS come from CMake: 100 and 1000 for the paper's results, 0 and 1 in the CI
 constexpr int WARMUP_ITERS = BENCH_WARMUP_ITERATIONS;
 constexpr int ITERS = BENCH_ITERATIONS;
 static_assert(WARMUP_ITERS >= 0 && ITERS >= 1, "at least one timed iteration");
 constexpr auto IDLE_GAP = std::chrono::milliseconds(1);
-constexpr unsigned FRAME_SEED = 1;
-constexpr unsigned CROP_SEED = 42;
 
 constexpr float MUL[3] = {1.f / 255.f, 1.f / 255.f, 1.f / 255.f};
 constexpr float SUB[3] = {0.485f, 0.456f, 0.406f};
@@ -85,22 +77,12 @@ struct Workload {
 void initWorkload(Workload& w) {
     w.frame = std::make_unique<NV12Image>(FRAME_W, FRAME_H, fk::MemType::Host);
     auto data = w.frame->getData();
-    std::mt19937 gen(FRAME_SEED);
-    std::uniform_int_distribution<int> byte(0, 255);
-    for (int y = 0; y < FRAME_H * 3 / 2; ++y) {
-        for (int x = 0; x < FRAME_W; ++x) {
-            data.at(x, y) = static_cast<uchar>(byte(gen));
-        }
-    }
+    generateFrame([&](int x, int y, uint8_t value) { data.at(x, y) = value; });
     const auto raw = data.ptr();
     w.nv12 = cv::Mat(FRAME_H * 3 / 2, FRAME_W, CV_8UC1, raw.data, raw.dims.pitch);
-    std::mt19937 cropGen(CROP_SEED);
-    std::uniform_int_distribution<int> distX(0, FRAME_W - CROP_W);
-    std::uniform_int_distribution<int> distY(0, FRAME_H - CROP_H);
-    for (auto& crop : w.crops) {
-        const int x = distX(cropGen);
-        const int y = distY(cropGen);
-        crop = fk::Rect(x, y, CROP_W, CROP_H);
+    const auto crops = makeCrops();
+    for (size_t i = 0; i < MAX_BATCH; ++i) {
+        w.crops[i] = fk::Rect(crops[i].x, crops[i].y, crops[i].width, crops[i].height);
     }
 }
 
@@ -192,7 +174,10 @@ std::vector<float> hostReference(const Workload& w, size_t n, bool openCVConvent
     const float sy = static_cast<float>(CROP_H) / RES_H;
     for (size_t i = 0; i < n; ++i) {
         const fk::Rect& r = w.crops[i];
-        float crop[CROP_H][CROP_W][3];
+        std::vector<float> cropPixels(static_cast<size_t>(CROP_W) * CROP_H * 3);
+        const auto crop = [&](int y, int x, int c) -> float& {
+            return cropPixels[(static_cast<size_t>(y) * CROP_W + x) * 3 + c];
+        };
         for (int y = 0; y < CROP_H; ++y) {
             for (int x = 0; x < CROP_W; ++x) {
                 fk::uchar3 yuv = w.frame->readAt(fk::Point{static_cast<int>(r.x) + x, static_cast<int>(r.y) + y, 0});
@@ -203,7 +188,7 @@ std::vector<float> hostReference(const Workload& w, size_t n, bool openCVConvent
                 const fk::float3 rgb = YUVToRGB::exec(yuv);
                 const float c3[3] = {rgb.x, rgb.y, rgb.z};
                 for (int c = 0; c < 3; ++c) {
-                    crop[y][x][c] = openCVConventions ? std::floor(std::clamp(c3[c], 0.f, 255.f) + 0.5f) : c3[c];
+                    crop(y, x, c) = openCVConventions ? std::floor(std::clamp(c3[c], 0.f, 255.f) + 0.5f) : c3[c];
                 }
             }
         }
@@ -220,8 +205,8 @@ std::vector<float> hostReference(const Workload& w, size_t n, bool openCVConvent
                     const int x1 = std::min(x0 + 1, CROP_W - 1), y1 = std::min(y0 + 1, CROP_H - 1);
                     const float ax = fx - x0, ay = fy - y0;
                     for (int c = 0; c < 3; ++c) {
-                        v[c] = (crop[y0][x0][c] * (1.f - ax) + crop[y0][x1][c] * ax) * (1.f - ay) +
-                               (crop[y1][x0][c] * (1.f - ax) + crop[y1][x1][c] * ax) * ay;
+                        v[c] = (crop(y0, x0, c) * (1.f - ax) + crop(y0, x1, c) * ax) * (1.f - ay) +
+                               (crop(y1, x0, c) * (1.f - ax) + crop(y1, x1, c) * ax) * ay;
                     }
                 }
                 float* dst = &out[((i * OUT_H + y) * OUT_W + x) * 3];
@@ -334,8 +319,8 @@ struct Check {
 };
 
 template <size_t N>
-void runBatch(Workload& w, std::vector<Row>& singleThread, std::vector<Row>& multiThread,
-              std::vector<Row>& multiThreadFkl, std::vector<Check>& checks, int hardwareThreads) {
+void runBatch(Workload& w, std::vector<Row>& singleThread, std::vector<Row>& multiThread, std::vector<Check>& checks,
+              int threads) {
     OpenCVCpu opencv(w, N);
     FklCpu<N> fkl(w);
     FklCpu<N, fk::ParArch::CPU_MULTITHREAD> fklMT(w);
@@ -350,44 +335,41 @@ void runBatch(Workload& w, std::vector<Row>& singleThread, std::vector<Row>& mul
     checks.push_back(c);
 
     singleThread.push_back(timeTwo(N, [&]() { opencv.run(); }, [&]() { fkl.run(); }));
-    cv::setNumThreads(hardwareThreads);
-    multiThread.push_back(timeTwo(N, [&]() { opencv.run(); }, [&]() { fkl.run(); }));
-    multiThreadFkl.push_back(timeTwo(N, [&]() { opencv.run(); }, [&]() { fklMT.run(); }));
+    cv::setNumThreads(threads);
+    multiThread.push_back(timeTwo(N, [&]() { opencv.run(); }, [&]() { fklMT.run(); }));
     cv::setNumThreads(1);
     const Row& s = singleThread.back();
     const Row& m = multiThread.back();
-    const Row& mt = multiThreadFkl.back();
-    std::printf("N %3zu | OpenCV 1 thread %8.1f us, OpenCV %d threads %8.1f us, FKL CPU %8.1f us, FKL CPU_MULTITHREAD "
-                "%8.1f us | mean speedup: FKL CPU vs OpenCV 1 thread %6.2fx, FKL CPU vs OpenCV %d threads %6.2fx, FKL "
-                "CPU_MULTITHREAD vs OpenCV %d threads %6.2fx | max err: FKL vs reference %.2e, OpenCV vs "
+    std::printf("N %3zu | OpenCV 1 thread %8.1f us, FKL CPU %8.1f us, mean speedup %6.2fx | OpenCV %d threads %8.1f us, "
+                "FKL CPU_MULTITHREAD %8.1f us, mean speedup %6.2fx | max err: FKL vs reference %.2e, OpenCV vs "
                 "OpenCV-convention reference %.2e, OpenCV vs FKL %.2e, FKL CPU_MULTITHREAD vs FKL CPU %.2e\n",
-                N, s.opencv.median * 1000., hardwareThreads, m.opencv.median * 1000., s.fkl.median * 1000.,
-                mt.fkl.median * 1000., s.meanSpeedup, hardwareThreads, m.meanSpeedup, hardwareThreads, mt.meanSpeedup,
-                c.fklVsReference, c.opencvVsReference, c.opencvVsFkl, c.fklMultithreadVsFkl);
+                N, s.opencv.median * 1000., s.fkl.median * 1000., s.meanSpeedup, threads,
+                m.opencv.median * 1000., m.fkl.median * 1000., m.meanSpeedup, c.fklVsReference, c.opencvVsReference,
+                c.opencvVsFkl, c.fklMultithreadVsFkl);
 }
 
 } // namespace cpubench
 
 int main(int argc, char** argv) {
     using namespace cpubench;
-    const std::filesystem::path outDir = argc > 1 ? argv[1] : "results/cpu";
+    const std::filesystem::path outDir = argc > 1 ? argv[1] : "results";
     std::filesystem::create_directories(outDir);
-    const int hardwareThreads = cv::getNumberOfCPUs();
+    // OpenCV runs on as many threads as FKL's thread pool has workers (std::thread::hardware_concurrency()), which can
+    // differ from cv::getNumberOfCPUs() under an affinity mask or a CPU quota
+    const int threads = static_cast<int>(fk::cpuThreadPool().size());
 
     Workload w;
     initWorkload(w);
-    std::vector<Row> singleThread, multiThread, multiThreadFkl;
+    std::vector<Row> singleThread, multiThread;
     std::vector<Check> checks;
     [&]<size_t... Is>(std::index_sequence<Is...>) {
-        (runBatch<BATCHES[Is]>(w, singleThread, multiThread, multiThreadFkl, checks, hardwareThreads), ...);
+        (runBatch<BATCHES[Is]>(w, singleThread, multiThread, checks, threads), ...);
     }(std::make_index_sequence<BATCHES.size()>{});
 
     writeCSV(outDir / "benchmark_cpu_opencv_1thread_vs_fkl_bvf_CPU.csv", "OpenCV 1 thread", singleThread);
-    writeCSV(outDir / ("benchmark_cpu_opencv_" + std::to_string(hardwareThreads) + "threads_vs_fkl_bvf_CPU.csv"),
-             "OpenCV " + std::to_string(hardwareThreads) + " threads", multiThread);
-    writeCSV(outDir / ("benchmark_cpu_opencv_" + std::to_string(hardwareThreads) +
+    writeCSV(outDir / ("benchmark_cpu_opencv_" + std::to_string(threads) +
                        "threads_vs_fkl_bvf_CPU_MULTITHREAD.csv"),
-             "OpenCV " + std::to_string(hardwareThreads) + " threads", multiThreadFkl, "FKL CPU_MULTITHREAD");
+             "OpenCV " + std::to_string(threads) + " threads", multiThread, "FKL CPU_MULTITHREAD");
     std::ofstream v(outDir / "cpu_validation.csv");
     v << "Batch size, FKL MaxAbsError vs FKL-convention reference, OpenCV MaxAbsError vs OpenCV-convention reference, "
          "OpenCV vs FKL MaxAbsDifference, FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference" << std::endl;
@@ -398,7 +380,9 @@ int main(int argc, char** argv) {
     const std::string opencvBuild = cv::getBuildInformation();
     std::ofstream(outDir / "cpu_opencv_build_information.txt") << opencvBuild;
     std::ofstream p(outDir / "cpu_platform.txt");
-    p << "CPU: " << bench::cpuName() << ", " << hardwareThreads << " hardware threads\n"
+    p << "CPU: " << bench::cpuName() << ", " << std::thread::hardware_concurrency() << " hardware threads, "
+      << cv::getNumberOfCPUs() << " available to OpenCV; the multithreaded comparison uses " << threads
+      << " threads on both sides\n"
 #ifdef _WIN32
       << "SIMD of the CPU: see the CPU model\n"
 #else
@@ -417,6 +401,7 @@ int main(int argc, char** argv) {
       << cv::getCPUFeaturesLine() << "), parallel framework " << bench::buildInfoValue(opencvBuild, "Parallel framework:")
       << "; full configuration in cpu_opencv_build_information.txt\n"
       << "OS: " << bench::osName() << "\n"
+      << "Workload: " << describe() << "\n"
       << "Pipeline: as the GPU benchmarks, with BT.601 limited range for NV12 -> RGB (the only NV12 conversion of "
          "OpenCV's CPU cvtColor)\n"
       << "Timing: steady_clock around each pipeline, " << WARMUP_ITERS << " warm-up and " << ITERS
