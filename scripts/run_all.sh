@@ -72,6 +72,20 @@ run() { # <log> <command...>: runs a benchmark, keeping its output
     "$@" > "$log" 2>&1 || { tail -30 "$log" >&2; echo "FAILED: $*" >&2; exit 1; }
 }
 
+# Every workload's builds and results are in folders named after its crop size, so two workloads cannot share one
+seen=" "
+for geometry in $GEOMETRIES; do
+    if [[ ! $geometry =~ ^[0-9]+x[0-9]+:[0-9]+x[0-9]+$ ]]; then
+        echo "GEOMETRIES: $geometry is not <crop W>x<crop H>:<resize W>x<resize H>" >&2
+        exit 1
+    fi
+    if [[ $seen == *" ${geometry%%:*} "* ]]; then
+        echo "GEOMETRIES: two workloads with ${geometry%%:*} crops would share their build and results folders" >&2
+        exit 1
+    fi
+    seen+="${geometry%%:*} "
+done
+
 NCU_COMMANDS=()
 for geometry in $GEOMETRIES; do
     crop=${geometry%%:*}

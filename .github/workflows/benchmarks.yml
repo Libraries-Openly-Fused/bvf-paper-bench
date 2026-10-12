@@ -5,8 +5,8 @@ name: Benchmarks
 # no job runs on the Windows ROCm runner.
 # scripts/ci/run_benchmarks.cmake does the work: it builds OpenCV once per runner and configuration in
 # ~/bvf-paper-bench-deps (the first run on a runner takes much longer), builds the benchmarks with one timed iteration
-# and no warm-up (the CI checks results, it does not measure), runs every mode except the Nsight Compute profiles (they
-# need root), and fails if FKL's outputs do not match their references. The results and logs of every job are uploaded
+# and no warm-up (the CI checks results, it does not measure), runs every mode except those for Nsight Compute, and
+# fails if FKL's outputs do not match their references. The results and logs of every job are uploaded
 # as artifacts. Times measured on shared CI runners are not the paper's numbers.
 #
 # The runners are persistent machines and this repository is public, so only trusted code runs on them: pull requests

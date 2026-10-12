@@ -203,10 +203,10 @@ Every job runs [`scripts/ci/run_benchmarks.cmake`](scripts/ci/run_benchmarks.cma
 (see its header). It builds OpenCV 4.14.0 with the modules the benchmarks use once per runner and configuration, in
 `~/bvf-paper-bench-deps` (so the first run on a runner takes much longer), builds the benchmarks for both workloads
 of the paper (`GEOMETRIES`) with one timed iteration and no warm-up (`ITERATIONS` and `WARMUP_ITERATIONS` of the
-script), runs every mode except the Nsight Compute profiles (they need root), and fails if a benchmark fails or if
-FKL's or NPPDx's outputs do not match their references (OpenCV's and NPP's are in `validation.csv` but not required:
-they come from the OpenCV build and the CUDA toolkit of each runner). The results and logs of every job are uploaded
-as artifacts. Times measured on shared CI runners are not the paper's numbers.
+script), runs every mode except those for Nsight Compute (`--ncu-target` and the profiling scripts), and fails if a
+benchmark fails or if FKL's or NPPDx's outputs do not match their references (OpenCV's and NPP's are in
+`validation.csv` but not required: they come from the OpenCV build and the CUDA toolkit of each runner). The results
+and logs of every job are uploaded as artifacts. Times measured on shared CI runners are not the paper's numbers.
 
 The runners are persistent machines and this repository is public, so the workflow only runs trusted code: pull
 requests from forks are skipped (push their commits to a branch of this repository after reviewing them to test them),

@@ -48,3 +48,7 @@ done
 rm -rf "$OUT/scratch"
 chown -R "$OWNER": "$OUT"
 echo "Done: $((total - failures)) of $total profiles written to $OUT ($failures failed)."
+# A partial run fails, so that its reports are not summarized as if complete
+if [ "$failures" -ne 0 ]; then
+    exit 1
+fi
