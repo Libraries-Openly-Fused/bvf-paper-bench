@@ -28,6 +28,7 @@ set(NPPDX_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../nppdx" CACHE PATH "NPPDx checkout 
 # Timed and warm-up iterations of every benchmark: 1000 and 100 for the paper's results; the CI runs 1 and 0
 set(BENCH_ITERATIONS 1000 CACHE STRING "Timed iterations of every benchmark (at least 1)")
 set(BENCH_WARMUP_ITERATIONS 100 CACHE STRING "Warm-up iterations before the timed ones")
+include(${CMAKE_CURRENT_SOURCE_DIR}/../common/bench_geometry.cmake)
 
 find_package(CUDAToolkit REQUIRED)
 list(APPEND CMAKE_PREFIX_PATH "${NPPDX_DIR}")
@@ -58,6 +59,7 @@ function(add_benchmark TARGET_NAME SOURCE)
     target_compile_options(${TARGET_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${BENCHMARK_CUDA_OPTIONS}>)
     target_compile_definitions(${TARGET_NAME} PRIVATE NPPDX_SM=${NPPDX_SM}
                                BENCH_ITERATIONS=${BENCH_ITERATIONS} BENCH_WARMUP_ITERATIONS=${BENCH_WARMUP_ITERATIONS}
+                               ${BENCH_GEOMETRY_DEFINITIONS}
                                FKL_VERSION="${FKL_VERSION}" NPPDX_GIT_VERSION="${NPPDX_GIT_VERSION}"
                                CUDA_ARCHITECTURES_STR="${CUDA_ARCH}")
     target_link_libraries(${TARGET_NAME} PRIVATE nppdx::nppdx CUDA::cudart CUDA::cupti CUDA::nvtx3)

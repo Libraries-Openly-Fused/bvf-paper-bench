@@ -1,0 +1,6 @@
+Batch size, Tile, Requested BlockDim (0 = NPPDx recommended), Actual BlockSize, Blocks per crop, Dynamic shared memory bytes
+1, 20x10, 256, 256, 1, 36960
+4, 20x10, 256, 256, 1, 36960
+16, 20x10, 256, 256, 1, 36960
+50, 20x10, 256, 256, 1, 36960
+100, 20x10, 256, 256, 1, 36960

@@ -1,5 +1,6 @@
 // Latency and correctness benchmark for the Backwards Vertical Fusion paper, Figure 1 pipeline:
 // ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
+// with the frame, sizes, batch sizes and crop positions of common/bench_geometry.h.
 //
 // Implementations:
 //   opencv_cuda        NPP NV12->RGB, then per crop cv::cuda convertTo, resize, copyMakeBorder,
@@ -33,6 +34,7 @@
 #include <cupti.h>
 #include <nvtx3/nvToolsExt.h>
 
+#include "bench_geometry.h"
 #include "bench_platform.h"
 
 #include <algorithm>
@@ -47,7 +49,6 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
-#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -64,24 +65,12 @@
 
 namespace bench {
 
-constexpr int FRAME_W = 3840;
-constexpr int FRAME_H = 2160;
-constexpr int CROP_W = 20;
-constexpr int CROP_H = 10;
-constexpr int RES_W = 64;
-constexpr int RES_H = 32;
-constexpr int BORDER_TOP = 16;
-constexpr int BORDER_BOTTOM = 16;
-constexpr int OUT_W = RES_W;
-constexpr int OUT_H = RES_H + BORDER_TOP + BORDER_BOTTOM;
-constexpr int MAX_BATCH = 100;
-constexpr std::array<int, 5> BATCHES{1, 4, 16, 50, 100};
+// Frame, crop, resize, border and output sizes, batch sizes, seeds and crop positions, shared by every benchmark
+using namespace geometry;
 // BENCH_WARMUP_ITERATIONS and BENCH_ITERATIONS come from CMake: 100 and 1000 for the paper's results, 0 and 1 in the CI
 constexpr int WARMUP_ITERS = BENCH_WARMUP_ITERATIONS;
 constexpr int TIMED_ITERS = BENCH_ITERATIONS;
 static_assert(WARMUP_ITERS >= 0 && TIMED_ITERS >= 1, "at least one timed iteration");
-constexpr unsigned FRAME_SEED = 1;
-constexpr unsigned CROP_SEED = 42;
 constexpr float TOLERANCE = 1e-3f;
 
 // Pointwise tail: ImageNet normalization of 8 bit RGB
@@ -92,16 +81,6 @@ constexpr float DIV[3] = {0.229f, 0.224f, 0.225f};
 // normalize to [0, 1], add half a level so that the truncating denormalization rounds to nearest,
 // saturate with __saturatef and denormalize to uchar3
 constexpr float QUANTIZATION_OFFSET = 0.5f / 255.f;
-
-// Crop, resize and output sizes of one benchmark: the main one (CROP_W x CROP_H resized to RES_W x RES_H), or one
-// case of the region-size sweep. The pipelines take them from the Context, so that the same code runs both.
-struct Geometry {
-    int cropW{CROP_W}, cropH{CROP_H}, resW{RES_W}, resH{RES_H};
-    int outW() const { return resW; }
-    int outH() const { return resH + BORDER_TOP + BORDER_BOTTOM; }
-    // Floats of one output plane
-    size_t outFloats() const { return static_cast<size_t>(outW()) * outH() * 3; }
-};
 
 using NV12Image = fk::Image<fk::PixelFormat::NV12>;
 using YUVToRGB = fk::ConvertYUVToRGB<fk::ColorDepth::p8bit, fk::ColorRange::Full, fk::ColorPrimitives::bt2020>;
@@ -122,7 +101,6 @@ struct Context {
     const Npp8u* uv{nullptr};
     int pitch{0};
     Npp32f twist[3][4]{};
-    Geometry geom;
     std::array<fk::Rect, MAX_BATCH> crops{};
 };
 
@@ -176,15 +154,10 @@ void initContext(Context& ctx) {
     ctx.frameHost = std::make_unique<NV12Image>(FRAME_W, FRAME_H, fk::MemType::Host);
     auto deviceData = ctx.frameDevice->getData();
     auto hostData = ctx.frameHost->getData();
-    std::mt19937 gen(FRAME_SEED);
-    std::uniform_int_distribution<int> byte(0, 255);
-    for (int y = 0; y < FRAME_H * 3 / 2; ++y) {
-        for (int x = 0; x < FRAME_W; ++x) {
-            const uchar value = static_cast<uchar>(byte(gen));
-            deviceData.at(x, y) = value;
-            hostData.at(x, y) = value;
-        }
-    }
+    generateFrame([&](int x, int y, uint8_t value) {
+        deviceData.at(x, y) = value;
+        hostData.at(x, y) = value;
+    });
     ctx.frameDevice->upload(*ctx.fkStream);
     gpuErrchk(cudaStreamSynchronize(ctx.stream));
     const auto raw = deviceData.ptr();
@@ -198,13 +171,9 @@ void initContext(Context& ctx) {
     ctx.uv = raw.data + static_cast<size_t>(FRAME_H) * ctx.pitch;
 
     // Crop rectangles at random positions, the first N are used for batch N
-    std::mt19937 cropGen(CROP_SEED);
-    std::uniform_int_distribution<int> distX(0, FRAME_W - CROP_W);
-    std::uniform_int_distribution<int> distY(0, FRAME_H - CROP_H);
-    for (auto& crop : ctx.crops) {
-        const int x = distX(cropGen);
-        const int y = distY(cropGen);
-        crop = fk::Rect(x, y, CROP_W, CROP_H);
+    const auto crops = makeCrops();
+    for (size_t i = 0; i < MAX_BATCH; ++i) {
+        ctx.crops[i] = fk::Rect(crops[i].x, crops[i].y, crops[i].width, crops[i].height);
     }
 }
 
@@ -249,7 +218,7 @@ void nv12ToRgb8(const Context& ctx, Npp8u* dst, int dstStep) {
 }
 
 // Each implementation enqueues one complete pipeline on ctx.stream with run(), and returns the
-// N x 64 x 64 x 3 float output with download(). fillNaN() poisons the output before validation.
+// N x OUT_H x OUT_W x 3 float output with download(). fillNaN() poisons the output before validation.
 struct Implementation {
     std::string name;
     bool eightBitRGB{false};
@@ -275,25 +244,24 @@ std::array<fk::Rect, N> firstCrops(const Context& ctx) {
 
 template <size_t N>
 Implementation makeFklBvf(Context& ctx) {
-    const Geometry g = ctx.geom;
-    auto out = std::make_shared<fk::Tensor<fk::float3>>(g.outW(), g.outH(), N, 1, fk::MemType::Device);
+    auto out = std::make_shared<fk::Tensor<fk::float3>>(OUT_W, OUT_H, N, 1, fk::MemType::Device);
     const auto crops = firstCrops<N>(ctx);
     Implementation impl{"fkl_bvf", false};
-    impl.run = [&ctx, out, crops, g]() {
+    impl.run = [&ctx, out, crops]() {
         beforeKernel();
         fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
             fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
             YUVToRGB::build(),
             fk::Crop<>::build(crops),
-            fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(g.resW, g.resH)),
+            fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(RES_W, RES_H)),
             fk::AddBorder<>::build(BORDER_TOP, BORDER_BOTTOM, 0, 0, black),
             fk::Mul<fk::float3>::build(mulValue),
             fk::Sub<fk::float3>::build(subValue),
             fk::Div<fk::float3>::build(divValue),
             fk::TensorWrite<fk::float3>::build(out->ptr()));
     };
-    impl.download = [out, g]() { return downloadDevice(out->ptr().data, N * g.outFloats()); };
-    impl.fillNaN = [out, g]() { gpuErrchk(cudaMemset(out->ptr().data, 0xFF, N * g.outFloats() * sizeof(float))); };
+    impl.download = [out]() { return downloadDevice(out->ptr().data, N * OUT_FLOATS); };
+    impl.fillNaN = [out]() { gpuErrchk(cudaMemset(out->ptr().data, 0xFF, N * OUT_FLOATS * sizeof(float))); };
     return impl;
 }
 
@@ -320,14 +288,13 @@ template <size_t N, bool EIGHT_BIT_FRAME>
 Implementation makeFklVfHf(Context& ctx) {
     constexpr bool EIGHT_BIT = EIGHT_BIT_FRAME;
     using RGB = std::conditional_t<EIGHT_BIT, fk::uchar3, fk::float3>;
-    const Geometry g = ctx.geom;
     auto rgb = std::make_shared<fk::Ptr2D<RGB>>(FRAME_W, FRAME_H, 0, fk::MemType::Device);
-    auto cropped = std::make_shared<fk::Tensor<fk::float3>>(g.cropW, g.cropH, N, 1, fk::MemType::Device);
-    auto resized = std::make_shared<fk::Tensor<fk::float3>>(g.resW, g.resH, N, 1, fk::MemType::Device);
-    auto out = std::make_shared<fk::Tensor<fk::float3>>(g.outW(), g.outH(), N, 1, fk::MemType::Device);
+    auto cropped = std::make_shared<fk::Tensor<fk::float3>>(CROP_W, CROP_H, N, 1, fk::MemType::Device);
+    auto resized = std::make_shared<fk::Tensor<fk::float3>>(RES_W, RES_H, N, 1, fk::MemType::Device);
+    auto out = std::make_shared<fk::Tensor<fk::float3>>(OUT_W, OUT_H, N, 1, fk::MemType::Device);
     const auto crops = firstCrops<N>(ctx);
-    const auto croppedViews = planeViews<N>(*cropped, g.cropW, g.cropH);
-    const auto resizedViews = planeViews<N>(*resized, g.resW, g.resH);
+    const auto croppedViews = planeViews<N>(*cropped, CROP_W, CROP_H);
+    const auto resizedViews = planeViews<N>(*resized, RES_W, RES_H);
     Implementation impl{EIGHT_BIT ? "fkl_vf_hf" : "fkl_vf_hf_float3_frame", EIGHT_BIT};
     impl.stages.emplace_back(EIGHT_BIT ? "1_nv12_to_rgb8_full_frame" : "1_nv12_to_rgb_float3_full_frame", [&ctx, rgb]() {
         if constexpr (EIGHT_BIT) {
@@ -363,11 +330,11 @@ Implementation makeFklVfHf(Context& ctx) {
                 fk::TensorWrite<fk::float3>::build(cropped->ptr()));
         }
     });
-    impl.stages.emplace_back("3_resize", [&ctx, resized, croppedViews, g]() {
+    impl.stages.emplace_back("3_resize", [&ctx, resized, croppedViews]() {
         beforeKernel();
         fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
             fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(croppedViews),
-            fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(g.resW, g.resH)),
+            fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(RES_W, RES_H)),
             fk::TensorWrite<fk::float3>::build(resized->ptr()));
     });
     impl.stages.emplace_back("4_addborder_mul_sub_div_write", [&ctx, out, resizedViews]() {
@@ -385,8 +352,8 @@ Implementation makeFklVfHf(Context& ctx) {
             stage.second();
         }
     };
-    impl.download = [out, g]() { return downloadDevice(out->ptr().data, N * g.outFloats()); };
-    impl.fillNaN = [out, g]() { gpuErrchk(cudaMemset(out->ptr().data, 0xFF, N * g.outFloats() * sizeof(float))); };
+    impl.download = [out]() { return downloadDevice(out->ptr().data, N * OUT_FLOATS); };
+    impl.fillNaN = [out]() { gpuErrchk(cudaMemset(out->ptr().data, 0xFF, N * OUT_FLOATS * sizeof(float))); };
     return impl;
 }
 
@@ -400,29 +367,28 @@ struct OpenCVState {
 
 template <size_t N>
 Implementation makeOpenCV(Context& ctx, std::shared_ptr<OpenCVState>& stateOut) {
-    const Geometry g = ctx.geom;
     auto st = std::make_shared<OpenCVState>();
     st->rgb8.create(FRAME_H, FRAME_W, CV_8UC3);
     for (size_t i = 0; i < N; ++i) {
         const fk::Rect& r = ctx.crops[i];
         st->rects.emplace_back(r.x, r.y, r.width, r.height);
-        st->cropped.emplace_back(g.cropH, g.cropW, CV_32FC3);
-        st->resized.emplace_back(g.resH, g.resW, CV_32FC3);
+        st->cropped.emplace_back(CROP_H, CROP_W, CV_32FC3);
+        st->resized.emplace_back(RES_H, RES_W, CV_32FC3);
     }
-    cv::cuda::createContinuous(static_cast<int>(N) * g.outH(), g.outW(), CV_32FC3, st->tensor);
+    cv::cuda::createContinuous(static_cast<int>(N) * OUT_H, OUT_W, CV_32FC3, st->tensor);
     stateOut = st;
     Implementation impl{"opencv_cuda", true};
     impl.stages.emplace_back("1_nv12_to_rgb8_full_frame_npp", [&ctx, st]() {
         nv12ToRgb8(ctx, st->rgb8.data, static_cast<int>(st->rgb8.step));
     });
-    impl.stages.emplace_back("2_per_crop_convertTo_resize_copyMakeBorder", [&ctx, st, g]() {
+    impl.stages.emplace_back("2_per_crop_convertTo_resize_copyMakeBorder", [&ctx, st]() {
         for (size_t i = 0; i < N; ++i) {
             beforeKernel();
             st->rgb8(st->rects[i]).convertTo(st->cropped[i], CV_32F, ctx.cvStream);
             beforeKernel();
-            cv::cuda::resize(st->cropped[i], st->resized[i], cv::Size(g.resW, g.resH), 0., 0., cv::INTER_LINEAR,
+            cv::cuda::resize(st->cropped[i], st->resized[i], cv::Size(RES_W, RES_H), 0., 0., cv::INTER_LINEAR,
                              ctx.cvStream);
-            cv::cuda::GpuMat plane = st->tensor.rowRange(static_cast<int>(i) * g.outH(), static_cast<int>(i + 1) * g.outH());
+            cv::cuda::GpuMat plane = st->tensor.rowRange(static_cast<int>(i) * OUT_H, static_cast<int>(i + 1) * OUT_H);
             beforeKernel();
             cv::cuda::copyMakeBorder(st->resized[i], plane, BORDER_TOP, BORDER_BOTTOM, 0, 0, cv::BORDER_CONSTANT,
                                      cv::Scalar(0., 0., 0.), ctx.cvStream);
@@ -441,8 +407,8 @@ Implementation makeOpenCV(Context& ctx, std::shared_ptr<OpenCVState>& stateOut) 
             stage.second();
         }
     };
-    impl.download = [st, g]() { return downloadDevice(st->tensor.data, N * g.outFloats()); };
-    impl.fillNaN = [st, g]() { gpuErrchk(cudaMemset(st->tensor.data, 0xFF, N * g.outFloats() * sizeof(float))); };
+    impl.download = [st]() { return downloadDevice(st->tensor.data, N * OUT_FLOATS); };
+    impl.fillNaN = [st]() { gpuErrchk(cudaMemset(st->tensor.data, 0xFF, N * OUT_FLOATS * sizeof(float))); };
     return impl;
 }
 
@@ -469,12 +435,11 @@ struct NPPState {
 
 template <size_t N>
 Implementation makeNPP(Context& ctx) {
-    const Geometry g = ctx.geom;
-    const int cropStep = g.cropW * 3 * sizeof(Npp32f);
-    const int outStep = g.outW() * 3 * sizeof(Npp32f);
-    const size_t cropFloats = static_cast<size_t>(g.cropW) * g.cropH * 3;
-    const size_t resizedFloats = static_cast<size_t>(g.resW) * g.resH * 3;
-    const size_t outFloats = g.outFloats();
+    const int cropStep = CROP_W * 3 * sizeof(Npp32f);
+    const int outStep = OUT_W * 3 * sizeof(Npp32f);
+    const size_t cropFloats = static_cast<size_t>(CROP_W) * CROP_H * 3;
+    const size_t resizedFloats = static_cast<size_t>(RES_W) * RES_H * 3;
+    const size_t outFloats = OUT_FLOATS;
     auto st = std::make_shared<NPPState>();
     size_t rgbPitch = 0;
     gpuErrchk(cudaMallocPitch(reinterpret_cast<void**>(&st->rgb8), &rgbPitch, FRAME_W * 3, FRAME_H));
@@ -486,9 +451,9 @@ Implementation makeNPP(Context& ctx) {
     std::vector<NppiImageDescriptor> src(N), dst(N);
     std::vector<NppiResizeBatchROI_Advanced> rois(N);
     for (size_t i = 0; i < N; ++i) {
-        src[i] = NppiImageDescriptor{st->cropped + i * cropFloats, cropStep, NppiSize{g.cropW, g.cropH}};
-        dst[i] = NppiImageDescriptor{st->resized + i * resizedFloats, outStep, NppiSize{g.resW, g.resH}};
-        rois[i] = NppiResizeBatchROI_Advanced{NppiRect{0, 0, g.cropW, g.cropH}, NppiRect{0, 0, g.resW, g.resH}};
+        src[i] = NppiImageDescriptor{st->cropped + i * cropFloats, cropStep, NppiSize{CROP_W, CROP_H}};
+        dst[i] = NppiImageDescriptor{st->resized + i * resizedFloats, outStep, NppiSize{RES_W, RES_H}};
+        rois[i] = NppiResizeBatchROI_Advanced{NppiRect{0, 0, CROP_W, CROP_H}, NppiRect{0, 0, RES_W, RES_H}};
         st->rects.push_back(ctx.crops[i]);
     }
     gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->srcDescriptors), N * sizeof(NppiImageDescriptor)));
@@ -500,40 +465,40 @@ Implementation makeNPP(Context& ctx) {
 
     Implementation impl{"npp", true};
     impl.stages.emplace_back("1_nv12_to_rgb8_full_frame", [&ctx, st]() { nv12ToRgb8(ctx, st->rgb8, st->rgbStep); });
-    impl.stages.emplace_back("2_per_crop_convert_8u32f", [&ctx, st, g, cropFloats, cropStep]() {
+    impl.stages.emplace_back("2_per_crop_convert_8u32f", [&ctx, st, cropFloats, cropStep]() {
         for (size_t i = 0; i < N; ++i) {
             const fk::Rect& r = st->rects[i];
             const Npp8u* cropSrc = st->rgb8 + static_cast<size_t>(r.y) * st->rgbStep + r.x * 3;
             beforeKernel();
             NPP_CHECK(nppiConvert_8u32f_C3R_Ctx(cropSrc, st->rgbStep, st->cropped + i * cropFloats, cropStep,
-                                                NppiSize{g.cropW, g.cropH}, ctx.npp));
+                                                NppiSize{CROP_W, CROP_H}, ctx.npp));
         }
     });
-    impl.stages.emplace_back("3_resize_batch", [&ctx, st, g, cropStep, outStep]() {
+    impl.stages.emplace_back("3_resize_batch", [&ctx, st, cropStep, outStep]() {
         if constexpr (N == 1) {
             // nppiResizeBatch rejects a batch of one image with NPP_BAD_ARGUMENT_ERROR
             beforeKernel();
-            NPP_CHECK(nppiResize_32f_C3R_Ctx(st->cropped, cropStep, NppiSize{g.cropW, g.cropH},
-                                             NppiRect{0, 0, g.cropW, g.cropH}, st->resized, outStep,
-                                             NppiSize{g.resW, g.resH}, NppiRect{0, 0, g.resW, g.resH},
+            NPP_CHECK(nppiResize_32f_C3R_Ctx(st->cropped, cropStep, NppiSize{CROP_W, CROP_H},
+                                             NppiRect{0, 0, CROP_W, CROP_H}, st->resized, outStep,
+                                             NppiSize{RES_W, RES_H}, NppiRect{0, 0, RES_W, RES_H},
                                              NPPI_INTER_LINEAR, ctx.npp));
         } else {
             beforeKernel();
-            NPP_CHECK(nppiResizeBatch_32f_C3R_Advanced_Ctx(g.resW, g.resH, st->srcDescriptors, st->dstDescriptors, st->rois,
+            NPP_CHECK(nppiResizeBatch_32f_C3R_Advanced_Ctx(RES_W, RES_H, st->srcDescriptors, st->dstDescriptors, st->rois,
                                                            static_cast<unsigned int>(N), NPPI_INTER_LINEAR, ctx.npp));
         }
     });
-    impl.stages.emplace_back("4_per_crop_copy_const_border", [&ctx, st, g, resizedFloats, outFloats, outStep]() {
+    impl.stages.emplace_back("4_per_crop_copy_const_border", [&ctx, st, resizedFloats, outFloats, outStep]() {
         static const Npp32f zero[3] = {0.f, 0.f, 0.f};
         for (size_t i = 0; i < N; ++i) {
             beforeKernel();
-            NPP_CHECK(nppiCopyConstBorder_32f_C3R_Ctx(st->resized + i * resizedFloats, outStep, NppiSize{g.resW, g.resH},
-                                                      st->tensor + i * outFloats, outStep, NppiSize{g.outW(), g.outH()},
+            NPP_CHECK(nppiCopyConstBorder_32f_C3R_Ctx(st->resized + i * resizedFloats, outStep, NppiSize{RES_W, RES_H},
+                                                      st->tensor + i * outFloats, outStep, NppiSize{OUT_W, OUT_H},
                                                       BORDER_TOP, 0, zero, ctx.npp));
         }
     });
-    impl.stages.emplace_back("5_mulc_subc_divc", [&ctx, st, g, outStep]() {
-        const NppiSize tensorSize{g.outW(), static_cast<int>(N) * g.outH()};
+    impl.stages.emplace_back("5_mulc_subc_divc", [&ctx, st, outStep]() {
+        const NppiSize tensorSize{OUT_W, static_cast<int>(N) * OUT_H};
         beforeKernel();
         NPP_CHECK(nppiMulC_32f_C3IR_Ctx(MUL, st->tensor, outStep, tensorSize, ctx.npp));
         beforeKernel();
@@ -555,15 +520,14 @@ Implementation makeNPP(Context& ctx) {
 // quantizes the RGB values to 8 bit right after the color conversion, like the OpenCV and NPP pipelines do.
 template <size_t N, bool EIGHT_BIT>
 std::vector<float> cpuReference(const Context& ctx) {
-    const Geometry g = ctx.geom;
     const auto crops = firstCrops<N>(ctx);
     fk::Stream_<fk::ParArch::CPU> cpuStream;
-    fk::Tensor<fk::float3> out(g.outW(), g.outH(), N, 1, fk::MemType::Host);
+    fk::Tensor<fk::float3> out(OUT_W, OUT_H, N, 1, fk::MemType::Host);
     const auto tail = [&](const auto& rgbRead) {
         fk::executeOperations<fk::TransformDPP<fk::ParArch::CPU>>(cpuStream,
             rgbRead,
             fk::Crop<>::build(crops),
-            fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(g.resW, g.resH)),
+            fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(RES_W, RES_H)),
             fk::AddBorder<>::build(BORDER_TOP, BORDER_BOTTOM, 0, 0, black),
             fk::Mul<fk::float3>::build(mulValue),
             fk::Sub<fk::float3>::build(subValue),
@@ -581,28 +545,28 @@ std::vector<float> cpuReference(const Context& ctx) {
     }
     cpuStream.sync();
     const float* data = reinterpret_cast<const float*>(out.ptr().data);
-    return std::vector<float>(data, data + N * g.outFloats());
+    return std::vector<float>(data, data + N * OUT_FLOATS);
 }
 
 // Plain C++ reference with NPP's bilinear sampling convention. FKL and OpenCV CUDA sample at src = dst * scale.
 // NPP's nppiResize / nppiResizeBatch 32f linear sample at src = dst * scale - 0.25, clamped to the image
-// (measured with linear ramps at upscale factors 2, 3.2 and 5; it is not the pixel-center convention,
-// which would be dst * scale - 0.34375 here). Same 8 bit RGB, border and pointwise tail as the 8 bit reference.
+// (measured with linear ramps at upscale factors 2, 3.2 and 5). That is the pixel-center convention,
+// (dst + 0.5) * scale - 0.5, only for an exact 2x upscale (scale 0.5); at 3.2x pixel centers would be
+// dst * scale - 0.34375. Same 8 bit RGB, border and pointwise tail as the 8 bit reference.
 constexpr float NPP_SAMPLE_OFFSET = -0.25f;
 
 template <size_t N>
 std::vector<float> nppConventionReference8bit(const Context& ctx) {
-    const Geometry g = ctx.geom;
-    const int outW = g.outW(), outH = g.outH();
-    std::vector<float> out(N * g.outFloats());
-    const float scaleX = static_cast<float>(g.cropW) / g.resW;
-    const float scaleY = static_cast<float>(g.cropH) / g.resH;
-    std::vector<float> crop(static_cast<size_t>(g.cropW) * g.cropH * 3);
-    const auto at = [&](int y, int x, int c) -> float& { return crop[(static_cast<size_t>(y) * g.cropW + x) * 3 + c]; };
+    const int outW = OUT_W, outH = OUT_H;
+    std::vector<float> out(N * OUT_FLOATS);
+    const float scaleX = static_cast<float>(CROP_W) / RES_W;
+    const float scaleY = static_cast<float>(CROP_H) / RES_H;
+    std::vector<float> crop(static_cast<size_t>(CROP_W) * CROP_H * 3);
+    const auto at = [&](int y, int x, int c) -> float& { return crop[(static_cast<size_t>(y) * CROP_W + x) * 3 + c]; };
     for (size_t i = 0; i < N; ++i) {
         const fk::Rect& r = ctx.crops[i];
-        for (int y = 0; y < g.cropH; ++y) {
-            for (int x = 0; x < g.cropW; ++x) {
+        for (int y = 0; y < CROP_H; ++y) {
+            for (int x = 0; x < CROP_W; ++x) {
                 const fk::float3 rgb = YUVToRGB::exec(
                     ctx.frameHost->readAt(fk::Point{static_cast<int>(r.x) + x, static_cast<int>(r.y) + y, 0}));
                 const float channels[3] = {rgb.x, rgb.y, rgb.z};
@@ -616,11 +580,11 @@ std::vector<float> nppConventionReference8bit(const Context& ctx) {
                 float* dst = &out[((i * outH + y) * outW + x) * 3];
                 const int ry = y - BORDER_TOP;
                 float value[3] = {0.f, 0.f, 0.f};
-                if (ry >= 0 && ry < g.resH) {
-                    const float sx = std::min(static_cast<float>(g.cropW - 1), std::max(0.f, x * scaleX + NPP_SAMPLE_OFFSET));
-                    const float sy = std::min(static_cast<float>(g.cropH - 1), std::max(0.f, ry * scaleY + NPP_SAMPLE_OFFSET));
+                if (ry >= 0 && ry < RES_H) {
+                    const float sx = std::min(static_cast<float>(CROP_W - 1), std::max(0.f, x * scaleX + NPP_SAMPLE_OFFSET));
+                    const float sy = std::min(static_cast<float>(CROP_H - 1), std::max(0.f, ry * scaleY + NPP_SAMPLE_OFFSET));
                     const int x0 = static_cast<int>(sx), y0 = static_cast<int>(sy);
-                    const int x1 = std::min(x0 + 1, g.cropW - 1), y1 = std::min(y0 + 1, g.cropH - 1);
+                    const int x1 = std::min(x0 + 1, CROP_W - 1), y1 = std::min(y0 + 1, CROP_H - 1);
                     const float fx = sx - x0, fy = sy - y0;
                     for (int c = 0; c < 3; ++c) {
                         value[c] = (at(y0, x0, c) * (1.f - fx) + at(y0, x1, c) * fx) * (1.f - fy) +
@@ -721,15 +685,11 @@ std::vector<std::vector<float>> measureInterleaved(const Context& ctx, const std
 // Kernel, memset and memcpy counts of one pipeline, from CUPTI activity tracing (no hardware counters,
 // so it works without admin rights). It runs in a separate pass after all the timings.
 // Time of each kernel of a multi-kernel pipeline: CUDA events between its kernels on the same stream
-// Case of the region-size sweep being measured ("" in the main benchmark), recorded in every result
-std::string currentRegion;
-
 struct StageTiming {
     std::string name;
     int batch{0};
     std::string stage;
     TimingStats timing;
-    std::string region{currentRegion};
 };
 std::vector<StageTiming> breakdown;
 
@@ -932,7 +892,6 @@ struct Result {
     ErrorStats errorVsNppConventionReference;
     std::string reference;
     LaunchCounts launches;
-    std::string region{currentRegion};
 };
 
 // The implementations in the comparison, all with the same intermediates (8 bit RGB frame, then float3), and FKL BVF
@@ -1077,9 +1036,8 @@ void conversionDiagnostic(const Context& ctx, std::ostream& os) {
        << maxTrunc << " levels\n";
 }
 
-// System, versions and protocol of a run; workload replaces the main benchmark's workload description
-void writePlatform(const std::filesystem::path& path, const Context& ctx, const std::string& diagnostic,
-                   const std::string& workload = "") {
+// System, versions, workload and protocol of a run
+void writePlatform(const std::filesystem::path& path, const Context& ctx, const std::string& diagnostic) {
     int device = 0, runtime = 0, driver = 0;
     gpuErrchk(cudaGetDevice(&device));
     cudaDeviceProp prop{};
@@ -1109,17 +1067,9 @@ void writePlatform(const std::filesystem::path& path, const Context& ctx, const 
        << "OS: " << bench::osName() << ", kernel " << bench::kernelVersion() << "\n"
        << "GPU clocks: not locked (locking needs root); application clocks as reported by nvidia-smi: "
        << bench::shell("nvidia-smi --query-gpu=clocks.max.sm,clocks.max.mem --format=csv,noheader") << "\n"
-       << "\nWorkload: ";
-    if (workload.empty()) {
-        os << FRAME_W << "x" << FRAME_H << " NV12 frame (uniform random bytes, seed " << FRAME_SEED << "), N crops of "
-           << CROP_W << "x" << CROP_H << " at uniform random positions (seed " << CROP_SEED
-           << ", the first N of one sequence), NV12->RGB BT.2020 full range, bilinear resize to " << RES_W << "x"
-           << RES_H << ", AddBorder " << BORDER_TOP << " rows top and " << BORDER_BOTTOM << " bottom (black), then "
-           << "Mul (1/255), Sub (0.485, 0.456, 0.406), Div (0.229, 0.224, 0.225), float3 tensor of N planes " << OUT_W
-           << "x" << OUT_H << "\n";
-    } else {
-        os << workload << "\n";
-    }
+       << "\nWorkload: " << geometry::describe() << ". NV12->RGB BT.2020 full range, AddBorder (black), then Mul "
+       << "(1/255), Sub (0.485, 0.456, 0.406), Div (0.229, 0.224, 0.225), float3 tensor of N planes " << OUT_W << "x"
+       << OUT_H << "\n";
     os << "Timing: " << WARMUP_ITERS << " warm-up then " << TIMED_ITERS << " timed iterations. In every iteration "
        << "OpenCV, NPP, FKL VF+HF and FKL BVF run one after the other, each timed with CUDA events on one stream "
        << "around the complete pipeline (all host enqueue work included) and followed by a synchronization. "
@@ -1172,9 +1122,8 @@ void hostOverheadBatch(Context& ctx) {
     const auto us = [](Clock::time_point a, Clock::time_point b) {
         return std::chrono::duration<float, std::milli>(b - a).count();
     };
-    const Geometry g = ctx.geom;
     const auto crops = firstCrops<N>(ctx);
-    fk::Tensor<fk::float3> out(g.outW(), g.outH(), N, 1, fk::MemType::Device);
+    fk::Tensor<fk::float3> out(OUT_W, OUT_H, N, 1, fk::MemType::Device);
     std::vector<float> build, fuse, launch, total;
     for (int i = 0; i < WARMUP_ITERS + TIMED_ITERS; ++i) {
         const auto t0 = Clock::now();
@@ -1182,7 +1131,7 @@ void hostOverheadBatch(Context& ctx) {
         const auto convert = YUVToRGB::build();
         const auto crop = fk::Crop<>::build(crops);
         const auto resize =
-            fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(g.resW, g.resH));
+            fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(RES_W, RES_H));
         const auto border = fk::AddBorder<>::build(BORDER_TOP, BORDER_BOTTOM, 0, 0, black);
         const auto mul = fk::Mul<fk::float3>::build(mulValue);
         const auto sub = fk::Sub<fk::float3>::build(subValue);
@@ -1429,263 +1378,19 @@ void writeTwoExecutionRow(std::ostream& two, long long key, const TimingStats& t
     two << std::endl;
 }
 
-// ------------------------------------------------------------------------------------------------
-// Region-size sweep: how the BVF advantage depends on how much of the producer's output (the RGB frame) is used.
-// N = 16 regions, one at the origin of each cell of a 4x4 grid of 960x540 cells (they never overlap), resized
-// exactly 2x in both axes, then the same 16 + 16 border rows, normalization and float3 write as the main benchmark.
-// The regions grow until they cover almost the whole frame.
-// ------------------------------------------------------------------------------------------------
-constexpr size_t REGION_N = 16;
-constexpr int REGION_GRID = 4;
-constexpr int REGION_CELL_W = FRAME_W / REGION_GRID;
-constexpr int REGION_CELL_H = FRAME_H / REGION_GRID;
-
-struct RegionCase {
-    const char* name;
-    Geometry geom;
-    long long pixels() const { return static_cast<long long>(geom.cropW) * geom.cropH; }
-    double coveragePercent() const {
-        return 100. * static_cast<double>(REGION_N * pixels()) / (static_cast<double>(FRAME_W) * FRAME_H);
-    }
-};
-
-const std::array<RegionCase, 4> REGION_CASES{{
-    {"A", Geometry{32, 16, 64, 32}},
-    {"B", Geometry{112, 96, 224, 192}},
-    {"C", Geometry{320, 304, 640, 608}},
-    {"D", Geometry{960, 524, 1920, 1048}},
-}};
-
-void setRegionCase(Context& ctx, const RegionCase& c) {
-    const Geometry& g = c.geom;
-    if (g.cropW > REGION_CELL_W || g.cropH > REGION_CELL_H || g.resW != 2 * g.cropW || g.resH != 2 * g.cropH) {
-        throw std::runtime_error(std::string("Invalid region case ") + c.name);
-    }
-    ctx.geom = g;
-    for (size_t i = 0; i < REGION_N; ++i) {
-        ctx.crops[i] = fk::Rect(static_cast<int>(i % REGION_GRID) * REGION_CELL_W,
-                                static_cast<int>(i / REGION_GRID) * REGION_CELL_H, g.cropW, g.cropH);
-    }
-    currentRegion = c.name;
-}
-
-const RegionCase& regionCase(const std::string& name) {
-    for (const auto& c : REGION_CASES) {
-        if (name == c.name) {
-            return c;
-        }
-    }
-    throw std::runtime_error("Unknown region case " + name + ", use A, B, C or D");
-}
-
-// Bytes of every buffer each implementation reads or writes in global memory for one execution, from the sizes in the
-// code and the operations it runs (an operation that reads or writes a whole buffer counts it once). The sizes are
-// logical (width x height x element): row padding of pitched allocations is neither read nor written.
-struct BufferTraffic {
-    std::string implementation, buffer, element;
-    long long width, height, planes, bufferBytes, bytesWritten, bytesRead;
-};
-
-std::vector<BufferTraffic> bufferTraffic(const Geometry& g) {
-    const long long n = REGION_N;
-    const long long frameNV12 = static_cast<long long>(FRAME_W) * FRAME_H * 3 / 2;
-    const long long cropPixels = n * g.cropW * g.cropH;
-    const long long resizedPixels = n * g.resW * g.resH;
-    const long long outPixels = n * g.outW() * g.outH();
-    constexpr long long F3 = 3 * sizeof(float);
-    std::vector<BufferTraffic> rows;
-    const auto multiKernel = [&](const std::string& impl, bool float3Frame, int outputWrites) {
-        const long long rgbElement = float3Frame ? F3 : 3;
-        const long long rgbFrame = static_cast<long long>(FRAME_W) * FRAME_H * rgbElement;
-        rows.push_back({impl, "nv12_frame (input)", "uint8", FRAME_W, FRAME_H * 3 / 2, 1, frameNV12, 0, frameNV12});
-        rows.push_back({impl, "rgb_frame", float3Frame ? "float3" : "uchar3", FRAME_W, FRAME_H, 1, rgbFrame, rgbFrame,
-                        cropPixels * rgbElement});
-        rows.push_back({impl, "crops", "float3", g.cropW, g.cropH, n, cropPixels * F3, cropPixels * F3,
-                        cropPixels * F3});
-        rows.push_back({impl, "resized_crops", "float3", g.resW, g.resH, n, resizedPixels * F3, resizedPixels * F3,
-                        resizedPixels * F3});
-        // OpenCV and NPP write the output with the border copy, then multiply, subtract and divide it in place
-        rows.push_back({impl, "output", "float3", g.outW(), g.outH(), n, outPixels * F3, outputWrites * outPixels * F3,
-                        (outputWrites - 1) * outPixels * F3});
-    };
-    multiKernel("opencv_cuda", false, 4);
-    multiKernel("npp", false, 4);
-    multiKernel("fkl_vf_hf", false, 1);
-    multiKernel("fkl_vf_hf_float3_frame", true, 1);
-    // BVF reads the NV12 samples of the regions (the 2x bilinear resize uses every pixel of each region) and
-    // writes the output once
-    rows.push_back({"fkl_bvf", "nv12_frame (input)", "uint8", FRAME_W, FRAME_H * 3 / 2, 1, frameNV12, 0,
-                    cropPixels * 3 / 2});
-    rows.push_back({"fkl_bvf", "output", "float3", g.outW(), g.outH(), n, outPixels * F3, outPixels * F3, 0});
-    return rows;
-}
-
-// Two-execution CSVs of the sweep, one per baseline and timing, keyed by the source pixels of one region
-void writeRegionTwoExecutionCSVs(const std::filesystem::path& outDir, const std::vector<Result>& results) {
-    const std::string parArch(fk::toStrView(fk::defaultParArch));
-    for (const std::string timingName : {"", "gpu_only_", "gpu_only_l2_flushed_"}) {
-        for (const std::string baseline : {"opencv_cuda", "npp", "fkl_vf_hf"}) {
-            std::ofstream two(outDir / (baseline + "_vs_fkl_bvf_region_sweep_" + timingName + parArch + ".csv"));
-            writeTwoExecutionHeader(two, "Source pixels per region", baseline);
-            for (const auto& c : REGION_CASES) {
-                const auto find = [&](const std::string& name) {
-                    return std::find_if(results.begin(), results.end(),
-                                        [&](const Result& r) { return r.name == name && r.region == c.name; });
-                };
-                const auto b = find(baseline), f = find("fkl_bvf");
-                if (b == results.end() || f == results.end()) {
-                    continue;
-                }
-                if (timingName.empty()) {
-                    writeTwoExecutionRow(two, c.pixels(), b->timing, f->timing, b->meanSpeedupOfBvf);
-                } else if (timingName == "gpu_only_") {
-                    writeTwoExecutionRow(two, c.pixels(), b->gpuTiming, f->gpuTiming, b->meanGpuSpeedupOfBvf);
-                } else {
-                    writeTwoExecutionRow(two, c.pixels(), b->gpuFlushedTiming, f->gpuFlushedTiming,
-                                         b->meanGpuFlushedSpeedupOfBvf);
-                }
-            }
-        }
-    }
-}
-
-void writeRegionSweep(const std::filesystem::path& outDir, const std::vector<Result>& results, bool validateOnly) {
-    std::ofstream summary(outDir / "region_sweep_cases.csv");
-    summary << "case,regions,crop_w,crop_h,resize_w,resize_h,output_w,output_h,source_pixels_per_region,"
-               "source_pixels_all_regions,frame_coverage_percent,region_positions\n";
-    for (const auto& c : REGION_CASES) {
-        const Geometry& g = c.geom;
-        summary << c.name << "," << REGION_N << "," << g.cropW << "," << g.cropH << "," << g.resW << "," << g.resH << ","
-                << g.outW() << "," << g.outH() << "," << c.pixels() << "," << REGION_N * c.pixels() << ","
-                << std::fixed << std::setprecision(4) << c.coveragePercent() << std::defaultfloat
-                << ",origin of each 960x540 cell of a 4x4 grid\n";
-    }
-    std::ofstream traffic(outDir / "region_sweep_buffers.csv");
-    traffic << "case,implementation,buffer,element,width,height,planes,logical_bytes,bytes_written,bytes_read\n";
-    for (const auto& c : REGION_CASES) {
-        for (const auto& b : bufferTraffic(c.geom)) {
-            traffic << c.name << "," << b.implementation << "," << b.buffer << "," << b.element << "," << b.width << ","
-                    << b.height << "," << b.planes << "," << b.bufferBytes << "," << b.bytesWritten << ","
-                    << b.bytesRead << "\n";
-        }
-    }
-    std::ofstream validation(outDir / "region_sweep_validation.csv");
-    validation << "case,implementation,reference,max_abs_err_r,max_abs_err_g,max_abs_err_b,mean_abs_err,"
-                  "non_finite_values,max_abs_err_vs_float_reference,max_abs_err_vs_npp_sampling_8bit_reference,"
-                  "within_tolerance_1e-3\n";
-    for (const auto& r : results) {
-        const auto& e = r.errorVsOwnReference;
-        validation << r.region << "," << r.name << "," << r.reference << "," << std::scientific << std::setprecision(3)
-                   << e.maxPerChannel[0] << "," << e.maxPerChannel[1] << "," << e.maxPerChannel[2] << "," << e.mean
-                   << "," << e.nonFinite << "," << r.errorVsFloatReference.max() << ","
-                   << r.errorVsNppConventionReference.max() << "," << (e.max() <= TOLERANCE ? "yes" : "no")
-                   << std::defaultfloat << "\n";
-    }
-    if (validateOnly) {
-        return;
-    }
-    std::ofstream times(outDir / "region_sweep_times.csv");
-    times << "case,source_pixels_per_region,implementation,kernels_launched,"
-             "cpu_gpu_median_us,cpu_gpu_p10_us,cpu_gpu_p90_us,cpu_gpu_mean_us,fkl_bvf_mean_speedup_cpu_gpu,"
-             "gpu_only_median_us,gpu_only_p10_us,gpu_only_p90_us,gpu_only_mean_us,fkl_bvf_mean_speedup_gpu_only,"
-             "gpu_l2_flushed_median_us,gpu_l2_flushed_p10_us,gpu_l2_flushed_p90_us,gpu_l2_flushed_mean_us,"
-             "fkl_bvf_mean_speedup_gpu_l2_flushed,iterations\n";
-    for (const auto& r : results) {
-        const RegionCase& c = regionCase(r.region);
-        times << r.region << "," << c.pixels() << "," << r.name << "," << r.launches.kernels << std::fixed
-              << std::setprecision(2);
-        for (const auto& [t, speedup] : std::array<std::pair<const TimingStats*, double>, 3>{
-                 {{&r.timing, r.meanSpeedupOfBvf}, {&r.gpuTiming, r.meanGpuSpeedupOfBvf},
-                  {&r.gpuFlushedTiming, r.meanGpuFlushedSpeedupOfBvf}}}) {
-            times << "," << t->median << "," << t->p10 << "," << t->p90 << "," << t->mean << ",";
-            if (!std::isnan(speedup)) {
-                times << std::setprecision(3) << speedup << std::setprecision(2);
-            }
-        }
-        times << "," << TIMED_ITERS << std::defaultfloat << "\n";
-    }
-    std::ofstream kernels(outDir / "region_sweep_kernels.csv");
-    kernels << "case,implementation,kernels,memsets,memcpys\n";
-    for (const auto& r : results) {
-        kernels << r.region << "," << r.name << "," << r.launches.kernels << "," << r.launches.memsets << ","
-                << r.launches.memcpys << "\n";
-    }
-    std::ofstream stages(outDir / "region_sweep_kernel_breakdown.csv");
-    stages << "case,implementation,kernel,median_us,p10_us,p90_us\n";
-    for (const auto& b : breakdown) {
-        if (!b.region.empty()) {
-            stages << b.region << "," << b.name << "," << b.stage << "," << std::fixed << std::setprecision(2)
-                   << b.timing.median << "," << b.timing.p10 << "," << b.timing.p90 << std::defaultfloat << "\n";
-        }
-    }
-    writeRegionTwoExecutionCSVs(outDir, results);
-}
-
-// The whole sweep: validation, CPU + GPU timing and per kernel breakdown for every case, then (with CUPTI, after all
-// of those) GPU time only, GPU time only with the L2 flushed before every kernel, and kernel counts. The passes and
-// their order are the main benchmark's.
-void regionSweep(Context& ctx, const std::filesystem::path& outDir, bool validateOnly) {
-    std::vector<std::vector<Result>> perCase(REGION_CASES.size());
-    for (size_t c = 0; c < REGION_CASES.size(); ++c) {
-        setRegionCase(ctx, REGION_CASES[c]);
-        const Geometry& g = ctx.geom;
-        std::cout << "=== Region case " << REGION_CASES[c].name << ": " << REGION_N << " crops of " << g.cropW << "x"
-                  << g.cropH << " -> " << g.resW << "x" << g.resH << " -> " << g.outW() << "x" << g.outH() << ", "
-                  << std::fixed << std::setprecision(4) << REGION_CASES[c].coveragePercent() << std::defaultfloat
-                  << "% of the frame" << std::endl;
-        runBatch<REGION_N>(ctx, perCase[c], !validateOnly);
-    }
-    if (!validateOnly) {
-        cupti::init();
-        std::cout << "=== GPU time only (CUPTI kernel execution times, after all CPU + GPU timings)" << std::endl;
-        for (size_t c = 0; c < REGION_CASES.size(); ++c) {
-            setRegionCase(ctx, REGION_CASES[c]);
-            gpuOnlyBatch<REGION_N>(ctx, perCase[c]);
-        }
-        L2Flusher flusher = makeL2Flusher(ctx);
-        for (size_t c = 0; c < REGION_CASES.size(); ++c) {
-            setRegionCase(ctx, REGION_CASES[c]);
-            gpuOnlyBatch<REGION_N>(ctx, perCase[c], &flusher);
-        }
-        freeL2Flusher(flusher);
-        std::cout << "=== Kernel counts (CUPTI activity tracing, after all timings)" << std::endl;
-        for (size_t c = 0; c < REGION_CASES.size(); ++c) {
-            setRegionCase(ctx, REGION_CASES[c]);
-            countBatch<REGION_N>(ctx, perCase[c]);
-        }
-    }
-    currentRegion.clear();
-    std::vector<Result> results;
-    for (const auto& r : perCase) {
-        results.insert(results.end(), r.begin(), r.end());
-    }
-    writeRegionSweep(outDir, results, validateOnly);
-    std::ostringstream workload;
-    workload << "region-size sweep. " << FRAME_W << "x" << FRAME_H << " NV12 frame (uniform random bytes, seed "
-             << FRAME_SEED << "), N = " << REGION_N << " regions, one at the origin of each " << REGION_CELL_W << "x"
-             << REGION_CELL_H << " cell of a " << REGION_GRID << "x" << REGION_GRID << " grid, bilinear resize exactly 2x";
-    for (const auto& c : REGION_CASES) {
-        workload << "; case " << c.name << ": " << c.geom.cropW << "x" << c.geom.cropH << " -> " << c.geom.resW << "x"
-                 << c.geom.resH << " -> " << c.geom.outW() << "x" << c.geom.outH() << ", " << std::fixed
-                 << std::setprecision(4) << c.coveragePercent() << std::defaultfloat << "% of the frame";
-    }
-    workload << ". NV12->RGB BT.2020 full range, AddBorder " << BORDER_TOP << " rows top and " << BORDER_BOTTOM
-             << " bottom (black), Mul (1/255), Sub (0.485, 0.456, 0.406), Div (0.229, 0.224, 0.225), float3 tensor "
-             << "of " << REGION_N << " planes. "
-             << (validateOnly ? "Validation only."
-                              : "All passes in one process: CPU + GPU for every case, then (CUPTI) GPU only for every "
-                                "case, then GPU only with the L2 flushed before every kernel (a kernel that reads twice "
-                                "the L2 size) for every case, then kernel counts.");
-    std::ostringstream diagnostic;
-    conversionDiagnostic(ctx, diagnostic);
-    writePlatform(outDir / "region_sweep_platform.txt", ctx, diagnostic.str(), workload.str());
-}
-
 } // namespace bench
 
 int main(int argc, char** argv) {
     using namespace bench;
     try {
+        if (argc == 2 && std::string(argv[1]) == "--batches") {
+            // The batch sizes, for the Nsight Compute scripts
+            for (size_t i = 0; i < BATCHES.size(); ++i) {
+                std::cout << (i ? " " : "") << BATCHES[i];
+            }
+            std::cout << std::endl;
+            return 0;
+        }
         std::filesystem::path outDir = argc > 1 ? argv[1] : "results";
         std::filesystem::create_directories(outDir);
 
@@ -1732,18 +1437,6 @@ int main(int argc, char** argv) {
         }
         if (argc > 4 && std::string(argv[2]) == "--ncu-target") {
             ncuTargetDispatch(ctx, argv[3], std::stoul(argv[4]), std::make_index_sequence<BATCHES.size()>{});
-            return 0;
-        }
-        if (argc > 2 && (std::string(argv[2]) == "--region-sweep" || std::string(argv[2]) == "--region-sweep-validate")) {
-            // Region-size sweep (N = 16, region sizes A to D); --region-sweep-validate only validates
-            regionSweep(ctx, outDir, std::string(argv[2]) == "--region-sweep-validate");
-            std::cout << "Results written to " << std::filesystem::absolute(outDir) << std::endl;
-            return 0;
-        }
-        if (argc > 4 && std::string(argv[2]) == "--region-ncu-target") {
-            // One execution of one pipeline of one case of the region-size sweep, for Nsight Compute
-            setRegionCase(ctx, regionCase(argv[4]));
-            ncuTarget<REGION_N>(ctx, argv[3]);
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "--host-overhead") {

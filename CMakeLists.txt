@@ -17,6 +17,7 @@ set(FKL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/fkl" CACHE PATH "FusedKernelLibrary che
 # Timed and warm-up iterations of every benchmark: 1000 and 100 for the paper's results; the CI runs 1 and 0
 set(BENCH_ITERATIONS 1000 CACHE STRING "Timed iterations of every benchmark (at least 1)")
 set(BENCH_WARMUP_ITERATIONS 100 CACHE STRING "Warm-up iterations before the timed ones")
+include(${CMAKE_CURRENT_SOURCE_DIR}/common/bench_geometry.cmake)
 find_package(CUDAToolkit REQUIRED)
 # OpenCVConfig.cmake still calls find_package(CUDA), which needs the legacy FindCUDA module
 cmake_policy(SET CMP0146 OLD)
@@ -45,6 +46,7 @@ function(add_bench_target TARGET_NAME SOURCE)
     target_compile_definitions(${TARGET_NAME} PRIVATE
         BENCH_FKL_COMMIT="${FKL_COMMIT}" BENCH_FKL_BRANCH="${FKL_BRANCH}"
         BENCH_ITERATIONS=${BENCH_ITERATIONS} BENCH_WARMUP_ITERATIONS=${BENCH_WARMUP_ITERATIONS}
+        ${BENCH_GEOMETRY_DEFINITIONS}
         BENCH_NVCC_VERSION="${CMAKE_CUDA_COMPILER_VERSION}" BENCH_NVCC_FLAGS="${BENCH_NVCC_FLAGS}")
     target_link_libraries(${TARGET_NAME} PRIVATE CUDA::cudart CUDA::nppc CUDA::nppicc CUDA::nppig CUDA::nppial
                                                  CUDA::nppidei CUDA::cupti CUDA::nvtx3 opencv_core opencv_cudaarithm opencv_cudawarping)
