@@ -85,7 +85,9 @@ or `NPPDX_CONFIG`), so run that one first. They need root while the driver restr
 to administrators (`RmProfilingAdminOnly=1` in `/proc/driver/nvidia/params`, the default); with the nvidia module
 option `NVreg_RestrictProfilingToAdminUsers=0` they run without sudo. They change nothing on the system and give the
 reports back to the user who ran sudo. Summarize them afterwards, without sudo, with `scripts/ncu_summarize.py` (DRAM) or
-`scripts/ncu_summarize.py l2`.
+`scripts/ncu_summarize.py l2`, then `scripts/ncu_traffic_model.py` puts the measured reads of every pipeline and N next
+to a compulsory-read model (`traffic_model.csv`; the model is described at the top of the script). It takes the
+workload from the NPPDx benchmark's platform file and regenerates the crop positions, so it works for any workload.
 
 To profile another workload, for example the earlier 20x10 crops resized 5:16, build both benchmarks with the same
 options into their own folders, run the NPPDx benchmark into a results folder of that workload, and point the scripts
@@ -99,6 +101,7 @@ and the summary at them (`BVF_RESULTS` is the folder of the workload, with the N
     sudo PAPER_BENCH=build-20x10/bvf_bench NPPDX_BENCH=build-nppdx-20x10/benchmark_figure1_bvf \
          BVF_RESULTS=../results/20x10 scripts/ncu_dram.sh        # and the same for scripts/ncu_l2.sh
     BVF_RESULTS=../results/20x10 scripts/ncu_summarize.py        # and scripts/ncu_summarize.py l2
+    BVF_RESULTS=../results/20x10 scripts/ncu_traffic_model.py
 
 ### Compile time (`compile_time/`)
 

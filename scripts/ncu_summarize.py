@@ -98,7 +98,8 @@ def main():
         writer = csv.DictWriter(f, fieldnames=list(summary[0].keys()))
         writer.writeheader()
         for s in summary:
-            writer.writerow({k: (f"{v:.3f}" if isinstance(v, float) else v) for k, v in s.items()})
+            # MB with 6 decimals: whole bytes, so that small differences (one region is a few hundred bytes) survive
+            writer.writerow({k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in s.items()})
     for s in summary:
         values = "  ".join(f"{k} {v:9.3f}" for k, v in s.items() if isinstance(v, float) and "time" not in k)
         print(f"{s['cache_control'][:4]} N={s['N']:3d} {s['benchmark']:12s} {s['implementation']:24s} "
