@@ -81,9 +81,10 @@ and of the NPPDx one. They stop unless both benchmarks were built for the same w
 NPPDx configuration file comes from a run with that workload (the `Workload` line of the platform file next to it).
 They take the batch sizes from the benchmarks (`--batches`) and NPPDx's tile and block for every
 N from the configuration file of the NPPDx benchmark's run (`../results/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv`,
-or `NPPDX_CONFIG`), so run that one first. They need root when the driver restricts the GPU performance counters to
-administrators (`RmProfilingAdminOnly=1`, the default); they change nothing on the system and give the reports back to
-the user who ran sudo. Summarize them afterwards, without sudo, with `scripts/ncu_summarize.py` (DRAM) or
+or `NPPDX_CONFIG`), so run that one first. They need root while the driver restricts the GPU performance counters
+to administrators (`RmProfilingAdminOnly=1` in `/proc/driver/nvidia/params`, the default); with the nvidia module
+option `NVreg_RestrictProfilingToAdminUsers=0` they run without sudo. They change nothing on the system and give the
+reports back to the user who ran sudo. Summarize them afterwards, without sudo, with `scripts/ncu_summarize.py` (DRAM) or
 `scripts/ncu_summarize.py l2`.
 
 To profile another workload, for example the earlier 20x10 crops resized 5:16, build both benchmarks with the same

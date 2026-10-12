@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# DRAM traffic of every Figure 1 pipeline with Nsight Compute. Needs root because the NVIDIA driver restricts the GPU
-# performance counters to admin users by default (RmProfilingAdminOnly=1):
+# DRAM traffic of every Figure 1 pipeline with Nsight Compute. Needs root while the NVIDIA driver restricts the GPU
+# performance counters to admin users (RmProfilingAdminOnly=1, the default; without it, run it without sudo):
 #
 #     sudo scripts/ncu_dram.sh
 #
@@ -18,8 +18,11 @@
 # the user who ran sudo. Nothing on the system is changed. Summarize afterwards, without sudo, with ncu_summarize.py.
 set -u
 
-if [ "$(id -u)" -ne 0 ]; then
-    echo "Run this script with sudo: sudo $0" >&2
+# Root is only needed while the driver restricts the GPU performance counters to admin users
+# (RmProfilingAdminOnly=1, the default; the nvidia module option NVreg_RestrictProfilingToAdminUsers=0 opens them)
+if [ "$(id -u)" -ne 0 ] && ! grep -q "RmProfilingAdminOnly: 0" /proc/driver/nvidia/params 2>/dev/null; then
+    echo "The GPU performance counters are restricted to admin users (RmProfilingAdminOnly=1):" \
+         "run this script with sudo: sudo $0" >&2
     exit 1
 fi
 

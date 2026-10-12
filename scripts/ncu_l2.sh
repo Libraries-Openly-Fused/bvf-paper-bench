@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Memory traffic between the SMs and the L2 cache of every Figure 1 pipeline with Nsight Compute: every byte the
-# kernels read or write, whether it then stays in L2 or goes to DRAM. Needs root for the GPU performance counters:
+# kernels read or write, whether it then stays in L2 or goes to DRAM. Needs root while the NVIDIA driver restricts the
+# GPU performance counters to admin users (RmProfilingAdminOnly=1, the default; without it, run it without sudo):
 #
 #     sudo scripts/ncu_l2.sh
 #
@@ -18,8 +19,11 @@
 # ncu_summarize.py l2.
 set -u
 
-if [ "$(id -u)" -ne 0 ]; then
-    echo "Run this script with sudo: sudo $0" >&2
+# Root is only needed while the driver restricts the GPU performance counters to admin users
+# (RmProfilingAdminOnly=1, the default; the nvidia module option NVreg_RestrictProfilingToAdminUsers=0 opens them)
+if [ "$(id -u)" -ne 0 ] && ! grep -q "RmProfilingAdminOnly: 0" /proc/driver/nvidia/params 2>/dev/null; then
+    echo "The GPU performance counters are restricted to admin users (RmProfilingAdminOnly=1):" \
+         "run this script with sudo: sudo $0" >&2
     exit 1
 fi
 
