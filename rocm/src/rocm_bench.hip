@@ -1952,7 +1952,15 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << "Memory traffic (Experiment 2): rocm/scripts/rocprof_counters.sh (rocprofv3 --pmc), not part of this program"
        << (onWsl() ? "; on WSL2 rocprofv3 --pmc reports \"Agent HW architecture is not supported, no counter metrics "
                      "found\" and aborts with \"Cannot open /dev/kfd\"."
-                   : ".")
+                   : ". What its counters measure on gfx12: GL2C_EA (FETCH_SIZE, GL2C_EA_WRREQ) counts the requests "
+                     "between L2 and the data fabric, with the Infinity Cache (MALL) behind the fabric, so L2 misses and "
+                     "write-backs, part of which the MALL may serve: not DRAM traffic; rocprofiler-sdk lists no MALL or "
+                     "DRAM counter for gfx1200; GL2C_EA_WRREQ counts the write-backs while a kernel runs, so the lines "
+                     "still dirty in L2 when each kernel ends (up to the L2 size per kernel) are not counted in any "
+                     "dispatch, and multi-kernel pipelines lose more of their writes than fused ones. The counters only "
+                     "count at a profiling performance level "
+                     "(at \"auto\" the GL2C counters read 0 on gfx1200); details in the platform.txt of its output "
+                     "directory.")
        << "\n\n" << diagnostic;
 }
 

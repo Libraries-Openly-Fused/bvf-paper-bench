@@ -247,16 +247,42 @@ thread pool, so that the idle gap before every timed run puts both pools to slee
 ### Build and run
 
 Everything, in one command (it writes a platform snapshot first, builds, checks that FKL is at the right commits and
-unmodified and that kernel dispatch tracing and the hardware counters are available, then runs the GPU benchmark, the
-counters and the CPU benchmark; the counters default to `FETCH_SIZE GL2C_EA_WRREQ_sum GL2C_EA_WRREQ_64B_sum`, since
-rocprofiler-sdk 1.4.1 defines no `WRITE_SIZE` for gfx12):
+unmodified and that kernel dispatch tracing and the hardware counters are available and count, then runs the GPU
+benchmark, the counters and the CPU benchmark; the counters default to `FETCH_SIZE GL2C_EA_WRREQ_sum
+GL2C_EA_WRREQ_64B_sum`, since rocprofiler-sdk 1.4.1 defines no `WRITE_SIZE` for gfx12):
 
     rocm/scripts/run_all.sh ../results/rocm
 
 Before running it, on the bare-metal machine: nothing else running (`uptime` load below 0.5, which the script checks),
 nothing else on the GPU (`amd-smi process`), and the performance level and clock lock state as they are: the script
-records them (`amd-smi metric`, `rocm-smi --showperflevel`) and does not change them. Hardware counters need access to
-the GPU's performance counters (membership of the `render` group). Duration on the development machine (WSL2,
+records them (`amd-smi metric`, including `--perf-level`) and does not change them. Hardware counters need access to
+the GPU's performance counters (membership of the `render` group) and, on gfx1200, a profiling performance level: at
+`auto`, which leaves the GPU's clock and power gating on, the GL2C, TA, TCP and SQ instruction counters read 0, while
+`STABLE_STD` (`sudo amd-smi set -l STABLE_STD`, sysfs `profile_standard`) makes them count, and pins the shader clock
+(1494 MHz on the RX 9060, against about 3.3 GHz at `auto`). The script checks this before the GPU benchmark
+(`rocprof_counters.sh --check`: the `FETCH_SIZE` of a cache flush kernel, which reads 2 x (L2 + MALL), must be at
+least half of it) and stops if the counters read 0. To time the benchmarks at another level, run it there with
+`ALLOW_NO_COUNTERS=1` and collect the counters afterwards at a profiling level with the `rocprof_counters.sh` command
+it prints at the end.
+
+What the counters measure on gfx12 (also in the `platform.txt` of the traffic directory): `FETCH_SIZE` and
+`GL2C_EA_WRREQ` count the requests between L2 and the data fabric. The Infinity Cache (MALL) is behind the fabric, so
+they are L2 misses and write-backs, part of which the MALL may serve, not DRAM traffic; rocprofiler-sdk lists no MALL
+or DRAM counter for gfx1200. `summarize_counters.py` derives the written KiB as
+((`GL2C_EA_WRREQ_sum` - `GL2C_EA_WRREQ_64B_sum`) x 256 + `GL2C_EA_WRREQ_64B_sum` x 64) / 1024 on gfx12 (a 256 MiB
+streaming write takes 1,042,140 requests, none of 64 B: 257.6 B per request). Writes are undercounted:
+`GL2C_EA_WRREQ` counts the write-backs while a kernel runs, and the lines still dirty in L2 when a kernel ends are
+written back without being counted in any dispatch (the flush kernels after them record 0 write requests). So every
+kernel can miss up to the L2 size of writes (4 MiB on the RX 9060), small intermediates can show about 0 (FKL VF+HF at
+N = 100: 5 requests for its 2.4 MB resize output), and a pipeline of several kernels loses more of its writes than a
+fused one. Reads are complete: with the caches flushed before every GPU operation, every kernel reads its inputs from
+beyond L2. Flush leak guard: the counts of a cache flush kernel occasionally land on the dispatches right after it (in
+one collection on the RX 9060, 5 of 60 profiles: `FETCH_SIZE` +3.6, +4.1, +72.7 and +96.1 MiB, and one
+`GL2C_EA_WRREQ_sum` about 98,000 requests too high), so `rocprof_counters.sh` collects a profile again when its
+measured execution exceeds the smallest of its three warm-up executions (the same dispatches, with the caches also
+flushed) by more than 2 % and 256 KiB of traffic, up to `MAX_REPEATS` (3) rounds; the rejected profiles stay in
+`raw_rejected/` and `traffic_repeats.csv`, and `traffic.csv` has their count per row and whether a leak is still
+suspected. Duration on the development machine (WSL2,
 Ryzen 7 5800X3D, RX 9060): 431 s (builds 29 s, GPU benchmark 26 s, CPU benchmark 371 s), without the GPU time only passes and the counters, which WSL2 cannot run; on bare metal they add two more passes of 1,000 iterations per N (GPU time only, and with L2 + MALL flushed) and one rocprofv3 run per counter, pipeline and N.
 
 The workload is the one of `common/bench_geometry.h` with its default sizes; for other sizes, give the same CMake
