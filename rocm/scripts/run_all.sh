@@ -81,7 +81,8 @@ for dir in "$FKL_GPU_DIR" "$FKL_CPU_DIR"; do
     # Unmodified: no changes to tracked files, submodules at their recorded commits
     [ -z "$(git -C "$dir" status --porcelain --untracked-files=no)" ] || allowed ALLOW_OTHER_FKL ||
         die "$dir has local modifications (git -C $dir status)"
-    ! git -C "$dir" submodule status 2>/dev/null | grep -q '^[+-]' || allowed ALLOW_OTHER_FKL ||
+    # git submodule status: '+' another commit, '-' not initialized, 'U' merge conflicts
+    ! git -C "$dir" submodule status 2>/dev/null | grep -q '^[-+U]' || allowed ALLOW_OTHER_FKL ||
         die "$dir: a submodule is not at its recorded commit (git -C $dir submodule status)"
 done
 [ -n "$(ls -A "$FKL_CPU_DIR/thread-pool/include" 2>/dev/null)" ] ||

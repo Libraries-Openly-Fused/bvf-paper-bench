@@ -50,6 +50,7 @@
 #include <fused_kernel/core/execution_model/cpu_multithread.h>
 
 #include "bench_geometry.h"
+#include "bench_platform.h"
 #include "bench_validation.h"
 
 #include <algorithm>
@@ -705,16 +706,22 @@ void selectionConfig(Workload& w, unsigned threads, bool timing, const std::vect
         const bool rmn = VARIANTS[k] == Variant::Fused || VARIANTS[k] == Variant::FusedNormalize;
         const auto& refOwn = rmn ? refRmn : refResize;
         pipelines[k]->run();
-        const float first = maxAbsError(pipelines[k]->outputValues(), refOwn);
+        const auto firstOut = pipelines[k]->outputValues();
+        const float first = maxAbsError(firstOut, refOwn);
         pipelines[k]->run();
         const auto out = pipelines[k]->outputValues();
         const float second = maxAbsError(out, refOwn);
+        // Same output twice, value by value (no library state may change from one call to the next)
+        const bool sameOutput = out == firstOut;
         if (k == 0) {
             perOp = out;
         }
-        SelectionRow r{threads, N, variantName(VARIANTS[k]), second, maxAbsError(out, perOp), first == second, false, {}};
+        SelectionRow r{threads, N, variantName(VARIANTS[k]), second, maxAbsError(out, perOp), sameOutput, false, {}};
         r.candidate = r.stable && r.vsOwnReference <= RPP_EQUIVALENCE && r.vsPerOp <= RPP_EQUIVALENCE;
-        checks.push_back({N, r.variant, threads, second, second, maxAbsError(out, refFloat), maxAbsError(out, ref8bit)});
+        // vs own reference (rppt_resize's or rppt_resize_mirror_normalize's convention), vs the RPP-convention reference
+        // of rppt_resize (the column of cpu_validation.csv), vs FKL's float and 8 bit references
+        checks.push_back({N, r.variant, threads, second, maxAbsError(out, refResize), maxAbsError(out, refFloat),
+                          maxAbsError(out, ref8bit)});
         std::printf("N %3zu | %-20s %2u thread(s): max err vs its RPP-convention reference %.2e (first run %.2e), vs "
                     "rpp_per_op %.2e, vs paper's 8 bit reference %.2e%s\n", N, r.variant.c_str(), threads, second, first,
                     r.vsPerOp, checks.back().vsFkl8bitReference, r.candidate ? "" : "  (not a candidate)");
@@ -835,16 +842,7 @@ void runBatch(Workload& w, std::array<std::vector<Row>, PAIRINGS>& rows, unsigne
                 hardwareThreads, c.rpp.median * 1000., c.fkl.median * 1000., c.meanSpeedup);
 }
 
-std::string shell(const std::string& command) {
-    std::string output;
-    if (FILE* pipe = popen(command.c_str(), "r")) {
-        char buffer[512];
-        while (fgets(buffer, sizeof(buffer), pipe)) output += buffer;
-        pclose(pipe);
-    }
-    while (!output.empty() && output.back() == '\n') output.pop_back();
-    return output;
-}
+using bench::shell;
 
 // rppt_resize HOST sampling convention, from linear ramps (value = position, exact), as for the HIP backend
 void resizeConvention(const std::filesystem::path& outDir) {
@@ -917,7 +915,9 @@ int main(int argc, char** argv) {
         if (argc > 2 && !validateOnly) {
             throw std::runtime_error(std::string("Unknown mode ") + argv[2] + " (--validate or --resize-convention)");
         }
-        const unsigned hardwareThreads = std::thread::hardware_concurrency();
+        // The all-threads runs use as many threads as FKL's thread pool has workers, on both sides, as fkl-vs-opencv-cpu
+        // does (it can differ from hardware_concurrency() under an affinity mask or a CPU quota)
+        const unsigned hardwareThreads = static_cast<unsigned>(fk::cpuThreadPool().size());
 
         Workload w;
         initWorkload(w);
@@ -1003,7 +1003,7 @@ int main(int argc, char** argv) {
         writeCSV(outDir / ("benchmark_cpu_rpp_" + all + "_vs_fkl_bvf_CPU_MULTITHREAD.csv"), "RPP HOST " + all,
                  rows[ALL_THREADS_VS_MT], "FKL CPU_MULTITHREAD");
         std::ofstream plat(outDir / "cpu_platform.txt");
-        plat << "CPU: " << shell("lscpu | sed -n 's/^Model name: *//p'") << ", " << hardwareThreads << " hardware threads\n"
+        plat << "CPU: " << bench::cpuName() << ", " << std::thread::hardware_concurrency() << " hardware threads\n"
              << "SIMD of the CPU: "
              << shell("grep -o -w -E 'avx|avx2|fma|avx512f|avx512bw|avx512vl' /proc/cpuinfo | sort -u | paste -sd' '") << "\n"
              << "Environment: " << (shell("grep -ci microsoft /proc/version 2>/dev/null") != "0" ? "WSL2" : "bare metal")
@@ -1021,7 +1021,7 @@ int main(int argc, char** argv) {
              << "before every timed run puts them to sleep; handles created with batch size 1 (the "
              << "HOST kernels iterate over the descriptors' n; the handle's batch size only sizes an unused scratch "
              << "buffer of 99532800 floats per image)\n"
-             << "OS: " << shell(". /etc/os-release && echo $PRETTY_NAME") << ", kernel " << shell("uname -r") << "\n"
+             << "OS: " << bench::osName() << ", kernel " << bench::kernelVersion() << "\n"
              << "Workload: " << describe() << "\n"
              << "Pipeline: as the GPU benchmark, BT.601 limited range NV12 -> RGB. RPP's NV12 conversion (rppt_yuv_to_rgb) is "
                 "HIP only, so the RPP HOST pipelines get their 8 bit RGB frame from FKL's CPU conversion (round to "

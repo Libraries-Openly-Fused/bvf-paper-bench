@@ -43,6 +43,7 @@
 #include <rocprofiler-sdk/rocprofiler.h>
 
 #include "bench_geometry.h"
+#include "bench_platform.h"
 #include "bench_validation.h"
 
 #include <algorithm>
@@ -1203,6 +1204,7 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
     };
     const size_t bvf = impls.size() - 1;
     std::vector<Result> batchResults;
+    std::vector<std::vector<float>> validatedOutputs; // compared with the outputs after the timed iterations
     for (const auto& impl : impls) {
         Result r;
         r.name = impl.name;
@@ -1225,6 +1227,7 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
         }
         gpuErrchk(hipStreamSynchronize(ctx.stream));
         const auto output = impl.download();
+        validatedOutputs.push_back(output);
         r.reference = impl.reference;
         r.errorVsOwnReference = compare(output, ownReference(impl));
         r.errorVsFloatReference = compare(output, refFloat);
@@ -1264,16 +1267,17 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
     }
     progress("CPU + GPU timing");
     const auto ms = measureInterleaved(ctx, impls);
-    // The outputs after the timed iterations must still be the validated ones (no library state, such as ROI tensors,
-    // may change from one call to the next)
+    // The outputs after the timed iterations must still be the validated ones, value by value (no library state, such
+    // as ROI tensors, may change from one call to the next)
     for (size_t k = 0; k < impls.size(); ++k) {
         impls[k].fillNaN();
         impls[k].run();
         gpuErrchk(hipStreamSynchronize(ctx.stream));
-        const ErrorStats after = compare(impls[k].download(), ownReference(impls[k]));
-        if (after.nonFinite != 0 || std::abs(after.max() - batchResults[k].errorVsOwnReference.max()) > 1e-6f) {
+        const ErrorStats after = compare(impls[k].download(), validatedOutputs[k]);
+        if (after.nonFinite != 0 || after.max() > 1e-6f) {
             throw std::runtime_error(impls[k].name + ": the output after the timed iterations differs from the validated "
-                                     "one (max error " + std::to_string(after.max()) + ")");
+                                     "one (max difference " + std::to_string(after.max()) + ", " +
+                                     std::to_string(after.nonFinite) + " values not finite)");
         }
     }
     for (size_t k = 0; k < impls.size(); ++k) {
@@ -1579,21 +1583,6 @@ void gpuOnlyBatch(Context& ctx, std::vector<Result>& results, CacheFlusher* flus
     }
 }
 
-std::string shell(const std::string& command) {
-    std::string output;
-    if (FILE* pipe = popen(command.c_str(), "r")) {
-        char buffer[512];
-        while (fgets(buffer, sizeof(buffer), pipe)) {
-            output += buffer;
-        }
-        pclose(pipe);
-    }
-    while (!output.empty() && (output.back() == '\n' || output.back() == ' ')) {
-        output.pop_back();
-    }
-    return output;
-}
-
 bool onWsl() {
     static const bool wsl = shell("grep -ci microsoft /proc/version 2>/dev/null") != "0";
     return wsl;
@@ -1813,7 +1802,7 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
     const size_t l2Bytes = static_cast<size_t>(prop.l2CacheSize), mallBytes = mall.kib * 1024;
     const std::string driverVersion =
         shell("amd-smi static --gpu 0 --driver 2>/dev/null | sed -n 's/^ *VERSION: *//p' | head -1");
-    const std::string osName = shell(". /etc/os-release && echo $PRETTY_NAME");
+    const std::string osDescription = osName();
     const std::string rocmVersion = shell(std::string("cat ") + BENCH_ROCM_PATH + "/.info/version 2>/dev/null");
     // HIP reports the work-group processors of RDNA GPUs as multiProcessorCount; rocminfo reports the compute units
     const std::string rocminfoCUs =
@@ -1838,7 +1827,7 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
     os << "Platform: " << prop.name << ", " << cus << " CUs, "
        << (prop.totalGlobalMem + (1ull << 29)) / (1ull << 30) << " GB, " << prop.gcnArchName << ", driver "
        << (driverVersion.empty() ? "unknown" : driverVersion) << " under " << (onWsl() ? "WSL2 " : "bare metal ")
-       << osName << ", ROCm " << rocmVersion << ", RPP " << RPP_VERSION_MAJOR << "." << RPP_VERSION_MINOR << "."
+       << osDescription << ", ROCm " << rocmVersion << ", RPP " << RPP_VERSION_MAJOR << "." << RPP_VERSION_MINOR << "."
        << RPP_VERSION_PATCH << "\n"
        << "GPU: " << prop.name << " (" << prop.gcnArchName << ", " << cus << " compute units (rocminfo; "
        << "hipDeviceProp_t::multiProcessorCount " << prop.multiProcessorCount
@@ -1858,8 +1847,8 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << "rocprofiler-sdk: " << BENCH_ROCPROFILER_LIB << "\n"
        << "FKL: " << BENCH_FKL_COMMIT
        << (std::string(BENCH_FKL_BRANCH) == "HEAD" ? std::string() : std::string(", branch ") + BENCH_FKL_BRANCH) << "\n"
-       << "CPU: " << shell("lscpu | sed -n 's/^Model name: *//p'") << "\n"
-       << "OS: " << osName << ", kernel " << shell("uname -r") << "\n"
+       << "CPU: " << cpuName() << "\n"
+       << "OS: " << osDescription << ", kernel " << kernelVersion() << "\n"
        << "GPU clocks: not changed by the benchmark. Performance level: "
        << (perfLevel.empty() ? std::string("not reported") : perfLevel)
        << " (STABLE_STD pins the shader clock: 1494 MHz on the RX 9060, which boosts to about 3.3 GHz at AUTO, above "
@@ -2109,8 +2098,16 @@ bool mergeProfileRows(const std::filesystem::path& file, std::vector<Result>& re
 bool runProfilingChild(const std::filesystem::path& outDir, std::vector<Result>& results) {
     const auto file = std::filesystem::absolute(outDir / ".profiling_pass.csv");
     const std::string exe = std::filesystem::read_symlink("/proc/self/exe").string();
-    const std::string command = "BENCH_ROCPROFILER=1 BENCH_RPP_VARIANT='" + selectedRpp + "' '" + exe + "' '" +
-                                outDir.string() + "' --profile-pass '" + file.string() + "'";
+    // Every interpolated value single-quoted for the shell, with its own quotes escaped ('\'')
+    const auto quote = [](const std::string& value) {
+        std::string quoted = "'";
+        for (const char c : value) {
+            quoted += c == '\'' ? std::string("'\\''") : std::string(1, c);
+        }
+        return quoted + "'";
+    };
+    const std::string command = "BENCH_ROCPROFILER=1 BENCH_RPP_VARIANT=" + quote(selectedRpp) + " " + quote(exe) + " " +
+                                quote(outDir.string()) + " --profile-pass " + quote(file.string());
     std::cout << "=== Profiling pass in a child process: " << command << std::endl;
     if (std::system(command.c_str()) != 0) {
         throw std::runtime_error("The profiling pass failed");

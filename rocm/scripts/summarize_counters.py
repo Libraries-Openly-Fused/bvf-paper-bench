@@ -300,8 +300,11 @@ def main():
         for counter, value in sorted(totals.items()):
             verdict, smallest, _ = verdicts[counter]
             still += verdict == "yes"
+            # The derived WRITE_SIZE has the rejected profiles of the two counters it comes from
+            sources = ("GL2C_EA_WRREQ_sum", "GL2C_EA_WRREQ_64B_sum") if counter == "WRITE_SIZE (derived)" else (counter,)
+            rejected = sum(repeats.get((label, c), 0) for c in sources)
             main_rows.append([impl, n, counter, f"{value:.1f}", "" if smallest is None else f"{smallest:.1f}", kernels,
-                              blits, repeats.get((label, counter), 0), verdict])
+                              blits, rejected, verdict])
 
     with open(os.path.join(out, "traffic.csv"), "w", newline="") as fh:
         w = csv.writer(fh, lineterminator="\n")
