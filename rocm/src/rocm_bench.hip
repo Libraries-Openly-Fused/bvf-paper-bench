@@ -113,7 +113,8 @@ constexpr int alignUp(int v, int a) { return (v + a - 1) / a * a; }
 static_assert(OUT_W % RPP_PIXEL_ALIGN == 0, "RPP's kernels write the output rows 8 pixels at a time");
 
 using NV12Image = fk::Image<fk::PixelFormat::NV12>;
-using YUVToRGB = fk::ConvertYUVToRGB<fk::ColorDepth::p8bit, fk::ColorRange::Full, fk::ColorPrimitives::bt2020>;
+// FKL's NV12 -> RGB conversion: BT.601, limited range, as in every benchmark of the repository
+using YUVToRGB = fk::ConvertYUVToRGB<fk::ColorDepth::p8bit, fk::ColorRange::Limited, fk::ColorPrimitives::bt601>;
 
 const fk::float3 mulValue{MUL[0], MUL[1], MUL[2]};
 const fk::float3 subValue{SUB[0], SUB[1], SUB[2]};
@@ -139,7 +140,7 @@ void initContext(Context& ctx) {
     gpuErrchk(hipStreamCreate(&ctx.stream));
     ctx.fkStream = std::make_unique<fk::Stream>(ctx.stream);
 
-    // Synthetic NV12 frame with uniform random bytes, identical for every implementation
+    // Synthetic NV12 frame (legal limited-range values, common/bench_geometry.h), identical for every implementation
     ctx.frameDevice = std::make_unique<NV12Image>(FRAME_W, FRAME_H);
     ctx.frameHost = std::make_unique<NV12Image>(FRAME_W, FRAME_H, fk::MemType::Host);
     auto deviceData = ctx.frameDevice->getData();
@@ -541,7 +542,7 @@ void rppYuvToRgb(const Context& ctx, const RppState& st) {
     beforeKernel();
     RPP_CHECK(rppt_yuv_to_rgb(ctx.y, ctx.uv, const_cast<RpptDesc*>(&st.nv12Desc), st.rgb8,
                               const_cast<RpptDesc*>(&st.rgbDesc), ctx.pitch, ctx.pitch, FRAME_W * 3, FRAME_W, FRAME_H,
-                              RpptColorStandard_BT2020_NCL, RpptColorRange_FULL, st.handle, RppBackend::RPP_HIP_BACKEND));
+                              RpptColorStandard_BT601, RpptColorRange_STUDIO, st.handle, RppBackend::RPP_HIP_BACKEND));
 }
 
 Stage yuvToRgbStage(Context& ctx, RppStatePtr st) {
@@ -756,9 +757,14 @@ std::vector<float> cpuReference(const Context& ctx) {
 // Plain C++ reference with RPP's bilinear sampling convention, measured with linear ramps (--resize-convention):
 // rppt_resize and rppt_resize_mirror_normalize sample at src = (dst + 0.5) * scale - 0.5 (pixel centers), with the
 // sample position clamped to [0, size - 2] in both axes (the last source column and row never get any weight).
-// The RGB values are RPP's own 8 bit frame (rppt_yuv_to_rgb's output, ctx.rppRgb8): its conversion differs from
-// FKL's rounded float conversion in a few values (conversionDiagnostic), which this reference does not mix in. Same
-// border and pointwise tail as the other references.
+// The RGB values are RPP's own 8 bit frame (rppt_yuv_to_rgb's output, ctx.rppRgb8). RPP's BT.601 limited range
+// conversion is the standard formula (R = 255/219 (Y - 16) + 255/224 * 1.402 (V - 128), G and B likewise with
+// Kr = 0.299, Kb = 0.114), rounded to nearest and saturated to [0, 255]: exactly for R and B, but for G 107 of the
+// 16777216 (Y, U, V) triples come out one level lower than the formula in float (values within float rounding of a
+// half level; measured on all triples on gfx1200, RPP 3.2.0). So this reference takes RPP's frame instead of the formula:
+// a one level difference in a crop would otherwise make every RPP variant fail the RPP_EQUIVALENCE check.
+// conversionDiagnostic reports how many values of the benchmark frame differ from the formula. Same border and
+// pointwise tail as the other references.
 template <size_t N>
 std::vector<float> rppConventionReference8bit(const Context& ctx) {
     if (ctx.rppRgb8.size() != static_cast<size_t>(FRAME_W) * FRAME_H * 3) {
@@ -1697,8 +1703,8 @@ void freeCacheFlusher(CacheFlusher& flusher) {
     gpuErrchk(hipFree(flusher.sink));
 }
 
-// Compares RPP's 8 bit NV12->RGB (rppt_yuv_to_rgb, BT.2020 full range) with FKL's float conversion, to show how RPP
-// rounds and samples chroma
+// Compares RPP's 8 bit NV12->RGB (rppt_yuv_to_rgb, BT.601 limited range) with FKL's float conversion, which is the
+// standard BT.601 limited range formula, to show how RPP rounds and samples chroma
 // rppt_yuv_to_rgb's 8 bit RGB frame, downloaded once (the input of the RPP-convention reference)
 void computeRppRgb8(Context& ctx) {
     auto st = makeRppState(ctx, 1);
@@ -1731,7 +1737,8 @@ void conversionDiagnostic(const Context& ctx, std::ostream& os) {
             }
         }
     }
-    os << "RPP NV12->RGB (rppt_yuv_to_rgb, RpptColorStandard_BT2020_NCL, RpptColorRange_FULL) vs FKL float conversion:\n"
+    os << "RPP NV12->RGB (rppt_yuv_to_rgb, RpptColorStandard_BT601, RpptColorRange_STUDIO) vs FKL float conversion "
+          "(the BT.601 limited range formula), saturated to [0, 255]:\n"
        << "  vs round-to-nearest of FKL: " << diffRound << " of " << total << " channel values differ, max "
        << maxRound << " levels\n"
        << "  vs truncation of FKL:       " << diffTrunc << " of " << total << " channel values differ, max "
@@ -1816,6 +1823,8 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
     const std::string rocminfoCUs =
         shell("rocminfo 2>/dev/null | awk '/Device Type: *GPU/{g=1} g && /Compute Unit:/{print $3; exit}'");
     const std::string cus = rocminfoCUs.empty() ? std::to_string(prop.multiProcessorCount) : rocminfoCUs;
+    // On RDNA (2 CUs per WGP) multiProcessorCount is half the CU count of rocminfo
+    const bool mpcCountsWgps = std::strtol(cus.c_str(), nullptr, 10) == 2L * prop.multiProcessorCount;
     const std::string perfLevel =
         shell("(rocm-smi --showperflevel 2>/dev/null | grep -i 'performance level' | head -1 | sed 's/^.*: *//') || true");
     os << "Platform: " << prop.name << ", " << cus << " CUs, "
@@ -1824,7 +1833,8 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << osName << ", ROCm " << rocmVersion << ", RPP " << RPP_VERSION_MAJOR << "." << RPP_VERSION_MINOR << "."
        << RPP_VERSION_PATCH << "\n"
        << "GPU: " << prop.name << " (" << prop.gcnArchName << ", " << cus << " compute units (rocminfo; "
-       << "hipDeviceProp_t::multiProcessorCount " << prop.multiProcessorCount << "), "
+       << "hipDeviceProp_t::multiProcessorCount " << prop.multiProcessorCount
+       << (mpcCountsWgps ? ", which counts work-group processors (WGPs, 2 CUs each), not CUs" : "") << "), "
        << (prop.totalGlobalMem >> 20) << " MiB VRAM, max clock " << prop.clockRate / 1000 << " MHz)\n"
        << "Caches: L2 " << prop.l2CacheSize / 1024 << " KiB (hipDeviceProp_t::l2CacheSize), L3 / MALL (Infinity Cache) "
        << mall.kib << " KiB (" << mall.source << ")\n"
@@ -1846,7 +1856,7 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << (perfLevel.empty() ? std::string("not reported") : perfLevel) << "; amd-smi: " << shell("amd-smi metric --gpu 0 --clock 2>/dev/null | grep -m1 CLK_LOCKED | sed 's/^ *//'")
        << ", " << shell("amd-smi metric --gpu 0 --power 2>/dev/null | grep -m1 POWER_MANAGEMENT | sed 's/^ *//'")
        << " (empty fields: not reported on this system)\n"
-       << "\nWorkload: " << describe() << ". NV12->RGB BT.2020 full range, AddBorder (black), then Mul "
+       << "\nWorkload: " << describe() << ". NV12->RGB BT.601 limited range, AddBorder (black), then Mul "
        << "(1/255), Sub (0.485, 0.456, 0.406), Div (0.229, 0.224, 0.225), float3 tensor of N planes " << OUT_W << "x"
        << OUT_H << "\n";
     os << "Timing: " << WARMUP_ITERS << " warm-up then " << TIMED_ITERS << " timed iterations. In every iteration "
@@ -1860,7 +1870,7 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << "validates and times every variant (CPU + GPU, interleaved, " << SELECTION_WARMUP << " warm-up + "
        << SELECTION_ITERS << " timed iterations per N) and picks the one with the lowest geometric mean "
        << "of its medians (rpp_selection.csv); only that one is measured afterwards.\n"
-       << "RPP variants (HIP backend): rpp_per_op = rppt_yuv_to_rgb (BT2020_NCL, FULL; 1 kernel plus 8 hipMemcpyToSymbol per "
+       << "RPP variants (HIP backend): rpp_per_op = rppt_yuv_to_rgb (RpptColorStandard_BT601, RpptColorRange_STUDIO; 1 kernel plus 8 hipMemcpyToSymbol per "
        << "call: its matrix and luma bias, and 6 integer constants used only by its cubic_v variant, uploaded on every "
        << "call), rppt_crop_mirror_normalize 8u->32f (one batched call, all batch images "
        << "aliasing the RGB frame with a zero batch stride, XYWH ROIs, offset 0, multiplier 1, no mirror), "

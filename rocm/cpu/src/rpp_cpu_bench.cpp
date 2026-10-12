@@ -2,8 +2,8 @@
 // cpu/src/cpu_bench.cpp (which compares with OpenCV).
 //   ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
 // The workload of common/bench_geometry.h: one 3840x2160 NV12 frame in host memory, N crops, each resized (bilinear)
-// and given black rows on top and bottom, then (x * mul - sub) / div written as float3 into an N-plane tensor. BT.2020
-// full range, as on the GPU.
+// and given black rows on top and bottom, then (x * mul - sub) / div written as float3 into an N-plane tensor. BT.601
+// limited range, as on the GPU.
 //
 //   rpp*:   RPP has no NV12 conversion on its HOST backend (rppt_yuv_to_rgb is HIP only), so every RPP HOST pipeline
 //           starts with FKL's CPU conversion of the full frame to 8 bit RGB (the first kernel of the GPU benchmark's
@@ -113,7 +113,8 @@ static_assert(RAMP_STEP_8BIT * static_cast<float>(std::max(CROP_W, CROP_H) - 1) 
               "The 8 bit sampling ramps need crop sides of at most 256 pixels");
 
 using NV12Image = fk::Image<fk::PixelFormat::NV12>;
-using YUVToRGB = fk::ConvertYUVToRGB<fk::ColorDepth::p8bit, fk::ColorRange::Full, fk::ColorPrimitives::bt2020>;
+// FKL's NV12 -> RGB conversion: BT.601, limited range, as in every benchmark of the repository
+using YUVToRGB = fk::ConvertYUVToRGB<fk::ColorDepth::p8bit, fk::ColorRange::Limited, fk::ColorPrimitives::bt601>;
 
 struct Workload {
     std::unique_ptr<NV12Image> frame;
@@ -947,7 +948,7 @@ int main(int argc, char** argv) {
              << "buffer of 99532800 floats per image)\n"
              << "OS: " << shell(". /etc/os-release && echo $PRETTY_NAME") << ", kernel " << shell("uname -r") << "\n"
              << "Workload: " << describe() << "\n"
-             << "Pipeline: as the GPU benchmark, BT.2020 full range NV12 -> RGB. RPP's NV12 conversion (rppt_yuv_to_rgb) is "
+             << "Pipeline: as the GPU benchmark, BT.601 limited range NV12 -> RGB. RPP's NV12 conversion (rppt_yuv_to_rgb) is "
                 "HIP only, so the RPP HOST pipelines get their 8 bit RGB frame from FKL's CPU conversion (round to "
                 "nearest after saturation): ParArch::CPU for the 1 thread runs, ParArch::CPU_MULTITHREAD for the "
              << hardwareThreads << " threads runs. RPP pipeline: " << variantName(oneThread) << " with 1 thread, "
