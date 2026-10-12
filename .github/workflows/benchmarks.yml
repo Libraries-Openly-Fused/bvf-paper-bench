@@ -75,12 +75,6 @@ jobs:
             cuda_toolkit: "13.4"
             cmake: "cmake-4.4.2-linux-aarch64"
             artifact: linux-cuda-arm64
-          - platform: "ROCm x86_64, CPU benchmark only"
-            runner: [self-hosted, linux, x64, rocm]
-            benchmarks: cpu
-            compiler: "clang++-23"
-            cmake: "cmake-4.4.2-linux-x86_64"
-            artifact: linux-rocm-x86_64-cpu
 
     steps:
       - uses: actions/checkout@v6
