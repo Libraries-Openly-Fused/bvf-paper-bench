@@ -11,19 +11,24 @@ columns that do not need them are written.
 
 Model, per execution:
   - a full-frame conversion reads the whole NV12 frame;
-  - per region, the crop stage reads the 8 bit RGB region (the float3 one for VF+HF with a float3 frame), the resize
-    stage the float3 region and the border stage the float3 resized region, once each;
+  - per region, the crop stage reads the 8 bit RGB region, the resize stage the float3 region and the border stage the
+    float3 resized region, once each;
   - OpenCV's and NPP's three pointwise passes read the whole output three times;
+  - NPPDx + NPP (nppdx_npp): its NPPDx kernel reads the NV12 source footprint of the regions (below), NPP's border
+    (nppiSet of the 8 bit RGB output) reads nothing, its 8u -> 32f conversion reads the 8 bit RGB output and its three
+    pointwise passes the float3 output three times; the per-launch terms of its six kernels are not modelled
+    (implied_fixed_term_KB is the measurement minus the model);
   - FKL BVF and NPPDx read a fixed per-launch term (code, constants, parameters), measured as the DRAM reads after a
     flush at the smallest N (N = 1) minus the footprint of its regions, plus the NV12 source footprint of the regions
     in 32 byte sectors: their luma rows and chroma rows, each sector counted once even where regions overlap (a cold
     execution reads it from DRAM once). Both resizes only read inside the region (FKL samples
-    at dst * scale and NPPDx at pixel centers, both clamped to the region). The NPPDx benchmark may choose a different
-    kernel configuration (tile, block) for every N (nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv), with its
-    own fixed term: the NPPDx model is only given for the N whose configuration is that of the smallest N. For every
-    N, implied_fixed_term_KB is the measurement minus the footprint, to see how constant the fixed term is.
+    at dst * scale and NPPDx at pixel centers, both clamped to the region). The NPPDx benchmarks may choose a different
+    kernel configuration (tile, block) for every N (<impl>/<benchmark>_nppdx_config_GPU_NVIDIA.csv), with its own
+    fixed term: the NPPDx model is only given for the N whose configuration is that of the smallest N. For every N,
+    implied_fixed_term_KB is the measurement minus the footprint, to see how constant the fixed term is.
   - Reads between the SMs and L2 (lts__t_sectors_srcunit_tex_op_read) only see data loads, not the fixed term, so for
-    FKL BVF and NPPDx they are compared with the compulsory part alone, the region footprint (sm_to_l2_compulsory_MB):
+    FKL BVF and NPPDx they are compared with the compulsory part alone, the region footprint (sm_to_l2_compulsory_MB;
+    for NPPDx + NPP plus the reads of its NPP kernels):
     the sum over the regions, without removing overlaps, since each region is loaded by its own thread blocks. It is
     not a model of the requests: measured_sm_to_l2_read_over_compulsory above 1 is the re-requested part. FKL BVF's
     bilinear taps request some sectors more than once. NPPDx splits a region into nppdx_blocks_per_crop tiles, and
@@ -43,8 +48,10 @@ import sys
 RESULTS = pathlib.Path(os.environ.get("BVF_RESULTS", pathlib.Path(__file__).resolve().parents[2] / "results"))
 SECTOR = 32
 PIPELINES = [("paper-bench", "opencv_cuda"), ("paper-bench", "npp"), ("paper-bench", "fkl_vf_hf"),
-             ("paper-bench", "fkl_vf_hf_float3_frame"), ("paper-bench", "fkl_bvf"),
-             ("FKL-vs-NPPDx", "nppdx"), ("FKL-vs-NPPDx", "fkl_bvf")]
+             ("paper-bench", "fkl_bvf"), ("FKL-vs-NPPDx", "nppdx_npp"), ("FKL-vs-NPPDx", "nppdx"),
+             ("FKL-vs-NPPDx", "fkl_bvf")]
+# The benchmark program of each NPPDx implementation; its results are in BVF_RESULTS/<implementation>
+NPPDX_BENCHMARKS = {"nppdx": "benchmark_figure1_bvf", "nppdx_npp": "benchmark_figure1_nppdx_npp"}
 
 
 class MT19937:
@@ -131,9 +138,9 @@ def load(name):
     return {(r["benchmark"], r["implementation"], int(r["N"]), r["cache_control"][:4]): r for r in csv.DictReader(open(path))}
 
 
-def nppdx_configs():
+def nppdx_configs(impl):
     """The NPPDx configuration (tile, requested block) and blocks per crop of every N, if the NPPDx run wrote them."""
-    path = RESULTS / "nppdx" / "benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv"
+    path = RESULTS / impl / f"{NPPDX_BENCHMARKS[impl]}_nppdx_config_GPU_NVIDIA.csv"
     if not path.exists():
         return {}
     rows = list(csv.reader(open(path), skipinitialspace=True))[1:]
@@ -147,6 +154,7 @@ def main():
     region8 = w["crop_w"] * w["crop_h"] * 3
     region32 = w["crop_w"] * w["crop_h"] * 12
     resized32 = w["res_w"] * w["res_h"] * 12
+    output8 = w["out_w"] * w["out_h"] * 3
     output = w["out_w"] * w["out_h"] * 12
 
     def footprint(x):  # NV12 bytes of one region, in whole 32 byte sectors (the frame pitch is a multiple of 32)
@@ -165,7 +173,7 @@ def main():
         return len(sectors) * SECTOR
 
     dram, l2 = load("dram_traffic.csv"), load("l2_traffic.csv")
-    configs = nppdx_configs()
+    configs = {impl: nppdx_configs(impl) for impl in NPPDX_BENCHMARKS}
     warnings = []
 
     def measured(table, bench, impl, n, cache, column):
@@ -180,8 +188,9 @@ def main():
     rows = []
     for bench, impl in PIPELINES:
         single = impl in ("fkl_bvf", "nppdx")
-        config = (lambda n: configs.get(n, ("", ""))[0]) if impl == "nppdx" else (lambda n: "")
-        blocks = (lambda n: configs.get(n, ("", ""))[1]) if impl == "nppdx" else (lambda n: "")
+        sources_read = single or impl == "nppdx_npp"  # reads the NV12 source footprint of the regions
+        config = lambda n, impl=impl: configs.get(impl, {}).get(n, ("", ""))[0]
+        blocks = lambda n, impl=impl: configs.get(impl, {}).get(n, ("", ""))[1]
         fixed, anchor = None, None
         if single:
             measured_ns = [n for n in w["batches"] if dram_cold(bench, impl, n) is not None]
@@ -204,8 +213,8 @@ def main():
                 model = frame + n * (region8 + region32 + resized32) + 3 * n * output
             elif impl == "fkl_vf_hf":
                 model = frame + n * (region8 + region32 + resized32)
-            elif impl == "fkl_vf_hf_float3_frame":
-                model = frame + n * (region32 + region32 + resized32)
+            elif impl == "nppdx_npp":
+                model = sources(n) + n * output8 + 3 * n * output
             elif fixed is None:
                 model = None
             elif config(n) != config(anchor):
@@ -213,7 +222,10 @@ def main():
                 note = f"NPPDx configuration {config(n)} differs from {config(anchor)} at N = {anchor}"
             else:
                 model = fixed + sources(n)
-            sm_l2_compulsory = requested(n) if single else model
+            if impl == "nppdx_npp":
+                sm_l2_compulsory = requested(n) + n * output8 + 3 * n * output
+            else:
+                sm_l2_compulsory = requested(n) if single else model
             cold = dram_cold(bench, impl, n)
             sm_l2 = measured(l2, bench, impl, n, "cold", "sm_to_l2_read_MB")
             ratio = lambda v, m: f"{v / m:.4f}" if v is not None and m else ""
@@ -222,9 +234,10 @@ def main():
                 "benchmark": bench, "implementation": impl, "N": n, "nppdx_configuration": config(n),
                 "nppdx_blocks_per_crop": blocks(n),
                 "model_compulsory_read_MB": mb(model),
-                "region_source_footprint_MB": mb(sources(n)) if single else "",
+                "region_source_footprint_MB": mb(sources(n)) if sources_read else "",
                 "fixed_term_KB": f"{fixed / 1e3:.3f}" if fixed is not None and model is not None else "",
-                "implied_fixed_term_KB": f"{(cold - sources(n)) / 1e3:.3f}" if single and cold is not None else "",
+                "implied_fixed_term_KB": (f"{(cold - (sources(n) if single else model)) / 1e3:.3f}"
+                                          if sources_read and cold is not None else ""),
                 "measured_dram_read_cold_MB": mb(cold),
                 "measured_dram_read_cold_over_model": ratio(cold, model),
                 "sm_to_l2_compulsory_MB": mb(sm_l2_compulsory),

@@ -78,10 +78,15 @@ def row_for(mode, totals):
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "dram"
     cfg = MODES[mode]
+    # The pipelines the profiling scripts profile, in the order of the summary
+    order = ["opencv_cuda", "npp", "nppdx_npp", "nppdx", "fkl_vf_hf", "fkl_bvf"]
     summary = []
     for report in sorted((RESULTS / cfg["dir"]).glob("*.ncu-rep")):
         match = REPORT_NAME.match(report.stem)
         if not match:
+            continue
+        if match["impl"] not in order:
+            print(f"Skipping {report.name}: not a pipeline the profiling scripts profile (a report of an earlier run?)")
             continue
         totals, kernels = totals_of(report, cfg["metrics"])
         summary.append({
@@ -92,7 +97,8 @@ def main():
             "kernels": kernels,
             **row_for(mode, totals),
         })
-    order = ["opencv_cuda", "npp", "nppdx", "fkl_vf_hf_float3_frame", "fkl_vf_hf", "fkl_bvf"]
+    if not summary:
+        sys.exit(f"No reports of the profiled pipelines in {RESULTS / cfg['dir']}: run the profiling script first")
     summary.sort(key=lambda s: (s["cache_control"], s["N"], s["benchmark"], order.index(s["implementation"])))
     with open(RESULTS / cfg["csv"], "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(summary[0].keys()))

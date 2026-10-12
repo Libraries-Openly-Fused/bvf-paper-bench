@@ -8,21 +8,40 @@ Fusion paper (Figure 1):
     ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
 
 One 3840x2160 NV12 frame in device memory, N crops of 32x16 pixels at fixed random positions, NV12 to RGB
-(BT.2020, full range), bilinear resize to 64x32, 16 black rows added on top and bottom (64x64), then
+(BT.601, limited range), bilinear resize to 64x32, 16 black rows added on top and bottom (64x64), then
 `(x * mul - sub) / div` with ImageNet constants (`mul = 1/255`, `sub = (0.485, 0.456, 0.406)`,
 `div = (0.229, 0.224, 0.225)`), written as float3 into a tensor of N planes. N is 1, 4, 16, 50 and 100. The frame,
 sizes, batch sizes and crop positions are those of every benchmark of this repository, from
 [`common/bench_geometry.h`](../common/bench_geometry.h) (see the [workload](../README.md#workload)).
 
-Both libraries run the whole pipeline in **one kernel**:
+NPPDx is a device-side library: it has no host API and no kernels of its own, so using it always means writing a
+CUDA kernel that calls its operations (all of NPPDx's examples do). NPPDx 0.1.2 has no crop, border or type
+conversion operation, its affine channel map only takes integer constants, and every output format it writes is
+integer (8, 10 or 16 bit, rounded and clamped): the normalized float values of this pipeline cannot leave an NPPDx
+kernel through NPPDx. So there are two ways to write the pipeline with NPPDx, and two benchmarks, each comparing it with
+the same FKL pipeline:
 
 - **FKL**: one `executeOperations` call with the nine operations (Backwards Vertical Fusion), from the `fkl`
-  submodule of this repository (FKL main, which has `AddBorder`).
-- **NPPDx**: one CUDA kernel built from NPPDx operations, one thread block per tile of a crop: NV12 ingest of the
-  tile, `ColorConvert<yuv_bt2020, rgb>` and `Resize<1, 2, bilinear>` (the J:K ratio of the geometry) on the shared
-  memory tile. AddBorder, Mul, Sub, Div and the float3 write are written by hand in the same kernel, because NPPDx
-  0.1.2 has no border operation, its affine channel map only takes integer constants, and it has no floating point
-  output format.
+  submodule of this repository (FKL main, which has `AddBorder`). One kernel.
+- **NPPDx** (`benchmark_figure1_bvf`, [`benchmarks/nppdx_figure1.h`](benchmarks/nppdx_figure1.h)): one CUDA kernel
+  built from NPPDx operations, one thread block per tile of a crop: NV12 ingest of the tile, `FromLimitedLuma` and
+  `FromLimitedChroma` (NPPDx's color conversion is full range), `ColorConvert<yuv_bt601, rgb>` and
+  `Resize<1, 2, bilinear>` (the J:K ratio of the geometry) on the shared memory tile. AddBorder, Mul, Sub, Div and the
+  float3 write are written by hand in the same kernel. One kernel, with hand written CUDA code.
+- **NPPDx+NPP** (`benchmark_figure1_nppdx_npp`, [`benchmarks/nppdx_npp_figure1.h`](benchmarks/nppdx_npp_figure1.h)):
+  only what NPPDx and NPP provide, with no hand written pixel processing code. NPPDx has no host API, so its operations
+  still run in a CUDA kernel written for them, with its launch configuration and the crop and batch given to NPPDx's
+  ingest as image pointers, but the kernel only calls NPPDx operations, in the order of the pipeline (the same ones,
+  then NPPDx's 8 bit RGB write of the resized tile). NPP does the rest: `nppiSet_8u_C3R` makes the N 8 bit RGB output
+  planes black first (one call, the planes as one image; NPP has no batched border), the NPPDx kernel writes every
+  resized crop between the black rows of its plane, and `nppiConvert_8u32f_C3R`, `nppiMulC_32f_C3IR`,
+  `nppiSubC_32f_C3IR` and `nppiDivC_32f_C3IR` run on the N planes as one image (one NPP call per pipeline operation,
+  as in the GPU benchmark's NPP pipeline). Six kernels for every N, with the intermediates in memory, and the resized
+  RGB is rounded to 8 bits before the normalization.
+
+The two benchmarks share everything but the NPPDx pipeline ([`benchmarks/figure1_common.h`](benchmarks/figure1_common.h)
+and [`benchmarks/nppdx_common.h`](benchmarks/nppdx_common.h)), and have the same modes and output files, with their
+own names.
 
 ## Results on an RTX 4090
 
@@ -54,7 +73,8 @@ microseconds:
 | 100 | 6.59 | 3.78 | 1.74 |
 
 **GPU only, L2 flushed**: like GPU only, but the L2 cache is flushed (a kernel reads twice the L2 size) before every
-execution, as on a GPU that runs other kernels in between, so that the input cannot be assumed to be in L2. Run with
+kernel, as on a GPU that runs other kernels in between, so that the input cannot be assumed to be in L2 (for
+NPPDx+NPP, its intermediates between its kernels either). Run with
 `benchmark_figure1_bvf <dir> --gpu-only-l2-flushed` after the run without a mode into the same directory, whose NPPDx
 configurations it uses. Median in microseconds:
 
@@ -91,43 +111,48 @@ whole working set (the 12.4 MB NV12 frame and an output of at most 4.9 MB). Coll
 
 ## Correctness and sampling conventions
 
-Every run checks both outputs before timing them:
+Every run checks both outputs before timing them, and writes the errors to `<benchmark>_validation_GPU_NVIDIA.csv`:
 
-- FKL is compared with FKL's CPU backend running the same chain: max absolute error below 2e-6.
-- NPPDx is compared with the same chain using pixel-center sampling in the resize: max absolute error below 2e-6.
+- FKL is compared with FKL's CPU backend running the same chain, with a tolerance of 1e-3.
+- NPPDx is compared with the same chain using pixel-center sampling in the resize, with a tolerance of 1e-3.
+- NPPDx+NPP is compared with the same chain using pixel-center sampling and the resized RGB rounded to 8 bits as
+  NPPDx writes it (+ 0.5, clamped to [0, 255]). A value that falls on a half level can round the other way on the
+  GPU, so the tolerance is one 8 bit level after the normalization plus 1e-3 (1 / 255 / 0.224 + 1e-3 = 0.0185); the
+  file also counts the values more than 1e-3 away.
 
 The two libraries do not compute the same bilinear resize. FKL (like OpenCV's CUDA `resize`) samples the source at
 `dst * scale`, while NPPDx samples at pixel centers, `(dst + 0.5) * scale - 0.5`, clamped to the image. Against
-FKL's reference the NPPDx output differs by up to 4.6 in normalized units for this random content. With the 1:2
+FKL's reference the NPPDx output differs by several units in normalized units for this random content (column
+`NPPDx MaxAbsError vs FKL reference` of the validation file). With the 1:2
 resize, pixel centers are also what NPP's `nppiResize` computes (`dst * scale - 0.25`). Both
-libraries replicate the NV12 chroma and neither clamps the RGB values after the conversion. Run
-`benchmark_figure1_bvf <dir> --analyze` to see the comparison against each convention.
+libraries replicate the NV12 chroma and neither clamps the RGB values after the conversion (NPPDx's 8 bit write
+clamps them after the resize). Run `<benchmark> <dir> --analyze` to see the comparison against each convention.
 
 The crop positions have even coordinates: NPPDx takes the chroma of a crop at `(x / 2, y / 2)` relative to the
 crop origin, and FKL relative to the frame, which only read the same samples for even origins.
 
 ## NPPDx configuration
 
-The NPPDx kernel and its configurations are in `benchmarks/nppdx_figure1.h`, derived at compile time from the
-geometry. NPPDx tiles are made of 4x2 pixel cells, and its resize maps whole groups of J source pixels, so a tile is a
+The NPPDx operations and their configurations are in `benchmarks/nppdx_common.h`, derived at compile time from the
+geometry; each benchmark chooses its own configuration, the same way. NPPDx tiles are made of 4x2 pixel cells, and its resize maps whole groups of J source pixels, so a tile is a
 multiple of lcm(4, J) x lcm(2, J) pixels that splits the crop. The candidate tiles are the whole crop and its
 successive halvings (the longer side first) down to 64 pixels: 32x16, 16x16, 16x8 and 8x8 for 32x16 crops. Of those,
 the benchmark keeps the ones NPPDx supports on the GPU's SM: `nppdx::is_supported_v` of the ingest and the resize
 (their input tile fits in shared memory), the checks NPPDx's resize makes of its output and intermediate tiles, and
-the shared memory of all the tiles of the kernel together. A larger crop whose whole-crop tile does not fit, for
-example, is split in tiles instead of failing to compile.
+the shared memory of all the tiles of the kernel together (for NPPDx+NPP, also the 8 bit RGB write of the output
+tile). A larger crop whose whole-crop tile does not fit, for example, is split in tiles instead of failing to compile.
 
 All the operations run in the same kernel, which is launched with the largest of their block sizes (the ingest's own
 recommended block covers the tile without the resize halo, and would leave rows of the input tile unloaded). Every
 supported tile is tried with NPPDx's recommended configuration and with `BlockDim` 64, 128, 256 and 512, for every N:
-the benchmark checks each one against the pixel-center reference, times it alone, and compares FKL with the fastest
-correct one (a `BlockDim` smaller than the recommended block of a tile gives wrong results, and is never chosen; a
+the benchmark checks each one (the whole pipeline) against its reference, times its NPPDx kernel alone (for
+NPPDx+NPP the NPP calls are the same in every configuration), and compares FKL with the fastest correct one (a `BlockDim` smaller than the recommended block of a tile gives wrong results, and is never chosen; a
 configuration this GPU cannot launch is reported and skipped). The chosen configuration of every N drives all three
 comparisons (CPU + GPU, GPU only and GPU only with the L2 flushed), the Nsight Compute scripts and the NPPDx
-compile-time units. `benchmark_figure1_bvf <dir> --configs <csv>` runs the comparison with the configurations of a
-CSV in the format of the configuration file instead of choosing them, for example to re-time other candidates. Every configuration tried is in
-`benchmark_figure1_bvf_nppdx_block_sweep_GPU_NVIDIA.csv`, and the chosen ones in
-`benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv`.
+compile-time units (of the single NPPDx kernel). `<benchmark> <dir> --configs <csv>` runs the comparison with the
+configurations of a CSV in the format of the configuration file instead of choosing them, for example to re-time other
+candidates. Every configuration tried is in `<benchmark>_nppdx_block_sweep_GPU_NVIDIA.csv`, and the chosen ones in
+`<benchmark>_nppdx_config_GPU_NVIDIA.csv`.
 
 ## Build and run
 
@@ -138,7 +163,9 @@ an NVIDIA GPU (sm_75 or newer). FKL and NPPDx are the `fkl` and `nppdx` submodul
     cd bvf-paper-bench
     cmake -S fkl-vs-nppdx -B build-nppdx -DCMAKE_BUILD_TYPE=Release
     cmake --build build-nppdx
-    ./build-nppdx/benchmark_figure1_bvf results/my_gpu     # or: ctest --test-dir build-nppdx (writes to build-nppdx/results)
+    ./build-nppdx/benchmark_figure1_bvf results/my_gpu/nppdx            # NPPDx, one kernel
+    ./build-nppdx/benchmark_figure1_nppdx_npp results/my_gpu/nppdx_npp  # NPPDx+NPP
+    # or: ctest --test-dir build-nppdx (both, writing to build-nppdx/results)
 
 `CUDA_ARCH` (default `native`) selects the CUDA architectures, and `NPPDX_SM` (detected with `nvidia-smi`) the
 SM version the NPPDx operations are specialized for, for example `-DNPPDX_SM=890` for compute capability 8.9.
@@ -147,11 +174,11 @@ SM version the NPPDx operations are specialized for, for example `-DNPPDX_SM=890
 ## Output files
 
 Following FKL's benchmark convention, each benchmark writes `<benchmark>_<ParArch>.csv` with one row per batch
-size: `Batch size`, then `MeanTime`, `TimeVariance`, `MaxTime` and `MinTime` of the first (baseline, NPPDx) and
+size: `Batch size`, then `MeanTime`, `TimeVariance`, `MaxTime` and `MinTime` of the first (baseline, NPPDx or NPPDx+NPP) and
 second (FKL) implementation in milliseconds, `Mean Speedup`, and the `MedianTime`, `P10Time` and `P90Time` of
 each. In every iteration both implementations are timed one after the other with CUDA events on one stream,
 synchronizing after each. `<benchmark>_gpu_only_<ParArch>.csv` has the same columns for the GPU only benchmark.
-Next to them are `_validation_` (errors), `_nppdx_block_sweep_` (every NPPDx configuration tried: tile, block,
+Next to them are `_validation_` (errors, tolerances and whether each output is within its tolerance), `_nppdx_block_sweep_` (every NPPDx configuration tried: tile, block,
 blocks per crop, shared memory, time alone, error, whether it was chosen), `_nppdx_config_` (the chosen configuration
 of every N: tile, requested and actual block, blocks per crop, shared memory) and `_platform.txt`.
 

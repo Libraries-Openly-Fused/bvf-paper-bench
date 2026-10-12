@@ -1,16 +1,16 @@
 // Latency and correctness benchmark for the Backwards Vertical Fusion paper, Figure 1 pipeline:
 // ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
 // with the frame, sizes, batch sizes and crop positions of common/bench_geometry.h.
+// The color conversion is NV12 -> RGB with BT.601 in limited range in every implementation (common/bench_geometry.h).
 //
 // Implementations:
-//   opencv_cuda        NPP NV12->RGB, then per crop cv::cuda convertTo, resize, copyMakeBorder,
-//                      then multiply, subtract, divide on the whole output tensor
+//   opencv_cuda        NPP NV12->RGB (OpenCV CUDA has no NV12 conversion), then per crop cv::cuda convertTo, resize,
+//                      copyMakeBorder, then multiply, subtract, divide on the whole output tensor
 //   npp                NV12->RGB, per crop 8u->32f, one batched resize (nppiResize for N = 1, since
 //                      nppiResizeBatch rejects a batch of one), per crop CopyConstBorder,
 //                      then MulC, SubC, DivC on the whole output tensor
 //   fkl_vf_hf          four FKL kernels with the intermediates in DRAM (VF + HF, no BVF), with the same
 //                      intermediates as OpenCV and NPP: 8 bit RGB frame, then float3 crops, resized crops and output
-//                      (fkl_vf_hf_float3_frame, with a float3 frame, is only in the per kernel breakdown)
 //   fkl_bvf            one FKL kernel for the whole chain (BVF)
 
 #include <fused_kernel/fused_kernel.h>
@@ -35,6 +35,7 @@
 #include <nvtx3/nvToolsExt.h>
 
 #include "bench_geometry.h"
+#include "bench_npp.h"
 #include "bench_platform.h"
 
 #include <algorithm>
@@ -55,14 +56,6 @@
 #include <utility>
 #include <vector>
 
-#define NPP_CHECK(expr)                                                                                     \
-    do {                                                                                                    \
-        const NppStatus status_ = (expr);                                                                   \
-        if (status_ != NPP_SUCCESS) {                                                                       \
-            throw std::runtime_error(std::string("NPP error ") + std::to_string(status_) + " in " + #expr); \
-        }                                                                                                   \
-    } while (0)
-
 namespace bench {
 
 // Frame, crop, resize, border and output sizes, batch sizes, seeds and crop positions, shared by every benchmark
@@ -77,13 +70,18 @@ constexpr float TOLERANCE = 1e-3f;
 constexpr float MUL[3] = {1.f / 255.f, 1.f / 255.f, 1.f / 255.f};
 constexpr float SUB[3] = {0.485f, 0.456f, 0.406f};
 constexpr float DIV[3] = {0.229f, 0.224f, 0.225f};
+// Tolerance against the 8 bit reference: a pipeline that rounds RGB to 8 bits can round a value that lies on a half
+// level differently from the CPU reference (different floating point contraction), which is one level of 8 bit RGB
+// after the normalization (1 / 255 / 0.224, the largest of the three channels)
+constexpr float TOLERANCE_8BIT = 1.f / 255.f / 0.224f + TOLERANCE;
 // 8 bit quantization of the RGB values for the reference of the 8 bit pipelines:
 // normalize to [0, 1], add half a level so that the truncating denormalization rounds to nearest,
 // saturate with __saturatef and denormalize to uchar3
 constexpr float QUANTIZATION_OFFSET = 0.5f / 255.f;
 
 using NV12Image = fk::Image<fk::PixelFormat::NV12>;
-using YUVToRGB = fk::ConvertYUVToRGB<fk::ColorDepth::p8bit, fk::ColorRange::Full, fk::ColorPrimitives::bt2020>;
+// FKL's NV12 -> RGB conversion: BT.601, limited range
+using YUVToRGB = fk::ConvertYUVToRGB<fk::ColorDepth::p8bit, fk::ColorRange::Limited, fk::ColorPrimitives::bt601>;
 
 const fk::float3 mulValue{MUL[0], MUL[1], MUL[2]};
 const fk::float3 subValue{SUB[0], SUB[1], SUB[2]};
@@ -100,56 +98,16 @@ struct Context {
     const Npp8u* y{nullptr};
     const Npp8u* uv{nullptr};
     int pitch{0};
-    Npp32f twist[3][4]{};
     std::array<fk::Rect, MAX_BATCH> crops{};
 };
-
-NppStreamContext makeNppStreamContext(cudaStream_t stream) {
-    NppStreamContext ctx{};
-    int device = 0;
-    gpuErrchk(cudaGetDevice(&device));
-    cudaDeviceProp prop{};
-    gpuErrchk(cudaGetDeviceProperties(&prop, device));
-    ctx.hStream = stream;
-    ctx.nCudaDeviceId = device;
-    ctx.nMultiProcessorCount = prop.multiProcessorCount;
-    ctx.nMaxThreadsPerMultiProcessor = prop.maxThreadsPerMultiProcessor;
-    ctx.nMaxThreadsPerBlock = prop.maxThreadsPerBlock;
-    ctx.nSharedMemPerBlock = prop.sharedMemPerBlock;
-    gpuErrchk(cudaDeviceGetAttribute(&ctx.nCudaDevAttrComputeCapabilityMajor, cudaDevAttrComputeCapabilityMajor, device));
-    gpuErrchk(cudaDeviceGetAttribute(&ctx.nCudaDevAttrComputeCapabilityMinor, cudaDevAttrComputeCapabilityMinor, device));
-    gpuErrchk(cudaStreamGetFlags(stream, &ctx.nStreamFlags));
-    return ctx;
-}
-
-// The NPP color twist is dst = M * (Y, U, V) + offset. FKL's conversion is affine in (Y, U, V),
-// so the exact same matrix and offsets are recovered by probing it.
-void fillTwistFromFKL(Npp32f twist[3][4]) {
-    const auto f = [](int y, int u, int v) {
-        return YUVToRGB::exec(fk::uchar3{static_cast<uchar>(y), static_cast<uchar>(u), static_cast<uchar>(v)});
-    };
-    const fk::float3 offset = f(0, 0, 0);
-    const fk::float3 colY = f(1, 0, 0) - offset;
-    const fk::float3 colU = f(0, 1, 0) - offset;
-    const fk::float3 colV = f(0, 0, 1) - offset;
-    const float m[3][4] = {{colY.x, colU.x, colV.x, offset.x},
-                           {colY.y, colU.y, colV.y, offset.y},
-                           {colY.z, colU.z, colV.z, offset.z}};
-    for (int r = 0; r < 3; ++r) {
-        for (int c = 0; c < 4; ++c) {
-            twist[r][c] = m[r][c];
-        }
-    }
-}
 
 void initContext(Context& ctx) {
     gpuErrchk(cudaStreamCreateWithFlags(&ctx.stream, cudaStreamNonBlocking));
     ctx.fkStream = std::make_unique<fk::Stream>(ctx.stream);
     ctx.cvStream = cv::cuda::StreamAccessor::wrapStream(ctx.stream);
-    ctx.npp = makeNppStreamContext(ctx.stream);
-    fillTwistFromFKL(ctx.twist);
+    ctx.npp = npp::streamContext(ctx.stream);
 
-    // Synthetic NV12 frame with uniform random bytes, identical for every implementation
+    // Synthetic NV12 frame (legal limited-range values), identical for every implementation
     ctx.frameDevice = std::make_unique<NV12Image>(FRAME_W, FRAME_H);
     ctx.frameHost = std::make_unique<NV12Image>(FRAME_W, FRAME_H, fk::MemType::Host);
     auto deviceData = ctx.frameDevice->getData();
@@ -209,12 +167,10 @@ inline void beforeKernel() {
     }
 }
 
+// NPP's NV12 -> 8 bit RGB, BT.601 limited range (common/bench_npp.h)
 void nv12ToRgb8(const Context& ctx, Npp8u* dst, int dstStep) {
     beforeKernel();
-    const Npp8u* src[2] = {ctx.y, ctx.uv};
-    int srcSteps[2] = {ctx.pitch, ctx.pitch};
-    NPP_CHECK(nppiNV12ToRGB_8u_ColorTwist32f_P2C3R_Ctx(src, srcSteps, dst, dstStep, NppiSize{FRAME_W, FRAME_H},
-                                                       ctx.twist, ctx.npp));
+    npp::nv12ToRgb8Bt601Limited(ctx.y, ctx.uv, ctx.pitch, dst, dstStep, NppiSize{FRAME_W, FRAME_H}, ctx.npp);
 }
 
 // Each implementation enqueues one complete pipeline on ctx.stream with run(), and returns the
@@ -283,52 +239,33 @@ std::array<fk::RawPtr<fk::ND::_2D, T>, N> planeViews(const fk::Tensor<T>& tensor
 // NPP pipelines: an 8 bit RGB frame (NPP's NV12 -> RGB can only write 8 or 16 bit integers, and OpenCV CUDA has no
 // NV12 conversion), quantized as in the 8 bit reference (normalize, add half a level, __saturatef, denormalize),
 // then float3 crops (like their per crop convertTo / Convert_8u32f), float3 resized crops and the float3 output.
-// With EIGHT_BIT_FRAME = false the frame is float3 instead; that variant is only used for the per kernel breakdown.
-template <size_t N, bool EIGHT_BIT_FRAME>
+template <size_t N>
 Implementation makeFklVfHf(Context& ctx) {
-    constexpr bool EIGHT_BIT = EIGHT_BIT_FRAME;
-    using RGB = std::conditional_t<EIGHT_BIT, fk::uchar3, fk::float3>;
-    auto rgb = std::make_shared<fk::Ptr2D<RGB>>(FRAME_W, FRAME_H, 0, fk::MemType::Device);
+    auto rgb = std::make_shared<fk::Ptr2D<fk::uchar3>>(FRAME_W, FRAME_H, 0, fk::MemType::Device);
     auto cropped = std::make_shared<fk::Tensor<fk::float3>>(CROP_W, CROP_H, N, 1, fk::MemType::Device);
     auto resized = std::make_shared<fk::Tensor<fk::float3>>(RES_W, RES_H, N, 1, fk::MemType::Device);
     auto out = std::make_shared<fk::Tensor<fk::float3>>(OUT_W, OUT_H, N, 1, fk::MemType::Device);
     const auto crops = firstCrops<N>(ctx);
     const auto croppedViews = planeViews<N>(*cropped, CROP_W, CROP_H);
     const auto resizedViews = planeViews<N>(*resized, RES_W, RES_H);
-    Implementation impl{EIGHT_BIT ? "fkl_vf_hf" : "fkl_vf_hf_float3_frame", EIGHT_BIT};
-    impl.stages.emplace_back(EIGHT_BIT ? "1_nv12_to_rgb8_full_frame" : "1_nv12_to_rgb_float3_full_frame", [&ctx, rgb]() {
-        if constexpr (EIGHT_BIT) {
-            beforeKernel();
-            fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
-                fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
-                YUVToRGB::build(),
-                fk::NormalizePixel<fk::float3, fk::ColorDepth::p8bit>::build(),
-                fk::Add<fk::float3>::build(fk::make_set<fk::float3>(QUANTIZATION_OFFSET)),
-                fk::SaturateDenormalizePixel<fk::float3, fk::uchar3, fk::ColorDepth::p8bit>::build(),
-                fk::PerThreadWrite<fk::ND::_2D, fk::uchar3>::build(rgb->ptr()));
-        } else {
-            beforeKernel();
-            fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
-                fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
-                YUVToRGB::build(),
-                fk::PerThreadWrite<fk::ND::_2D, fk::float3>::build(rgb->ptr()));
-        }
+    Implementation impl{"fkl_vf_hf", true};
+    impl.stages.emplace_back("1_nv12_to_rgb8_full_frame", [&ctx, rgb]() {
+        beforeKernel();
+        fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
+            fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
+            YUVToRGB::build(),
+            fk::NormalizePixel<fk::float3, fk::ColorDepth::p8bit>::build(),
+            fk::Add<fk::float3>::build(fk::make_set<fk::float3>(QUANTIZATION_OFFSET)),
+            fk::SaturateDenormalizePixel<fk::float3, fk::uchar3, fk::ColorDepth::p8bit>::build(),
+            fk::PerThreadWrite<fk::ND::_2D, fk::uchar3>::build(rgb->ptr()));
     });
     impl.stages.emplace_back("2_crop_to_float3", [&ctx, rgb, cropped, crops]() {
-        if constexpr (EIGHT_BIT) {
-            beforeKernel();
-            fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
-                fk::PerThreadRead<fk::ND::_2D, RGB>::build(rgb->ptr()),
-                fk::Crop<>::build(crops),
-                fk::Cast<fk::uchar3, fk::float3>::build(),
-                fk::TensorWrite<fk::float3>::build(cropped->ptr()));
-        } else {
-            beforeKernel();
-            fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
-                fk::PerThreadRead<fk::ND::_2D, RGB>::build(rgb->ptr()),
-                fk::Crop<>::build(crops),
-                fk::TensorWrite<fk::float3>::build(cropped->ptr()));
-        }
+        beforeKernel();
+        fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
+            fk::PerThreadRead<fk::ND::_2D, fk::uchar3>::build(rgb->ptr()),
+            fk::Crop<>::build(crops),
+            fk::Cast<fk::uchar3, fk::float3>::build(),
+            fk::TensorWrite<fk::float3>::build(cropped->ptr()));
     });
     impl.stages.emplace_back("3_resize", [&ctx, resized, croppedViews]() {
         beforeKernel();
@@ -604,6 +541,7 @@ struct ErrorStats {
     std::array<float, 3> maxPerChannel{0.f, 0.f, 0.f};
     double mean{0.};
     size_t nonFinite{0};
+    size_t beyondTolerance{0}; // values more than TOLERANCE away from the reference
     float max() const { return std::max({maxPerChannel[0], maxPerChannel[1], maxPerChannel[2]}); }
 };
 
@@ -618,6 +556,7 @@ ErrorStats compare(const std::vector<float>& output, const std::vector<float>& r
             continue;
         }
         stats.maxPerChannel[i % 3] = std::max(stats.maxPerChannel[i % 3], err);
+        stats.beyondTolerance += err > TOLERANCE;
         sum += err;
     }
     stats.mean = sum / static_cast<double>(output.size());
@@ -892,6 +831,14 @@ struct Result {
     ErrorStats errorVsNppConventionReference;
     std::string reference;
     LaunchCounts launches;
+    // 1e-3 against the float reference, one level of 8 bit RGB against the 8 bit reference
+    float tolerance() const { return reference == "fkl_cpu_float" ? TOLERANCE : TOLERANCE_8BIT; }
+    // The largest error within the tolerance, and at most one value in a thousand more than 1e-3 away: ties on a half
+    // level are rare, while a systematic one-level error (truncating instead of rounding, for example) is not
+    bool withinTolerance() const {
+        return errorVsOwnReference.max() <= tolerance() &&
+               errorVsOwnReference.beyondTolerance * 1000 <= static_cast<size_t>(batch) * OUT_FLOATS;
+    }
 };
 
 // The implementations in the comparison, all with the same intermediates (8 bit RGB frame, then float3), and FKL BVF
@@ -901,7 +848,7 @@ std::vector<Implementation> makeImplementations(Context& ctx, std::shared_ptr<Op
     std::vector<Implementation> impls;
     impls.push_back(makeOpenCV<N>(ctx, ocvState));
     impls.push_back(makeNPP<N>(ctx));
-    impls.push_back(makeFklVfHf<N, true>(ctx));
+    impls.push_back(makeFklVfHf<N>(ctx));
     impls.push_back(makeFklBvf<N>(ctx));
     return impls;
 }
@@ -932,15 +879,6 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
         r.errorVsNppConventionReference = compare(output, refNppConvention);
         batchResults.push_back(r);
     }
-    const auto checkFloat3Frame = [&](const Implementation& float3Frame) {
-        float3Frame.fillNaN();
-        float3Frame.run();
-        gpuErrchk(cudaStreamSynchronize(ctx.stream));
-        const ErrorStats float3FrameError = compare(float3Frame.download(), refFloat);
-        if (float3FrameError.max() > TOLERANCE) {
-            throw std::runtime_error("fkl_vf_hf_float3_frame does not match the float reference");
-        }
-    };
     if (!timing) {
         for (const Result& r : batchResults) {
             std::cout << std::left << std::setw(12) << r.name << std::right << "  max err " << std::scientific
@@ -949,7 +887,6 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
                       << std::defaultfloat << std::endl;
             results.push_back(r);
         }
-        checkFloat3Frame(makeFklVfHf<N, false>(ctx));
         return;
     }
     const auto ms = measureInterleaved(ctx, impls);
@@ -973,15 +910,12 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
                   << r.reference << ")" << std::defaultfloat << std::endl;
         results.push_back(r);
     }
-    // Per kernel breakdown of the multi-kernel pipelines, and of VF + HF with a float3 frame for reference
+    // Per stage breakdown of the multi-kernel pipelines
     for (const auto& impl : impls) {
         if (!impl.stages.empty()) {
             measureStages(ctx, impl, static_cast<int>(N));
         }
     }
-    const auto float3Frame = makeFklVfHf<N, false>(ctx);
-    checkFloat3Frame(float3Frame);
-    measureStages(ctx, float3Frame, static_cast<int>(N));
 }
 
 // Kernel counts of every implementation for batch N, after all the timings
@@ -1029,7 +963,8 @@ void conversionDiagnostic(const Context& ctx, std::ostream& os) {
             }
         }
     }
-    os << "NPP NV12->RGB (ColorTwist32f, BT.2020 full range matrix taken from FKL) vs FKL float conversion:\n"
+    os << "NPP NV12->RGB (ColorTwist32f with the BT.601 limited range matrix of the standard, bench_npp.h) vs FKL's "
+          "float BT.601 limited range conversion:\n"
        << "  vs round-to-nearest of FKL: " << diffRound << " of " << total << " channel values differ, max "
        << maxRound << " levels\n"
        << "  vs truncation of FKL:       " << diffTrunc << " of " << total << " channel values differ, max "
@@ -1067,7 +1002,7 @@ void writePlatform(const std::filesystem::path& path, const Context& ctx, const 
        << "OS: " << bench::osName() << ", kernel " << bench::kernelVersion() << "\n"
        << "GPU clocks: not locked (locking needs root); application clocks as reported by nvidia-smi: "
        << bench::shell("nvidia-smi --query-gpu=clocks.max.sm,clocks.max.mem --format=csv,noheader") << "\n"
-       << "\nWorkload: " << geometry::describe() << ". NV12->RGB BT.2020 full range, AddBorder (black), then Mul "
+       << "\nWorkload: " << geometry::describe() << ". AddBorder (black), then Mul "
        << "(1/255), Sub (0.485, 0.456, 0.406), Div (0.229, 0.224, 0.225), float3 tensor of N planes " << OUT_W << "x"
        << OUT_H << "\n";
     os << "Timing: " << WARMUP_ITERS << " warm-up then " << TIMED_ITERS << " timed iterations. In every iteration "
@@ -1093,8 +1028,7 @@ void runAllBatches(Context& ctx, std::vector<Result>& results, std::index_sequen
 template <size_t N>
 void profileBatch(Context& ctx) {
     std::shared_ptr<OpenCVState> ocvState;
-    auto impls = makeImplementations<N>(ctx, ocvState);
-    impls.insert(impls.begin() + 3, makeFklVfHf<N, false>(ctx));
+    const auto impls = makeImplementations<N>(ctx, ocvState);
     for (const auto& impl : impls) {
         profiles.push_back(profilePipeline(ctx, impl, static_cast<int>(N)));
         const auto& p = profiles.back();
@@ -1155,7 +1089,7 @@ void hostOverheadBatch(Context& ctx) {
     hostTimings.push_back({"fkl_bvf", static_cast<int>(N), "3_launch", computeStats(launch)});
     hostTimings.push_back({"fkl_bvf", static_cast<int>(N), "total_host_enqueue", computeStats(total)});
 
-    const auto vfhf = makeFklVfHf<N, true>(ctx);
+    const auto vfhf = makeFklVfHf<N>(ctx);
     std::vector<std::vector<float>> stageTimes(vfhf.stages.size());
     std::vector<float> vfhfTotal;
     for (int i = 0; i < WARMUP_ITERS + TIMED_ITERS; ++i) {
@@ -1192,8 +1126,7 @@ void hostOverheadBatch(Context& ctx) {
 template <size_t N>
 void ncuTarget(Context& ctx, const std::string& name) {
     std::shared_ptr<OpenCVState> ocvState;
-    auto impls = makeImplementations<N>(ctx, ocvState);
-    impls.push_back(makeFklVfHf<N, false>(ctx));
+    const auto impls = makeImplementations<N>(ctx, ocvState);
     const auto impl = std::find_if(impls.begin(), impls.end(), [&](const Implementation& i) { return i.name == name; });
     if (impl == impls.end()) {
         throw std::runtime_error("Unknown implementation " + name);
@@ -1502,7 +1435,7 @@ int main(int argc, char** argv) {
         std::ofstream validation(outDir / "validation.csv");
         validation << "implementation,N,reference,max_abs_err_r,max_abs_err_g,max_abs_err_b,mean_abs_err,"
                       "non_finite_values,max_abs_err_vs_float_reference,max_abs_err_vs_npp_sampling_8bit_reference,"
-                      "within_tolerance_1e-3\n";
+                      "values_beyond_1e-3,values,tolerance,within_tolerance\n";
         std::ofstream kernels(outDir / "kernels.csv");
         kernels << "implementation,N,kernels,memsets,memcpys\n";
         for (const auto& r : results) {
@@ -1519,7 +1452,8 @@ int main(int argc, char** argv) {
                        << std::setprecision(3) << e.maxPerChannel[0] << "," << e.maxPerChannel[1] << ","
                        << e.maxPerChannel[2] << "," << e.mean << "," << e.nonFinite << ","
                        << r.errorVsFloatReference.max() << "," << r.errorVsNppConventionReference.max() << ","
-                       << (e.max() <= TOLERANCE ? "yes" : "no") << "\n";
+                       << e.beyondTolerance << "," << r.batch * OUT_FLOATS << "," << r.tolerance() << ","
+                       << (r.withinTolerance() ? "yes" : "no") << "\n";
             kernels << r.name << "," << r.batch << "," << r.launches.kernels << "," << r.launches.memsets << ","
                     << r.launches.memcpys << "\n";
         }

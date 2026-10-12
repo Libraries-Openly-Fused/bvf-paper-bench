@@ -6,11 +6,13 @@
 #     sudo scripts/ncu_l2.sh
 #
 # Paths default to the layout described in README.md (the build and build-nppdx folders of this repository, and
-# results/ next to it) and can be overridden with the environment variables NCU, PAPER_BENCH, NPPDX_BENCH, BVF_RESULTS
-# (the results folder of one workload: the NPPDx run in nppdx/, the reports in ncu_l2/), NPPDX_CONFIG and OUT, e.g.
+# results/ next to it) and can be overridden with the environment variables NCU, PAPER_BENCH, NPPDX_BENCH,
+# NPPDX_NPP_BENCH, BVF_RESULTS (the results folder of one workload: the NPPDx runs in nppdx/ and nppdx_npp/, the reports
+# in ncu_l2/), NPPDX_CONFIG, NPPDX_NPP_CONFIG and OUT, e.g.
 #     sudo NCU=/usr/local/cuda-13.3/bin/ncu scripts/ncu_l2.sh
 # or, for benchmarks built with other BENCH_CROP_*/BENCH_RESIZE_* options (see README.md),
 #     sudo PAPER_BENCH=build-20x10/bvf_bench NPPDX_BENCH=build-nppdx-20x10/benchmark_figure1_bvf \
+#          NPPDX_NPP_BENCH=build-nppdx-20x10/benchmark_figure1_nppdx_npp \
 #          BVF_RESULTS=../results/20x10 scripts/ncu_l2.sh
 #
 # For every pipeline and every batch size N of the benchmarks, profiles one execution (the NVTX range "measure" of the
@@ -32,33 +34,43 @@ ROOT=$(dirname "$REPO")
 NCU=${NCU:-/usr/local/cuda/bin/ncu}
 PAPER_BENCH=${PAPER_BENCH:-$REPO/build/bvf_bench}
 NPPDX_BENCH=${NPPDX_BENCH:-$REPO/build-nppdx/benchmark_figure1_bvf}
-# The NPPDx configuration (tile and block) the NPPDx benchmark chose for every N, from its run without a mode
+NPPDX_NPP_BENCH=${NPPDX_NPP_BENCH:-$REPO/build-nppdx/benchmark_figure1_nppdx_npp}
+# The NPPDx configuration (tile and block) each NPPDx benchmark chose for every N, from its run without a mode
 RESULTS=${BVF_RESULTS:-$ROOT/results}
 NPPDX_CONFIG=${NPPDX_CONFIG:-$RESULTS/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv}
+NPPDX_NPP_CONFIG=${NPPDX_NPP_CONFIG:-$RESULTS/nppdx_npp/benchmark_figure1_nppdx_npp_nppdx_config_GPU_NVIDIA.csv}
 OUT=${OUT:-$RESULTS/ncu_l2}
 OWNER=${SUDO_USER:-$(id -un)}
 METRICS=lts__t_sectors_srcunit_tex_op_read.sum,lts__t_sectors_srcunit_tex_op_write.sum,lts__t_bytes.sum,dram__bytes_read.sum,dram__bytes_write.sum,gpu__time_duration.sum
 
-# The workload (frame, sizes, batch sizes, crop positions of common/bench_geometry.h) must be the same in both
-# benchmarks and in the run that chose the NPPDx configurations; the batch sizes come from the benchmarks themselves
+# The workload (frame, sizes, batch sizes, crop positions of common/bench_geometry.h) must be the same in the three
+# benchmarks and in the runs that chose the NPPDx configurations; the batch sizes come from the benchmarks themselves
 WORKLOAD=$("$PAPER_BENCH" --workload) || exit 1
-if [ "$WORKLOAD" != "$("$NPPDX_BENCH" --workload)" ]; then
-    echo "$PAPER_BENCH and $NPPDX_BENCH were built for different workloads: configure both with the same" \
-         "BENCH_CROP_W, BENCH_CROP_H, BENCH_RESIZE_W and BENCH_RESIZE_H" >&2
-    exit 1
-fi
+for bench in "$NPPDX_BENCH" "$NPPDX_NPP_BENCH"; do
+    if [ "$WORKLOAD" != "$("$bench" --workload)" ]; then
+        echo "$PAPER_BENCH and $bench were built for different workloads: configure both with the same" \
+             "BENCH_CROP_W, BENCH_CROP_H, BENCH_RESIZE_W and BENCH_RESIZE_H" >&2
+        exit 1
+    fi
+done
 BATCHES=$("$PAPER_BENCH" --batches) || exit 1
-if [ ! -f "$NPPDX_CONFIG" ]; then
-    echo "No NPPDx configuration file $NPPDX_CONFIG: run benchmark_figure1_bvf first, or set NPPDX_CONFIG" >&2
-    exit 1
-fi
-NPPDX_PLATFORM=$(dirname "$NPPDX_CONFIG")/benchmark_figure1_bvf_platform.txt
-if [ ! -f "$NPPDX_PLATFORM" ] || ! grep -qF "Workload: $WORKLOAD" "$NPPDX_PLATFORM"; then
-    echo "$NPPDX_CONFIG does not come from a run with this workload (no matching Workload line in $NPPDX_PLATFORM)" >&2
-    exit 1
-fi
-nppdx_config() { # <N>: the tile and requested block chosen for N (columns Batch size, Tile, Requested BlockDim)
-    awk -F', *' -v n="$1" '$1 == n { print $2, $3 }' "$NPPDX_CONFIG"
+check_config() { # <configuration CSV> <benchmark name>: it exists and comes from a run with this workload
+    if [ ! -f "$1" ]; then
+        echo "No NPPDx configuration file $1: run $2 first, or set the variable of its path" >&2
+        exit 1
+    fi
+    local platform
+    platform=$(dirname "$1")/$2_platform.txt
+    if [ ! -f "$platform" ] || ! grep -qF "Workload: $WORKLOAD" "$platform"; then
+        echo "$1 does not come from a run with this workload (no matching Workload line in $platform)" >&2
+        exit 1
+    fi
+}
+check_config "$NPPDX_CONFIG" benchmark_figure1_bvf
+check_config "$NPPDX_NPP_CONFIG" benchmark_figure1_nppdx_npp
+nppdx_config() { # <configuration CSV> <N>: the tile and requested block chosen for N (columns Batch size, Tile,
+                 # Requested BlockDim)
+    awk -F', *' -v n="$2" '$1 == n { print $2, $3 }' "$1"
 }
 
 mkdir -p "$OUT"
@@ -81,11 +93,14 @@ profile() { # <report name> <benchmark binary> <implementation> <N> [<NPPDx tile
 }
 
 for n in $BATCHES; do
-    for impl in opencv_cuda npp fkl_vf_hf fkl_vf_hf_float3_frame fkl_bvf; do
+    for impl in opencv_cuda npp fkl_vf_hf fkl_bvf; do
         profile "${impl}_N${n}_cache-all" "$PAPER_BENCH" "$impl" "$n"
     done
     # shellcheck disable=SC2046  # the tile and the block are two arguments
-    profile "nppdxrepo_nppdx_N${n}_cache-all" "$NPPDX_BENCH" nppdx "$n" $(nppdx_config "$n")
+    profile "nppdxrepo_nppdx_N${n}_cache-all" "$NPPDX_BENCH" nppdx "$n" $(nppdx_config "$NPPDX_CONFIG" "$n")
+    # shellcheck disable=SC2046
+    profile "nppdxrepo_nppdx_npp_N${n}_cache-all" "$NPPDX_NPP_BENCH" nppdx_npp "$n" \
+        $(nppdx_config "$NPPDX_NPP_CONFIG" "$n")
     profile "nppdxrepo_fkl_bvf_N${n}_cache-all" "$NPPDX_BENCH" fkl_bvf "$n"
 done
 

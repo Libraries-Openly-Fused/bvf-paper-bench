@@ -24,7 +24,7 @@
 //   -DIMPL_NPP          NPP calls, batched where they exist
 // and -DCT_BATCH=<N> (number of crops). The program is compiled with the nvcc command line of bvf_bench (see run.sh) and
 // is never executed: main() calls the pipeline only when it gets an argument, which keeps every template instantiated.
-// The pipeline calls are those of src/bvf_bench.cu (makeFklBvf, makeFklVfHf<N, true>, makeOpenCV, makeNPP,
+// The pipeline calls are those of src/bvf_bench.cu (makeFklBvf, makeFklVfHf<N>, makeOpenCV, makeNPP,
 // nv12ToRgb8) without the benchmark scaffolding: same operations, template arguments and order.
 
 #include <fused_kernel/fused_kernel.h>
@@ -44,6 +44,8 @@
 #include <opencv2/cudaarithm.hpp>
 #include <opencv2/cudawarping.hpp>
 #include <npp.h>
+
+#include "bench_npp.h"
 #endif
 
 #include "bench_geometry.h"
@@ -59,16 +61,6 @@
 #error "Define -DCT_BATCH=<number of crops> (not BATCH: FKL uses that name for template parameters)"
 #endif
 
-#ifndef IMPL_HEADERS_FKL
-#define NPP_CHECK(expr)                                                                                     \
-    do {                                                                                                    \
-        const NppStatus status_ = (expr);                                                                   \
-        if (status_ != NPP_SUCCESS) {                                                                       \
-            throw std::runtime_error(std::string("NPP error ") + std::to_string(status_) + " in " + #expr); \
-        }                                                                                                   \
-    } while (0)
-#endif
-
 namespace {
 
 // Frame, crop, resize, border and output sizes of the benchmarks
@@ -80,7 +72,7 @@ using namespace bench::geometry;
 [[maybe_unused]] constexpr float QUANTIZATION_OFFSET = 0.5f / 255.f;
 
 using NV12Image = fk::Image<fk::PixelFormat::NV12>;
-using YUVToRGB = fk::ConvertYUVToRGB<fk::ColorDepth::p8bit, fk::ColorRange::Full, fk::ColorPrimitives::bt2020>;
+using YUVToRGB = fk::ConvertYUVToRGB<fk::ColorDepth::p8bit, fk::ColorRange::Limited, fk::ColorPrimitives::bt601>;
 [[maybe_unused]] const fk::float3 mulValue{MUL[0], MUL[1], MUL[2]};
 [[maybe_unused]] const fk::float3 subValue{SUB[0], SUB[1], SUB[2]};
 [[maybe_unused]] const fk::float3 divValue{DIV[0], DIV[1], DIV[2]};
@@ -122,7 +114,7 @@ void runPipeline() {
 
 #elif defined(IMPL_VFHF)
 // ---------------------------------------------------------------- VF+HF: four kernels, 8 bit RGB frame
-// (makeFklVfHf<N, true>)
+// (makeFklVfHf<N>)
 template <typename T>
 std::array<fk::RawPtr<fk::ND::_2D, T>, N> planeViews(const fk::Tensor<T>& tensor, int width, int height) {
     const auto raw = tensor.ptr();
@@ -176,21 +168,17 @@ void runPipeline() {
 
 #elif defined(IMPL_OPENCV) || defined(IMPL_NPP)
 // ---------------------------------------------------------------- the libraries
-// The frame pointers, pitch, color twist and NPP stream context of the benchmark's Context
+// The frame pointers, pitch and NPP stream context of the benchmark's Context
 struct LibState {
     const Npp8u* y{nullptr};
     const Npp8u* uv{nullptr};
     int pitch{0};
-    Npp32f twist[3][4]{};
     NppStreamContext npp{};
     cv::cuda::Stream cvStream;
 };
 
 void nv12ToRgb8(const LibState& st, Npp8u* dst, int dstStep) {
-    const Npp8u* src[2] = {st.y, st.uv};
-    int srcSteps[2] = {st.pitch, st.pitch};
-    NPP_CHECK(nppiNV12ToRGB_8u_ColorTwist32f_P2C3R_Ctx(src, srcSteps, dst, dstStep, NppiSize{FRAME_W, FRAME_H},
-                                                       st.twist, st.npp));
+    bench::npp::nv12ToRgb8Bt601Limited(st.y, st.uv, st.pitch, dst, dstStep, NppiSize{FRAME_W, FRAME_H}, st.npp);
 }
 
 #if defined(IMPL_OPENCV)

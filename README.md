@@ -8,16 +8,20 @@ pipeline of the paper,
 
 on one 3840x2160 NV12 frame with N in {1, 4, 16, 50, 100} crops of 32x16, each resized (bilinear) to 64x32, padded
 with 16 black rows on top and bottom to 64x64, normalized as (x * mul - sub) / div and written as float3 into an N plane
-tensor. The comparison of FKL with NVIDIA's NPPDx, one kernel in each library, is in
-[`fkl-vs-nppdx/`](fkl-vs-nppdx/README.md) (until October 2026 the separate repository FKL-vs-NPPDx), with its RTX 4090
-results.
+tensor. The comparisons of FKL with NVIDIA's NPPDx are in [`fkl-vs-nppdx/`](fkl-vs-nppdx/README.md) (until October
+2026 the separate repository FKL-vs-NPPDx), with their RTX 4090 results: NPPDx as one kernel, with hand written CUDA
+code for the steps NPPDx has no operation for, and NPPDx combined with NPP without hand written pixel processing code.
 
 ## Workload
 
 Every benchmark of this repository (GPU, CPU, FKL vs NPPDx and the compile-time units) takes its workload from
 [`common/bench_geometry.h`](common/bench_geometry.h):
 
-- the frame: 3840x2160 NV12, uniform random bytes (seed 1);
+- the frame: 3840x2160 NV12, uniform random values in the legal range of limited (video) range NV12, Y in [16, 235]
+  and U, V in [16, 240] (seed 1), as in real video;
+- the color conversion: NV12 to RGB with BT.601 in limited range, in every implementation, because it is the only
+  NV12 conversion that every library offers (OpenCV's CPU `cvtColor` has no other; NPP's through its color twist with
+  the BT.601 matrix, NPPDx's through `FromLimitedLuma`, `FromLimitedChroma` and `ColorConvert<yuv_bt601, rgb>`);
 - the crops: `BENCH_CROP_W` x `BENCH_CROP_H` (default 32x16) at uniform random positions (seed 42; batch N uses the
   first N of one sequence of 100), with even coordinates, so that every library reads the same NV12 chroma samples, and
   at least 8 pixels from the frame edges, so that a neighborhood operation can later be inserted before the crop
@@ -64,7 +68,7 @@ Other modes, selected with a second argument:
 | `--ncu-target <impl> <N>` | runs one execution of one pipeline inside the NVTX range `measure`, for Nsight Compute |
 
 `bvf_bench --batches` and `bvf_bench --workload` (with no results directory) print the batch sizes and the whole
-workload the binary was built for, for the scripts; `benchmark_figure1_bvf` has the same two modes.
+workload the binary was built for, for the scripts; the two NPPDx benchmarks have the same two modes.
 
 No CUDA Graphs are used anywhere.
 
@@ -77,11 +81,12 @@ each kernel or stage of the multi-kernel pipelines), `validation.csv`, `kernels.
 
 `scripts/ncu_dram.sh` (DRAM traffic, with cold and warm caches) and `scripts/ncu_l2.sh` (traffic between the SMs and
 L2) profile every pipeline for every batch size with Nsight Compute through the `--ncu-target` mode of this benchmark
-and of the NPPDx one. They stop unless both benchmarks were built for the same workload (`--workload`) and the
-NPPDx configuration file comes from a run with that workload (the `Workload` line of the platform file next to it).
-They take the batch sizes from the benchmarks (`--batches`) and NPPDx's tile and block for every
-N from the configuration file of the NPPDx benchmark's run (`../results/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv`,
-or `NPPDX_CONFIG`), so run that one first. They need root while the driver restricts the GPU performance counters
+and of the two NPPDx ones. They stop unless the three benchmarks were built for the same workload (`--workload`) and
+the NPPDx configuration files come from runs with that workload (the `Workload` line of the platform file next to
+each). They take the batch sizes from the benchmarks (`--batches`) and NPPDx's tile and block for every N from the
+configuration files of the NPPDx benchmarks' runs (`../results/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv`
+and `../results/nppdx_npp/benchmark_figure1_nppdx_npp_nppdx_config_GPU_NVIDIA.csv`, or `NPPDX_CONFIG` and
+`NPPDX_NPP_CONFIG`), so run those first. They need root while the driver restricts the GPU performance counters
 to administrators (`RmProfilingAdminOnly=1` in `/proc/driver/nvidia/params`, the default); with the nvidia module
 option `NVreg_RestrictProfilingToAdminUsers=0` they run without sudo. They change nothing on the system and give the
 reports back to the user who ran sudo. Summarize them afterwards, without sudo, with `scripts/ncu_summarize.py` (DRAM) or
@@ -89,16 +94,18 @@ reports back to the user who ran sudo. Summarize them afterwards, without sudo, 
 to a compulsory-read model (`traffic_model.csv`; the model is described at the top of the script). It takes the
 workload from the NPPDx benchmark's platform file and regenerates the crop positions, so it works for any workload.
 
-To profile another workload, for example the earlier 20x10 crops resized 5:16, build both benchmarks with the same
-options into their own folders, run the NPPDx benchmark into a results folder of that workload, and point the scripts
-and the summary at them (`BVF_RESULTS` is the folder of the workload, with the NPPDx run in `nppdx/` and the reports in
-`ncu/` and `ncu_l2/`):
+To profile another workload, for example the earlier 20x10 crops resized 5:16, build the benchmarks with the same
+options into their own folders, run the NPPDx benchmarks into a results folder of that workload, and point the scripts
+and the summary at them (`BVF_RESULTS` is the folder of the workload, with the NPPDx runs in `nppdx/` and
+`nppdx_npp/` and the reports in `ncu/` and `ncu_l2/`):
 
     G="-DBENCH_CROP_W=20 -DBENCH_CROP_H=10 -DBENCH_RESIZE_W=64 -DBENCH_RESIZE_H=32"
     cmake -S . -B build-20x10 -DCMAKE_BUILD_TYPE=Release -DOpenCV_DIR=<OpenCV> $G && cmake --build build-20x10 -j
     cmake -S fkl-vs-nppdx -B build-nppdx-20x10 -DCMAKE_BUILD_TYPE=Release $G && cmake --build build-nppdx-20x10 -j
     ./build-nppdx-20x10/benchmark_figure1_bvf ../results/20x10/nppdx
+    ./build-nppdx-20x10/benchmark_figure1_nppdx_npp ../results/20x10/nppdx_npp
     sudo PAPER_BENCH=build-20x10/bvf_bench NPPDX_BENCH=build-nppdx-20x10/benchmark_figure1_bvf \
+         NPPDX_NPP_BENCH=build-nppdx-20x10/benchmark_figure1_nppdx_npp \
          BVF_RESULTS=../results/20x10 scripts/ncu_dram.sh        # and the same for scripts/ncu_l2.sh
     BVF_RESULTS=../results/20x10 scripts/ncu_summarize.py        # and scripts/ncu_summarize.py l2
     BVF_RESULTS=../results/20x10 scripts/ncu_traffic_model.py
@@ -147,7 +154,7 @@ Each benchmark has its own requirements, besides a C++20 compiler:
 |---|---|
 | GPU (`.`) | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.28, OpenCV 4.14 built with CUDA and the opencv_contrib modules `cudaarithm` and `cudawarping` |
 | CPU (`cpu`) | CMake 3.28 and OpenCV 4.14 with `core` and `imgproc`; no GPU or CUDA |
-| FKL vs NPPDx (`fkl-vs-nppdx`) | an NVIDIA GPU, CUDA 13.3 or newer with CUPTI and NVTX, CMake 3.30, a Linux x86_64 or Windows x64 machine (NPPDx's platforms); no OpenCV |
+| FKL vs NPPDx (`fkl-vs-nppdx`) | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.30, a Linux x86_64 or Windows x64 machine (NPPDx's platforms); no OpenCV |
 
 The paper's results were measured on Linux; the CI also builds and runs every benchmark on Windows, and the CPU
 benchmark and the GPU one on ARM64.
@@ -175,11 +182,21 @@ expect those folders, and a `results` directory next to this repository.
     cmake --build build-nppdx -j
     ./build-nppdx/benchmark_figure1_bvf ../results/nppdx
     ./build-nppdx/benchmark_figure1_bvf ../results/nppdx --gpu-only-l2-flushed   # NPPDx as chosen by the run above
+    ./build-nppdx/benchmark_figure1_nppdx_npp ../results/nppdx_npp               # NPPDx + NPP
+    ./build-nppdx/benchmark_figure1_nppdx_npp ../results/nppdx_npp --gpu-only-l2-flushed
 
     # CPU benchmark, preferably with a recent clang; -march=native by default (CPU_ARCH_FLAGS)
     cmake -S cpu -B build-cpu -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++ -DOpenCV_DIR=<OpenCV>
     cmake --build build-cpu -j
     ./build-cpu/cpu_bench ../results/cpu
+
+`scripts/run_all.sh` does all of this for both workloads of the paper, the 32x16 crops resized 1:2 and the earlier
+20x10 crops resized 5:16 (`GEOMETRIES`), each with its own build folders (`build-32x16`, `build-nppdx-32x16`,
+`build-cpu-32x16`, ...) and results folder (`../results/32x16`, `../results/20x10`, with the FKL vs NPPDx runs in
+`nppdx/` and `nppdx_npp/` and the CPU one in `cpu/`), and prints the Nsight Compute commands of each workload, which
+need sudo; `COMPILE_TIME=1` adds the compile-time units:
+
+    OpenCV_DIR=<OpenCV> CPU_CXX=clang++ scripts/run_all.sh ../results
 
 `CUDA_ARCH` (default `native`, the GPU of the machine) selects the CUDA architectures of the GPU benchmarks.
 `BENCH_ITERATIONS` and `BENCH_WARMUP_ITERATIONS` (default 1000 and 100, as for the paper's results) set the timed and
@@ -197,10 +214,11 @@ NVIDIA GPU and run the CPU benchmark only. FKL vs NPPDx runs on the x86_64 CUDA 
 
 Every job runs [`scripts/ci/run_benchmarks.cmake`](scripts/ci/run_benchmarks.cmake), which also runs on any machine
 (see its header). It builds OpenCV 4.14.0 with the modules the benchmarks use once per runner and configuration, in
-`~/bvf-paper-bench-deps` (so the first run on a runner takes much longer), builds the benchmarks with one timed
-iteration and no warm-up (`ITERATIONS` and `WARMUP_ITERATIONS` of the script), runs every mode except the Nsight
-Compute profiles (they need root), and fails if a benchmark fails or if FKL's outputs do not match their references
-(the baselines' errors are reported, not checked: OpenCV and NPP round and sample differently). The results and logs
+`~/bvf-paper-bench-deps` (so the first run on a runner takes much longer), builds the benchmarks for both workloads
+of the paper (`GEOMETRIES`) with one timed iteration and no warm-up (`ITERATIONS` and `WARMUP_ITERATIONS` of the
+script), runs every mode except the Nsight Compute profiles (they need root), and fails if a benchmark fails or if
+FKL's or NPPDx's outputs do not match their references (the errors of OpenCV and NPP are reported, not checked: they
+round and sample differently). The results and logs
 of every job are uploaded as artifacts. Times measured on shared CI runners are not the paper's numbers.
 
 The runners are persistent machines and this repository is public, so the workflow only runs trusted code: pull

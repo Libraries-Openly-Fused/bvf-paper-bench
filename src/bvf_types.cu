@@ -51,7 +51,7 @@ int main() {
 
     const auto fused = fk::BackFuser::fuse_back(
         fk::ReadYUV<fk::PixelFormat::NV12>::build(frame),
-        fk::ConvertYUVToRGB<fk::ColorDepth::p8bit, fk::ColorRange::Full, fk::ColorPrimitives::bt2020>::build(),
+        fk::ConvertYUVToRGB<fk::ColorDepth::p8bit, fk::ColorRange::Limited, fk::ColorPrimitives::bt601>::build(),
         fk::Crop<>::build(crops),
         fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(RES_W, RES_H)),
         fk::AddBorder<>::build(BORDER_TOP, BORDER_BOTTOM, 0, 0, black),

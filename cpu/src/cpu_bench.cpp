@@ -5,7 +5,7 @@
 // (x * mul - sub) / div written as float3 into an N-plane tensor.
 //
 // The color conversion is BT.601 limited range in both, because OpenCV's CPU cvtColor only implements that one for
-// NV12 (the GPU benchmarks use BT.2020 full range).
+// NV12; every benchmark of this repository uses it (common/bench_geometry.h).
 //
 //   opencv: cvtColor(COLOR_YUV2RGB_NV12) on the full frame (8 bit RGB), then per crop convertTo(CV_32F), resize and
 //           copyMakeBorder, then multiply, subtract and divide on the whole tensor. OpenCV uses its own SIMD dispatch
