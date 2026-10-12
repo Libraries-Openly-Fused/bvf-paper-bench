@@ -126,8 +126,11 @@ GL2C_EA_WRREQ_64B_sum`, since rocprofiler-sdk 1.4.1 defines no `WRITE_SIZE` for 
     rocm/scripts/run_all.sh ../results/rocm
 
 The results directory must be new or empty (the script stops otherwise), so that no file of an earlier run sits next
-to this run's, and both builds are configured from an empty CMake cache (`cmake --fresh`, a full rebuild), so that no
-option cached by an earlier configure applies. Before running it, on the bare-metal machine: nothing else running (`uptime` load below 0.5, which the script checks),
+to this run's, and both builds are configured from scratch with `cmake --fresh`, so that no option cached by an earlier
+configure applies: it deletes the build directory's `CMakeCache.txt` and `CMakeFiles/`, where the Ninja build keeps
+its object files, so every run compiles both benchmarks again.
+
+Before running it, on the bare-metal machine: nothing else running (`uptime` load below 0.5, which the script checks),
 nothing else on the GPU (`amd-smi process`), and the performance level and clock lock state as they are: the script
 records them (`amd-smi metric`, including `--perf-level`) and does not change them. Hardware counters need access to
 the GPU's performance counters (membership of the `render` group) and, on gfx1200, a profiling performance level: at
