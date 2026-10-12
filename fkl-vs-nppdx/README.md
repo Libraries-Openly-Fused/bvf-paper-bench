@@ -7,19 +7,22 @@ Fusion paper (Figure 1):
 
     ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
 
-One 3840x2160 NV12 frame in device memory, N crops of 20x10 pixels at fixed random positions, NV12 to RGB
+One 3840x2160 NV12 frame in device memory, N crops of 32x16 pixels at fixed random positions, NV12 to RGB
 (BT.2020, full range), bilinear resize to 64x32, 16 black rows added on top and bottom (64x64), then
 `(x * mul - sub) / div` with ImageNet constants (`mul = 1/255`, `sub = (0.485, 0.456, 0.406)`,
-`div = (0.229, 0.224, 0.225)`), written as float3 into a tensor of N planes. N is 1, 4, 16, 50 and 100.
+`div = (0.229, 0.224, 0.225)`), written as float3 into a tensor of N planes. N is 1, 4, 16, 50 and 100. The frame,
+sizes, batch sizes and crop positions are those of every benchmark of this repository, from
+[`common/bench_geometry.h`](../common/bench_geometry.h) (see the [workload](../README.md#workload)).
 
 Both libraries run the whole pipeline in **one kernel**:
 
 - **FKL**: one `executeOperations` call with the nine operations (Backwards Vertical Fusion), from the `fkl`
   submodule of this repository (FKL main, which has `AddBorder`).
-- **NPPDx**: one CUDA kernel built from NPPDx operations, one thread block per crop: NV12 ingest of the crop,
-  `ColorConvert<yuv_bt2020, rgb>` and `Resize<5, 16, bilinear>` on the shared memory tile. AddBorder, Mul, Sub,
-  Div and the float3 write are written by hand in the same kernel, because NPPDx 0.1.2 has no border
-  operation, its affine channel map only takes integer constants, and it has no floating point output format.
+- **NPPDx**: one CUDA kernel built from NPPDx operations, one thread block per tile of a crop: NV12 ingest of the
+  tile, `ColorConvert<yuv_bt2020, rgb>` and `Resize<1, 2, bilinear>` (the J:K ratio of the geometry) on the shared
+  memory tile. AddBorder, Mul, Sub, Div and the float3 write are written by hand in the same kernel, because NPPDx
+  0.1.2 has no border operation, its affine channel map only takes integer constants, and it has no floating point
+  output format.
 
 ## Results on an RTX 4090
 
@@ -51,7 +54,8 @@ microseconds:
 
 **GPU only, L2 flushed**: like GPU only, but the L2 cache is flushed (a kernel reads twice the L2 size) before every
 execution, as on a GPU that runs other kernels in between, so that the input cannot be assumed to be in L2. Run with
-`benchmark_figure1_bvf <dir> --gpu-only-l2-flushed` (NPPDx with 256 threads per block). Median in microseconds:
+`benchmark_figure1_bvf <dir> --gpu-only-l2-flushed` after the run without a mode into the same directory, whose NPPDx
+configurations it uses. Median in microseconds:
 
 | N | NPPDx (us) | FKL (us) | Speedup |
 |---|---|---|---|
@@ -73,7 +77,8 @@ GPU clocks were not locked.
 91 and 154 KB from DRAM for N = 1, 16 and 100, and FKL 9, 22 and 84 KB. With a warm cache both read nothing from
 DRAM, and neither writes to DRAM while the kernel runs: the RTX 4090's 72 MB L2 is write-back and holds the
 whole working set (the 12.4 MB NV12 frame and an output of at most 4.9 MB). Collected with
-`--ncu-target <nppdx|fkl_bvf> <N>`, which runs one execution inside the NVTX range `measure`.
+`--ncu-target <nppdx|fkl_bvf> <N> [<tileX>x<tileY> <block>]`, which runs one execution inside the NVTX range
+`measure` (NPPDx in the given tile and requested block, for example the ones of the configuration file).
 
 ## Correctness and sampling conventions
 
@@ -88,47 +93,29 @@ FKL's reference the NPPDx output differs by up to 5.4 in normalized units for th
 libraries replicate the NV12 chroma and neither clamps the RGB values after the conversion. Run
 `benchmark_figure1_bvf <dir> --analyze` to see the comparison against each convention.
 
-The crop positions are snapped to even coordinates: NPPDx takes the chroma of a crop at `(x / 2, y / 2)` relative
-to the crop origin, and FKL relative to the frame, which only read the same samples for even origins.
+The crop positions have even coordinates: NPPDx takes the chroma of a crop at `(x / 2, y / 2)` relative to the
+crop origin, and FKL relative to the frame, which only read the same samples for even origins.
 
 ## NPPDx configuration
 
-The NPPDx kernel and its configuration (`NppdxFigure1`) are in `benchmarks/nppdx_figure1.h`.
+The NPPDx kernel and its configurations are in `benchmarks/nppdx_figure1.h`, derived at compile time from the
+geometry. NPPDx tiles are made of 4x2 pixel cells, and its resize maps whole groups of J source pixels, so a tile is a
+multiple of lcm(4, J) x lcm(2, J) pixels that splits the crop. The candidate tiles are the whole crop and its
+successive halvings (the longer side first) down to 64 pixels: 32x16, 16x16, 16x8 and 8x8 for 32x16 crops. Of those,
+the benchmark keeps the ones NPPDx supports on the GPU's SM: `nppdx::is_supported_v` of the ingest and the resize
+(their input tile fits in shared memory), the checks NPPDx's resize makes of its output and intermediate tiles, and
+the shared memory of all the tiles of the kernel together. A larger crop whose whole-crop tile does not fit, for
+example, is split in tiles instead of failing to compile.
 
-NPPDx tiles must be multiples of its 4x2 pixel cells and of the 5:16 resize ratio, so the only valid tile for a
-20x10 crop is the whole crop, one thread block per crop. All the operations run in the same kernel, which is
-launched with the largest of their block sizes (the ingest's own recommended block covers the tile without the
-resize halo, and would leave rows of the input tile unloaded). The benchmark tries NPPDx's recommended
-configuration and `BlockDim` 64, 128, 256 and 512 for every N, checks each one, and compares FKL with the fastest
-correct one (256 or 512 threads, which are within noise of each other). The sweep is in
-`benchmark_figure1_bvf_nppdx_block_sweep_GPU_NVIDIA.csv`.
-
-## Region size sweep
-
-`benchmark_figure1_bvf <dir> --region-sweep` runs the same chain with N = 16 regions of growing size, each resized
-exactly 2x (NPPDx ratio 1:2) and given the 16 black rows on top and bottom:
-
-| Region | Source | Resized | Output | 16 regions cover |
-|---|---|---|---|---|
-| A | 32x16 | 64x32 | 64x64 | 0.0988% of the frame |
-| B | 112x96 | 224x192 | 224x224 | 2.0741% |
-| C | 320x304 | 640x608 | 640x640 | 18.7654% |
-| D | 960x524 | 1920x1048 | 1920x1080 | 97.0370% |
-
-The regions sit at the origins of a 4x4 grid of 960x540 cells (region i = row * 4 + column), so they never overlap.
-Only a 32x16 region fits in one NPPDx tile: for the larger ones NPPDx rejects a whole-region tile (its output tile
-does not fit in the shared memory of a block), so every region is split in tiles, several thread blocks per region.
-For every size the benchmark checks three tiles with NPPDx's recommended block and with `BlockDim` 128 and 256,
-times the correct ones alone and compares FKL with the fastest. A `BlockDim` smaller than the recommended block of
-a tile gives wrong results and is never chosen. As in the main benchmark there are three comparisons: CPU + GPU,
-GPU only and GPU only with the L2 flushed. The files start with `benchmark_figure1_bvf_region_sweep`, with
-`Source pixels per region` as the first column, plus `_validation_`, `_nppdx_configs_` (every tile and block tried),
-`_summary_` (sizes, coverage, chosen NPPDx configuration, kernels per execution and bytes written) and
-`_platform.txt`.
-
-`--region-sweep-validate` only checks the results, without timing. `--region-ncu-target <nppdx|fkl_bvf> <A|B|C|D>
-[<tileX>x<tileY> <block>]` runs one execution inside the NVTX range `measure` for Nsight Compute; NPPDx needs the
-tile and block, for example the ones chosen in the summary file (block 0 is NPPDx's recommended one).
+All the operations run in the same kernel, which is launched with the largest of their block sizes (the ingest's own
+recommended block covers the tile without the resize halo, and would leave rows of the input tile unloaded). Every
+supported tile is tried with NPPDx's recommended configuration and with `BlockDim` 64, 128, 256 and 512, for every N:
+the benchmark checks each one against the pixel-center reference, times it alone, and compares FKL with the fastest
+correct one (a `BlockDim` smaller than the recommended block of a tile gives wrong results, and is never chosen). The
+chosen configuration of every N drives all three comparisons (CPU + GPU, GPU only and GPU only with the L2 flushed),
+the Nsight Compute scripts and the NPPDx compile-time units. Every configuration tried is in
+`benchmark_figure1_bvf_nppdx_block_sweep_GPU_NVIDIA.csv`, and the chosen ones in
+`benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv`.
 
 ## Build and run
 
@@ -152,7 +139,9 @@ size: `Batch size`, then `MeanTime`, `TimeVariance`, `MaxTime` and `MinTime` of 
 second (FKL) implementation in milliseconds, `Mean Speedup`, and the `MedianTime`, `P10Time` and `P90Time` of
 each. In every iteration both implementations are timed one after the other with CUDA events on one stream,
 synchronizing after each. `<benchmark>_gpu_only_<ParArch>.csv` has the same columns for the GPU only benchmark.
-Next to them are `_validation_` (errors), `_nppdx_block_sweep_` and `_platform.txt`.
+Next to them are `_validation_` (errors), `_nppdx_block_sweep_` (every NPPDx configuration tried: tile, block,
+blocks per crop, shared memory, time alone, error, whether it was chosen), `_nppdx_config_` (the chosen configuration
+of every N: tile, requested and actual block, blocks per crop, shared memory) and `_platform.txt`.
 
 ## License
 

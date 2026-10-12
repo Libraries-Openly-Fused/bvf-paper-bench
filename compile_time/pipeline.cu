@@ -46,6 +46,8 @@
 #include <npp.h>
 #endif
 
+#include "bench_geometry.h"
+
 #include <array>
 #include <cstdio>
 #include <memory>
@@ -69,16 +71,8 @@
 
 namespace {
 
-[[maybe_unused]] constexpr int FRAME_W = 3840;
-[[maybe_unused]] constexpr int FRAME_H = 2160;
-[[maybe_unused]] constexpr int CROP_W = 20;
-[[maybe_unused]] constexpr int CROP_H = 10;
-[[maybe_unused]] constexpr int RES_W = 64;
-[[maybe_unused]] constexpr int RES_H = 32;
-[[maybe_unused]] constexpr int BORDER_TOP = 16;
-[[maybe_unused]] constexpr int BORDER_BOTTOM = 16;
-[[maybe_unused]] constexpr int OUT_W = RES_W;
-[[maybe_unused]] constexpr int OUT_H = RES_H + BORDER_TOP + BORDER_BOTTOM;
+// Frame, crop, resize, border and output sizes of the benchmarks
+using namespace bench::geometry;
 [[maybe_unused]] constexpr size_t N = CT_BATCH;
 [[maybe_unused]] constexpr float MUL[3] = {1.f / 255.f, 1.f / 255.f, 1.f / 255.f};
 [[maybe_unused]] constexpr float SUB[3] = {0.485f, 0.456f, 0.406f};

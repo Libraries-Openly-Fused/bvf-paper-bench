@@ -6,10 +6,32 @@ pipeline of the paper,
 
     ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
 
-on one 3840x2160 NV12 frame with N in {1, 4, 16, 50, 100} crops of 20x10, each resized (bilinear) to 64x32, padded
-with 16 black rows on top and bottom, normalized as (x * mul - sub) / div and written as float3 into an N plane tensor.
-The comparison of FKL with NVIDIA's NPPDx, one kernel in each library, is in [`fkl-vs-nppdx/`](fkl-vs-nppdx/README.md)
-(until October 2026 the separate repository FKL-vs-NPPDx), with its RTX 4090 results.
+on one 3840x2160 NV12 frame with N in {1, 4, 16, 50, 100} crops of 32x16, each resized (bilinear) to 64x32, padded
+with 16 black rows on top and bottom to 64x64, normalized as (x * mul - sub) / div and written as float3 into an N plane
+tensor. The comparison of FKL with NVIDIA's NPPDx, one kernel in each library, is in
+[`fkl-vs-nppdx/`](fkl-vs-nppdx/README.md) (until October 2026 the separate repository FKL-vs-NPPDx), with its RTX 4090
+results.
+
+## Workload
+
+Every benchmark of this repository (GPU, CPU, FKL vs NPPDx and the compile-time units) takes its workload from
+[`common/bench_geometry.h`](common/bench_geometry.h):
+
+- the frame: 3840x2160 NV12, uniform random bytes (seed 1);
+- the crops: `BENCH_CROP_W` x `BENCH_CROP_H` (default 32x16) at uniform random positions (seed 42; batch N uses the
+  first N of one sequence of 100), with even coordinates, so that every library reads the same NV12 chroma samples, and
+  at least 8 pixels from the frame edges, so that a neighborhood operation can later be inserted before the crop
+  without moving them;
+- the resize to `BENCH_RESIZE_W` x `BENCH_RESIZE_H` (default 64x32), with the same ratio in both dimensions (NPPDx's
+  `Resize<J, K>` takes one ratio, 1:2 by default);
+- the border: (`BENCH_RESIZE_W` - `BENCH_RESIZE_H`) / 2 black rows on top and bottom, which make the output square
+  (16 rows and 64x64 by default);
+- the batch sizes N in {1, 4, 16, 50, 100}.
+
+The four sizes are CMake options of every project ([`common/bench_geometry.cmake`](common/bench_geometry.cmake)), and
+every platform file records them. The frame bytes and the crop positions come from `std::mt19937` through a mapping
+written out in the header (the one libstdc++ uses), not through `std::uniform_int_distribution`, whose algorithm
+differs between standard libraries: they are the same on every platform and compiler.
 
 ## GPU benchmark (`src/bvf_bench.cu`)
 
@@ -40,9 +62,8 @@ Other modes, selected with a second argument:
 | `--profile-kernels` | GPU time of every kernel of every pipeline |
 | `--host-overhead` | host time to enqueue the FKL pipelines |
 | `--ncu-target <impl> <N>` | runs one execution of one pipeline inside the NVTX range `measure`, for Nsight Compute |
-| `--region-sweep` | the region-size sweep below: validation, CPU + GPU, GPU only and GPU only with the L2 flushed, kernel counts |
-| `--region-sweep-validate` | the validation of the region-size sweep only |
-| `--region-ncu-target <impl> <A\|B\|C\|D>` | like `--ncu-target`, for one case of the region-size sweep |
+
+`bvf_bench --batches` (with no results directory) prints the batch sizes, for the Nsight Compute scripts.
 
 No CUDA Graphs are used anywhere.
 
@@ -51,36 +72,15 @@ Output files: `latency.csv` (CPU + GPU: median, p10, p90 and mean in us, kernels
 `<baseline>_vs_fkl_bvf_GPU_NVIDIA.csv` (FKL's two-execution format, times in ms), `kernel_breakdown.csv` (time of
 each kernel or stage of the multi-kernel pipelines), `validation.csv`, `kernels.csv` and `platform.txt`.
 
-### Region-size sweep (`--region-sweep`)
-
-How the BVF advantage depends on how much of the producer's output is used: N = 16 regions, one at the origin of
-each 960x540 cell of a 4x4 grid (they never overlap), resized exactly 2x in both axes, then the same 16 + 16 black
-border rows, normalization and float3 write as the main benchmark. Same frame, constants, implementations,
-intermediates, references and timing protocol.
-
-| Case | Region | Resized | Output per region | 16 regions cover |
-|---|---|---|---|---|
-| A | 32x16 | 64x32 | 64x64 | 8,192 px, 0.0988% of the frame |
-| B | 112x96 | 224x192 | 224x224 | 172,032 px, 2.0741% |
-| C | 320x304 | 640x608 | 640x640 | 1,556,480 px, 18.7654% |
-| D | 960x524 | 1920x1048 | 1920x1080 | 8,048,640 px, 97.0370% |
-
-Output files: `region_sweep_times.csv` (the three timings, kernels launched and FKL BVF's mean speedups per case and
-implementation), `<baseline>_vs_fkl_bvf_region_sweep_[gpu_only_|gpu_only_l2_flushed_]GPU_NVIDIA.csv` (FKL's
-two-execution format, keyed by the source pixels of one region), `region_sweep_validation.csv`,
-`region_sweep_kernels.csv`, `region_sweep_kernel_breakdown.csv`, `region_sweep_cases.csv` (sizes and exact frame
-coverage), `region_sweep_buffers.csv` (the logical size of every buffer each implementation uses in global memory and
-the bytes it writes and reads there in one execution, from the sizes in the code) and `region_sweep_platform.txt`.
-NPPDx is in the `--region-sweep` mode of [`fkl-vs-nppdx/`](fkl-vs-nppdx/README.md#region-size-sweep). After both sweeps have run, `sudo scripts/ncu_region_sweep.sh`
-profiles the memory traffic of every pipeline of both benchmarks for every case in one go (NPPDx in the tile and block
-its sweep chose); summarize it with `scripts/ncu_summarize.py region`.
-
 ### Memory traffic with Nsight Compute
 
 `scripts/ncu_dram.sh` (DRAM traffic, with cold and warm caches) and `scripts/ncu_l2.sh` (traffic between the SMs and
-L2) profile every pipeline with Nsight Compute through the `--ncu-target` mode of this benchmark and of the NPPDx one. They need root when the driver restricts the GPU performance counters to administrators
-(`RmProfilingAdminOnly=1`, the default); they change nothing on the system and give the reports back to the user who
-ran sudo. Summarize them afterwards, without sudo, with `scripts/ncu_summarize.py` (DRAM) or
+L2) profile every pipeline for every batch size with Nsight Compute through the `--ncu-target` mode of this benchmark
+and of the NPPDx one. They take the batch sizes from the benchmarks (`--batches`) and NPPDx's tile and block for every
+N from the configuration file of the NPPDx benchmark's run (`../results/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv`,
+or `NPPDX_CONFIG`), so run that one first. They need root when the driver restricts the GPU performance counters to
+administrators (`RmProfilingAdminOnly=1`, the default); they change nothing on the system and give the reports back to
+the user who ran sudo. Summarize them afterwards, without sudo, with `scripts/ncu_summarize.py` (DRAM) or
 `scripts/ncu_summarize.py l2`.
 
 ### Compile time (`compile_time/`)
@@ -91,7 +91,10 @@ selected with `-DIMPL_<NAME>` and `-DCT_BATCH=<N>` (not `BATCH`, which FKL uses 
 OpenCV (`OPENCV`) and NPP (`NPP`), with the calls of `src/bvf_bench.cu`, plus two baselines without a pipeline: the FKL
 headers only (`HEADERS_FKL`) and every header of the other TUs (`HEADERS_ALL`). The TUs are compiled, never run.
 `fkl-vs-nppdx/benchmarks/compile_time_pipeline.cu` does the same for the NPPDx kernel of `nppdx_figure1.h` and FKL's
-`runFKL` (`HEADERS`, `NPPDX`, `BVF`).
+`runFKL` (`HEADERS`, `NPPDX`, `BVF`). The NPPDx kernel of every N is compiled in the tile and block size the NPPDx
+benchmark chose for that N, read from its configuration file (`NPPDX_CONFIG`, default
+`../results/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv`). The geometry only enters the other TUs as
+run-time values (sizes and rectangles), never as template arguments.
 
 `compile_time/run.sh` compiles every TU with the nvcc command line of the benchmark target (read from
 `compile_commands.json`, so configure with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`), 10 times after one discarded warm-up,
@@ -103,6 +106,7 @@ TU, medians, min and max), `compile_time_kernels.csv` and `compile_time_phases.c
 
     compile_time/run.sh ../results/compile_time                    # BUILD=build: src/bvf_bench.cu's command
     SET=nppdx compile_time/run.sh ../results/compile_time_nppdx    # BUILD=build-nppdx: benchmark_figure1_bvf's command
+                                                                   # (after its run into ../results/nppdx)
 
 The results of the RTX 4090 machine for FKL vs NPPDx are in `fkl-vs-nppdx/results/RTX4090/compile_time*`.
 
@@ -143,14 +147,13 @@ expect those folders, and a `results` directory next to this repository.
     cmake --build build -j
     ./build/bvf_bench ../results                          # CPU + GPU and GPU only
     ./build/bvf_bench ../results --gpu-only-l2-flushed    # adds the *_l2_flushed* files (same for the other modes)
-    ./build/bvf_bench ../results/region_sweep --region-sweep
     ./build/bvf_types                                     # C++ type of the fused read operation for N = 100
 
     # FKL vs NPPDx (Linux x86_64 or Windows x64), see fkl-vs-nppdx/README.md
     cmake -S fkl-vs-nppdx -B build-nppdx -DCMAKE_BUILD_TYPE=Release
     cmake --build build-nppdx -j
     ./build-nppdx/benchmark_figure1_bvf ../results/nppdx
-    ./build-nppdx/benchmark_figure1_bvf ../results/region_sweep/nppdx --region-sweep
+    ./build-nppdx/benchmark_figure1_bvf ../results/nppdx --gpu-only-l2-flushed   # NPPDx as chosen by the run above
 
     # CPU benchmark, preferably with a recent clang; -march=native by default (CPU_ARCH_FLAGS)
     cmake -S cpu -B build-cpu -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++ -DOpenCV_DIR=<OpenCV>
@@ -159,7 +162,8 @@ expect those folders, and a `results` directory next to this repository.
 
 `CUDA_ARCH` (default `native`, the GPU of the machine) selects the CUDA architectures of the GPU benchmarks.
 `BENCH_ITERATIONS` and `BENCH_WARMUP_ITERATIONS` (default 1000 and 100, as for the paper's results) set the timed and
-warm-up iterations of every benchmark in all three projects.
+warm-up iterations of every benchmark in all three projects, and `BENCH_CROP_W`, `BENCH_CROP_H`, `BENCH_RESIZE_W` and
+`BENCH_RESIZE_H` (default 32, 16, 64 and 32) the [workload](#workload); give all three projects the same values.
 
 ## Continuous integration
 

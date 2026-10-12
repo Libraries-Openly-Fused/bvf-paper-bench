@@ -9,8 +9,11 @@
 #                                                             # fkl-vs-nppdx/benchmarks/compile_time_pipeline.cu
 #
 # BUILD is the CMake build folder of the benchmark target, configured with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON (default
-# build for SET=paper, build-nppdx for SET=nppdx). REPS (default 10) sets the timed compiles per TU. The script waits
-# until the 1 minute load average is below MAX_LOAD (default 0.5) before starting.
+# build for SET=paper, build-nppdx for SET=nppdx); the geometry is the one it was configured with. REPS (default 10)
+# sets the timed compiles per TU. The script waits until the 1 minute load average is below MAX_LOAD (default 0.5)
+# before starting. SET=nppdx compiles the NPPDx kernel of every N in the configuration benchmark_figure1_bvf chose for
+# it: NPPDX_CONFIG is the benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv of its run (default
+# ../results/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv).
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 OUT=$(mkdir -p "${1:?results directory}" && cd "$1" && pwd)
@@ -35,6 +38,11 @@ case "$SET" in
     TUS=("HEADERS 1"
          "NPPDX 1" "NPPDX 4" "NPPDX 16" "NPPDX 50" "NPPDX 100"
          "BVF 1" "BVF 4" "BVF 16" "BVF 50" "BVF 100")
+    NPPDX_CONFIG=${NPPDX_CONFIG:-$(dirname "$REPO")/results/nppdx/benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv}
+    if [ ! -f "$NPPDX_CONFIG" ]; then
+      echo "No NPPDx configuration file $NPPDX_CONFIG: run benchmark_figure1_bvf first, or set NPPDX_CONFIG" >&2
+      exit 1
+    fi
     ;;
   *) echo "SET must be paper or nppdx" >&2; exit 1 ;;
 esac
@@ -75,6 +83,18 @@ printf '%q ' "${NVCC[@]}" > "$OUT/nvcc_command.txt"
 echo >> "$OUT/nvcc_command.txt"
 FKL_DIR=$(sed -n 's/^FKL_DIR:PATH=//p' "$BUILD/CMakeCache.txt")
 NPPDX_DIR=$(sed -n 's/^NPPDX_DIR:PATH=//p' "$BUILD/CMakeCache.txt")
+GEOMETRY=$(for v in BENCH_CROP_W BENCH_CROP_H BENCH_RESIZE_W BENCH_RESIZE_H; do
+             echo -n "$v=$(sed -n "s/^$v:STRING=//p" "$BUILD/CMakeCache.txt") "; done)
+
+tu_flags() {  # impl batch: the definitions of one TU; the NPPDx kernel in the configuration chosen for this batch
+  echo "-DIMPL_$1 -DCT_BATCH=$2"
+  if [ "$1" = NPPDX ]; then
+    # Batch size, Tile, Requested BlockDim, ...
+    awk -F', *' -v n="$2" '$1 == n { split($2, t, "x"); found = 1
+        print "-DCT_NPPDX_TILE_X=" t[1] " -DCT_NPPDX_TILE_Y=" t[2] " -DCT_NPPDX_BLOCK=" $3 }
+        END { if (!found) exit 1 }' "$NPPDX_CONFIG" || { echo "No NPPDx configuration for N = $2" >&2; return 1; }
+  fi
+}
 
 # 2. Wait for an idle machine
 for _ in $(seq 60); do
@@ -92,9 +112,11 @@ START=$(date -Is)
 
 compile() {  # impl batch rep: one timed compile, wall/user/sys/maxrss appended to compile_time.csv
   local impl=$1 batch=$2 rep=$3
-  local tag="${impl}_${batch}"
+  local tag="${impl}_${batch}" flags
+  flags=$(tu_flags "$impl" "$batch")
+  # shellcheck disable=SC2086  # flags holds several definitions
   /usr/bin/time -f "%e,%U,%S,%M" -o "$WORK/time.txt" \
-    "${NVCC[@]}" "-DIMPL_$impl" "-DCT_BATCH=$batch" --time "$OUT/phases_$tag.csv" -c "$SOURCE" -o "$WORK/$tag.o"
+    "${NVCC[@]}" $flags --time "$OUT/phases_$tag.csv" -c "$SOURCE" -o "$WORK/$tag.o"
   echo "$impl,$batch,$rep,$(cat "$WORK/time.txt")" >> "$OUT/compile_time.csv"
 }
 
@@ -121,7 +143,8 @@ for tu in "${TUS[@]}"; do
   keep="$OUT/keep_$tag"
   rm -rf "$keep"
   mkdir -p "$keep"
-  "${NVCC[@]}" "-DIMPL_$1" "-DCT_BATCH=$2" -Xptxas -v --keep --keep-dir "$keep" -c "$SOURCE" -o "$keep/$tag.o" \
+  # shellcheck disable=SC2046
+  "${NVCC[@]}" $(tu_flags "$1" "$2") -Xptxas -v --keep --keep-dir "$keep" -c "$SOURCE" -o "$keep/$tag.o" \
     > "$keep/ptxas.log" 2>&1
   "$(dirname "${NVCC[0]}")/cuobjdump" --dump-resource-usage "$keep/$tag.o" > "$keep/resource_usage.txt"
   stat -c "%s" "$WORK/$tag.o" > "$keep/object_bytes.txt"   # the object of the last timed compile
@@ -148,6 +171,13 @@ done
   fi
   echo "bvf-paper-bench: $(git -C "$REPO" rev-parse --short HEAD)$([ -z "$(git -C "$REPO" status --porcelain)" ] || echo ' (with uncommitted or untracked changes)')"
   echo "source: ${SOURCE#$REPO/}, nvcc command of ${ENTRY} from $BUILD/compile_commands.json"
+  echo "geometry: $GEOMETRY(common/bench_geometry.h)"
+  if [ "$SET" = nppdx ]; then
+    for tu in "${TUS[@]}"; do
+      set -- $tu
+      [ "$1" = NPPDX ] && echo "NPPDx configuration for N = $2: $(tu_flags "$1" "$2" | tail -1) (from $NPPDX_CONFIG)"
+    done
+  fi
   echo "protocol: $REPS timed compiles per TU after 1 discarded warm-up, round-robin over the TUs, one nvcc at a time" \
        "(no -j, no ccache), -c only, objects on tmpfs ($WORK); /usr/bin/time around nvcc and nvcc --time in the same" \
        "compile; one more untimed compile per TU with -Xptxas -v --keep for the kernel facts and sizes"

@@ -1,7 +1,8 @@
 // Exploratory CPU benchmark of the Figure 1 pipeline: OpenCV on the CPU vs FKL's CPU backend (BVF).
 //   ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
-// One 3840x2160 NV12 frame in host memory, N crops of 20x10, bilinear resize to 64x32, 16 black rows on top and
-// bottom, then (x * mul - sub) / div written as float3 into an N-plane tensor.
+// One 3840x2160 NV12 frame in host memory and N crops, with the sizes and positions of common/bench_geometry.h (by
+// default 32x16 crops resized to 64x32), bilinear resize, black rows added on top and bottom up to a square, then
+// (x * mul - sub) / div written as float3 into an N-plane tensor.
 //
 // The color conversion is BT.601 limited range in both, because OpenCV's CPU cvtColor only implements that one for
 // NV12 (the GPU benchmarks use BT.2020 full range).
@@ -31,6 +32,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include "bench_geometry.h"
 #include "bench_platform.h"
 
 #include <algorithm>
@@ -42,32 +44,19 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
-#include <random>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace cpubench {
 
-constexpr int FRAME_W = 3840;
-constexpr int FRAME_H = 2160;
-constexpr int CROP_W = 20;
-constexpr int CROP_H = 10;
-constexpr int RES_W = 64;
-constexpr int RES_H = 32;
-constexpr int BORDER_TOP = 16;
-constexpr int BORDER_BOTTOM = 16;
-constexpr int OUT_W = RES_W;
-constexpr int OUT_H = RES_H + BORDER_TOP + BORDER_BOTTOM;
-constexpr int MAX_BATCH = 100;
-constexpr std::array<size_t, 5> BATCHES{1, 4, 16, 50, 100};
+// Frame, crop, resize, border and output sizes, batch sizes, seeds and crop positions, shared by every benchmark
+using namespace bench::geometry;
 // BENCH_WARMUP_ITERATIONS and BENCH_ITERATIONS come from CMake: 100 and 1000 for the paper's results, 0 and 1 in the CI
 constexpr int WARMUP_ITERS = BENCH_WARMUP_ITERATIONS;
 constexpr int ITERS = BENCH_ITERATIONS;
 static_assert(WARMUP_ITERS >= 0 && ITERS >= 1, "at least one timed iteration");
 constexpr auto IDLE_GAP = std::chrono::milliseconds(1);
-constexpr unsigned FRAME_SEED = 1;
-constexpr unsigned CROP_SEED = 42;
 
 constexpr float MUL[3] = {1.f / 255.f, 1.f / 255.f, 1.f / 255.f};
 constexpr float SUB[3] = {0.485f, 0.456f, 0.406f};
@@ -85,22 +74,12 @@ struct Workload {
 void initWorkload(Workload& w) {
     w.frame = std::make_unique<NV12Image>(FRAME_W, FRAME_H, fk::MemType::Host);
     auto data = w.frame->getData();
-    std::mt19937 gen(FRAME_SEED);
-    std::uniform_int_distribution<int> byte(0, 255);
-    for (int y = 0; y < FRAME_H * 3 / 2; ++y) {
-        for (int x = 0; x < FRAME_W; ++x) {
-            data.at(x, y) = static_cast<uchar>(byte(gen));
-        }
-    }
+    generateFrame([&](int x, int y, uint8_t value) { data.at(x, y) = value; });
     const auto raw = data.ptr();
     w.nv12 = cv::Mat(FRAME_H * 3 / 2, FRAME_W, CV_8UC1, raw.data, raw.dims.pitch);
-    std::mt19937 cropGen(CROP_SEED);
-    std::uniform_int_distribution<int> distX(0, FRAME_W - CROP_W);
-    std::uniform_int_distribution<int> distY(0, FRAME_H - CROP_H);
-    for (auto& crop : w.crops) {
-        const int x = distX(cropGen);
-        const int y = distY(cropGen);
-        crop = fk::Rect(x, y, CROP_W, CROP_H);
+    const auto crops = makeCrops();
+    for (size_t i = 0; i < MAX_BATCH; ++i) {
+        w.crops[i] = fk::Rect(crops[i].x, crops[i].y, crops[i].width, crops[i].height);
     }
 }
 
@@ -417,6 +396,7 @@ int main(int argc, char** argv) {
       << cv::getCPUFeaturesLine() << "), parallel framework " << bench::buildInfoValue(opencvBuild, "Parallel framework:")
       << "; full configuration in cpu_opencv_build_information.txt\n"
       << "OS: " << bench::osName() << "\n"
+      << "Workload: " << describe() << "\n"
       << "Pipeline: as the GPU benchmarks, with BT.601 limited range for NV12 -> RGB (the only NV12 conversion of "
          "OpenCV's CPU cvtColor)\n"
       << "Timing: steady_clock around each pipeline, " << WARMUP_ITERS << " warm-up and " << ITERS
