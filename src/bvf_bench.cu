@@ -550,8 +550,9 @@ std::vector<float> cpuReference(const Context& ctx) {
 
 // Plain C++ reference with NPP's bilinear sampling convention. FKL and OpenCV CUDA sample at src = dst * scale.
 // NPP's nppiResize / nppiResizeBatch 32f linear sample at src = dst * scale - 0.25, clamped to the image
-// (measured with linear ramps at upscale factors 2, 3.2 and 5; it is not the pixel-center convention,
-// which would be dst * scale - 0.34375 here). Same 8 bit RGB, border and pointwise tail as the 8 bit reference.
+// (measured with linear ramps at upscale factors 2, 3.2 and 5). That is the pixel-center convention,
+// (dst + 0.5) * scale - 0.5, only for an exact 2x upscale (scale 0.5); at 3.2x pixel centers would be
+// dst * scale - 0.34375. Same 8 bit RGB, border and pointwise tail as the 8 bit reference.
 constexpr float NPP_SAMPLE_OFFSET = -0.25f;
 
 template <size_t N>

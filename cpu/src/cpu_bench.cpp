@@ -171,7 +171,10 @@ std::vector<float> hostReference(const Workload& w, size_t n, bool openCVConvent
     const float sy = static_cast<float>(CROP_H) / RES_H;
     for (size_t i = 0; i < n; ++i) {
         const fk::Rect& r = w.crops[i];
-        float crop[CROP_H][CROP_W][3];
+        std::vector<float> cropPixels(static_cast<size_t>(CROP_W) * CROP_H * 3);
+        const auto crop = [&](int y, int x, int c) -> float& {
+            return cropPixels[(static_cast<size_t>(y) * CROP_W + x) * 3 + c];
+        };
         for (int y = 0; y < CROP_H; ++y) {
             for (int x = 0; x < CROP_W; ++x) {
                 fk::uchar3 yuv = w.frame->readAt(fk::Point{static_cast<int>(r.x) + x, static_cast<int>(r.y) + y, 0});
@@ -182,7 +185,7 @@ std::vector<float> hostReference(const Workload& w, size_t n, bool openCVConvent
                 const fk::float3 rgb = YUVToRGB::exec(yuv);
                 const float c3[3] = {rgb.x, rgb.y, rgb.z};
                 for (int c = 0; c < 3; ++c) {
-                    crop[y][x][c] = openCVConventions ? std::floor(std::clamp(c3[c], 0.f, 255.f) + 0.5f) : c3[c];
+                    crop(y, x, c) = openCVConventions ? std::floor(std::clamp(c3[c], 0.f, 255.f) + 0.5f) : c3[c];
                 }
             }
         }
@@ -199,8 +202,8 @@ std::vector<float> hostReference(const Workload& w, size_t n, bool openCVConvent
                     const int x1 = std::min(x0 + 1, CROP_W - 1), y1 = std::min(y0 + 1, CROP_H - 1);
                     const float ax = fx - x0, ay = fy - y0;
                     for (int c = 0; c < 3; ++c) {
-                        v[c] = (crop[y0][x0][c] * (1.f - ax) + crop[y0][x1][c] * ax) * (1.f - ay) +
-                               (crop[y1][x0][c] * (1.f - ax) + crop[y1][x1][c] * ax) * ay;
+                        v[c] = (crop(y0, x0, c) * (1.f - ax) + crop(y0, x1, c) * ax) * (1.f - ay) +
+                               (crop(y1, x0, c) * (1.f - ax) + crop(y1, x1, c) * ax) * ay;
                     }
                 }
                 float* dst = &out[((i * OUT_H + y) * OUT_W + x) * 3];

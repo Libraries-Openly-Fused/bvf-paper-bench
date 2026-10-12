@@ -179,17 +179,18 @@ struct Tile {
 };
 
 // Candidate tiles: the whole crop, then the longer side halved (the height on ties, the other side when the longer
-// one cannot be halved) while the tile still splits the crop, down to 64 pixels
+// one cannot be halved) while the tile still splits the crop, down to 64 pixels (a crop of fewer pixels is its only
+// candidate). 24 entries hold every halving of any crop that fits in the frame.
 constexpr unsigned MIN_TILE_PIXELS = 64;
 struct TileList {
-    std::array<Tile, 8> tiles{};
+    std::array<Tile, 24> tiles{};
     size_t count{0};
 };
 constexpr TileList candidateTiles() {
     static_assert(tileSplitsCrop(CROP_W, CROP_H), "NPPDx needs crops made of 4x2 pixel cells and J pixel groups");
     TileList list;
     Tile t{CROP_W, CROP_H};
-    while (list.count < list.tiles.size() && t.x * t.y >= MIN_TILE_PIXELS) {
+    while (list.count < list.tiles.size() && (list.count == 0 || t.x * t.y >= MIN_TILE_PIXELS)) {
         list.tiles[list.count++] = t;
         const Tile halveX{t.x / 2, t.y}, halveY{t.x, t.y / 2};
         const Tile first = t.x > t.y ? halveX : halveY, second = t.x > t.y ? halveY : halveX;

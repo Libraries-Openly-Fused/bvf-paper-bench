@@ -111,9 +111,11 @@ All the operations run in the same kernel, which is launched with the largest of
 recommended block covers the tile without the resize halo, and would leave rows of the input tile unloaded). Every
 supported tile is tried with NPPDx's recommended configuration and with `BlockDim` 64, 128, 256 and 512, for every N:
 the benchmark checks each one against the pixel-center reference, times it alone, and compares FKL with the fastest
-correct one (a `BlockDim` smaller than the recommended block of a tile gives wrong results, and is never chosen). The
-chosen configuration of every N drives all three comparisons (CPU + GPU, GPU only and GPU only with the L2 flushed),
-the Nsight Compute scripts and the NPPDx compile-time units. Every configuration tried is in
+correct one (a `BlockDim` smaller than the recommended block of a tile gives wrong results, and is never chosen; a
+configuration this GPU cannot launch is reported and skipped). The chosen configuration of every N drives all three
+comparisons (CPU + GPU, GPU only and GPU only with the L2 flushed), the Nsight Compute scripts and the NPPDx
+compile-time units. `benchmark_figure1_bvf <dir> --configs <csv>` runs the comparison with the configurations of a
+CSV in the format of the configuration file instead of choosing them, for example to re-time other candidates. Every configuration tried is in
 `benchmark_figure1_bvf_nppdx_block_sweep_GPU_NVIDIA.csv`, and the chosen ones in
 `benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv`.
 

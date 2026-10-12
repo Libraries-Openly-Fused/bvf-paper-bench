@@ -285,8 +285,12 @@ void analyze(Workload& w) {
         float* tile = nullptr;
         gpuErrchk(cudaMalloc(&tile, TW * TH * 3 * sizeof(float)));
         constexpr size_t smemIn = nppdx::shared_memory::compute_total_tile_storage<In>();
-        nppdxConvertOnlyKernel<typename Nppdx::Ingest, typename Nppdx::Convert, In>
-            <<<1, Nppdx::block, smemIn, w.stream>>>(w.y, w.uv, w.pitch, origins.origin[0], tile);
+        constexpr auto convertOnly = nppdxConvertOnlyKernel<typename Nppdx::Ingest, typename Nppdx::Convert, In>;
+        if constexpr (smemIn > 48 * 1024) {
+            gpuErrchk(cudaFuncSetAttribute(convertOnly, cudaFuncAttributeMaxDynamicSharedMemorySize, smemIn));
+        }
+        convertOnly<<<1, Nppdx::block, smemIn, w.stream>>>(w.y, w.uv, w.pitch, origins.origin[0], tile);
+        gpuErrchk(cudaGetLastError());
         gpuErrchk(cudaStreamSynchronize(w.stream));
         const auto t = download(tile, TW * TH * 3);
         gpuErrchk(cudaFree(tile));
@@ -310,7 +314,12 @@ void analyze(Workload& w) {
                   << ", clamped to [0,255] " << maxClamped << std::endl;
     }
     const auto ref = hostVariant(w, w.crops[0], false, Sampling::DstTimesScale);
+    // The first rows of the top border and of the resized crop, the middle, the last resized row and the first row of
+    // the bottom border (when there is one)
     for (const int y : {0, BORDER_TOP, BORDER_TOP + 1, OUT_H / 2 - 2, BORDER_TOP + RES_H - 1, BORDER_TOP + RES_H}) {
+        if (y >= OUT_H) {
+            continue;
+        }
         for (const int x : {0, 1, OUT_W / 2 - 1, OUT_W - 1}) {
             const size_t i = (y * OUT_W + x) * 3;
             std::cout << "  (" << x << "," << y << ") NPPDx " << nppdx[i] << " " << nppdx[i + 1] << " " << nppdx[i + 2]
@@ -324,6 +333,8 @@ constexpr float TOLERANCE = 1e-3f;
 // NPPDx configuration (index into NPPDX_CONFIGS) chosen for every batch size in the CPU + GPU benchmark, reused by
 // the GPU only benchmark and, through the configuration CSV, by --gpu-only-l2-flushed
 std::map<size_t, size_t> chosenConfig;
+// Configurations given with --configs <csv>, used instead of choosing one
+std::map<size_t, size_t> pinnedConfig;
 
 struct BlockSweep {
     size_t batch{0};
@@ -367,13 +378,23 @@ template <size_t N, NppdxConfig C>
 void sweepConfig(Workload& w, const CropOrigins<N>& origins, float* out, const std::vector<float>& reference,
                  std::vector<BlockSweep>& sweep) {
     using Nppdx = NppdxKernel<NPPDX_SM, N, C>;
-    Nppdx::init();
     constexpr size_t outFloats = N * OUT_FLOATS;
+    BlockSweep b{N, C.block, C.tileX, C.tileY, Nppdx::block.x, Nppdx::grid.x * Nppdx::grid.y, Nppdx::smem};
     gpuErrchk(cudaMemset(out, 0xFF, outFloats * sizeof(float)));
-    Nppdx::run(w.stream, w.y, w.uv, w.pitch, origins, norm, out);
-    gpuErrchk(cudaStreamSynchronize(w.stream));
-    BlockSweep b{N, C.block, C.tileX, C.tileY, Nppdx::block.x, Nppdx::grid.x * Nppdx::grid.y, Nppdx::smem, {},
-                 compare(download(out, outFloats), reference)};
+    try {
+        Nppdx::init();
+        Nppdx::run(w.stream, w.y, w.uv, w.pitch, origins, norm, out);
+        gpuErrchk(cudaStreamSynchronize(w.stream));
+    } catch (const std::exception& e) {
+        // A configuration that cannot be launched (more than 1024 threads, too many registers or too much shared
+        // memory for this GPU) is recorded as failed, with an infinite error, and never chosen
+        std::cout << "Batch " << N << ": NPPDx tile " << C.tileX << "x" << C.tileY << " block " << C.block
+                  << " cannot run here: " << e.what() << std::endl;
+        b.vsPixelCenters.max = INFINITY;
+        sweep.push_back(b);
+        return;
+    }
+    b.vsPixelCenters = compare(download(out, outFloats), reference);
     b.time = benchmark::runOneExecution(w.stream, [&]() { Nppdx::run(w.stream, w.y, w.uv, w.pitch, origins, norm, out); });
     sweep.push_back(b);
 }
@@ -418,24 +439,29 @@ void runBatch(Workload& w, std::vector<benchmark::TwoExecutionsResult>& results,
     const auto fklReference = cpuReference<N>(w, crops);
     const auto pixelCenters = pixelCenterReference<N>(w, crops);
 
-    // Every NPPDx configuration is validated and timed alone; the fastest correct one is compared with FKL
-    const size_t first = sweep.size();
-    [&]<size_t... Is>(std::index_sequence<Is...>) {
-        (sweepConfig<N, NPPDX_CONFIGS[Is]>(w, origins, nppdxOut, pixelCenters, sweep), ...);
-    }(std::make_index_sequence<NPPDX_CONFIGS.size()>{});
+    // Every NPPDx configuration is validated and timed alone; the fastest correct one is compared with FKL (unless
+    // --configs gave one)
     size_t best = NPPDX_CONFIGS.size();
-    float bestMedian = INFINITY;
-    for (size_t i = first; i < sweep.size(); ++i) {
-        if (sweep[i].vsPixelCenters.max <= TOLERANCE && sweep[i].time.median < bestMedian) {
-            bestMedian = sweep[i].time.median;
-            best = i - first;
+    if (pinnedConfig.count(N)) {
+        best = pinnedConfig.at(N);
+    } else {
+        const size_t first = sweep.size();
+        [&]<size_t... Is>(std::index_sequence<Is...>) {
+            (sweepConfig<N, NPPDX_CONFIGS[Is]>(w, origins, nppdxOut, pixelCenters, sweep), ...);
+        }(std::make_index_sequence<NPPDX_CONFIGS.size()>{});
+        float bestMedian = INFINITY;
+        for (size_t i = first; i < sweep.size(); ++i) {
+            if (sweep[i].vsPixelCenters.max <= TOLERANCE && sweep[i].time.median < bestMedian) {
+                bestMedian = sweep[i].time.median;
+                best = i - first;
+            }
         }
-    }
-    if (best == NPPDX_CONFIGS.size()) {
-        throw std::runtime_error("No NPPDx configuration produced a correct result for batch " + std::to_string(N));
+        if (best == NPPDX_CONFIGS.size()) {
+            throw std::runtime_error("No NPPDx configuration produced a correct result for batch " + std::to_string(N));
+        }
+        sweep[first + best].chosen = true;
     }
     chosenConfig[N] = best;
-    sweep[first + best].chosen = true;
     withConfig<NPPDX_CONFIGS>(best, [&]<NppdxConfig C>() {
         compareWithFKL<N, C>(w, origins, crops, nppdxOut, fklOut, fklReference, pixelCenters, results, checks);
     });
@@ -486,28 +512,30 @@ size_t configIndex(unsigned tileX, unsigned tileY, unsigned block) {
                              " and block " + std::to_string(block) + "; valid:" + valid);
 }
 
-// The configuration chosen for every batch size, as the CPU + GPU benchmark wrote it
+// The NPPDx configuration of every batch size from a configuration CSV, as the CPU + GPU benchmark writes it
 // (benchmark_figure1_bvf_nppdx_config_<ParArch>.csv: batch size, tile, requested block, ...)
-void readChosenConfigs(const std::filesystem::path& path) {
+std::map<size_t, size_t> readConfigs(const std::filesystem::path& path) {
     std::ifstream csv(path);
     if (!csv) {
         throw std::runtime_error("Cannot read " + path.string() + ": run the benchmark without a mode into the same "
                                  "directory first, it chooses the NPPDx configuration of every batch size");
     }
+    std::map<size_t, size_t> configs;
     std::string line;
     std::getline(csv, line); // header
     while (std::getline(csv, line)) {
         size_t batch = 0;
         unsigned tileX = 0, tileY = 0, block = 0;
         if (std::sscanf(line.c_str(), "%zu, %ux%u, %u", &batch, &tileX, &tileY, &block) == 4) {
-            chosenConfig[batch] = configIndex(tileX, tileY, block);
+            configs[batch] = configIndex(tileX, tileY, block);
         }
     }
     for (const size_t n : BATCHES) {
-        if (!chosenConfig.count(n)) {
+        if (!configs.count(n)) {
             throw std::runtime_error(path.string() + " has no configuration for batch size " + std::to_string(n));
         }
     }
+    return configs;
 }
 
 // Target for Nsight Compute: warms up NPPDx (in the configuration given by its index into NPPDX_CONFIGS) or FKL, then
@@ -594,7 +622,7 @@ int main(int argc, char** argv) {
         initWorkload(w);
         if (argc > 2 && std::string(argv[2]) == "--gpu-only-l2-flushed") {
             // NPPDx in the configuration the CPU + GPU benchmark chose for every batch size, from its CSV in outDir
-            readChosenConfigs(configCsv);
+            chosenConfig = readConfigs(configCsv);
             const benchmark::L2Flusher flusher(w.stream);
             std::cout << "Flushing " << flusher.bytes() / (1 << 20) << " MiB (2x L2) before every kernel" << std::endl;
             std::vector<benchmark::TwoExecutionsResult> flushed;
@@ -628,8 +656,12 @@ int main(int argc, char** argv) {
             analyze<256>(w);
             return 0;
         }
-        // Any other argument is a mistake: running the default benchmark instead would overwrite its results in outDir
-        if (argc > 2) {
+        // --configs <csv>: the default benchmark with the NPPDx configuration of every batch size given in the CSV (in
+        // the format of the configuration CSV this benchmark writes) instead of the fastest of NPPDX_CONFIGS
+        if (argc > 3 && std::string(argv[2]) == "--configs") {
+            pinnedConfig = readConfigs(argv[3]);
+        } else if (argc > 2) {
+            // Any other argument is a mistake: running the default benchmark instead would overwrite its results
             throw std::runtime_error(std::string("Unknown mode: ") + argv[2] + " (see the modes in README.md)");
         }
         std::vector<benchmark::TwoExecutionsResult> results;
@@ -657,20 +689,23 @@ int main(int argc, char** argv) {
         blocks << "Batch size, Requested BlockDim (0 = NPPDx recommended), Tile, Actual BlockSize, Blocks per crop, "
                   "Dynamic shared memory bytes, MeanTime, MedianTime, P10Time, P90Time, "
                   "MaxAbsError vs pixel-center reference, Chosen" << std::endl;
-        // The chosen configuration of every batch size, read back by --gpu-only-l2-flushed and the Nsight Compute
-        // scripts
-        std::ofstream chosen(configCsv);
-        chosen << "Batch size, Tile, Requested BlockDim (0 = NPPDx recommended), Actual BlockSize, Blocks per crop, "
-                  "Dynamic shared memory bytes" << std::endl;
         for (const auto& b : sweep) {
             blocks << b.batch << ", " << b.requestedBlock << ", " << b.tileX << "x" << b.tileY << ", " << b.actualBlock
                    << ", " << b.blocksPerCrop << ", " << b.smem << ", " << b.time.mean << ", " << b.time.median << ", "
                    << b.time.p10 << ", " << b.time.p90 << ", " << b.vsPixelCenters.max << ", "
                    << (b.chosen ? "yes" : "no") << std::endl;
-            if (b.chosen) {
-                chosen << b.batch << ", " << b.tileX << "x" << b.tileY << ", " << b.requestedBlock << ", "
-                       << b.actualBlock << ", " << b.blocksPerCrop << ", " << b.smem << std::endl;
-            }
+        }
+        // The configuration of every batch size, read back by --gpu-only-l2-flushed, --configs, the Nsight Compute
+        // scripts and the compile-time units
+        std::ofstream chosen(configCsv);
+        chosen << "Batch size, Tile, Requested BlockDim (0 = NPPDx recommended), Actual BlockSize, Blocks per crop, "
+                  "Dynamic shared memory bytes" << std::endl;
+        for (const auto& [batch, index] : chosenConfig) {
+            withConfig<NPPDX_CONFIGS>(index, [&, batch = batch]<NppdxConfig C>() {
+                using K = NppdxKernel<NPPDX_SM, 1, C>;
+                chosen << batch << ", " << C.tileX << "x" << C.tileY << ", " << C.block << ", " << K::block.x << ", "
+                       << K::grid.x * K::grid.y << ", " << K::smem << std::endl;
+            });
         }
         std::string tiles;
         for (size_t i = 0; i < NPPDX_CONFIGS.size(); i += NPPDX_BLOCKS.size()) {
@@ -707,10 +742,13 @@ int main(int argc, char** argv) {
                  << "NPPDx configuration: resize " << RESIZE_J << ":" << RESIZE_K << "; the tiles NPPDx supports for "
                  << CROP_W << "x" << CROP_H << " crops among the whole crop and its successive halvings down to "
                  << MIN_TILE_PIXELS << " pixels (multiples of NPPDx's 4x2 pixel cells and of J) are " << tiles
-                 << ", each with NPPDx's recommended block and with BlockDim 64, 128, 256 and 512. For every batch "
-                    "size every configuration is validated and timed alone (" << name << "_nppdx_block_sweep_"
-                 << parArch << ".csv), and the fastest correct one (" << configCsv.filename().string()
-                 << ") is compared with FKL in all three benchmarks.\n";
+                 << ", each with NPPDx's recommended block and with BlockDim 64, 128, 256 and 512. "
+                 << (pinnedConfig.empty()
+                         ? "For every batch size every configuration is validated and timed alone (" + name +
+                               "_nppdx_block_sweep_" + parArch + ".csv), and the fastest correct one (" +
+                               configCsv.filename().string() + ") is compared with FKL in all three benchmarks.\n"
+                         : "This run used the configurations given with --configs (" + configCsv.filename().string() +
+                               ") instead of choosing them.\n");
         std::cout << "CSV files written to " << std::filesystem::absolute(outDir) << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "ERROR: " << e.what() << std::endl;
