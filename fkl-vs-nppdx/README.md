@@ -93,6 +93,8 @@ to the crop origin, and FKL relative to the frame, which only read the same samp
 
 ## NPPDx configuration
 
+The NPPDx kernel and its configuration (`NppdxFigure1`) are in `benchmarks/nppdx_figure1.h`.
+
 NPPDx tiles must be multiples of its 4x2 pixel cells and of the 5:16 resize ratio, so the only valid tile for a
 20x10 crop is the whole crop, one thread block per crop. All the operations run in the same kernel, which is
 launched with the largest of their block sizes (the ingest's own recommended block covers the tile without the
