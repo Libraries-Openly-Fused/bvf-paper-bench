@@ -193,8 +193,10 @@ expect those folders, and a `results` directory next to this repository.
 `scripts/run_all.sh` does all of this for both workloads of the paper, the 32x16 crops resized 1:2 and the earlier
 20x10 crops resized 5:16 (`GEOMETRIES`), each with its own build folders (`build-32x16`, `build-nppdx-32x16`,
 `build-cpu-32x16`, ...) and results folder (`../results/32x16`, `../results/20x10`, with the FKL vs NPPDx runs in
-`nppdx/` and `nppdx_npp/` and the CPU one in `cpu/`), and prints the Nsight Compute commands of each workload, which
-need sudo; `COMPILE_TIME=1` adds the compile-time units:
+`nppdx/` and `nppdx_npp/` and the CPU one in `cpu/`); `COMPILE_TIME=1` adds the compile-time units. When the
+driver lets every user read the GPU performance counters (`RmProfilingAdminOnly: 0`), it also runs the Nsight Compute
+scripts, their summaries and the traffic model of each workload; otherwise it prints their commands, which then need
+sudo:
 
     OpenCV_DIR=<OpenCV> CPU_CXX=clang++ scripts/run_all.sh ../results
 

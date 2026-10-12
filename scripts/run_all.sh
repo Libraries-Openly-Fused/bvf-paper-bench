@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Builds and runs every benchmark of this repository for every workload of the paper, each into its own results
 # folder: the GPU benchmark (all modes but the Nsight Compute targets), the two FKL vs NPPDx benchmarks (with the L2
-# flushed too), the CPU benchmark and, with COMPILE_TIME=1, the compile-time units. Without sudo; the Nsight Compute
-# scripts, which need root while the driver restricts the GPU performance counters, are printed at the end.
+# flushed too), the CPU benchmark, with COMPILE_TIME=1 the compile-time units, and the memory traffic with Nsight
+# Compute (scripts/ncu_dram.sh and ncu_l2.sh, their summaries and the traffic model) when the driver lets every user
+# read the GPU performance counters (RmProfilingAdminOnly=0); otherwise, since those scripts then need root, their
+# commands are printed at the end. Never uses sudo itself.
 #
 #     OpenCV_DIR=<OpenCV build or install> scripts/run_all.sh [<results folder, default ../results>]
 #
@@ -12,6 +14,8 @@
 #                <results folder>/<crop W>x<crop H>
 #   STEPS        what to build and run, among gpu, nppdx, cpu (default "gpu nppdx cpu")
 #   COMPILE_TIME 1 to also run compile_time/run.sh for both sets after the benchmarks (long: 10 rounds of every unit)
+#   PROFILE      1 to run the Nsight Compute scripts, 0 to print their commands (default 1 when the GPU performance
+#                counters are open to every user, needs the gpu and nppdx steps)
 #   BUILD_ROOT   where the build folders go (default this repository): build-<crop>, build-nppdx-<crop> and
 #                build-cpu-<crop>, for example build-32x16
 #   CPU_CXX      C++ compiler of the CPU benchmark (default clang++; the README recommends a recent clang)
@@ -24,6 +28,12 @@ RESULTS=$(realpath -m "${1:-$(dirname "$REPO")/results}")
 GEOMETRIES=${GEOMETRIES:-"32x16:64x32 20x10:64x32"}
 STEPS=${STEPS:-"gpu nppdx cpu"}
 COMPILE_TIME=${COMPILE_TIME:-0}
+if grep -q "RmProfilingAdminOnly: 0" /proc/driver/nvidia/params 2>/dev/null; then
+    COUNTERS_OPEN=1
+else
+    COUNTERS_OPEN=0
+fi
+PROFILE=${PROFILE:-$COUNTERS_OPEN}
 BUILD_ROOT=${BUILD_ROOT:-$REPO}
 CPU_CXX=${CPU_CXX:-clang++}
 read -r -a EXTRA <<< "${CMAKE_ARGS:-}"
@@ -39,8 +49,9 @@ configure() { # <source> <build folder> <geometry options...>: configures and bu
     local source=$1 build=$2
     shift 2
     cmake -G "$GENERATOR" -S "$source" -B "$build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-          "$@" "${EXTRA[@]}" > "$build.configure.log" 2>&1 || { cat "$build.configure.log" >&2; exit 1; }
-    cmake --build "$build" -j "$(nproc)" > "$build.build.log" 2>&1 || { tail -50 "$build.build.log" >&2; exit 1; }
+          "$@" "${EXTRA[@]}" > "$build/run_all_configure.log" 2>&1 || { cat "$build/run_all_configure.log" >&2; exit 1; }
+    cmake --build "$build" -j "$(nproc)" > "$build/run_all_build.log" 2>&1 ||
+        { tail -50 "$build/run_all_build.log" >&2; exit 1; }
 }
 
 run() { # <log> <command...>: runs a benchmark, keeping its output
@@ -97,17 +108,27 @@ for geometry in $GEOMETRIES; do
             "$REPO/compile_time/run.sh" "$out/compile_time_nppdx"
     fi
     if has_step gpu && has_step nppdx; then
-        NCU_COMMANDS+=("sudo PAPER_BENCH=$gpu/bvf_bench NPPDX_BENCH=$nppdx/benchmark_figure1_bvf \\
-     NPPDX_NPP_BENCH=$nppdx/benchmark_figure1_nppdx_npp BVF_RESULTS=$out $REPO/scripts/ncu_dram.sh
-sudo PAPER_BENCH=$gpu/bvf_bench NPPDX_BENCH=$nppdx/benchmark_figure1_bvf \\
-     NPPDX_NPP_BENCH=$nppdx/benchmark_figure1_nppdx_npp BVF_RESULTS=$out $REPO/scripts/ncu_l2.sh
+        benches=(PAPER_BENCH="$gpu/bvf_bench" NPPDX_BENCH="$nppdx/benchmark_figure1_bvf"
+                 NPPDX_NPP_BENCH="$nppdx/benchmark_figure1_nppdx_npp" BVF_RESULTS="$out")
+        if [ "$PROFILE" = 1 ]; then
+            echo "  Memory traffic (Nsight Compute)"
+            run "$out/logs/ncu_dram_run.log" env "${benches[@]}" "$REPO/scripts/ncu_dram.sh"
+            run "$out/logs/ncu_l2_run.log" env "${benches[@]}" "$REPO/scripts/ncu_l2.sh"
+            run "$out/logs/ncu_summarize.log" env BVF_RESULTS="$out" "$REPO/scripts/ncu_summarize.py"
+            run "$out/logs/ncu_summarize_l2.log" env BVF_RESULTS="$out" "$REPO/scripts/ncu_summarize.py" l2
+            run "$out/logs/ncu_traffic_model.log" env BVF_RESULTS="$out" "$REPO/scripts/ncu_traffic_model.py"
+        else
+            sudo=$([ "$COUNTERS_OPEN" = 1 ] && echo "" || echo "sudo ")
+            NCU_COMMANDS+=("${sudo}${benches[*]} $REPO/scripts/ncu_dram.sh
+${sudo}${benches[*]} $REPO/scripts/ncu_l2.sh
 BVF_RESULTS=$out $REPO/scripts/ncu_summarize.py && BVF_RESULTS=$out $REPO/scripts/ncu_summarize.py l2 && \\
      BVF_RESULTS=$out $REPO/scripts/ncu_traffic_model.py")
+        fi
     fi
 done
 
 echo "Done: results in $RESULTS"
 if [ ${#NCU_COMMANDS[@]} -gt 0 ]; then
-    echo "Memory traffic (Nsight Compute; root while RmProfilingAdminOnly=1), for every workload:"
+    echo "Memory traffic (Nsight Compute; with sudo while RmProfilingAdminOnly=1), for every workload:"
     printf '%s\n\n' "${NCU_COMMANDS[@]}"
 fi
