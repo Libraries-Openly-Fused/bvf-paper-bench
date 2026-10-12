@@ -8,6 +8,9 @@ project(bvf_rpp_cpu_bench LANGUAGES CXX)
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
+# The workload of every benchmark: BENCH_CROP_W, BENCH_CROP_H, BENCH_RESIZE_W, BENCH_RESIZE_H (common/bench_geometry.h)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../common/bench_geometry.cmake)
+
 set(FKL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../FusedKernelLibrary-b7f97b5" CACHE PATH "FusedKernelLibrary checkout (b7f97b5, the paper's CPU commit)")
 set(ROCM_PATH "/opt/rocm/core-10.1" CACHE PATH "ROCm installation (HIP headers, which rpp.h includes)")
 set(RPP_ROOT "${ROCM_PATH}" CACHE PATH "Prefix with include/rpp/rpp.h and lib/librpp.so")
@@ -34,12 +37,12 @@ find_package(Threads REQUIRED)
 add_executable(rpp_cpu_bench src/rpp_cpu_bench.cpp)
 set_target_properties(rpp_cpu_bench PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF
                                                BUILD_RPATH "${RPP_ROOT}/lib")
-target_include_directories(rpp_cpu_bench PRIVATE ${FKL_DIR}/include ${FKL_DIR}/thread-pool/include ${RPP_INCLUDE_DIR}
+target_include_directories(rpp_cpu_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../common ${FKL_DIR}/include ${FKL_DIR}/thread-pool/include ${RPP_INCLUDE_DIR}
                                                  ${ROCM_PATH}/include)
 separate_arguments(CPU_ARCH_FLAGS_LIST UNIX_COMMAND "${CPU_ARCH_FLAGS}")
 target_compile_options(rpp_cpu_bench PRIVATE ${CPU_ARCH_FLAGS_LIST} -ftemplate-depth=1000)
 # FK_CPU_MULTITHREAD_ENABLED turns on FKL's CPU_MULTITHREAD backend; __HIP_PLATFORM_AMD__ for the HIP headers rpp.h includes
-target_compile_definitions(rpp_cpu_bench PRIVATE FK_CPU_MULTITHREAD_ENABLED __HIP_PLATFORM_AMD__
+target_compile_definitions(rpp_cpu_bench PRIVATE ${BENCH_GEOMETRY_DEFINITIONS} FK_CPU_MULTITHREAD_ENABLED __HIP_PLATFORM_AMD__
                            BENCH_FKL_COMMIT="${FKL_COMMIT}" BENCH_THREAD_POOL_COMMIT="${THREAD_POOL_COMMIT}"
                            BENCH_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
                            BENCH_CXX_FLAGS="${CMAKE_CXX_FLAGS_RELEASE} -std=c++20 ${CPU_ARCH_FLAGS} -ftemplate-depth=1000"

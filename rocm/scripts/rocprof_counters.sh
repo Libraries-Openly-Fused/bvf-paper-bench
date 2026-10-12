@@ -1,8 +1,8 @@
 #!/bin/bash
 # Experiment 2, memory traffic: hardware counters (rocprofv3 --pmc) of one execution of every pipeline, with the
-# caches flushed before every GPU operation, after three warm-up executions (rocm_bench --rocprof-target), for
-# N = 1, 16, 100 (and, with RUN_REGION=1, the four cases of the region-size sweep). One rocprofv3 run per counter, so
-# that no counter needs a second hardware pass. The counters of the dispatches after the marker kernel are summed,
+# caches flushed before every GPU operation, after three warm-up executions (rocm_bench --rocprof-target), for every
+# batch size N of the benchmark (rocm_bench --batches, common/bench_geometry.h). One rocprofv3 run per counter, so that
+# no counter needs a second hardware pass. The counters of the dispatches after the marker kernel are summed,
 # without the flush kernels (summarize_counters.py).
 #   rocm/scripts/rocprof_counters.sh <output dir> [<rocm_bench executable>]
 # COUNTERS (default "FETCH_SIZE GL2C_EA_WRREQ_sum GL2C_EA_WRREQ_64B_sum"): the counters to collect, as listed by
@@ -32,16 +32,10 @@ collect() { # <label> <rocm_bench target arguments...>: one rocprofv3 run per co
     echo "$label"
 }
 
-for N in 1 16 100; do
+BATCHES=$("$BENCH" --batches) || { echo "$BENCH --batches failed"; exit 1; }
+for N in $BATCHES; do
     for impl in $IMPLS; do
         collect "${impl}_N${N}" --rocprof-target "$impl" "$N"
     done
 done
-if [ "${RUN_REGION:-0}" = 1 ]; then
-    for case in A B C D; do
-        for impl in $IMPLS; do
-            collect "${impl}_region_${case}" --region-rocprof-target "$impl" "$case"
-        done
-    done
-fi
 python3 "$REPO/rocm/scripts/summarize_counters.py" "$OUT"

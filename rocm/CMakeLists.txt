@@ -14,6 +14,9 @@ if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
     set(CMAKE_HIP_ARCHITECTURES gfx1200)
 endif()
 
+# The workload of every benchmark: BENCH_CROP_W, BENCH_CROP_H, BENCH_RESIZE_W, BENCH_RESIZE_H (common/bench_geometry.h)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../common/bench_geometry.cmake)
+
 set(FKL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../FusedKernelLibrary" CACHE PATH "FusedKernelLibrary checkout (branch bvf-paper-bench, b9f4281)")
 set(ROCM_PATH "/opt/rocm/core-10.1" CACHE PATH "ROCm installation")
 set(RPP_ROOT "${ROCM_PATH}" CACHE PATH "Prefix with include/rpp/rpp.h and lib/librpp.so")
@@ -43,9 +46,10 @@ set_target_properties(rocm_bench PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRE
                                             # rocprofiler_configure must be visible to rocprofiler-register
                                             ENABLE_EXPORTS ON
                                             BUILD_RPATH "${RPP_ROOT}/lib;${ROCPROFILER_SDK_ROOT}/lib")
-target_include_directories(rocm_bench PRIVATE ${FKL_DIR}/include ${RPP_INCLUDE_DIR} ${ROCPROFILER_SDK_INCLUDE_DIR})
+target_include_directories(rocm_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common ${FKL_DIR}/include ${RPP_INCLUDE_DIR}
+                                              ${ROCPROFILER_SDK_INCLUDE_DIR})
 target_compile_options(rocm_bench PRIVATE $<$<COMPILE_LANGUAGE:HIP>:${BENCH_HIP_OPTIONS}>)
-target_compile_definitions(rocm_bench PRIVATE
+target_compile_definitions(rocm_bench PRIVATE ${BENCH_GEOMETRY_DEFINITIONS}
     BENCH_FKL_COMMIT="${FKL_COMMIT}" BENCH_FKL_BRANCH="${FKL_BRANCH}" BENCH_HIP_FLAGS="${BENCH_HIP_FLAGS}"
     BENCH_ROCM_PATH="${ROCM_PATH}" BENCH_RPP_LIB="${RPP_LIBRARY}" BENCH_ROCPROFILER_LIB="${ROCPROFILER_SDK_LIBRARY}")
 target_link_libraries(rocm_bench PRIVATE ${RPP_LIBRARY} ${ROCPROFILER_SDK_LIBRARY})

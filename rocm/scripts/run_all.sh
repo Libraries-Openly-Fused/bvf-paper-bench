@@ -4,7 +4,8 @@
 # In order: a platform snapshot, the builds, the prerequisite checks (kernel dispatch tracing, hardware counters), the
 # GPU benchmark (CPU + GPU pass, then in its profiling child process the kernel counts, GPU time only and GPU time only
 # with L2 + MALL flushed), RPP's resize convention, the hardware counter collection (Experiment 2) and the CPU
-# benchmark (RPP HOST vs FKL CPU). The region-size sweep only with RUN_REGION=1. Every step logs to <results dir>/logs.
+# benchmark (RPP HOST vs FKL CPU). Every step logs to <results dir>/logs. The workload (crop and resize sizes, batch
+# sizes) is the one of common/bench_geometry.h; BENCH_CMAKE_ARGS passes other BENCH_CROP_W ... values to both builds.
 #
 # Environment (all optional):
 #   ROCM_PATH       ROCm installation (default /opt/rocm/core-10.1)
@@ -15,7 +16,7 @@
 #   COUNTERS        hardware counters for Experiment 2 (default "FETCH_SIZE GL2C_EA_WRREQ_sum GL2C_EA_WRREQ_64B_sum":
 #                   rocprofiler-sdk 1.4.1 defines FETCH_SIZE for gfx12 but not WRITE_SIZE, which summarize_counters.py
 #                   derives from the two GL2C_EA write counters with WRITE_SIZE's gfx10/gfx11 formula)
-#   RUN_REGION=1    also run the region-size sweep (GPU benchmark and counters)
+#   BENCH_CMAKE_ARGS extra CMake arguments of both builds, e.g. "-DBENCH_CROP_W=32 -DBENCH_CROP_H=16" (default none)
 #   BENCH_MALL_KIB  MALL (Infinity Cache) size in KiB, if rocminfo / amd-smi cannot report it
 # Development only (the results are then not the paper's): ALLOW_NO_KERNEL_TRACE=1, ALLOW_NO_COUNTERS=1, ALLOW_BUSY=1,
 # ALLOW_OTHER_FKL=1, SKIP_CPU=1
@@ -103,16 +104,25 @@ if awk "BEGIN{exit !($LOAD >= 0.5)}"; then
 fi
 
 # ---------------------------------------------------------------- builds
+# The geometry options are reset on every configure, so that values cached in an existing build directory (an earlier
+# run with BENCH_CMAKE_ARGS, a manual configure) never leak into this run: the defaults of common/bench_geometry.cmake
+# unless BENCH_CMAKE_ARGS sets them
+GEOMETRY_ARGS="-UBENCH_CROP_W -UBENCH_CROP_H -UBENCH_RESIZE_W -UBENCH_RESIZE_H ${BENCH_CMAKE_ARGS:-}"
 step build_gpu bash -c "cmake -S '$REPO/rocm' -B '$BUILD_GPU' -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER='$ROCM_PATH/bin/amdclang++' -DCMAKE_HIP_COMPILER='$ROCM_PATH/bin/amdclang++' \
     -DROCM_PATH='$ROCM_PATH' -DFKL_DIR='$FKL_GPU_DIR' -DRPP_ROOT='$ROCM_EXTRA' -DROCPROFILER_SDK_ROOT='$ROCM_EXTRA' \
-    && cmake --build '$BUILD_GPU'"
+    $GEOMETRY_ARGS && cmake --build '$BUILD_GPU'"
 if ! allowed SKIP_CPU; then
     step build_cpu bash -c "cmake -S '$REPO/rocm/cpu' -B '$BUILD_CPU' -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CXX_COMPILER='$CXX_CPU' -DROCM_PATH='$ROCM_PATH' -DFKL_DIR='$FKL_CPU_DIR' -DRPP_ROOT='$ROCM_EXTRA' \
-        && cmake --build '$BUILD_CPU'"
+        $GEOMETRY_ARGS && cmake --build '$BUILD_CPU'"
 fi
 BENCH=$BUILD_GPU/rocm_bench
+WORKLOAD=$("$BENCH" --workload) || die "$BENCH --workload failed"
+if ! allowed SKIP_CPU && [ "$WORKLOAD" != "$("$BUILD_CPU/rpp_cpu_bench" --workload)" ]; then
+    die "rocm_bench and rpp_cpu_bench have different workloads (sizes or batch sizes): build both from the same checkout and options"
+fi
+echo "Workload: $WORKLOAD"
 
 # ---------------------------------------------------------------- what the profiler supports here
 TRACING=1
@@ -136,10 +146,10 @@ fi
 # ---------------------------------------------------------------- GPU
 step gpu_resize_convention "$BENCH" "$OUT/gpu" --resize-convention
 step gpu_main "$BENCH" "$OUT/gpu"
-allowed RUN_REGION && step gpu_region_sweep "$BENCH" "$OUT/gpu_region_sweep" --region-sweep
 if [ $COUNTERS_OK = 1 ]; then
     # The counters of the RPP pipeline that the GPU benchmark's selection pass chose
-    BENCH_RPP_VARIANT=$(awk -F, '$10 == "yes" {print $3; exit}' "$OUT/gpu/rpp_selection.csv")
+    BENCH_RPP_VARIANT=$(awk -F, 'NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
+                                 $col["chosen"] == "yes" { print $col["variant"]; exit }' "$OUT/gpu/rpp_selection.csv")
     [ -n "$BENCH_RPP_VARIANT" ] || die "no chosen RPP variant in $OUT/gpu/rpp_selection.csv"
     export BENCH_RPP_VARIANT
     step gpu_counters "$REPO/rocm/scripts/rocprof_counters.sh" "$OUT/traffic" "$BENCH"

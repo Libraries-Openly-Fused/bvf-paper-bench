@@ -1,8 +1,9 @@
 // CPU benchmark of the Figure 1 pipeline: RPP's HOST backend vs FKL's CPU backends (BVF), the ROCm counterpart of
 // cpu/src/cpu_bench.cpp (which compares with OpenCV).
 //   ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
-// One 3840x2160 NV12 frame in host memory, N crops of 20x10, bilinear resize to 64x32, 16 black rows on top and
-// bottom, then (x * mul - sub) / div written as float3 into an N-plane tensor. BT.2020 full range, as on the GPU.
+// The workload of common/bench_geometry.h: one 3840x2160 NV12 frame in host memory, N crops, each resized (bilinear)
+// and given black rows on top and bottom, then (x * mul - sub) / div written as float3 into an N-plane tensor. BT.2020
+// full range, as on the GPU.
 //
 //   rpp*:   RPP has no NV12 conversion on its HOST backend (rppt_yuv_to_rgb is HIP only), so every RPP HOST pipeline
 //           starts with FKL's CPU conversion of the full frame to 8 bit RGB (the first kernel of the GPU benchmark's
@@ -10,8 +11,8 @@
 //           the 1 thread runs and on FKL's thread pool (ParArch::CPU_MULTITHREAD) for the all threads runs. Then the
 //           same RPP variants as the GPU benchmark (rocm/src/rocm_bench.hip), with RPP_HOST_BACKEND:
 //             rpp                 rppt_crop_mirror_normalize 8u -> 32f (one batched call, all batch images aliasing
-//                                 the RGB frame), memset of the output, rppt_resize into rows 16..47 of the output
-//                                 planes, rppt_multiply_scalar, rppt_tensor_subtract_tensor, rppt_tensor_divide_tensor
+//                                 the RGB frame), memset of the output, rppt_resize into the rows of the output planes
+//                                 below the top border, rppt_multiply_scalar, rppt_tensor_subtract_tensor, rppt_tensor_divide_tensor
 //             rpp_npp_like        the resized crops in their own buffer, copied into the output rows by rppt_crop
 //             rpp_fused           memset, rppt_resize_mirror_normalize (crop + 8u -> 32f + resize + Mul), Sub, Div
 //             rpp_normalize       rpp with Mul + Sub + Div in one rppt_normalize
@@ -41,6 +42,8 @@
 #include <fused_kernel/algorithms/image_processing/saturate.h>
 #include <fused_kernel/core/execution_model/cpu_multithread.h>
 
+#include "bench_geometry.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -53,7 +56,6 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
-#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -70,24 +72,11 @@
 
 namespace rppcpu {
 
-constexpr int FRAME_W = 3840;
-constexpr int FRAME_H = 2160;
-constexpr int CROP_W = 20;
-constexpr int CROP_H = 10;
-constexpr int RES_W = 64;
-constexpr int RES_H = 32;
-constexpr int BORDER_TOP = 16;
-constexpr int BORDER_BOTTOM = 16;
-constexpr int OUT_W = RES_W;
-constexpr int OUT_H = RES_H + BORDER_TOP + BORDER_BOTTOM;
-constexpr size_t OUT_FLOATS = static_cast<size_t>(OUT_W) * OUT_H * 3; // one output plane
-constexpr int MAX_BATCH = 100;
-constexpr std::array<size_t, 5> BATCHES{1, 4, 16, 50, 100};
+// Frame, crop, resize, border and output sizes, batch sizes, seeds and crop positions, shared by every benchmark
+using namespace bench::geometry;
 constexpr int WARMUP_ITERS = 100;
 constexpr int ITERS = 1000;
 constexpr auto IDLE_GAP = std::chrono::milliseconds(1);
-constexpr unsigned FRAME_SEED = 1;
-constexpr unsigned CROP_SEED = 42;
 
 constexpr float MUL[3] = {1.f / 255.f, 1.f / 255.f, 1.f / 255.f};
 constexpr float SUB[3] = {0.485f, 0.456f, 0.406f};
@@ -100,7 +89,28 @@ constexpr float RPP_EQUIVALENCE = 1e-5f;
 // every RPP buffer gets slack at its end
 constexpr int RPP_PIXEL_ALIGN = 8;
 constexpr size_t RPP_SLACK_FLOATS = 1 << 14;
-int alignUp(int v, int a) { return (v + a - 1) / a * a; }
+constexpr int alignUp(int v, int a) { return (v + a - 1) / a * a; }
+// RPP 3.2.0's HOST rppt_crop_mirror_normalize (8u -> 32f, packed RGB) writes one float past the end of every row (the
+// constant 1.0, from its 48-float AVX store) when the ROI width is a multiple of 16, as with 32 pixel crops. Inside a
+// crop the next row overwrites it, but the last row's lands on the first float of the next crop, which another OpenMP
+// thread may already have written. So every crop of the crop buffer is followed by a spare row.
+constexpr int CROP_SPARE_ROWS = 1;
+// RPP's HOST rppt_resize (F32) reads 12 bytes before its source and rppt_resize_mirror_normalize (8u) 3 bytes before
+// the first row of its ROI: the buffers they read start after some slack. (On the RGB frame, the crops are at least
+// CROP_MARGIN pixels from the edges.)
+constexpr size_t RPP_FRONT_SLACK_FLOATS = 16;
+// The 8 bit ramps that measure rppt_resize_mirror_normalize's sampling positions: value = RAMP_STEP_8BIT * position,
+// the largest power of two that keeps the longest crop side within 255 (exact in float, and divided back exactly)
+constexpr float rampStep8bit() {
+    float step = 128.f;
+    while (step > 1.f && step * static_cast<float>(std::max(CROP_W, CROP_H) - 1) > 255.f) {
+        step /= 2.f;
+    }
+    return step;
+}
+constexpr float RAMP_STEP_8BIT = rampStep8bit();
+static_assert(RAMP_STEP_8BIT * static_cast<float>(std::max(CROP_W, CROP_H) - 1) <= 255.f,
+              "The 8 bit sampling ramps need crop sides of at most 256 pixels");
 
 using NV12Image = fk::Image<fk::PixelFormat::NV12>;
 using YUVToRGB = fk::ConvertYUVToRGB<fk::ColorDepth::p8bit, fk::ColorRange::Full, fk::ColorPrimitives::bt2020>;
@@ -113,20 +123,10 @@ struct Workload {
 void initWorkload(Workload& w) {
     w.frame = std::make_unique<NV12Image>(FRAME_W, FRAME_H, fk::MemType::Host);
     auto data = w.frame->getData();
-    std::mt19937 gen(FRAME_SEED);
-    std::uniform_int_distribution<int> byte(0, 255);
-    for (int y = 0; y < FRAME_H * 3 / 2; ++y) {
-        for (int x = 0; x < FRAME_W; ++x) {
-            data.at(x, y) = static_cast<uchar>(byte(gen));
-        }
-    }
-    std::mt19937 cropGen(CROP_SEED);
-    std::uniform_int_distribution<int> distX(0, FRAME_W - CROP_W);
-    std::uniform_int_distribution<int> distY(0, FRAME_H - CROP_H);
-    for (auto& crop : w.crops) {
-        const int x = distX(cropGen);
-        const int y = distY(cropGen);
-        crop = fk::Rect(x, y, CROP_W, CROP_H);
+    generateFrame([&](int x, int y, uint8_t value) { data.at(x, y) = value; });
+    const auto crops = makeCrops();
+    for (size_t i = 0; i < MAX_BATCH; ++i) {
+        w.crops[i] = fk::Rect(crops[i].x, crops[i].y, crops[i].width, crops[i].height);
     }
 }
 
@@ -181,7 +181,10 @@ struct RppHost {
     rppHandle_t handle{};
     FklRgb8<PA> rgb8;
     int cropPitch{alignUp(CROP_W, RPP_PIXEL_ALIGN)}, resizedPitch{alignUp(RES_W, RPP_PIXEL_ALIGN)};
+    // Floats from one crop to the next: its rows and a spare row (CROP_SPARE_ROWS)
+    size_t cropStride{static_cast<size_t>(cropPitch) * (CROP_H + CROP_SPARE_ROWS) * 3};
     std::vector<float> cropped, resized, tensorA, tensorB;
+    float* crops{nullptr}; // the first crop, RPP_FRONT_SLACK_FLOATS into cropped
     float* output{nullptr};
     std::vector<RpptROI> cropRois, resizeRois, resizedRois;
     std::vector<RpptImagePatch> dstSizes;
@@ -199,7 +202,8 @@ struct RppHost {
         : w(workload), n(batch), variant(v), threads(numThreads) {
         RPP_CHECK(static_cast<RppStatus>(rppCreate(&handle, 1, threads, nullptr, RppBackend::RPP_HOST_BACKEND)));
         const unsigned N = static_cast<unsigned>(n);
-        cropped.assign(n * cropPitch * CROP_H * 3 + RPP_SLACK_FLOATS, 0.f);
+        cropped.assign(RPP_FRONT_SLACK_FLOATS + n * cropStride + RPP_SLACK_FLOATS, 0.f);
+        crops = cropped.data() + RPP_FRONT_SLACK_FLOATS;
         resized.assign(n * resizedPitch * RES_H * 3 + RPP_SLACK_FLOATS, 0.f);
         tensorA.assign(n * OUT_FLOATS + BORDER_TOP * OUT_W * 3 + RPP_SLACK_FLOATS, 0.f);
         tensorB.assign(n * OUT_FLOATS + RPP_SLACK_FLOATS, 0.f);
@@ -250,8 +254,7 @@ struct RppHost {
         frameBatchDesc = RpptDesc(N, 3, FRAME_H, FRAME_W, RpptDataType::U8, RpptLayout::NHWC, 0,
                                   RpptStrides{0, 1, rgb8.pitch(), 3});
         cropDesc = RpptDesc(N, 3, CROP_H, CROP_W, RpptDataType::F32, RpptLayout::NHWC, 0,
-                            RpptStrides{static_cast<Rpp32u>(cropPitch * CROP_H * 3), 1,
-                                        static_cast<Rpp32u>(cropPitch * 3), 3});
+                            RpptStrides{static_cast<Rpp32u>(cropStride), 1, static_cast<Rpp32u>(cropPitch * 3), 3});
         resizedDesc = RpptDesc(N, 3, RES_H, RES_W, RpptDataType::F32, RpptLayout::NHWC, 0,
                                RpptStrides{static_cast<Rpp32u>(resizedPitch * RES_H * 3), 1,
                                            static_cast<Rpp32u>(resizedPitch * 3), 3});
@@ -275,7 +278,7 @@ struct RppHost {
     ~RppHost() { rppDestroy(handle, RppBackend::RPP_HOST_BACKEND); }
 
     void cropConvert() {
-        RPP_CHECK(rppt_crop_mirror_normalize(rgb8.data(), &frameBatchDesc, cropped.data(), &cropDesc, cmnOffset.data(),
+        RPP_CHECK(rppt_crop_mirror_normalize(rgb8.data(), &frameBatchDesc, crops, &cropDesc, cmnOffset.data(),
                                              cmnMultiplier.data(), mirror.data(), cropRois.data(), RpptRoiType::XYWH,
                                              handle, RppBackend::RPP_HOST_BACKEND));
     }
@@ -324,7 +327,7 @@ struct RppHost {
             add("rppt_crop_mirror_normalize_8u32f_batch", [this]() { cropConvert(); });
             add("memset_output_tensor", [this]() { zeroTensor(); });
             add("rppt_resize_batch_into_output_rows",
-                [this]() { resizeInto(cropped.data(), &cropDesc, tensorA.data(), &outInteriorDesc); });
+                [this]() { resizeInto(crops, &cropDesc, tensorA.data(), &outInteriorDesc); });
             add("rppt_multiply_scalar", [this]() { multiply(); });
             add("rppt_tensor_subtract_tensor", [this]() { subtract(); });
             add("rppt_tensor_divide_tensor", [this]() { divide(); });
@@ -332,7 +335,7 @@ struct RppHost {
             break;
         case Variant::NppLike:
             add("rppt_crop_mirror_normalize_8u32f_batch", [this]() { cropConvert(); });
-            add("rppt_resize_batch", [this]() { resizeInto(cropped.data(), &cropDesc, resized.data(), &resizedDesc); });
+            add("rppt_resize_batch", [this]() { resizeInto(crops, &cropDesc, resized.data(), &resizedDesc); });
             add("memset_output_tensor", [this]() { zeroTensor(); });
             add("rppt_crop_f32_batch_into_output_rows", [this]() { copyIntoOutput(); });
             add("rppt_multiply_scalar", [this]() { multiply(); });
@@ -353,7 +356,7 @@ struct RppHost {
             add("rppt_crop_mirror_normalize_8u32f_batch", [this]() { cropConvert(); });
             add("memset_output_tensor", [this]() { zeroTensor(); });
             add("rppt_resize_batch_into_output_rows",
-                [this]() { resizeInto(cropped.data(), &cropDesc, tensorA.data(), &outInteriorDesc); });
+                [this]() { resizeInto(crops, &cropDesc, tensorA.data(), &outInteriorDesc); });
             add("rppt_normalize_mul_sub_div", [this]() { normalize(); });
             output = tensorB.data();
             break;
@@ -425,11 +428,13 @@ Sampling measureHostSampling(bool resizeMirrorNormalize) {
     const int pitch = alignUp(CROP_W, RPP_PIXEL_ALIGN);
     Sampling s{std::vector<float>(RES_W), std::vector<float>(RES_H)};
     for (const bool vertical : {false, true}) {
-        // Ramp along one axis: the position (F32) or 10 * position (8 bit), both exact; the output divided back is the
-        // position
-        const float step = resizeMirrorNormalize ? 10.f : 1.f;
-        std::vector<float> inF(static_cast<size_t>(pitch) * CROP_H * 3 + RPP_SLACK_FLOATS, 0.f);
-        std::vector<Rpp8u> inU(static_cast<size_t>(pitch) * CROP_H * 3 + RPP_SLACK_FLOATS, 0);
+        // Ramp along one axis: the position (F32) or RAMP_STEP_8BIT * position (8 bit), both exact; the output divided
+        // back is the position
+        const float step = resizeMirrorNormalize ? RAMP_STEP_8BIT : 1.f;
+        std::vector<float> inFBuffer(RPP_FRONT_SLACK_FLOATS + static_cast<size_t>(pitch) * CROP_H * 3 + RPP_SLACK_FLOATS, 0.f);
+        std::vector<Rpp8u> inUBuffer(RPP_FRONT_SLACK_FLOATS + static_cast<size_t>(pitch) * CROP_H * 3 + RPP_SLACK_FLOATS, 0);
+        float* inF = inFBuffer.data() + RPP_FRONT_SLACK_FLOATS;
+        Rpp8u* inU = inUBuffer.data() + RPP_FRONT_SLACK_FLOATS;
         for (int y = 0; y < CROP_H; ++y)
             for (int x = 0; x < CROP_W; ++x)
                 for (int c = 0; c < 3; ++c) {
@@ -447,11 +452,11 @@ Sampling measureHostSampling(bool resizeMirrorNormalize) {
         if (resizeMirrorNormalize) {
             float mean[3] = {0.f, 0.f, 0.f}, stdDev[3] = {1.f, 1.f, 1.f};
             Rpp32u mirror[1] = {0};
-            RPP_CHECK(rppt_resize_mirror_normalize(inU.data(), &src, out.data(), &dst, &size, RpptInterpolationType::BILINEAR,
+            RPP_CHECK(rppt_resize_mirror_normalize(inU, &src, out.data(), &dst, &size, RpptInterpolationType::BILINEAR,
                                                    mean, stdDev, mirror, &roi, RpptRoiType::XYWH, handle,
                                                    RppBackend::RPP_HOST_BACKEND));
         } else {
-            RPP_CHECK(rppt_resize(inF.data(), &src, out.data(), &dst, &size, RpptInterpolationType::BILINEAR, &roi,
+            RPP_CHECK(rppt_resize(inF, &src, out.data(), &dst, &size, RpptInterpolationType::BILINEAR, &roi,
                                   RpptRoiType::XYWH, handle, RppBackend::RPP_HOST_BACKEND));
         }
         if (vertical) {
@@ -790,11 +795,14 @@ void resizeConvention(const std::filesystem::path& outDir) {
     rppHandle_t handle{};
     RPP_CHECK(static_cast<RppStatus>(rppCreate(&handle, 1, 1, nullptr, RppBackend::RPP_HOST_BACKEND)));
     struct Case { bool vertical; int src, dst; };
-    for (const Case c : {Case{false, 20, 64}, Case{false, 10, 32}, Case{false, 16, 32}, Case{false, 8, 40},
-                         Case{true, 10, 32}, Case{true, 20, 64}}) {
+    // The benchmark's crop -> resize in both axes, then other ratios
+    for (const Case c : {Case{false, CROP_W, RES_W}, Case{true, CROP_H, RES_H}, Case{false, 20, 64}, Case{false, 10, 32},
+                         Case{false, 8, 40}, Case{true, 20, 64}}) {
         const int sw = c.vertical ? 8 : c.src, sh = c.vertical ? c.src : 2;
         const int dw = c.vertical ? 8 : c.dst, dh = c.vertical ? c.dst : 2;
-        std::vector<float> in(static_cast<size_t>(sw) * sh * 3 + RPP_SLACK_FLOATS), out(static_cast<size_t>(dw) * dh * 3 + RPP_SLACK_FLOATS);
+        std::vector<float> inBuffer(RPP_FRONT_SLACK_FLOATS + static_cast<size_t>(sw) * sh * 3 + RPP_SLACK_FLOATS);
+        std::vector<float> out(static_cast<size_t>(dw) * dh * 3 + RPP_SLACK_FLOATS);
+        float* in = inBuffer.data() + RPP_FRONT_SLACK_FLOATS;
         for (int y = 0; y < sh; ++y)
             for (int x = 0; x < sw; ++x)
                 for (int ch = 0; ch < 3; ++ch) in[(y * sw + x) * 3 + ch] = static_cast<float>(c.vertical ? y : x);
@@ -802,7 +810,7 @@ void resizeConvention(const std::filesystem::path& outDir) {
         RpptROI roi;
         roi.xywhROI = {{0, 0}, sw, sh};
         RpptImagePatch size{static_cast<Rpp32u>(dw), static_cast<Rpp32u>(dh)};
-        RPP_CHECK(rppt_resize(in.data(), &s, out.data(), &d, &size, RpptInterpolationType::BILINEAR, &roi,
+        RPP_CHECK(rppt_resize(in, &s, out.data(), &d, &size, RpptInterpolationType::BILINEAR, &roi,
                               RpptRoiType::XYWH, handle, RppBackend::RPP_HOST_BACKEND));
         const float scale = static_cast<float>(c.src) / c.dst;
         double maxDev = 0.;
@@ -829,6 +837,18 @@ int main(int argc, char** argv) {
     // run_all.sh exports it too.
     setenv("KMP_BLOCKTIME", "100us", 0);
     try {
+        if (argc == 2 && std::string(argv[1]) == "--batches") {
+            for (size_t i = 0; i < BATCHES.size(); ++i) {
+                std::cout << (i ? " " : "") << BATCHES[i];
+            }
+            std::cout << std::endl;
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--workload") {
+            // The workload (sizes, batch sizes, seeds), for the consistency check of rocm/scripts/run_all.sh
+            std::cout << describe() << std::endl;
+            return 0;
+        }
         const std::filesystem::path outDir = argc > 1 ? argv[1] : "results/rocm_cpu";
         std::filesystem::create_directories(outDir);
         const bool validateOnly = argc > 2 && std::string(argv[2]) == "--validate";
@@ -926,6 +946,7 @@ int main(int argc, char** argv) {
              << "HOST kernels iterate over the descriptors' n; the handle's batch size only sizes an unused scratch "
              << "buffer of 99532800 floats per image)\n"
              << "OS: " << shell(". /etc/os-release && echo $PRETTY_NAME") << ", kernel " << shell("uname -r") << "\n"
+             << "Workload: " << describe() << "\n"
              << "Pipeline: as the GPU benchmark, BT.2020 full range NV12 -> RGB. RPP's NV12 conversion (rppt_yuv_to_rgb) is "
                 "HIP only, so the RPP HOST pipelines get their 8 bit RGB frame from FKL's CPU conversion (round to "
                 "nearest after saturation): ParArch::CPU for the 1 thread runs, ParArch::CPU_MULTITHREAD for the "
@@ -943,11 +964,18 @@ int main(int argc, char** argv) {
                 "replaces the caller's stdDev values by scale/stdDev (restored before every call, inside the timing) "
                 "and zeroes its destination before reading its source (run out of place); rppt_resize_mirror_normalize "
                 "zeroes only nStride bytes of each float destination plane (the whole output is zeroed by the memset). "
+                "rppt_crop_mirror_normalize 8u->32f writes one float (1.0) past the end of every row when the ROI width "
+                "is a multiple of 16: every crop in the crop buffer is followed by a spare row, so that this float never "
+                "lands on the next crop, which another OpenMP thread may have written already; rppt_resize reads 12 bytes "
+                "before its source and rppt_resize_mirror_normalize up to 3 bytes before and 13 after the rows of its "
+                "ROIs: the crop buffer starts after some slack, and the crops are at least " << CROP_MARGIN << " pixels "
+                "from the frame edges. "
                 "multiply_scalar, tensor_subtract_tensor, tensor_divide_tensor and normalize see the output as N samples "
                 "(RPP's HOST backend parallelizes over the samples), so at N = 1 they, like every RPP HOST call, run "
                 "on one thread. "
                 "RPP-convention reference: RGB rounded to 8 bit, bilinear sampling at the positions RPP HOST uses, "
-                "measured with linear ramps for this geometry (rpp_host_sampling_positions.csv): pixel centers, "
+                "measured with linear ramps for this geometry (rpp_host_sampling_positions.csv; 8 bit ramps of step "
+             << RAMP_STEP_8BIT << " per pixel for rppt_resize_mirror_normalize): pixel centers, "
                 "rppt_resize clamps them to [0, size - 2] except the last output columns (its AVX bilinear load only "
                 "replaces the right neighbour when the left one is past size - 3, so positions >= size - 1 read pixel "
                 "size - 1), rppt_resize_mirror_normalize clamps them to [0, size - 1]; "
