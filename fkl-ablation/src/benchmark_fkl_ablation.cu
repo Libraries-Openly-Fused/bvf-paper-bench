@@ -95,7 +95,8 @@ struct HostTiming {
 template <size_t N>
 void hostOverheadBatch(Context& ctx, std::vector<HostTiming>& hostTimings) {
     using Clock = std::chrono::steady_clock;
-    const auto us = [](Clock::time_point a, Clock::time_point b) {
+    // In milliseconds, like the CUDA event times: computeStats() takes milliseconds and reports microseconds
+    const auto ms = [](Clock::time_point a, Clock::time_point b) {
         return std::chrono::duration<float, std::milli>(b - a).count();
     };
     const auto crops = firstCrops<N>(ctx);
@@ -120,10 +121,10 @@ void hostOverheadBatch(Context& ctx, std::vector<HostTiming>& hostTimings) {
         const auto t3 = Clock::now();
         gpuErrchk(cudaStreamSynchronize(ctx.stream));
         if (i >= WARMUP_ITERS) {
-            build.push_back(us(t0, t1));
-            fuse.push_back(us(t1, t2));
-            launch.push_back(us(t2, t3));
-            total.push_back(us(t0, t3));
+            build.push_back(ms(t0, t1));
+            fuse.push_back(ms(t1, t2));
+            launch.push_back(ms(t2, t3));
+            total.push_back(ms(t0, t3));
         }
     }
     hostTimings.push_back({"fkl_bvf", static_cast<int>(N), "1_build_iops", computeStats(build)});
@@ -141,12 +142,12 @@ void hostOverheadBatch(Context& ctx, std::vector<HostTiming>& hostTimings) {
             vfhf.stages[k].second();
             const Clock::time_point next = Clock::now();
             if (i >= WARMUP_ITERS) {
-                stageTimes[k].push_back(us(t, next));
+                stageTimes[k].push_back(ms(t, next));
             }
             t = next;
         }
         if (i >= WARMUP_ITERS) {
-            vfhfTotal.push_back(us(first, t));
+            vfhfTotal.push_back(ms(first, t));
         }
         gpuErrchk(cudaStreamSynchronize(ctx.stream));
     }
