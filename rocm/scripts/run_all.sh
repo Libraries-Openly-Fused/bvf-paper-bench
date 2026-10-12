@@ -27,7 +27,9 @@
 # ALLOW_OTHER_FKL=1, SKIP_CPU=1
 set -uo pipefail
 
-OUT=$(realpath -m "${1:?usage: rocm/scripts/run_all.sh <results dir>}")
+# The usage check in this shell: inside $(...) a failed ${1:?} would only end the subshell
+: "${1:?usage: rocm/scripts/run_all.sh <results dir>}"
+OUT=$(realpath -m "$1")
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 . "$REPO/rocm/scripts/env.sh"
 # The paper's FKL commit, the one of the repository's fkl submodule, for every benchmark
@@ -62,12 +64,12 @@ allowed() { [ "${!1:-0}" = 1 ]; }
 # ---------------------------------------------------------------- prerequisites
 [ -x "$ROCM_PATH/bin/amdclang++" ] || die "amdclang++ not found in $ROCM_PATH (set ROCM_PATH)"
 [ -f "$ROCM_EXTRA/include/rpp/rpp.h" ] && [ -e "$ROCM_EXTRA/lib/librpp.so" ] ||
-    die "RPP not found in $ROCM_EXTRA (install amdrocm-rpp-dev10.1 or set ROCM_EXTRA, see rocm/scripts/env.sh)"
+    die "RPP not found in $ROCM_EXTRA (install amdrocm-rpp10.1 and amdrocm-rpp-dev10.1 or set ROCM_EXTRA, see rocm/scripts/env.sh)"
 [ -f "$ROCM_EXTRA/include/rocprofiler-sdk/rocprofiler.h" ] && [ -e "$ROCM_EXTRA/lib/librocprofiler-sdk.so" ] ||
     die "rocprofiler-sdk not found in $ROCM_EXTRA (install amdrocm-profiler-base10.1 or set ROCM_EXTRA)"
 command -v amd-smi > /dev/null || die "amd-smi not found (install amdrocm-amdsmi10.1)"
 command -v rocminfo > /dev/null || die "rocminfo not found"
-command -v rocprofv3 > /dev/null || die "rocprofv3 not found (install amdrocm-profiler10.1)"
+command -v rocprofv3 > /dev/null || die "rocprofv3 not found (install amdrocm-profiler-base10.1)"
 command -v "$CXX_CPU" > /dev/null || die "C++ compiler $CXX_CPU not found (set CXX_CPU)"
 FKL_GPU_COMMIT=$(git -C "$FKL_GPU_DIR" rev-parse --short=7 HEAD 2>/dev/null) && [ -f "$FKL_GPU_DIR/CMakeLists.txt" ] ||
     die "no FKL checkout in $FKL_GPU_DIR (git -C $REPO submodule update --init --recursive fkl)"
@@ -117,7 +119,7 @@ fi
 # The geometry options are reset on every configure, so that values cached in an existing build directory (an earlier
 # run with BENCH_CMAKE_ARGS, a manual configure) never leak into this run: the defaults of common/bench_geometry.cmake
 # unless BENCH_CMAKE_ARGS sets them
-GEOMETRY_ARGS="-UBENCH_CROP_W -UBENCH_CROP_H -UBENCH_RESIZE_W -UBENCH_RESIZE_H ${BENCH_CMAKE_ARGS:-}"
+GEOMETRY_ARGS="-UBENCH_CROP_W -UBENCH_CROP_H -UBENCH_RESIZE_W -UBENCH_RESIZE_H -UBENCH_ITERATIONS -UBENCH_WARMUP_ITERATIONS ${BENCH_CMAKE_ARGS:-}"
 step build_gpu bash -c "cmake -S '$REPO/rocm' -B '$BUILD_GPU' -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER='$ROCM_PATH/bin/amdclang++' -DCMAKE_HIP_COMPILER='$ROCM_PATH/bin/amdclang++' \
     -DROCM_PATH='$ROCM_PATH' -DFKL_DIR='$FKL_GPU_DIR' -DRPP_ROOT='$ROCM_EXTRA' -DROCPROFILER_SDK_ROOT='$ROCM_EXTRA' \

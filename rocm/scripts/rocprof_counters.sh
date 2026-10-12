@@ -27,12 +27,17 @@ if [ "${1:-}" = "--check" ]; then
     shift
 fi
 OUT=$(realpath -m "${1:?usage: rocprof_counters.sh [--check] <output dir> [<rocm_bench>]}")
-BENCH=${2:-$REPO/build-rocm/rocm_bench}
+BENCH=$(realpath -m "${2:-$REPO/build-rocm/rocm_bench}")
 . "$REPO/rocm/scripts/env.sh"
 COUNTERS=${COUNTERS:-"FETCH_SIZE GL2C_EA_WRREQ_sum GL2C_EA_WRREQ_64B_sum"}
 MAX_REPEATS=${MAX_REPEATS:-3}
 IMPLS="rpp fkl_vf_hf fkl_vf_hf_float3_frame fkl_bvf"
 mkdir -p "$OUT"
+# rocprofv3 writes .rocprofv3/<pid>-counter_values.dat into its working directory: it runs from a scratch directory of
+# $OUT, removed on exit, instead of the caller's (the repository root, usually)
+PROFILER_CWD=$OUT/.rocprofv3_cwd
+mkdir -p "$PROFILER_CWD"
+trap 'rm -rf "$PROFILER_CWD"' EXIT
 
 perf_level() {
     amd-smi metric -g 0 --perf-level 2>/dev/null | sed -n 's/^ *PERF_LEVEL: *//p' | head -1
@@ -42,8 +47,8 @@ perf_level() {
 check_counters() {
     local dir=$OUT/counter_check
     rm -rf "$dir" "$OUT/counter_check.log"
-    if ! rocprofv3 --pmc FETCH_SIZE --output-format csv -d "$dir" -- \
-            "$BENCH" "$dir/target" --rocprof-target fkl_bvf 1 > "$OUT/counter_check.log" 2>&1; then
+    if ! (cd "$PROFILER_CWD" && rocprofv3 --pmc FETCH_SIZE --output-format csv -d "$dir" -- \
+            "$BENCH" "$dir/target" --rocprof-target fkl_bvf 1) > "$OUT/counter_check.log" 2>&1; then
         tail -20 "$OUT/counter_check.log"
         echo "rocprofv3 failed in the counter check (log: $OUT/counter_check.log)"
         return 1
@@ -87,8 +92,8 @@ mkdir -p "$OUT/raw"
 collect_one() { # <label> <counter> <rocm_bench target arguments...>: one rocprofv3 run, in <label>/<counter>
     local label=$1 counter=$2; shift 2
     rm -rf "$OUT/raw/$label/$counter"
-    rocprofv3 --pmc "$counter" --output-format csv -d "$OUT/raw/$label/$counter" -- \
-        "$BENCH" "$OUT/raw/$label/$counter/target" "$@" > "$OUT/raw/$label.$counter.log" 2>&1 ||
+    (cd "$PROFILER_CWD" && rocprofv3 --pmc "$counter" --output-format csv -d "$OUT/raw/$label/$counter" -- \
+        "$BENCH" "$OUT/raw/$label/$counter/target" "$@") > "$OUT/raw/$label.$counter.log" 2>&1 ||
         { tail -20 "$OUT/raw/$label.$counter.log"; echo "rocprofv3 failed for $label $counter"; exit 1; }
 }
 

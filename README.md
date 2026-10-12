@@ -29,7 +29,7 @@ Next to them:
   GPU benchmarks of OpenCV CUDA, NPP and FKL's ablation (`bench_gpu.h`, `bench_gpu.cmake`), the validation rules
   shared by every GPU benchmark (`bench_validation.h`), NPP's error check and NV12 conversion (`bench_npp.h`), the
   platform description (`bench_platform.h`) and the common part of the compile-time units (`compile_time_unit.h`);
-- [`scripts/`](scripts): `run_all.sh` (every benchmark for every workload), the memory traffic with Nsight Compute
+- [`scripts/`](scripts): `run_all.sh` (every benchmark but `rocm/` for every workload), the memory traffic with Nsight Compute
   (`ncu_dram.sh`, `ncu_l2.sh`, `ncu_common.sh`, `ncu_summarize.py`, `ncu_traffic_model.py`), the compile time
   (`compile_time.sh`, `compile_time_summarize.py`) and the CI (`ci/run_benchmarks.cmake`);
 - the submodules `fkl` (FusedKernelLibrary main, with its `thread-pool` submodule for the `CPU_MULTITHREAD` backend)
@@ -157,10 +157,10 @@ Each benchmark has its own requirements, besides a C++20 compiler:
 | `fkl-vs-npp`, `fkl-ablation` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.28; no OpenCV |
 | `fkl-vs-nppdx` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.30, a Linux x86_64 or Windows x64 machine (NPPDx's platforms); no OpenCV |
 | `fkl-vs-opencv-cpu` | CMake 3.28 and OpenCV 4.14 with `core` and `imgproc`; no GPU or CUDA |
-| `rocm` | Linux, an AMD GPU, ROCm 10.1 with RPP 3.2.0 and rocprofiler-sdk, CMake 3.28, Ninja (see [its README](rocm/README.md)); no CUDA or OpenCV |
+| `rocm` | Linux, an AMD GPU (gfx1200 by default, another one with `-DCMAKE_HIP_ARCHITECTURES`), ROCm 10.1 with RPP 3.2.0 and rocprofiler-sdk, CMake 3.28, Ninja (see [its README](rocm/README.md)); no CUDA or OpenCV |
 
-The paper's results were measured on Linux; the CI also builds and runs every benchmark on Windows, and every
-benchmark but FKL vs NPPDx on ARM64.
+The paper's results were measured on Linux; the CI also builds and runs every benchmark but `rocm/` on Windows, and
+every benchmark but FKL vs NPPDx and `rocm/` on ARM64.
 
 Clone with `git clone --recursive https://github.com/Libraries-Openly-Fused/bvf-paper-bench.git`, or run
 `git submodule update --init --recursive` in an existing clone. Every benchmark takes another FKL checkout with
@@ -177,7 +177,8 @@ of every benchmark in a folder of its name:
     ./build-npp/benchmark_npp ../results/fkl-vs-npp                          # CPU + GPU and GPU only
     ./build-npp/benchmark_npp ../results/fkl-vs-npp --gpu-only-l2-flushed    # adds the *_l2_flushed* files
 
-The README of every folder has its commands. `scripts/run_all.sh` builds and runs every benchmark for both workloads
+The README of every folder has its commands. `scripts/run_all.sh` builds and runs every benchmark but `rocm/` (which
+has its own `rocm/scripts/run_all.sh`) for both workloads
 of the paper, the 32x16 crops resized 1:2 and the earlier 20x10 crops resized 5:16 (`GEOMETRIES`), each with its own
 build folders (`build-npp-32x16`, ...) and results folder (`../results/32x16/fkl-vs-npp`, ...); `COMPILE_TIME=1`
 adds the compile-time units and `PROFILE=1` the Nsight Compute scripts, their summaries and the traffic model of each
@@ -189,7 +190,8 @@ prints their commands, which then need sudo:
 `CUDA_ARCH` (default `native`, the GPU of the machine) selects the CUDA architectures of the GPU benchmarks.
 `BENCH_ITERATIONS` and `BENCH_WARMUP_ITERATIONS` (default 1000 and 100, as for the paper's results) set the timed and
 warm-up iterations of every benchmark, and `BENCH_CROP_W`, `BENCH_CROP_H`, `BENCH_RESIZE_W` and `BENCH_RESIZE_H`
-(default 32, 16, 64 and 32) the [workload](#workload); give every project the same values.
+(default 32, 16, 64 and 32) the [workload](#workload); give every project the same values (for `rocm/`, in the
+`BENCH_CMAKE_ARGS` of `rocm/scripts/run_all.sh`).
 
 ## Continuous integration
 

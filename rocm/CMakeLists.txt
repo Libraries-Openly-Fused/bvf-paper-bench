@@ -1,4 +1,7 @@
 cmake_minimum_required(VERSION 3.28)
+# Radeon RX 9060 (gfx1200) by default, FKL's default HIP architecture (cmake/libs/hip/archs.cmake); one target, since it
+# goes into --offload-arch. Set before project(), where CMake would otherwise detect the GPU of the machine
+set(CMAKE_HIP_ARCHITECTURES gfx1200 CACHE STRING "HIP architecture of the GPU benchmark (one target)")
 # ROCm port of the GPU benchmarks of common/bench_gpu.h: FKL's HIP backend against RPP, on an AMD GPU.
 # Configure with amdclang++ as both the C++ and the HIP compiler, as FKL's ROCm CI does, for example:
 #   cmake -S rocm -B build-rocm -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -9,13 +12,12 @@ project(bvf_paper_bench_rocm LANGUAGES CXX HIP)
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
-# Radeon RX 9060 only (gfx1200), FKL's default HIP architecture (cmake/libs/hip/archs.cmake)
-if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
-    set(CMAKE_HIP_ARCHITECTURES gfx1200)
-endif()
 
 # The workload of every benchmark: BENCH_CROP_W, BENCH_CROP_H, BENCH_RESIZE_W, BENCH_RESIZE_H (common/bench_geometry.h)
 include(${CMAKE_CURRENT_SOURCE_DIR}/../common/bench_geometry.cmake)
+# Timed and warm-up iterations, as in every benchmark of the repository (common/bench_gpu.cmake)
+set(BENCH_ITERATIONS 1000 CACHE STRING "Timed iterations of every benchmark (at least 1)")
+set(BENCH_WARMUP_ITERATIONS 100 CACHE STRING "Warm-up iterations before the timed ones")
 
 set(FKL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../fkl" CACHE PATH "FusedKernelLibrary checkout (default: the repository's fkl submodule, 63782f6)")
 set(ROCM_PATH "/opt/rocm/core-10.1" CACHE PATH "ROCm installation")
@@ -50,6 +52,7 @@ target_include_directories(rocm_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../com
                                               ${ROCPROFILER_SDK_INCLUDE_DIR})
 target_compile_options(rocm_bench PRIVATE $<$<COMPILE_LANGUAGE:HIP>:${BENCH_HIP_OPTIONS}>)
 target_compile_definitions(rocm_bench PRIVATE ${BENCH_GEOMETRY_DEFINITIONS}
+    BENCH_ITERATIONS=${BENCH_ITERATIONS} BENCH_WARMUP_ITERATIONS=${BENCH_WARMUP_ITERATIONS}
     BENCH_FKL_COMMIT="${FKL_COMMIT}" BENCH_FKL_BRANCH="${FKL_BRANCH}" BENCH_HIP_FLAGS="${BENCH_HIP_FLAGS}"
     BENCH_ROCM_PATH="${ROCM_PATH}" BENCH_RPP_LIB="${RPP_LIBRARY}" BENCH_ROCPROFILER_LIB="${ROCPROFILER_SDK_LIBRARY}")
 target_link_libraries(rocm_bench PRIVATE ${RPP_LIBRARY} ${ROCPROFILER_SDK_LIBRARY})

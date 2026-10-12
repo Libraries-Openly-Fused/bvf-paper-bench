@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 # CPU benchmark of the Figure 1 pipeline: RPP's HOST backend vs FKL's CPU backends (BVF), the ROCm counterpart of
-# cpu/ (which compares with OpenCV). Meant to be built with a recent clang and the best SIMD of the CPU, for example:
+# fkl-vs-opencv-cpu/ (which compares with OpenCV). Meant to be built with a recent clang and the best SIMD of the CPU, for example:
 #   cmake -S rocm/cpu -B build-rocm-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++-23 \
 #         -DRPP_ROOT=<prefix with RPP>   (FKL: the repository's fkl submodule with its thread-pool, or -DFKL_DIR=<checkout>)
 project(bvf_rpp_cpu_bench LANGUAGES CXX)
@@ -10,6 +10,9 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 # The workload of every benchmark: BENCH_CROP_W, BENCH_CROP_H, BENCH_RESIZE_W, BENCH_RESIZE_H (common/bench_geometry.h)
 include(${CMAKE_CURRENT_SOURCE_DIR}/../../common/bench_geometry.cmake)
+# Timed and warm-up iterations, as in every benchmark of the repository (common/bench_gpu.cmake)
+set(BENCH_ITERATIONS 1000 CACHE STRING "Timed iterations of every benchmark (at least 1)")
+set(BENCH_WARMUP_ITERATIONS 100 CACHE STRING "Warm-up iterations before the timed ones")
 
 set(FKL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../fkl" CACHE PATH "FusedKernelLibrary checkout (default: the repository's fkl submodule, 63782f6)")
 set(ROCM_PATH "/opt/rocm/core-10.1" CACHE PATH "ROCm installation (HIP headers, which rpp.h includes)")
@@ -43,6 +46,7 @@ separate_arguments(CPU_ARCH_FLAGS_LIST UNIX_COMMAND "${CPU_ARCH_FLAGS}")
 target_compile_options(rpp_cpu_bench PRIVATE ${CPU_ARCH_FLAGS_LIST} -ftemplate-depth=1000)
 # FK_CPU_MULTITHREAD_ENABLED turns on FKL's CPU_MULTITHREAD backend; __HIP_PLATFORM_AMD__ for the HIP headers rpp.h includes
 target_compile_definitions(rpp_cpu_bench PRIVATE ${BENCH_GEOMETRY_DEFINITIONS} FK_CPU_MULTITHREAD_ENABLED __HIP_PLATFORM_AMD__
+                           BENCH_ITERATIONS=${BENCH_ITERATIONS} BENCH_WARMUP_ITERATIONS=${BENCH_WARMUP_ITERATIONS}
                            BENCH_FKL_COMMIT="${FKL_COMMIT}" BENCH_THREAD_POOL_COMMIT="${THREAD_POOL_COMMIT}"
                            BENCH_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
                            BENCH_CXX_FLAGS="${CMAKE_CXX_FLAGS_RELEASE} -std=c++20 ${CPU_ARCH_FLAGS} -ftemplate-depth=1000"

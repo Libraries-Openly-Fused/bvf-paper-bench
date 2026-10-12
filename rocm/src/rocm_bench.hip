@@ -87,8 +87,11 @@ namespace bench {
 
 // Frame, crop, resize, border and output sizes, batch sizes, seeds and crop positions, shared by every benchmark
 using namespace geometry;
-constexpr int WARMUP_ITERS = 100;
-constexpr int TIMED_ITERS = 1000;
+// BENCH_WARMUP_ITERATIONS and BENCH_ITERATIONS come from CMake: 100 and 1000 for the paper's results, as in
+// common/bench_gpu.h (the selection pass and the event floor keep their own fixed counts)
+constexpr int WARMUP_ITERS = BENCH_WARMUP_ITERATIONS;
+constexpr int TIMED_ITERS = BENCH_ITERATIONS;
+static_assert(WARMUP_ITERS >= 0 && TIMED_ITERS >= 1, "at least one timed iteration");
 // How outputs are checked against their references: the rules of every GPU benchmark (common/bench_validation.h)
 using validation::TOLERANCE;
 using validation::TOLERANCE_8BIT;
@@ -271,8 +274,9 @@ std::array<fk::RawPtr<fk::ND::_2D, T>, N> planeViews(const fk::Tensor<T>& tensor
 
 // VF + HF without BVF: four kernels with the intermediates in memory, the same intermediates as the paper's OpenCV
 // and NPP pipelines: an 8 bit RGB frame, quantized as in the 8 bit reference (normalize, add half a level, saturate,
-// denormalize), then float3 crops, float3 resized crops and the float3 output. Unchanged from common/bench_gpu.h.
-// With EIGHT_BIT_FRAME = false the frame is float3 instead; that variant is only used for the per kernel breakdown.
+// denormalize), then float3 crops, float3 resized crops and the float3 output: the four kernels of makeFklVfHf<N> of
+// fkl-ablation/src/benchmark_fkl_ablation.cu, unchanged (EIGHT_BIT_FRAME = true here). With EIGHT_BIT_FRAME = false
+// the frame is float3 instead; that variant is only used for the per kernel breakdown and the counters.
 template <size_t N, bool EIGHT_BIT_FRAME>
 Implementation makeFklVfHf(Context& ctx) {
     constexpr bool EIGHT_BIT = EIGHT_BIT_FRAME;
@@ -840,7 +844,7 @@ TimingStats computeStats(std::vector<float> ms) {
     for (const float v : ms) {
         sumOfDiff += (v * 1000. - t.mean) * (v * 1000. - t.mean);
     }
-    t.variance = sumOfDiff / (ms.size() - 1);
+    t.variance = ms.size() > 1 ? sumOfDiff / (ms.size() - 1) : 0.;
     std::sort(ms.begin(), ms.end());
     t.min = ms.front() * 1000.;
     t.max = ms.back() * 1000.;
@@ -1817,8 +1821,20 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
     const std::string cus = rocminfoCUs.empty() ? std::to_string(prop.multiProcessorCount) : rocminfoCUs;
     // On RDNA (2 CUs per WGP) multiProcessorCount is half the CU count of rocminfo
     const bool mpcCountsWgps = std::strtol(cus.c_str(), nullptr, 10) == 2L * prop.multiProcessorCount;
-    const std::string perfLevel =
-        shell("(rocm-smi --showperflevel 2>/dev/null | grep -i 'performance level' | head -1 | sed 's/^.*: *//') || true");
+    // The performance level and the clocks, from amd-smi (rocm-smi is not part of ROCm 10.1); the clocks are those at
+    // the end of the run, with amd-smi's MIN_CLK and MAX_CLK, which are not bounds (the GFX clock boosts above MAX_CLK
+    // at AUTO, and is below MIN_CLK in deep sleep)
+    std::string perfLevel = shell("amd-smi metric --gpu 0 --perf-level 2>/dev/null | sed -n 's/^ *PERF_LEVEL: *//p' | head -1");
+    if (perfLevel.empty()) {
+        perfLevel = shell("(rocm-smi --showperflevel 2>/dev/null | grep -i 'performance level' | head -1 | sed 's/^.*: *//') || true");
+    }
+    const auto amdSmiClock = [](const std::string& block) {
+        return shell("amd-smi metric --gpu 0 --clock 2>/dev/null | awk -v B='" + block +
+                     "' '$1 == B\":\" {f=1; next} f && /^ *[A-Z_0-9]+:$/ {f=0} f && $1 == \"CLK:\" {c=$2} "
+                     "f && $1 == \"MIN_CLK:\" {mn=$2} f && $1 == \"MAX_CLK:\" {mx=$2} f && $1 == \"DEEP_SLEEP:\" {ds=$2} "
+                     "END {if (c != \"\") printf \"%s MHz (amd-smi MIN_CLK %s, MAX_CLK %s MHz, deep sleep %s)\", c, mn, mx, ds}'");
+    };
+    const std::string gfxClock = amdSmiClock("GFX_0"), memClock = amdSmiClock("MEM_0");
     os << "Platform: " << prop.name << ", " << cus << " CUs, "
        << (prop.totalGlobalMem + (1ull << 29)) / (1ull << 30) << " GB, " << prop.gcnArchName << ", driver "
        << (driverVersion.empty() ? "unknown" : driverVersion) << " under " << (onWsl() ? "WSL2 " : "bare metal ")
@@ -1827,7 +1843,7 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << "GPU: " << prop.name << " (" << prop.gcnArchName << ", " << cus << " compute units (rocminfo; "
        << "hipDeviceProp_t::multiProcessorCount " << prop.multiProcessorCount
        << (mpcCountsWgps ? ", which counts work-group processors (WGPs, 2 CUs each), not CUs" : "") << "), "
-       << (prop.totalGlobalMem >> 20) << " MiB VRAM, max clock " << prop.clockRate / 1000 << " MHz)\n"
+       << (prop.totalGlobalMem >> 20) << " MiB VRAM, hipDeviceProp_t::clockRate " << prop.clockRate / 1000 << " MHz)\n"
        << "Caches: L2 " << prop.l2CacheSize / 1024 << " KiB (hipDeviceProp_t::l2CacheSize), L3 / MALL (Infinity Cache) "
        << mall.kib << " KiB (" << mall.source << ")\n"
        << "Environment: " << (onWsl() ? "WSL2 (GPU through /dev/dxg)" : "bare metal") << "\n"
@@ -1844,10 +1860,13 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << (std::string(BENCH_FKL_BRANCH) == "HEAD" ? std::string() : std::string(", branch ") + BENCH_FKL_BRANCH) << "\n"
        << "CPU: " << shell("lscpu | sed -n 's/^Model name: *//p'") << "\n"
        << "OS: " << osName << ", kernel " << shell("uname -r") << "\n"
-       << "GPU clocks: not changed by the benchmark. rocm-smi performance level: "
-       << (perfLevel.empty() ? std::string("not reported") : perfLevel) << "; amd-smi: " << shell("amd-smi metric --gpu 0 --clock 2>/dev/null | grep -m1 CLK_LOCKED | sed 's/^ *//'")
-       << ", " << shell("amd-smi metric --gpu 0 --power 2>/dev/null | grep -m1 POWER_MANAGEMENT | sed 's/^ *//'")
-       << " (empty fields: not reported on this system)\n"
+       << "GPU clocks: not changed by the benchmark. Performance level: "
+       << (perfLevel.empty() ? std::string("not reported") : perfLevel)
+       << " (STABLE_STD pins the shader clock: 1494 MHz on the RX 9060, which boosts to about 3.3 GHz at AUTO, above "
+          "amd-smi's MAX_CLK); at the end of the run, GFX clock "
+       << (gfxClock.empty() ? std::string("not reported") : gfxClock) << ", memory clock "
+       << (memClock.empty() ? std::string("not reported") : memClock) << "; "
+       << shell("amd-smi metric --gpu 0 --power 2>/dev/null | grep -m1 POWER_MANAGEMENT | sed 's/^ *//'") << "\n"
        << "\nWorkload: " << describe() << ". NV12->RGB BT.601 limited range, AddBorder (black), then Mul "
        << "(1/255), Sub (0.485, 0.456, 0.406), Div (0.229, 0.224, 0.225), float3 tensor of N planes " << OUT_W << "x"
        << OUT_H << "\n";

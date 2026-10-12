@@ -11,12 +11,17 @@
 //           the 1 thread runs and on FKL's thread pool (ParArch::CPU_MULTITHREAD) for the all threads runs. Then the
 //           same RPP variants as the GPU benchmark (rocm/src/rocm_bench.hip), with RPP_HOST_BACKEND:
 //             rpp                 rppt_crop_mirror_normalize 8u -> 32f (one batched call, all batch images aliasing
-//                                 the RGB frame), memset of the output, rppt_resize into the rows of the output planes
-//                                 below the top border, rppt_multiply_scalar, rppt_tensor_subtract_tensor, rppt_tensor_divide_tensor
+//                                 the RGB frame), memset of the border rows of the output, rppt_resize into the rows of
+//                                 the output planes below the top border, rppt_multiply_scalar,
+//                                 rppt_tensor_subtract_tensor, rppt_tensor_divide_tensor
 //             rpp_npp_like        the resized crops in their own buffer, copied into the output rows by rppt_crop
-//             rpp_fused           memset, rppt_resize_mirror_normalize (crop + 8u -> 32f + resize + Mul), Sub, Div
-//             rpp_normalize       rpp with Mul + Sub + Div in one rppt_normalize
-//             rpp_fused_normalize memset, rppt_resize_mirror_normalize (crop + 8u -> 32f + resize), rppt_normalize
+//             rpp_fused           memset of the border rows, rppt_resize_mirror_normalize (crop + 8u -> 32f + resize
+//                                 + Mul), Sub, Div
+//             rpp_normalize       rpp with Mul + Sub + Div in one rppt_normalize (out of place), without the memset
+//             rpp_fused_normalize rppt_resize_mirror_normalize (crop + 8u -> 32f + resize), rppt_normalize
+//           Only the border rows need zeroing (every pipeline writes all the interior rows), and only where the
+//           pipeline modifies them in place: the normalize variants never write the border rows of their input
+//           tensor, which is zeroed once when it is allocated.
 //           RPP's HOST backend parallelizes over the batch images with OpenMP; it is timed with 1 thread and with all
 //           the hardware threads (numThreads of rppCreate).
 // Two comparisons, each with the same number of threads on both sides, as in fkl-vs-opencv-cpu: RPP with 1 thread
@@ -45,6 +50,7 @@
 #include <fused_kernel/core/execution_model/cpu_multithread.h>
 
 #include "bench_geometry.h"
+#include "bench_validation.h"
 
 #include <algorithm>
 #include <array>
@@ -76,8 +82,10 @@ namespace rppcpu {
 
 // Frame, crop, resize, border and output sizes, batch sizes, seeds and crop positions, shared by every benchmark
 using namespace bench::geometry;
-constexpr int WARMUP_ITERS = 100;
-constexpr int ITERS = 1000;
+// BENCH_WARMUP_ITERATIONS and BENCH_ITERATIONS come from CMake: 100 and 1000 for the paper's results
+constexpr int WARMUP_ITERS = BENCH_WARMUP_ITERATIONS;
+constexpr int ITERS = BENCH_ITERATIONS;
+static_assert(WARMUP_ITERS >= 0 && ITERS >= 1, "at least one timed iteration");
 constexpr auto IDLE_GAP = std::chrono::milliseconds(1);
 
 constexpr float MUL[3] = {1.f / 255.f, 1.f / 255.f, 1.f / 255.f};
@@ -285,7 +293,16 @@ struct RppHost {
                                              cmnMultiplier.data(), mirror.data(), cropRois.data(), RpptRoiType::XYWH,
                                              handle, RppBackend::RPP_HOST_BACKEND));
     }
-    void zeroTensor() { std::memset(tensorA.data(), 0, n * OUT_FLOATS * sizeof(float)); }
+    // The border rows of every output plane (RPP has no constant border); the interior rows are written by every
+    // pipeline. Only for the variants that modify the border rows in place
+    void zeroBorders() {
+        for (size_t i = 0; i < n; ++i) {
+            float* plane = tensorA.data() + i * OUT_FLOATS;
+            std::memset(plane, 0, static_cast<size_t>(BORDER_TOP) * OUT_W * 3 * sizeof(float));
+            std::memset(plane + static_cast<size_t>(BORDER_TOP + RES_H) * OUT_W * 3, 0,
+                        static_cast<size_t>(BORDER_BOTTOM) * OUT_W * 3 * sizeof(float));
+        }
+    }
     void resizeInto(float* src, RpptDesc* srcDesc, float* dst, RpptDesc* dstDesc) {
         RPP_CHECK(rppt_resize(src, srcDesc, dst, dstDesc, dstSizes.data(), RpptInterpolationType::BILINEAR,
                               resizeRois.data(), RpptRoiType::XYWH, handle, RppBackend::RPP_HOST_BACKEND));
@@ -328,7 +345,7 @@ struct RppHost {
         switch (variant) {
         case Variant::Rpp:
             add("rppt_crop_mirror_normalize_8u32f_batch", [this]() { cropConvert(); });
-            add("memset_output_tensor", [this]() { zeroTensor(); });
+            add("memset_output_border_rows", [this]() { zeroBorders(); });
             add("rppt_resize_batch_into_output_rows",
                 [this]() { resizeInto(crops, &cropDesc, tensorA.data(), &outInteriorDesc); });
             add("rppt_multiply_scalar", [this]() { multiply(); });
@@ -339,7 +356,7 @@ struct RppHost {
         case Variant::NppLike:
             add("rppt_crop_mirror_normalize_8u32f_batch", [this]() { cropConvert(); });
             add("rppt_resize_batch", [this]() { resizeInto(crops, &cropDesc, resized.data(), &resizedDesc); });
-            add("memset_output_tensor", [this]() { zeroTensor(); });
+            add("memset_output_border_rows", [this]() { zeroBorders(); });
             add("rppt_crop_f32_batch_into_output_rows", [this]() { copyIntoOutput(); });
             add("rppt_multiply_scalar", [this]() { multiply(); });
             add("rppt_tensor_subtract_tensor", [this]() { subtract(); });
@@ -347,24 +364,25 @@ struct RppHost {
             output = tensorA.data();
             break;
         case Variant::Fused:
-            // The HOST rppt_resize_mirror_normalize zeroes only nStride bytes of each destination plane, so the whole
-            // tensor is zeroed by the memset
-            add("memset_output_tensor", [this]() { zeroTensor(); });
+            // The HOST rppt_resize_mirror_normalize zeroes nStride bytes (OUT_H / 4 rows) from the first interior row of
+            // each destination plane, never past the plane, then writes the interior rows; Sub and Div modify the
+            // border rows in place, so they are zeroed again
+            add("memset_output_border_rows", [this]() { zeroBorders(); });
             add("rppt_resize_mirror_normalize_8u32f_batch_mul_into_output_rows", [this]() { resizeMirrorNormalize(true); });
             add("rppt_tensor_subtract_tensor", [this]() { subtract(); });
             add("rppt_tensor_divide_tensor", [this]() { divide(); });
             output = tensorA.data();
             break;
         case Variant::Normalize:
+            // rppt_normalize writes tensorB: tensorA's border rows stay zero from its allocation
             add("rppt_crop_mirror_normalize_8u32f_batch", [this]() { cropConvert(); });
-            add("memset_output_tensor", [this]() { zeroTensor(); });
             add("rppt_resize_batch_into_output_rows",
                 [this]() { resizeInto(crops, &cropDesc, tensorA.data(), &outInteriorDesc); });
             add("rppt_normalize_mul_sub_div", [this]() { normalize(); });
             output = tensorB.data();
             break;
         case Variant::FusedNormalize:
-            add("memset_output_tensor", [this]() { zeroTensor(); });
+            // As rpp_normalize: tensorA's border rows stay zero from its allocation
             add("rppt_resize_mirror_normalize_8u32f_batch_into_output_rows", [this]() { resizeMirrorNormalize(false); });
             add("rppt_normalize_mul_sub_div", [this]() { normalize(); });
             output = tensorB.data();
@@ -555,7 +573,7 @@ Stats stats(std::vector<double> ms) {
     s.mean = sum / ms.size();
     double sq = 0.;
     for (const double v : ms) sq += (v - s.mean) * (v - s.mean);
-    s.variance = sq / (ms.size() - 1);
+    s.variance = ms.size() > 1 ? sq / (ms.size() - 1) : 0.;
     std::sort(ms.begin(), ms.end());
     s.min = ms.front();
     s.max = ms.back();
@@ -571,23 +589,36 @@ struct Row {
     double meanSpeedup;
 };
 
-Row timeTwo(size_t batch, const std::function<void()>& rpp, const std::function<void()>& fkl) {
+// FKL's pool workers spin FKL_POOL_SPIN after their last chunk before they sleep (fkl/thread-pool/include/ThreadPool.h).
+// The RPP all-threads pipeline starts with FKL's conversion on that pool, then RPP's OpenMP team runs on the same
+// hardware threads: the pool's spin is turned off before every timed run of it, and restored to FKL's default before
+// every timed run of FKL, both outside of the timing (before the idle gap)
+constexpr auto FKL_POOL_SPIN = std::chrono::microseconds(100);
+void fklPoolSpin(bool on) {
+    fk::cpuThreadPool().setSpinTime(on ? std::chrono::nanoseconds(FKL_POOL_SPIN) : std::chrono::nanoseconds(0));
+}
+
+Row timeTwo(size_t batch, const std::function<void()>& rpp, const std::function<void()>& fkl,
+            const std::function<void()>& beforeRpp = {}, const std::function<void()>& beforeFkl = {}) {
     using Clock = std::chrono::steady_clock;
-    const auto time = [](const std::function<void()>& f) {
+    const auto time = [](const std::function<void()>& f, const std::function<void()>& before) {
+        if (before) {
+            before();
+        }
         std::this_thread::sleep_for(IDLE_GAP);
         const auto t0 = Clock::now();
         f();
         return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     };
     for (int i = 0; i < WARMUP_ITERS; ++i) {
-        time(rpp);
-        time(fkl);
+        time(rpp, beforeRpp);
+        time(fkl, beforeFkl);
     }
     std::vector<double> a(ITERS), b(ITERS);
     double speedup = 0.;
     for (int i = 0; i < ITERS; ++i) {
-        a[i] = time(rpp);
-        b[i] = time(fkl);
+        a[i] = time(rpp, beforeRpp);
+        b[i] = time(fkl, beforeFkl);
         speedup += a[i] / b[i];
     }
     return {batch, stats(a), stats(b), speedup / ITERS};
@@ -650,7 +681,10 @@ struct SelectionRow {
     Stats timing;
 };
 
-double timeOnce(const std::function<void()>& f) {
+double timeOnce(const std::function<void()>& f, const std::function<void()>& before = {}) {
+    if (before) {
+        before();
+    }
     std::this_thread::sleep_for(IDLE_GAP);
     const auto t0 = std::chrono::steady_clock::now();
     f();
@@ -691,13 +725,18 @@ void selectionConfig(Workload& w, unsigned threads, bool timing, const std::vect
         for (int i = 0; i < SELECTION_WARMUP + SELECTION_ITERS; ++i) {
             for (size_t k = 0; k < VARIANTS.size(); ++k) {
                 if (local[k].candidate) {
-                    const double t = timeOnce([&]() { pipelines[k]->run(); });
+                    const double t = timeOnce([&]() { pipelines[k]->run(); }, [] {
+                        if constexpr (PA == fk::ParArch::CPU_MULTITHREAD) {
+                            fklPoolSpin(false);
+                        }
+                    });
                     if (i >= SELECTION_WARMUP) {
                         ms[k].push_back(t);
                     }
                 }
             }
         }
+        fklPoolSpin(true);
         std::printf("N %3zu | RPP selection, %u thread(s):", N, threads);
         for (size_t k = 0; k < VARIANTS.size(); ++k) {
             if (local[k].candidate) {
@@ -735,6 +774,23 @@ void selectionBatch(Workload& w, unsigned hardwareThreads, bool timing, const Sa
                                                      ref8bit, rows, checks);
 }
 
+// Whether some RPP variant is a candidate (numerically equivalent to rpp_per_op and to its reference) at every N
+bool hasRppCandidate(const std::vector<SelectionRow>& rows, unsigned threads) {
+    for (const Variant v : VARIANTS) {
+        bool seen = false, candidate = true;
+        for (const auto& r : rows) {
+            if (r.threads == threads && r.variant == variantName(v)) {
+                seen = true;
+                candidate = candidate && r.candidate;
+            }
+        }
+        if (seen && candidate) {
+            return true;
+        }
+    }
+    return false;
+}
+
 Variant chooseRpp(const std::vector<SelectionRow>& rows, unsigned threads) {
     int best = -1;
     double bestScore = INFINITY;
@@ -770,7 +826,8 @@ void runBatch(Workload& w, std::array<std::vector<Row>, PAIRINGS>& rows, unsigne
     RppHost<fk::ParArch::CPU> rpp1(w, N, oneThread, 1);
     RppHost<fk::ParArch::CPU_MULTITHREAD> rppAll(w, N, allThreads, hardwareThreads);
     rows[ONE_THREAD_VS_CPU].push_back(timeTwo(N, [&]() { rpp1.run(); }, [&]() { fkl.run(); }));
-    rows[ALL_THREADS_VS_MT].push_back(timeTwo(N, [&]() { rppAll.run(); }, [&]() { fklMT.run(); }));
+    rows[ALL_THREADS_VS_MT].push_back(timeTwo(N, [&]() { rppAll.run(); }, [&]() { fklMT.run(); },
+                                              [] { fklPoolSpin(false); }, [] { fklPoolSpin(true); }));
     const Row& a = rows[ONE_THREAD_VS_CPU].back();
     const Row& c = rows[ALL_THREADS_VS_MT].back();
     std::printf("N %3zu | RPP 1 thread %9.1f us vs FKL CPU %8.1f us (BVF mean speedup %6.2fx) | RPP %u threads %9.1f us vs "
@@ -895,6 +952,26 @@ int main(int argc, char** argv) {
             v << c.batch << ", " << c.implementation << ", " << c.threads << ", " << c.vsOwnReference << ", "
               << c.vsRppReference << ", " << c.vsFklFloatReference << ", " << c.vsFkl8bitReference << std::endl;
         }
+        // FKL's outputs must be within TOLERANCE of the FKL float reference (common/bench_validation.h), and every
+        // thread count needs an RPP pipeline numerically equivalent to rpp_per_op; the RPP outputs are reported
+        bool failed = false;
+        for (const auto& c : checks) {
+            if (c.implementation.rfind("fkl_", 0) == 0 && !(c.vsOwnReference <= bench::validation::TOLERANCE)) {
+                std::cerr << "ERROR: " << c.implementation << " at N = " << c.batch << ": max abs error " << c.vsOwnReference
+                          << " against the FKL float reference, more than " << bench::validation::TOLERANCE << std::endl;
+                failed = true;
+            }
+        }
+        for (const unsigned t : {1u, hardwareThreads}) {
+            if (!hasRppCandidate(selection, t)) {
+                std::cerr << "ERROR: no RPP HOST variant is numerically equivalent to rpp_per_op at every N with " << t
+                          << " thread(s)" << std::endl;
+                failed = true;
+            }
+        }
+        if (failed) {
+            return 1;
+        }
         if (validateOnly) {
             return 0;
         }
@@ -955,14 +1032,20 @@ int main(int argc, char** argv) {
              << "by a selection pass (every candidate timed round-robin, " << SELECTION_WARMUP << " warm-up + "
              << SELECTION_ITERS << " iterations per N, lowest geometric mean of the medians; cpu_rpp_selection.csv); only "
              << "that pipeline is measured afterwards. "
-             << "Variants: rpp_per_op (crop_mirror_normalize 8u->32f, memset, resize into the "
-                "output rows, multiply_scalar, tensor_subtract_tensor, tensor_divide_tensor), rpp_npp_like (resized crops "
-                "in their own buffer, copied by crop), rpp_fused (memset, resize_mirror_normalize with Mul, Sub, Div), "
-                "rpp_normalize (rpp_per_op with Mul + Sub + Div in one normalize), rpp_fused_normalize (memset, "
-                "resize_mirror_normalize, normalize). RPP HOST behaviour handled in the pipelines: rppt_normalize "
+             << "Variants: rpp_per_op (crop_mirror_normalize 8u->32f, memset of the output's border rows, resize into "
+                "the output rows, multiply_scalar, tensor_subtract_tensor, tensor_divide_tensor), rpp_npp_like (resized "
+                "crops in their own buffer, copied by crop), rpp_fused (memset of the border rows, resize_mirror_normalize "
+                "with Mul, Sub, Div), rpp_normalize (rpp_per_op with Mul + Sub + Div in one normalize, out of place, "
+                "without the memset: its input's border rows stay zero), rpp_fused_normalize (resize_mirror_normalize, "
+                "normalize, without the memset). RPP HOST behaviour handled in the pipelines: rppt_normalize "
                 "replaces the caller's stdDev values by scale/stdDev (restored before every call, inside the timing) "
                 "and zeroes its destination before reading its source (run out of place); rppt_resize_mirror_normalize "
-                "zeroes only nStride bytes of each float destination plane (the whole output is zeroed by the memset). "
+                "zeroes nStride bytes (a quarter of the plane) from the first interior row of each float destination "
+                "plane, never past the plane: harmless, the interior rows are written afterwards and the border rows "
+                "are zero. "
+                "FKL's thread pool does not spin after the conversion of the RPP all-threads pipeline (setSpinTime(0) "
+                "before every timed run of it, outside of the timing; FKL's default 100 us before FKL's runs), so that its "
+                "workers do not compete with RPP's OpenMP team. "
                 "rppt_crop_mirror_normalize 8u->32f writes one float (1.0) past the end of every row when the ROI width "
                 "is a multiple of 16: every crop in the crop buffer is followed by a spare row, so that this float never "
                 "lands on the next crop, which another OpenMP thread may have written already; rppt_resize reads 12 bytes "
