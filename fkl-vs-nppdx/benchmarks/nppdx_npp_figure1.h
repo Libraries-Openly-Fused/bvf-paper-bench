@@ -110,6 +110,11 @@ public:
     NppTail(const NppTail&) = delete;
     NppTail& operator=(const NppTail&) = delete;
 
+    // Fills the bordered planes with values the border never writes, before a validation
+    void poison(cudaStream_t stream) const {
+        gpuErrchk(cudaMemsetAsync(m_bordered, 0xAB, m_n * OUT_W * OUT_H * 3, stream));
+    }
+
     template <typename Before>
     void run(const uint8_t* resized, float* out, const Normalization& n, const NppStreamContext& ctx,
              Before&& before) const {

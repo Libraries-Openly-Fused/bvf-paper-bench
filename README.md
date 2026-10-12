@@ -9,8 +9,9 @@ pipeline of the paper,
 on one 3840x2160 NV12 frame with N in {1, 4, 16, 50, 100} crops of 32x16, each resized (bilinear) to 64x32, padded
 with 16 black rows on top and bottom to 64x64, normalized as (x * mul - sub) / div and written as float3 into an N plane
 tensor. The comparisons of FKL with NVIDIA's NPPDx are in [`fkl-vs-nppdx/`](fkl-vs-nppdx/README.md) (until October
-2026 the separate repository FKL-vs-NPPDx), with their RTX 4090 results: NPPDx as one kernel, with hand written CUDA
-code for the steps NPPDx has no operation for, and NPPDx combined with NPP without hand written pixel processing code.
+2026 the separate repository FKL-vs-NPPDx), with RTX 4090 results of the previous workload: NPPDx as one kernel, with
+hand written CUDA code for the steps NPPDx has no operation for, and NPPDx combined with NPP without hand written pixel
+processing code.
 
 ## Workload
 

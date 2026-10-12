@@ -84,6 +84,7 @@ struct NppdxNppPipeline {
     template <size_t N>
     static void poison(const Buffers<N>& b, cudaStream_t stream) {
         gpuErrchk(cudaMemsetAsync(b.resized, 0xAB, N * RES_W * RES_H * 3, stream));
+        b.tail.poison(stream);
         gpuErrchk(cudaMemsetAsync(b.out, 0xFF, N * OUT_FLOATS * sizeof(float), stream));
     }
 

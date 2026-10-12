@@ -142,7 +142,7 @@ struct NppdxPipeline {
                 const Error e = compare(nppdx, hostVariant(w, w.crops[0], clampRGB, s, false).plane);
                 std::cout << "NPPDx vs host reference, "
                           << (clampRGB ? "RGB clamped to [0,255], " : "RGB not clamped,      ")
-                          << names[static_cast<int>(s)] << ": max " << e.max << ", mean " << e.mean << std::endl;
+                          << names[static_cast<int>(s)] << ": max " << e.max() << ", mean " << e.mean << std::endl;
             }
         }
         {

@@ -127,6 +127,15 @@ inline std::array<CropRect, MAX_BATCH> makeCrops() {
     return crops;
 }
 
+// The batch sizes separated by spaces: what the --batches mode of the GPU benchmarks prints for the scripts
+inline std::string batchList() {
+    std::ostringstream os;
+    for (size_t i = 0; i < BATCHES.size(); ++i) {
+        os << (i ? " " : "") << BATCHES[i];
+    }
+    return os.str();
+}
+
 // The workload, for the platform files of every benchmark
 inline std::string describe() {
     std::ostringstream os;

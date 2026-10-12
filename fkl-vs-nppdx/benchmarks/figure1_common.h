@@ -35,6 +35,7 @@
 #include <benchmarks/benchmark_common.h>
 #include "bench_platform.h"
 #include "bench_npp.h"
+#include "bench_validation.h"
 
 #include <fused_kernel/fused_kernel.h>
 #include <fused_kernel/algorithms/basic_ops/arithmetic.h>
@@ -172,35 +173,13 @@ std::vector<float> cpuReference(const Workload& w, const std::array<fk::Rect, N>
     return std::vector<float>(data, data + N * OUT_FLOATS);
 }
 
-constexpr float TOLERANCE = 1e-3f;
-// A pipeline that rounds the resized RGB to 8 bits can round a value on a half level differently from the CPU
-// reference: one level of 8 bit RGB after the normalization (1 / 255 / 0.224, the largest of the three channels)
-constexpr float TOLERANCE_8BIT = 1.f / 255.f / 0.224f + TOLERANCE;
-
-// Errors of an output against a reference, in normalized units
-struct Error {
-    float max{0.f};
-    double mean{0.};
-    size_t beyond{0}; // values more than TOLERANCE away from the reference
-};
-
-// The largest error within the tolerance, and at most one value in a thousand more than TOLERANCE away: ties on a half
-// level are rare, while a systematic one-level error (truncating instead of rounding, for example) is not
-inline bool withinTolerance(const Error& e, size_t values, float tolerance) {
-    return e.max <= tolerance && e.beyond * 1000 <= values;
-}
-
-inline Error compare(const std::vector<float>& output, const std::vector<float>& reference) {
-    Error e;
-    for (size_t i = 0; i < output.size(); ++i) {
-        const float d = std::abs(output[i] - reference[i]);
-        e.max = std::isfinite(d) ? std::max(e.max, d) : INFINITY;
-        e.beyond += !(d <= TOLERANCE);
-        e.mean += d;
-    }
-    e.mean /= static_cast<double>(output.size());
-    return e;
-}
+// Tolerances, errors and the rule of an output within its tolerance, shared with the GPU benchmark
+// (common/bench_validation.h): TOLERANCE against a float reference, TOLERANCE_8BIT against one rounded to 8 bits
+using bench::validation::TOLERANCE;
+using bench::validation::TOLERANCE_8BIT;
+using Error = bench::validation::Errors;
+using bench::validation::compare;
+using bench::validation::withinTolerance;
 
 template <typename T>
 std::vector<T> download(const T* data, size_t count) {
@@ -326,7 +305,7 @@ void sweepConfig(Workload& w, const CropOrigins<N>& origins, const typename P::t
         // memory for this GPU) is recorded as failed, with an infinite error, and never chosen
         std::cout << "Batch " << N << ": NPPDx tile " << C.tileX << "x" << C.tileY << " block " << C.block
                   << " cannot run here: " << e.what() << std::endl;
-        s.vsReference.max = INFINITY;
+        s.vsReference.maxPerChannel.fill(INFINITY);
         sweep.push_back(s);
         return;
     }
@@ -354,6 +333,14 @@ void compareWithFKL(Workload& w, const CropOrigins<N>& origins, const std::array
     const Validation v{N, K::block.x, C.tileX, C.tileY, compare(nppdx, reference), compare(nppdx, fklReference),
                        compare(fkl, fklReference)};
     checks.push_back(v);
+    // The sweep only chooses a configuration within the tolerance; one given with --configs may not be
+    if (!withinTolerance(v.nppdxVsReference, P::tolerance)) {
+        throw std::runtime_error(std::string(P::label) + " in configuration tile " + std::to_string(C.tileX) + "x" +
+                                 std::to_string(C.tileY) + " block " + std::to_string(C.block) + " is not within its "
+                                 "tolerance for batch " + std::to_string(N) + ": max abs error " +
+                                 std::to_string(v.nppdxVsReference.max()) + ", " +
+                                 std::to_string(v.nppdxVsReference.beyond) + " values beyond 1e-3");
+    }
     const auto r = benchmark::runTwoExecutions(
         w.stream, static_cast<int>(N), [&]() { P::template run<N, C>(w, origins, b, noFlush); },
         [&]() { runFKL<N>(w, crops, fklOut); });
@@ -361,8 +348,8 @@ void compareWithFKL(Workload& w, const CropOrigins<N>& origins, const std::array
     std::cout << "Batch " << N << ": " << P::label << " (block " << K::block.x << ", tile " << C.tileX << "x" << C.tileY
               << ") median " << r.first.median * 1000.f << " us, FKL median " << r.second.median * 1000.f
               << " us, mean speedup " << r.meanSpeedup << " | max abs error: " << P::label << " vs its reference "
-              << v.nppdxVsReference.max << " (" << v.nppdxVsReference.beyond << " values beyond 1e-3), vs FKL "
-              << "reference " << v.nppdxVsFkl.max << ", FKL vs FKL reference " << v.fkl.max << std::endl;
+              << v.nppdxVsReference.max() << " (" << v.nppdxVsReference.beyond << " values beyond 1e-3), vs FKL "
+              << "reference " << v.nppdxVsFkl.max() << ", FKL vs FKL reference " << v.fkl.max() << std::endl;
 }
 
 template <typename P, size_t N>
@@ -387,7 +374,7 @@ void runBatch(Workload& w, std::vector<benchmark::TwoExecutionsResult>& results,
         }(std::make_index_sequence<P::configs.size()>{});
         float bestMedian = INFINITY;
         for (size_t i = first; i < sweep.size(); ++i) {
-            if (withinTolerance(sweep[i].vsReference, N * OUT_FLOATS, P::tolerance) &&
+            if (withinTolerance(sweep[i].vsReference, P::tolerance) &&
                 sweep[i].time.median < bestMedian) {
                 bestMedian = sweep[i].time.median;
                 best = i - first;
@@ -539,10 +526,7 @@ int figure1Main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--batches") {
             // The batch sizes, for the Nsight Compute scripts
-            for (size_t i = 0; i < BATCHES.size(); ++i) {
-                std::cout << (i ? " " : "") << BATCHES[i];
-            }
-            std::cout << std::endl;
+            std::cout << batchList() << std::endl;
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--workload") {
@@ -630,11 +614,12 @@ int figure1Main(int argc, char** argv) {
                       "NPPDx tolerance, NPPDx within tolerance, FKL within tolerance" << std::endl;
         for (const auto& v : checks) {
             validation << v.batch << ", " << v.nppdxBlock << ", " << v.tileX << "x" << v.tileY << ", "
-                       << v.nppdxVsReference.max << ", " << v.nppdxVsReference.mean << ", " << v.nppdxVsReference.beyond
-                       << ", " << v.nppdxVsFkl.max << ", " << v.nppdxVsFkl.mean << ", " << v.fkl.max << ", "
+                       << v.nppdxVsReference.max() << ", " << v.nppdxVsReference.mean << ", "
+                       << v.nppdxVsReference.beyond << ", " << v.nppdxVsFkl.max() << ", " << v.nppdxVsFkl.mean << ", "
+                       << v.fkl.max() << ", "
                        << v.fkl.mean << ", " << v.batch * OUT_FLOATS << ", " << P::tolerance << ", "
-                       << (withinTolerance(v.nppdxVsReference, v.batch * OUT_FLOATS, P::tolerance) ? "yes" : "no")
-                       << ", " << (withinTolerance(v.fkl, v.batch * OUT_FLOATS, TOLERANCE) ? "yes" : "no") << std::endl;
+                       << (withinTolerance(v.nppdxVsReference, P::tolerance) ? "yes" : "no") << ", "
+                       << (withinTolerance(v.fkl, TOLERANCE) ? "yes" : "no") << std::endl;
         }
         std::ofstream blocks(outDir / (name + "_nppdx_block_sweep_" + parArch + ".csv"));
         blocks << "Batch size, Requested BlockDim (0 = NPPDx recommended), Tile, Actual BlockSize, Blocks per crop, "
@@ -643,7 +628,7 @@ int figure1Main(int argc, char** argv) {
         for (const auto& b : sweep) {
             blocks << b.batch << ", " << b.requestedBlock << ", " << b.tileX << "x" << b.tileY << ", " << b.actualBlock
                    << ", " << b.blocksPerCrop << ", " << b.smem << ", " << b.time.mean << ", " << b.time.median << ", "
-                   << b.time.p10 << ", " << b.time.p90 << ", " << b.vsReference.max << ", "
+                   << b.time.p10 << ", " << b.time.p90 << ", " << b.vsReference.max() << ", "
                    << (b.chosen ? "yes" : "no") << std::endl;
         }
         // The configuration of every batch size, read back by --gpu-only-l2-flushed, --configs, the Nsight Compute

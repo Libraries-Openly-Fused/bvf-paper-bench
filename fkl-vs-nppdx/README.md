@@ -44,6 +44,12 @@ own names.
 
 ## Results on an RTX 4090
 
+**These results are from the previous workload and will be replaced:** the tables below and the files in
+[`results/RTX4090`](results/RTX4090) and [`results/RTX4090-20x10`](results/RTX4090-20x10) were measured with NV12 to
+RGB in BT.2020 full range on a frame of uniform random bytes (see their platform files), before the BT.601 limited
+range workload described above and before the NPPDx+NPP benchmark existed. Their configuration files do not match the
+current workload, so the scripts that check the workload refuse them.
+
 Three benchmarks, with the same iterations: 1000 timed after 100 warm-up ones, NPPDx and FKL one after the other in
 each, and FKL's mean speedup computed per iteration (NPPDx time / FKL time) and averaged, as in FKL's and
 cvGPUSpeedup's benchmarks. NPPDx runs in the configuration chosen for every N (see

@@ -36,6 +36,7 @@
 
 #include "bench_geometry.h"
 #include "bench_npp.h"
+#include "bench_validation.h"
 #include "bench_platform.h"
 
 #include <algorithm>
@@ -64,16 +65,16 @@ using namespace geometry;
 constexpr int WARMUP_ITERS = BENCH_WARMUP_ITERATIONS;
 constexpr int TIMED_ITERS = BENCH_ITERATIONS;
 static_assert(WARMUP_ITERS >= 0 && TIMED_ITERS >= 1, "at least one timed iteration");
-constexpr float TOLERANCE = 1e-3f;
+// Tolerances and error statistics shared with fkl-vs-nppdx (common/bench_validation.h)
+using validation::TOLERANCE;
+using validation::TOLERANCE_8BIT;
+using ErrorStats = validation::Errors;
+using validation::compare;
 
 // Pointwise tail: ImageNet normalization of 8 bit RGB
 constexpr float MUL[3] = {1.f / 255.f, 1.f / 255.f, 1.f / 255.f};
 constexpr float SUB[3] = {0.485f, 0.456f, 0.406f};
 constexpr float DIV[3] = {0.229f, 0.224f, 0.225f};
-// Tolerance against the 8 bit reference: a pipeline that rounds RGB to 8 bits can round a value that lies on a half
-// level differently from the CPU reference (different floating point contraction), which is one level of 8 bit RGB
-// after the normalization (1 / 255 / 0.224, the largest of the three channels)
-constexpr float TOLERANCE_8BIT = 1.f / 255.f / 0.224f + TOLERANCE;
 // 8 bit quantization of the RGB values for the reference of the 8 bit pipelines:
 // normalize to [0, 1], add half a level so that the truncating denormalization rounds to nearest,
 // saturate with __saturatef and denormalize to uchar3
@@ -178,6 +179,8 @@ void nv12ToRgb8(const Context& ctx, Npp8u* dst, int dstStep) {
 struct Implementation {
     std::string name;
     bool eightBitRGB{false};
+    // Its resize samples as NPP's does (nppConventionReference8bit), not at dst * scale like FKL's and OpenCV's
+    bool nppSampling{false};
     std::function<void()> run;
     std::function<std::vector<float>()> download;
     std::function<void()> fillNaN;
@@ -401,6 +404,7 @@ Implementation makeNPP(Context& ctx) {
     gpuErrchk(cudaMemcpy(st->rois, rois.data(), N * sizeof(NppiResizeBatchROI_Advanced), cudaMemcpyHostToDevice));
 
     Implementation impl{"npp", true};
+    impl.nppSampling = true;
     impl.stages.emplace_back("1_nv12_to_rgb8_full_frame", [&ctx, st]() { nv12ToRgb8(ctx, st->rgb8, st->rgbStep); });
     impl.stages.emplace_back("2_per_crop_convert_8u32f", [&ctx, st, cropFloats, cropStep]() {
         for (size_t i = 0; i < N; ++i) {
@@ -535,32 +539,6 @@ std::vector<float> nppConventionReference8bit(const Context& ctx) {
         }
     }
     return out;
-}
-
-struct ErrorStats {
-    std::array<float, 3> maxPerChannel{0.f, 0.f, 0.f};
-    double mean{0.};
-    size_t nonFinite{0};
-    size_t beyondTolerance{0}; // values more than TOLERANCE away from the reference
-    float max() const { return std::max({maxPerChannel[0], maxPerChannel[1], maxPerChannel[2]}); }
-};
-
-ErrorStats compare(const std::vector<float>& output, const std::vector<float>& reference) {
-    ErrorStats stats;
-    double sum = 0.;
-    for (size_t i = 0; i < output.size(); ++i) {
-        const float err = std::abs(output[i] - reference[i]);
-        if (!std::isfinite(err)) {
-            stats.nonFinite++;
-            stats.maxPerChannel[i % 3] = INFINITY;
-            continue;
-        }
-        stats.maxPerChannel[i % 3] = std::max(stats.maxPerChannel[i % 3], err);
-        stats.beyondTolerance += err > TOLERANCE;
-        sum += err;
-    }
-    stats.mean = sum / static_cast<double>(output.size());
-    return stats;
 }
 
 // Statistics of a set of timed executions, in microseconds
@@ -833,12 +811,7 @@ struct Result {
     LaunchCounts launches;
     // 1e-3 against the float reference, one level of 8 bit RGB against the 8 bit reference
     float tolerance() const { return reference == "fkl_cpu_float" ? TOLERANCE : TOLERANCE_8BIT; }
-    // The largest error within the tolerance, and at most one value in a thousand more than 1e-3 away: ties on a half
-    // level are rare, while a systematic one-level error (truncating instead of rounding, for example) is not
-    bool withinTolerance() const {
-        return errorVsOwnReference.max() <= tolerance() &&
-               errorVsOwnReference.beyondTolerance * 1000 <= static_cast<size_t>(batch) * OUT_FLOATS;
-    }
+    bool withinTolerance() const { return validation::withinTolerance(errorVsOwnReference, tolerance()); }
 };
 
 // The implementations in the comparison, all with the same intermediates (8 bit RGB frame, then float3), and FKL BVF
@@ -873,8 +846,10 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
         impl.run();
         gpuErrchk(cudaStreamSynchronize(ctx.stream));
         const auto output = impl.download();
-        r.reference = impl.eightBitRGB ? "fkl_cpu_8bit_rgb" : "fkl_cpu_float";
-        r.errorVsOwnReference = compare(output, impl.eightBitRGB ? ref8bit : refFloat);
+        // Every pipeline against the reference of its own conventions: NPP samples its resize differently
+        r.reference = impl.nppSampling ? "npp_sampling_8bit" : impl.eightBitRGB ? "fkl_cpu_8bit_rgb" : "fkl_cpu_float";
+        r.errorVsOwnReference =
+            compare(output, impl.nppSampling ? refNppConvention : impl.eightBitRGB ? ref8bit : refFloat);
         r.errorVsFloatReference = compare(output, refFloat);
         r.errorVsNppConventionReference = compare(output, refNppConvention);
         batchResults.push_back(r);
@@ -1318,10 +1293,7 @@ int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--batches") {
             // The batch sizes, for the Nsight Compute scripts
-            for (size_t i = 0; i < BATCHES.size(); ++i) {
-                std::cout << (i ? " " : "") << BATCHES[i];
-            }
-            std::cout << std::endl;
+            std::cout << batchList() << std::endl;
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--workload") {
@@ -1452,7 +1424,7 @@ int main(int argc, char** argv) {
                        << std::setprecision(3) << e.maxPerChannel[0] << "," << e.maxPerChannel[1] << ","
                        << e.maxPerChannel[2] << "," << e.mean << "," << e.nonFinite << ","
                        << r.errorVsFloatReference.max() << "," << r.errorVsNppConventionReference.max() << ","
-                       << e.beyondTolerance << "," << r.batch * OUT_FLOATS << "," << r.tolerance() << ","
+                       << e.beyond << "," << e.values << "," << r.tolerance() << ","
                        << (r.withinTolerance() ? "yes" : "no") << "\n";
             kernels << r.name << "," << r.batch << "," << r.launches.kernels << "," << r.launches.memsets << ","
                     << r.launches.memcpys << "\n";
