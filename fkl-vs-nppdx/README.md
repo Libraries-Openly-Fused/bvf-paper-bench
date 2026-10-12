@@ -164,8 +164,8 @@ the benchmark checks each one (the whole pipeline, on the regions of the first t
 times its NPPDx kernel alone on the regions of every iteration (for NPPDx+NPP the NPP calls are the same in every
 configuration), and compares FKL with the fastest correct one (a `BlockDim` smaller than the recommended block of a tile gives wrong results, and is never chosen; a
 configuration this GPU cannot launch is reported and skipped). The chosen configuration of every N drives all three
-comparisons (CPU + GPU, GPU only and GPU only with the L2 flushed), the Nsight Compute scripts and the NPPDx
-compile-time units (of the single NPPDx kernel). `<benchmark> <dir> --configs <csv>` runs the comparison with the
+comparisons (CPU + GPU, GPU only and GPU only with the L2 flushed) and the NPPDx compile-time unit (of the single
+NPPDx kernel, at N = 100), and gives the tile and block to pass to `--ncu-target` by hand. `<benchmark> <dir> --configs <csv>` runs the comparison with the
 configurations of a CSV in the format of the configuration file instead of choosing them, for example to re-time other
 candidates; a configuration whose output is not within its tolerance is still timed and written, and then the program
 fails (as it does when FKL's output is not). Every configuration tried is in

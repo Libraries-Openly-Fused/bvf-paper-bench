@@ -559,7 +559,7 @@ template <typename P>
 int figure1Main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--batches") {
-            // The batch sizes, for the Nsight Compute scripts
+            // The batch sizes, for scripts
             std::cout << batchList() << std::endl;
             return 0;
         }
@@ -666,8 +666,8 @@ int figure1Main(int argc, char** argv) {
                    << (withinTolerance(b.vsReference, P::tolerance) ? "yes" : "no") << ", " << (b.chosen ? "yes" : "no")
                    << std::endl;
         }
-        // The configuration of every batch size, read back by --gpu-only-l2-flushed, --configs, the Nsight Compute
-        // scripts and the compile-time units
+        // The configuration of every batch size, read back by --gpu-only-l2-flushed, --configs and the compile-time
+        // unit (scripts/compile_time.sh), and the tile and block to give --ncu-target
         std::ofstream chosen(configCsv);
         chosen << "Batch size, Tile, Requested BlockDim (0 = NPPDx recommended), Actual BlockSize, Blocks per crop, "
                   "Dynamic shared memory bytes" << std::endl;
