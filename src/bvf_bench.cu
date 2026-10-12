@@ -174,13 +174,27 @@ void nv12ToRgb8(const Context& ctx, Npp8u* dst, int dstStep) {
     npp::nv12ToRgb8Bt601Limited(ctx.y, ctx.uv, ctx.pitch, dst, dstStep, NppiSize{FRAME_W, FRAME_H}, ctx.npp);
 }
 
+// The reference an implementation is checked against, with its tolerance: the Figure 1 chain on FKL's CPU backend in
+// float (FKL BVF); the same with the RGB rounded to 8 bits, for the pipelines with an 8 bit RGB frame (OpenCV, FKL
+// VF+HF), which resize at dst * scale like FKL; or that with NPP's resize sampling (NPP, nppConventionReference8bit)
+enum class Reference { FklFloat, Fkl8bit, NppSampling8bit };
+
+inline const char* referenceName(Reference r) {
+    switch (r) {
+        case Reference::FklFloat: return "fkl_cpu_float";
+        case Reference::Fkl8bit: return "fkl_cpu_8bit_rgb";
+        default: return "npp_sampling_8bit";
+    }
+}
+
+// 1e-3 against the float reference, one level of 8 bit RGB against the 8 bit ones
+inline float toleranceOf(Reference r) { return r == Reference::FklFloat ? TOLERANCE : TOLERANCE_8BIT; }
+
 // Each implementation enqueues one complete pipeline on ctx.stream with run(), and returns the
 // N x OUT_H x OUT_W x 3 float output with download(). fillNaN() poisons the output before validation.
 struct Implementation {
     std::string name;
-    bool eightBitRGB{false};
-    // Its resize samples as NPP's does (nppConventionReference8bit), not at dst * scale like FKL's and OpenCV's
-    bool nppSampling{false};
+    Reference reference{Reference::FklFloat};
     std::function<void()> run;
     std::function<std::vector<float>()> download;
     std::function<void()> fillNaN;
@@ -205,7 +219,7 @@ template <size_t N>
 Implementation makeFklBvf(Context& ctx) {
     auto out = std::make_shared<fk::Tensor<fk::float3>>(OUT_W, OUT_H, N, 1, fk::MemType::Device);
     const auto crops = firstCrops<N>(ctx);
-    Implementation impl{"fkl_bvf", false};
+    Implementation impl{"fkl_bvf", Reference::FklFloat};
     impl.run = [&ctx, out, crops]() {
         beforeKernel();
         fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
@@ -251,7 +265,7 @@ Implementation makeFklVfHf(Context& ctx) {
     const auto crops = firstCrops<N>(ctx);
     const auto croppedViews = planeViews<N>(*cropped, CROP_W, CROP_H);
     const auto resizedViews = planeViews<N>(*resized, RES_W, RES_H);
-    Implementation impl{"fkl_vf_hf", true};
+    Implementation impl{"fkl_vf_hf", Reference::Fkl8bit};
     impl.stages.emplace_back("1_nv12_to_rgb8_full_frame", [&ctx, rgb]() {
         beforeKernel();
         fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
@@ -317,7 +331,7 @@ Implementation makeOpenCV(Context& ctx, std::shared_ptr<OpenCVState>& stateOut) 
     }
     cv::cuda::createContinuous(static_cast<int>(N) * OUT_H, OUT_W, CV_32FC3, st->tensor);
     stateOut = st;
-    Implementation impl{"opencv_cuda", true};
+    Implementation impl{"opencv_cuda", Reference::Fkl8bit};
     impl.stages.emplace_back("1_nv12_to_rgb8_full_frame_npp", [&ctx, st]() {
         nv12ToRgb8(ctx, st->rgb8.data, static_cast<int>(st->rgb8.step));
     });
@@ -403,8 +417,7 @@ Implementation makeNPP(Context& ctx) {
     gpuErrchk(cudaMemcpy(st->dstDescriptors, dst.data(), N * sizeof(NppiImageDescriptor), cudaMemcpyHostToDevice));
     gpuErrchk(cudaMemcpy(st->rois, rois.data(), N * sizeof(NppiResizeBatchROI_Advanced), cudaMemcpyHostToDevice));
 
-    Implementation impl{"npp", true};
-    impl.nppSampling = true;
+    Implementation impl{"npp", Reference::NppSampling8bit};
     impl.stages.emplace_back("1_nv12_to_rgb8_full_frame", [&ctx, st]() { nv12ToRgb8(ctx, st->rgb8, st->rgbStep); });
     impl.stages.emplace_back("2_per_crop_convert_8u32f", [&ctx, st, cropFloats, cropStep]() {
         for (size_t i = 0; i < N; ++i) {
@@ -493,7 +506,9 @@ std::vector<float> cpuReference(const Context& ctx) {
 // NPP's nppiResize / nppiResizeBatch 32f linear sample at src = dst * scale - 0.25, clamped to the image
 // (measured with linear ramps at upscale factors 2, 3.2 and 5). That is the pixel-center convention,
 // (dst + 0.5) * scale - 0.5, only for an exact 2x upscale (scale 0.5); at 3.2x pixel centers would be
-// dst * scale - 0.34375. Same 8 bit RGB, border and pointwise tail as the 8 bit reference.
+// dst * scale - 0.34375. Same 8 bit RGB, border and pointwise tail as the 8 bit reference. Only measured for
+// upscales: for a workload that downscales the crops (BENCH_RESIZE_* smaller than BENCH_CROP_*), NPP's linear resize
+// may not sample this way, and its row of validation.csv would then report an error against this reference.
 constexpr float NPP_SAMPLE_OFFSET = -0.25f;
 
 template <size_t N>
@@ -807,10 +822,9 @@ struct Result {
     ErrorStats errorVsOwnReference;
     ErrorStats errorVsFloatReference;
     ErrorStats errorVsNppConventionReference;
-    std::string reference;
+    Reference reference{Reference::FklFloat};
     LaunchCounts launches;
-    // 1e-3 against the float reference, one level of 8 bit RGB against the 8 bit reference
-    float tolerance() const { return reference == "fkl_cpu_float" ? TOLERANCE : TOLERANCE_8BIT; }
+    float tolerance() const { return toleranceOf(reference); }
     bool withinTolerance() const { return validation::withinTolerance(errorVsOwnReference, tolerance()); }
 };
 
@@ -846,10 +860,11 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
         impl.run();
         gpuErrchk(cudaStreamSynchronize(ctx.stream));
         const auto output = impl.download();
-        // Every pipeline against the reference of its own conventions: NPP samples its resize differently
-        r.reference = impl.nppSampling ? "npp_sampling_8bit" : impl.eightBitRGB ? "fkl_cpu_8bit_rgb" : "fkl_cpu_float";
-        r.errorVsOwnReference =
-            compare(output, impl.nppSampling ? refNppConvention : impl.eightBitRGB ? ref8bit : refFloat);
+        // Every pipeline against the reference of its own conventions
+        r.reference = impl.reference;
+        r.errorVsOwnReference = compare(output, impl.reference == Reference::FklFloat ? refFloat
+                                                : impl.reference == Reference::Fkl8bit ? ref8bit
+                                                                                       : refNppConvention);
         r.errorVsFloatReference = compare(output, refFloat);
         r.errorVsNppConventionReference = compare(output, refNppConvention);
         batchResults.push_back(r);
@@ -857,7 +872,7 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
     if (!timing) {
         for (const Result& r : batchResults) {
             std::cout << std::left << std::setw(12) << r.name << std::right << "  max err " << std::scientific
-                      << std::setprecision(2) << r.errorVsOwnReference.max() << " (" << r.reference << "), vs float "
+                      << std::setprecision(2) << r.errorVsOwnReference.max() << " (" << referenceName(r.reference) << "), vs float "
                       << r.errorVsFloatReference.max() << ", vs NPP sampling " << r.errorVsNppConventionReference.max()
                       << std::defaultfloat << std::endl;
             results.push_back(r);
@@ -882,7 +897,7 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
             std::cout << "  FKL BVF mean speedup " << std::setw(6) << std::setprecision(2) << r.meanSpeedupOfBvf << "x";
         }
         std::cout << "  max err " << std::scientific << std::setprecision(2) << r.errorVsOwnReference.max() << " ("
-                  << r.reference << ")" << std::defaultfloat << std::endl;
+                  << referenceName(r.reference) << ")" << std::defaultfloat << std::endl;
         results.push_back(r);
     }
     // Per stage breakdown of the multi-kernel pipelines
@@ -1420,7 +1435,7 @@ int main(int argc, char** argv) {
             }
             latency << "\n";
             const auto& e = r.errorVsOwnReference;
-            validation << r.name << "," << r.batch << "," << r.reference << "," << std::scientific
+            validation << r.name << "," << r.batch << "," << referenceName(r.reference) << "," << std::scientific
                        << std::setprecision(3) << e.maxPerChannel[0] << "," << e.maxPerChannel[1] << ","
                        << e.maxPerChannel[2] << "," << e.mean << "," << e.nonFinite << ","
                        << r.errorVsFloatReference.max() << "," << r.errorVsNppConventionReference.max() << ","

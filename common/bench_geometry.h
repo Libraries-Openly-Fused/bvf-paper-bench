@@ -127,11 +127,11 @@ inline std::array<CropRect, MAX_BATCH> makeCrops() {
     return crops;
 }
 
-// The batch sizes separated by spaces: what the --batches mode of the GPU benchmarks prints for the scripts
-inline std::string batchList() {
+// The batch sizes, separated by sep (by spaces: what the --batches mode of the GPU benchmarks prints for the scripts)
+inline std::string batchList(const char* sep = " ") {
     std::ostringstream os;
     for (size_t i = 0; i < BATCHES.size(); ++i) {
-        os << (i ? " " : "") << BATCHES[i];
+        os << (i ? sep : "") << BATCHES[i];
     }
     return os.str();
 }
@@ -141,11 +141,7 @@ inline std::string describe() {
     std::ostringstream os;
     os << FRAME_W << "x" << FRAME_H << " NV12 frame (uniform random limited-range values, Y in [" << LUMA_MIN << ", "
        << LUMA_MAX << "], U and V in [" << CHROMA_MIN << ", " << CHROMA_MAX << "], seed " << FRAME_SEED
-       << "), NV12->RGB BT.601 limited range, N in {";
-    for (size_t i = 0; i < BATCHES.size(); ++i) {
-        os << (i ? ", " : "") << BATCHES[i];
-    }
-    os << "} crops of " << CROP_W << "x" << CROP_H << " at uniform random even positions at least " << CROP_MARGIN
+       << "), NV12->RGB BT.601 limited range, N in {" << batchList(", ") << "} crops of " << CROP_W << "x" << CROP_H << " at uniform random even positions at least " << CROP_MARGIN
        << " pixels from the frame edges (seed " << CROP_SEED << ", the first N of one sequence), bilinear resize to "
        << RES_W << "x" << RES_H << " (ratio " << RESIZE_J << ":" << RESIZE_K << "), " << BORDER_TOP
        << " black rows added on top and " << BORDER_BOTTOM << " at the bottom, output " << OUT_W << "x" << OUT_H

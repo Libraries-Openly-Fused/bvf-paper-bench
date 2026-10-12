@@ -16,7 +16,7 @@
 //           thread pool (one worker per hardware thread), in chunks of one output row of one crop, and sync() waits.
 //
 // Two comparisons, each with the same number of threads on both sides: OpenCV with 1 thread against fkl, and OpenCV
-// with all the hardware threads against fkl mt.
+// with as many threads as FKL's thread pool has workers (one per hardware thread) against fkl mt.
 //
 // Both libraries' thread pools spin for a while after finishing before their workers go to sleep, so every timed run
 // is preceded by an idle gap that lets them fall asleep: neither steals cores from the other, and both start from
@@ -320,7 +320,7 @@ struct Check {
 
 template <size_t N>
 void runBatch(Workload& w, std::vector<Row>& singleThread, std::vector<Row>& multiThread, std::vector<Check>& checks,
-              int hardwareThreads) {
+              int threads) {
     OpenCVCpu opencv(w, N);
     FklCpu<N> fkl(w);
     FklCpu<N, fk::ParArch::CPU_MULTITHREAD> fklMT(w);
@@ -335,7 +335,7 @@ void runBatch(Workload& w, std::vector<Row>& singleThread, std::vector<Row>& mul
     checks.push_back(c);
 
     singleThread.push_back(timeTwo(N, [&]() { opencv.run(); }, [&]() { fkl.run(); }));
-    cv::setNumThreads(hardwareThreads);
+    cv::setNumThreads(threads);
     multiThread.push_back(timeTwo(N, [&]() { opencv.run(); }, [&]() { fklMT.run(); }));
     cv::setNumThreads(1);
     const Row& s = singleThread.back();
@@ -343,7 +343,7 @@ void runBatch(Workload& w, std::vector<Row>& singleThread, std::vector<Row>& mul
     std::printf("N %3zu | OpenCV 1 thread %8.1f us, FKL CPU %8.1f us, mean speedup %6.2fx | OpenCV %d threads %8.1f us, "
                 "FKL CPU_MULTITHREAD %8.1f us, mean speedup %6.2fx | max err: FKL vs reference %.2e, OpenCV vs "
                 "OpenCV-convention reference %.2e, OpenCV vs FKL %.2e, FKL CPU_MULTITHREAD vs FKL CPU %.2e\n",
-                N, s.opencv.median * 1000., s.fkl.median * 1000., s.meanSpeedup, hardwareThreads,
+                N, s.opencv.median * 1000., s.fkl.median * 1000., s.meanSpeedup, threads,
                 m.opencv.median * 1000., m.fkl.median * 1000., m.meanSpeedup, c.fklVsReference, c.opencvVsReference,
                 c.opencvVsFkl, c.fklMultithreadVsFkl);
 }
@@ -354,20 +354,22 @@ int main(int argc, char** argv) {
     using namespace cpubench;
     const std::filesystem::path outDir = argc > 1 ? argv[1] : "results/cpu";
     std::filesystem::create_directories(outDir);
-    const int hardwareThreads = cv::getNumberOfCPUs();
+    // OpenCV runs on as many threads as FKL's thread pool has workers (std::thread::hardware_concurrency()), which can
+    // differ from cv::getNumberOfCPUs() under an affinity mask or a CPU quota
+    const int threads = static_cast<int>(fk::cpuThreadPool().size());
 
     Workload w;
     initWorkload(w);
     std::vector<Row> singleThread, multiThread;
     std::vector<Check> checks;
     [&]<size_t... Is>(std::index_sequence<Is...>) {
-        (runBatch<BATCHES[Is]>(w, singleThread, multiThread, checks, hardwareThreads), ...);
+        (runBatch<BATCHES[Is]>(w, singleThread, multiThread, checks, threads), ...);
     }(std::make_index_sequence<BATCHES.size()>{});
 
     writeCSV(outDir / "benchmark_cpu_opencv_1thread_vs_fkl_bvf_CPU.csv", "OpenCV 1 thread", singleThread);
-    writeCSV(outDir / ("benchmark_cpu_opencv_" + std::to_string(hardwareThreads) +
+    writeCSV(outDir / ("benchmark_cpu_opencv_" + std::to_string(threads) +
                        "threads_vs_fkl_bvf_CPU_MULTITHREAD.csv"),
-             "OpenCV " + std::to_string(hardwareThreads) + " threads", multiThread, "FKL CPU_MULTITHREAD");
+             "OpenCV " + std::to_string(threads) + " threads", multiThread, "FKL CPU_MULTITHREAD");
     std::ofstream v(outDir / "cpu_validation.csv");
     v << "Batch size, FKL MaxAbsError vs FKL-convention reference, OpenCV MaxAbsError vs OpenCV-convention reference, "
          "OpenCV vs FKL MaxAbsDifference, FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference" << std::endl;
@@ -378,7 +380,9 @@ int main(int argc, char** argv) {
     const std::string opencvBuild = cv::getBuildInformation();
     std::ofstream(outDir / "cpu_opencv_build_information.txt") << opencvBuild;
     std::ofstream p(outDir / "cpu_platform.txt");
-    p << "CPU: " << bench::cpuName() << ", " << hardwareThreads << " hardware threads\n"
+    p << "CPU: " << bench::cpuName() << ", " << std::thread::hardware_concurrency() << " hardware threads, "
+      << cv::getNumberOfCPUs() << " available to OpenCV; the multithreaded comparison uses " << threads
+      << " threads on both sides\n"
 #ifdef _WIN32
       << "SIMD of the CPU: see the CPU model\n"
 #else

@@ -73,10 +73,18 @@ workload the binary was built for, for the scripts; the two NPPDx benchmarks hav
 
 No CUDA Graphs are used anywhere.
 
-Output files: `latency.csv` (CPU + GPU: median, p10, p90 and mean in us, kernels launched, FKL BVF mean speedup),
-`gpu_time.csv` (GPU only, same columns), `<baseline>_vs_fkl_bvf_gpu_only_GPU_NVIDIA.csv` and
-`<baseline>_vs_fkl_bvf_GPU_NVIDIA.csv` (FKL's two-execution format, times in ms), `kernel_breakdown.csv` (time of
-each kernel or stage of the multi-kernel pipelines), `validation.csv`, `kernels.csv` and `platform.txt`.
+Output files: `latency.csv` (CPU + GPU: median, p10, p90 and mean in us, kernels launched, FKL BVF mean speedup, and
+the largest error against the implementation's own reference), `gpu_time.csv` (GPU only, same columns),
+`<baseline>_vs_fkl_bvf_gpu_only_GPU_NVIDIA.csv` and `<baseline>_vs_fkl_bvf_GPU_NVIDIA.csv` (FKL's two-execution
+format, times in ms), `kernel_breakdown.csv` (time of each kernel or stage of the multi-kernel pipelines),
+`validation.csv`, `kernels.csv` and `platform.txt`.
+
+Every implementation is checked against a reference with its own conventions, named in `validation.csv`: FKL BVF
+against the chain on FKL's CPU backend in float (tolerance 1e-3); OpenCV and FKL VF+HF, which write an 8 bit RGB
+frame, against the same chain with the RGB rounded to 8 bits; NPP, which also samples its resize differently (at
+`dst * scale - 0.25`, measured for upscales only), against that with NPP's sampling. Against an 8 bit reference the
+tolerance is one 8 bit level (a value on a half level can round either way), and at most one value in a thousand may be
+more than 1e-3 away. The errors against FKL's float reference and against NPP's sampling are in `validation.csv` too.
 
 ### Memory traffic with Nsight Compute
 
@@ -221,8 +229,8 @@ Every job runs [`scripts/ci/run_benchmarks.cmake`](scripts/ci/run_benchmarks.cma
 `~/bvf-paper-bench-deps` (so the first run on a runner takes much longer), builds the benchmarks for both workloads
 of the paper (`GEOMETRIES`) with one timed iteration and no warm-up (`ITERATIONS` and `WARMUP_ITERATIONS` of the
 script), runs every mode except the Nsight Compute profiles (they need root), and fails if a benchmark fails or if
-FKL's or NPPDx's outputs do not match their references (the errors of OpenCV and NPP are reported, not checked: they
-round and sample differently). The results and logs
+FKL's or NPPDx's outputs do not match their references (OpenCV's and NPP's are in `validation.csv` but not required:
+they come from the OpenCV build and the CUDA toolkit of each runner). The results and logs
 of every job are uploaded as artifacts. Times measured on shared CI runners are not the paper's numbers.
 
 The runners are persistent machines and this repository is public, so the workflow only runs trusted code: pull

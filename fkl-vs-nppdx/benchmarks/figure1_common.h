@@ -333,14 +333,6 @@ void compareWithFKL(Workload& w, const CropOrigins<N>& origins, const std::array
     const Validation v{N, K::block.x, C.tileX, C.tileY, compare(nppdx, reference), compare(nppdx, fklReference),
                        compare(fkl, fklReference)};
     checks.push_back(v);
-    // The sweep only chooses a configuration within the tolerance; one given with --configs may not be
-    if (!withinTolerance(v.nppdxVsReference, P::tolerance)) {
-        throw std::runtime_error(std::string(P::label) + " in configuration tile " + std::to_string(C.tileX) + "x" +
-                                 std::to_string(C.tileY) + " block " + std::to_string(C.block) + " is not within its "
-                                 "tolerance for batch " + std::to_string(N) + ": max abs error " +
-                                 std::to_string(v.nppdxVsReference.max()) + ", " +
-                                 std::to_string(v.nppdxVsReference.beyond) + " values beyond 1e-3");
-    }
     const auto r = benchmark::runTwoExecutions(
         w.stream, static_cast<int>(N), [&]() { P::template run<N, C>(w, origins, b, noFlush); },
         [&]() { runFKL<N>(w, crops, fklOut); });
@@ -617,7 +609,7 @@ int figure1Main(int argc, char** argv) {
                        << v.nppdxVsReference.max() << ", " << v.nppdxVsReference.mean << ", "
                        << v.nppdxVsReference.beyond << ", " << v.nppdxVsFkl.max() << ", " << v.nppdxVsFkl.mean << ", "
                        << v.fkl.max() << ", "
-                       << v.fkl.mean << ", " << v.batch * OUT_FLOATS << ", " << P::tolerance << ", "
+                       << v.fkl.mean << ", " << v.nppdxVsReference.values << ", " << P::tolerance << ", "
                        << (withinTolerance(v.nppdxVsReference, P::tolerance) ? "yes" : "no") << ", "
                        << (withinTolerance(v.fkl, TOLERANCE) ? "yes" : "no") << std::endl;
         }
@@ -688,6 +680,20 @@ int figure1Main(int argc, char** argv) {
                                std::filesystem::absolute(configsInput).string() + " instead of choosing them (copied to " +
                                configCsv.filename().string() + ").\n");
         std::cout << "CSV files written to " << std::filesystem::absolute(outDir) << std::endl;
+        // The sweep only chooses configurations within their tolerance, but one given with --configs may not be, and
+        // FKL's output is checked too: the results are written either way, and the program fails
+        bool failed = false;
+        for (const auto& v : checks) {
+            if (!withinTolerance(v.nppdxVsReference, P::tolerance) || !withinTolerance(v.fkl, TOLERANCE)) {
+                std::cerr << "ERROR: batch " << v.batch << ": " << P::label << " (tile " << v.tileX << "x" << v.tileY
+                          << ", block " << v.nppdxBlock << ") or FKL is not within its tolerance, see "
+                          << name << "_validation_" << parArch << ".csv" << std::endl;
+                failed = true;
+            }
+        }
+        if (failed) {
+            return 1;
+        }
     } catch (const std::exception& e) {
         std::cerr << "ERROR: " << e.what() << std::endl;
         return 1;

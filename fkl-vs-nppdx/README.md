@@ -156,8 +156,9 @@ configuration this GPU cannot launch is reported and skipped). The chosen config
 comparisons (CPU + GPU, GPU only and GPU only with the L2 flushed), the Nsight Compute scripts and the NPPDx
 compile-time units (of the single NPPDx kernel). `<benchmark> <dir> --configs <csv>` runs the comparison with the
 configurations of a CSV in the format of the configuration file instead of choosing them, for example to re-time other
-candidates. Every configuration tried is in `<benchmark>_nppdx_block_sweep_GPU_NVIDIA.csv`, and the chosen ones in
-`<benchmark>_nppdx_config_GPU_NVIDIA.csv`.
+candidates; a configuration whose output is not within its tolerance is still timed and written, and then the program
+fails (as it does when FKL's output is not). Every configuration tried is in
+`<benchmark>_nppdx_block_sweep_GPU_NVIDIA.csv`, and the chosen ones in `<benchmark>_nppdx_config_GPU_NVIDIA.csv`.
 
 ## Build and run
 
