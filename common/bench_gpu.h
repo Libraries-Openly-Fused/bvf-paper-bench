@@ -761,6 +761,9 @@ void runBatch(Context& ctx, std::vector<Result>& results) {
         };
         for (size_t i = 0; i < impls.size(); ++i) {
             impls[i].fillNaN();
+            // fillNaN's cudaMemset runs on the legacy default stream, which ctx.stream (non-blocking) does not wait for:
+            // without this, the poison can land after the pipeline's writes
+            gpuErrchk(cudaDeviceSynchronize());
             impls[i].run(t);
             gpuErrchk(cudaStreamSynchronize(ctx.stream));
             const auto output = impls[i].download();
