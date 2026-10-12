@@ -26,31 +26,32 @@ Both libraries run the whole pipeline in **one kernel**:
 
 ## Results on an RTX 4090
 
-Two benchmarks, with the same iterations: 1000 timed after 100 warm-up ones, NPPDx and FKL one after the other in
+Three benchmarks, with the same iterations: 1000 timed after 100 warm-up ones, NPPDx and FKL one after the other in
 each, and FKL's mean speedup computed per iteration (NPPDx time / FKL time) and averaged, as in FKL's and
-cvGPUSpeedup's benchmarks.
+cvGPUSpeedup's benchmarks. NPPDx runs in the configuration chosen for every N (see
+[NPPDx configuration](#nppdx-configuration)).
 
 **CPU + GPU**: CUDA events around everything the host does to enqueue the kernel plus its execution. Median
 latency in microseconds:
 
 | N | NPPDx (us) | FKL (us) | Speedup |
 |---|---|---|---|
-| 1 | 19.4 | 3.1 | 5.9 |
-| 4 | 18.4 | 3.4 | 5.3 |
-| 16 | 19.1 | 4.1 | 4.4 |
-| 50 | 34.6 | 7.9 | 4.5 |
-| 100 | 61.1 | 11.4 | 5.3 |
+| 1 | 5.12 | 3.07 | 1.70 |
+| 4 | 5.38 | 3.36 | 1.61 |
+| 16 | 6.24 | 4.10 | 1.50 |
+| 50 | 7.17 | 7.82 | 0.96 |
+| 100 | 8.19 | 11.30 | 0.73 |
 
 **GPU only**: the GPU execution time of each kernel, from CUPTI kernel tracing (no host work). Median in
 microseconds:
 
 | N | NPPDx (us) | FKL (us) | Speedup |
 |---|---|---|---|
-| 1 | 16.4 | 1.38 | 12.0 |
-| 4 | 16.5 | 1.47 | 11.3 |
-| 16 | 17.2 | 1.60 | 10.7 |
-| 50 | 32.8 | 2.66 | 12.4 |
-| 100 | 58.9 | 3.78 | 15.5 |
+| 1 | 3.62 | 1.41 | 2.58 |
+| 4 | 3.71 | 1.50 | 2.47 |
+| 16 | 4.58 | 1.66 | 2.78 |
+| 50 | 5.50 | 2.66 | 2.06 |
+| 100 | 6.59 | 3.78 | 1.74 |
 
 **GPU only, L2 flushed**: like GPU only, but the L2 cache is flushed (a kernel reads twice the L2 size) before every
 execution, as on a GPU that runs other kernels in between, so that the input cannot be assumed to be in L2. Run with
@@ -59,26 +60,34 @@ configurations it uses. Median in microseconds:
 
 | N | NPPDx (us) | FKL (us) | Speedup |
 |---|---|---|---|
-| 1 | 16.9 | 1.92 | 8.9 |
-| 4 | 17.1 | 2.21 | 7.7 |
-| 16 | 17.7 | 2.43 | 7.3 |
-| 50 | 34.3 | 3.46 | 9.9 |
-| 100 | 62.8 | 4.51 | 13.9 |
+| 1 | 4.10 | 1.89 | 2.15 |
+| 4 | 4.19 | 2.24 | 1.88 |
+| 16 | 5.15 | 2.40 | 2.14 |
+| 50 | 6.18 | 3.46 | 1.77 |
+| 100 | 7.49 | 4.51 | 1.66 |
 
-Most of the difference between the two benchmarks for FKL is host work: building and back-fusing the chain of
-operations for N crops and launching a kernel with their parameters (about 1.7 us at N = 1 and 7 us at N = 100).
+FKL's kernel is faster at every N, but end to end NPPDx is faster from N = 50: most of the difference between the
+two benchmarks for FKL is host work, building and back-fusing the chain of operations for N crops and launching a
+kernel with their parameters (about 1.7 us at N = 1 and 6.7 us at N = 100, `bvf_bench --host-overhead`), while
+NPPDx launches a kernel configured at compile time.
 
 The CSV files and the platform description are in [`results/RTX4090`](results/RTX4090): NVIDIA GeForce RTX 4090,
-driver 610.43.02, CUDA 13.3, GCC 15.2, AMD Ryzen 9 5950X, Ubuntu 26.04.1, FKL `b9f4281`, NPPDx v0.1.2.
-GPU clocks were not locked.
+driver 610.43.02, CUDA 13.3, GCC 15.2, AMD Ryzen 9 5950X, Ubuntu 26.04.1, FKL `63782f6`, NPPDx v0.1.2.
+GPU clocks were not locked. The NPPDx configuration chosen for every N was the same in two more runs of the
+selection.
+
+[`results/RTX4090-20x10`](results/RTX4090-20x10) has the same program built with `-DBENCH_CROP_W=20
+-DBENCH_CROP_H=10 -DBENCH_RESIZE_W=64 -DBENCH_RESIZE_H=32` (20x10 crops resized 5:16 to 64x32, the paper's earlier
+workload, with crop positions from the same generator), to show what NPPDx's compile-time resize ratio costs it: at
+5:16 the only valid tile is the whole 20x10 crop, one thread block per crop.
 
 **DRAM traffic** (Nsight Compute, `dram__bytes_read.sum` and `dram__bytes_write.sum` of one execution, see
-`benchmark_figure1_bvf_dram_traffic_GPU_NVIDIA.csv`). With the L2 cache flushed before the kernel, NPPDx reads 77,
-91 and 154 KB from DRAM for N = 1, 16 and 100, and FKL 9, 22 and 84 KB. With a warm cache both read nothing from
+`benchmark_figure1_bvf_dram_traffic_GPU_NVIDIA.csv`). With the L2 cache flushed before the kernel, NPPDx reads 35,
+70 and 182 KB from DRAM for N = 1, 16 and 100, and FKL 10, 32 and 158 KB. With a warm cache both read nothing from
 DRAM, and neither writes to DRAM while the kernel runs: the RTX 4090's 72 MB L2 is write-back and holds the
 whole working set (the 12.4 MB NV12 frame and an output of at most 4.9 MB). Collected with
 `--ncu-target <nppdx|fkl_bvf> <N> [<tileX>x<tileY> <block>]`, which runs one execution inside the NVTX range
-`measure` (NPPDx in the given tile and requested block, for example the ones of the configuration file).
+`measure` (NPPDx in the given tile and requested block, here the ones of the configuration file).
 
 ## Correctness and sampling conventions
 
@@ -89,7 +98,8 @@ Every run checks both outputs before timing them:
 
 The two libraries do not compute the same bilinear resize. FKL (like OpenCV's CUDA `resize`) samples the source at
 `dst * scale`, while NPPDx samples at pixel centers, `(dst + 0.5) * scale - 0.5`, clamped to the image. Against
-FKL's reference the NPPDx output differs by up to 5.4 in normalized units for this random content. Both
+FKL's reference the NPPDx output differs by up to 4.6 in normalized units for this random content. With the 1:2
+resize, pixel centers are also what NPP's `nppiResize` computes (`dst * scale - 0.25`). Both
 libraries replicate the NV12 chroma and neither clamps the RGB values after the conversion. Run
 `benchmark_figure1_bvf <dir> --analyze` to see the comparison against each convention.
 

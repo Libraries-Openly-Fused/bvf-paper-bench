@@ -1,0 +1,13 @@
+GPU: NVIDIA GeForce RTX 4090 (sm_89, 128 SMs)
+NVIDIA driver: 610.43.02
+CUDA runtime: 13.3
+Host compiler: GCC 15.2.0
+FKL: Beta-0.2.0-78-g63782f6
+NPPDx: v0.1.2, operations for SM 890
+CPU: AMD Ryzen 9 5950X 16-Core Processor
+OS: Ubuntu 26.04.1 LTS
+Workload: 3840x2160 NV12 frame (uniform random bytes, seed 1), N in {1, 4, 16, 50, 100} crops of 20x10 at uniform random even positions at least 8 pixels from the frame edges (seed 42, the first N of one sequence), bilinear resize to 64x32 (ratio 5:16), 16 black rows added on top and 16 at the bottom, output 64x64 per crop (CMake options BENCH_CROP_W=20 BENCH_CROP_H=10 BENCH_RESIZE_W=64 BENCH_RESIZE_H=32). NV12->RGB BT.2020 full range, AddBorder (black), Mul (1/255), Sub (0.485, 0.456, 0.406), Div (0.229, 0.224, 0.225), float3 tensor of N planes 64x64
+Timing, three benchmarks: 100 warm-up and 1000 timed iterations, in each one NPPDx and then FKL, with a synchronization after each. CPU + GPU (benchmark_figure1_bvf_GPU_NVIDIA.csv): CUDA events around everything the host does to enqueue the kernel plus its execution. GPU only (benchmark_figure1_bvf_gpu_only_GPU_NVIDIA.csv): a second pass with CUPTI kernel tracing, the GPU execution time of the kernel. GPU only with the L2 flushed before every kernel (benchmark_figure1_bvf_gpu_only_l2_flushed_GPU_NVIDIA.csv, --gpu-only-l2-flushed, a separate run). The speedup is computed per iteration and averaged. Times in the CSV are in ms.
+nvcc flags: -O3 -DNDEBUG -std=c++20 --threads 0 -rdc=false -split-compile=0 -ftemplate-depth=1000 -lineinfo --expt-relaxed-constexpr, CUDA_ARCHITECTURES native
+Correctness: FKL against FKL's CPU backend running the same chain (resize samples at dst * scale); NPPDx against the same chain with pixel-center sampling ((dst + 0.5) * scale - 0.5), which is the convention NPPDx's resize uses, and also against FKL's CPU backend.
+NPPDx configuration: resize 5:16; the tiles NPPDx supports for 20x10 crops among the whole crop and its successive halvings down to 64 pixels (multiples of NPPDx's 4x2 pixel cells and of J) are 20x10, each with NPPDx's recommended block and with BlockDim 64, 128, 256 and 512. For every batch size every configuration is validated and timed alone (benchmark_figure1_bvf_nppdx_block_sweep_GPU_NVIDIA.csv), and the fastest correct one (benchmark_figure1_bvf_nppdx_config_GPU_NVIDIA.csv) is compared with FKL in all three benchmarks.

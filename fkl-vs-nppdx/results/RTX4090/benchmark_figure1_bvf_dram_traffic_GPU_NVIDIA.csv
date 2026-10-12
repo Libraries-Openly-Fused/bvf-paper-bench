@@ -1,13 +1,21 @@
 implementation,benchmark,N,cache_control,kernels,dram_read_MB,dram_write_MB,dram_total_MB,sum_kernel_time_us_under_ncu
-nppdx,FKL-vs-NPPDx,1,cold (flush before every kernel),1,0.077,0.000,0.077,19.328
-fkl_bvf,FKL-vs-NPPDx,1,cold (flush before every kernel),1,0.009,0.000,0.009,2.592
-nppdx,FKL-vs-NPPDx,16,cold (flush before every kernel),1,0.091,0.000,0.091,19.808
-fkl_bvf,FKL-vs-NPPDx,16,cold (flush before every kernel),1,0.022,0.000,0.022,2.912
-nppdx,FKL-vs-NPPDx,100,cold (flush before every kernel),1,0.154,0.000,0.154,67.584
-fkl_bvf,FKL-vs-NPPDx,100,cold (flush before every kernel),1,0.084,0.000,0.084,5.568
-nppdx,FKL-vs-NPPDx,1,warm (no flush),1,0.000,0.000,0.000,18.592
-fkl_bvf,FKL-vs-NPPDx,1,warm (no flush),1,0.000,0.000,0.000,2.208
-nppdx,FKL-vs-NPPDx,16,warm (no flush),1,0.000,0.000,0.000,19.360
-fkl_bvf,FKL-vs-NPPDx,16,warm (no flush),1,0.000,0.000,0.000,2.560
-nppdx,FKL-vs-NPPDx,100,warm (no flush),1,0.000,0.000,0.000,67.040
-fkl_bvf,FKL-vs-NPPDx,100,warm (no flush),1,0.000,0.000,0.000,4.768
+nppdx,FKL-vs-NPPDx,1,cold (flush before every kernel),1,0.035,0.000,0.035,5.312
+fkl_bvf,FKL-vs-NPPDx,1,cold (flush before every kernel),1,0.010,0.000,0.010,2.592
+nppdx,FKL-vs-NPPDx,4,cold (flush before every kernel),1,0.040,0.000,0.040,5.568
+fkl_bvf,FKL-vs-NPPDx,4,cold (flush before every kernel),1,0.014,0.000,0.014,2.880
+nppdx,FKL-vs-NPPDx,16,cold (flush before every kernel),1,0.070,0.000,0.070,6.688
+fkl_bvf,FKL-vs-NPPDx,16,cold (flush before every kernel),1,0.032,0.000,0.032,2.944
+nppdx,FKL-vs-NPPDx,50,cold (flush before every kernel),1,0.109,0.000,0.109,7.328
+fkl_bvf,FKL-vs-NPPDx,50,cold (flush before every kernel),1,0.084,0.000,0.084,4.288
+nppdx,FKL-vs-NPPDx,100,cold (flush before every kernel),1,0.182,0.000,0.182,8.640
+fkl_bvf,FKL-vs-NPPDx,100,cold (flush before every kernel),1,0.158,0.000,0.158,5.504
+nppdx,FKL-vs-NPPDx,1,warm (no flush),1,0.000,0.000,0.000,4.736
+fkl_bvf,FKL-vs-NPPDx,1,warm (no flush),1,0.000,0.000,0.000,2.240
+nppdx,FKL-vs-NPPDx,4,warm (no flush),1,0.000,0.000,0.000,4.928
+fkl_bvf,FKL-vs-NPPDx,4,warm (no flush),1,0.000,0.000,0.000,2.368
+nppdx,FKL-vs-NPPDx,16,warm (no flush),1,0.000,0.000,0.000,6.208
+fkl_bvf,FKL-vs-NPPDx,16,warm (no flush),1,0.000,0.000,0.000,2.624
+nppdx,FKL-vs-NPPDx,50,warm (no flush),1,0.000,0.000,0.000,6.720
+fkl_bvf,FKL-vs-NPPDx,50,warm (no flush),1,0.000,0.000,0.000,3.808
+nppdx,FKL-vs-NPPDx,100,warm (no flush),1,0.000,0.000,0.000,8.288
+fkl_bvf,FKL-vs-NPPDx,100,warm (no flush),1,0.000,0.000,0.000,4.864
