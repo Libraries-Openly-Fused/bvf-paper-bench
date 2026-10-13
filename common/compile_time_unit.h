@@ -51,7 +51,7 @@
 
 namespace ct {
 
-// Frame, crop, resize, border and output sizes of the benchmarks
+// Frame, region, resize, border and output sizes of the benchmarks
 using namespace bench::geometry;
 [[maybe_unused]] constexpr size_t N = CT_BATCH;
 [[maybe_unused]] constexpr float MUL[3] = {1.f / 255.f, 1.f / 255.f, 1.f / 255.f};
@@ -66,10 +66,12 @@ using YUVToRGB = fk::ConvertYUVToRGB<fk::ColorDepth::p8bit, fk::ColorRange::Limi
 [[maybe_unused]] inline const fk::float3 divValue{DIV[0], DIV[1], DIV[2]};
 [[maybe_unused]] inline const fk::float3 black{0.f, 0.f, 0.f};
 
+// N rectangles with the region sizes of iteration 0 (the code does not depend on the values)
 [[maybe_unused]] inline std::array<fk::Rect, N> someCrops() {
     std::array<fk::Rect, N> crops{};
     for (size_t i = 0; i < N; ++i) {
-        crops[i] = fk::Rect(static_cast<int>(i), static_cast<int>(i), CROP_W, CROP_H);
+        const RegionSize s = regionSize(0, i);
+        crops[i] = fk::Rect(static_cast<int>(i), static_cast<int>(i), s.width, s.height);
     }
     return crops;
 }

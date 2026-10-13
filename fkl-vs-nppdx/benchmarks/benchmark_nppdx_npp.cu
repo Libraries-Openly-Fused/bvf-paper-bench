@@ -113,9 +113,9 @@ struct NppdxNppPipeline {
         analyzeBlock<256>(w);
     }
 
-    // What NPPDx computes: the NPPDx kernel alone (N = 1, the first crop, the first and largest tile of configs, block
-    // size BlockX) against the host reference with every sampling convention, with and without clamping RGB before the
-    // resize, always rounded to 8 bits as NPPDx writes it
+    // What NPPDx computes: the NPPDx kernel alone (N = 1, the first region of iteration 0, the first and largest tile of
+    // configs, block size BlockX) against the host reference with every sampling convention, with and without clamping
+    // RGB before the resize, always rounded to 8 bits as NPPDx writes it
     template <unsigned BlockX>
     static void analyzeBlock(Workload& w) {
         using Nppdx = NppdxRgb<NPPDX_SM, 1, BlockX, configs[0].tileX, configs[0].tileY>;
@@ -127,7 +127,7 @@ struct NppdxNppPipeline {
                   << Nppdx::block.x << "x" << Nppdx::block.y << "x" << Nppdx::block.z << ", dynamic shared memory " << Nppdx::smem
                   << " bytes, resize halo (l,r,t,b) " << Nppdx::halo.left_top.x << "," << Nppdx::halo.right_bottom.x
                   << "," << Nppdx::halo.left_top.y << "," << Nppdx::halo.right_bottom.y << std::endl;
-        const CropOrigins<1> origins{{int2{static_cast<int>(w.crops[0].x), static_cast<int>(w.crops[0].y)}}};
+        const CropOrigins<1> origins{{int2{static_cast<int>(w.rect(0, 0).x), static_cast<int>(w.rect(0, 0).y)}}};
         uint8_t* resized = nullptr;
         gpuErrchk(cudaMalloc(&resized, RES_W * RES_H * 3));
         Nppdx::run(w.stream, w.y, w.uv, w.pitch, origins, resized);
@@ -137,7 +137,7 @@ struct NppdxNppPipeline {
         const char* names[] = {"dst*scale (FKL)", "pixel centers", "dst*scale-0.25 (NPP)"};
         for (bool clampRGB : {false, true}) {
             for (Sampling s : {Sampling::DstTimesScale, Sampling::PixelCenters, Sampling::NppMinusQuarter}) {
-                const auto ref = hostVariant(w, w.crops[0], clampRGB, s, true).resized;
+                const auto ref = hostVariant(w, w.rect(0, 0), clampRGB, s, true).resized;
                 int maxLevels = 0;
                 size_t differing = 0;
                 for (size_t i = 0; i < ref.size(); ++i) {

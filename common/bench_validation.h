@@ -12,8 +12,9 @@
    See the License for the specific language governing permissions and
    limitations under the License. */
 
-// How the GPU benchmarks (common/bench_gpu.h and fkl-vs-nppdx) check an output against its reference: the errors in
-// normalized units, the tolerances, and the rule that decides whether an output is within its tolerance.
+// How the benchmarks (common/bench_gpu.h, fkl-vs-nppdx and fkl-vs-opencv-cpu) check an output against its reference:
+// the iterations whose outputs are checked, the errors in normalized units, the tolerances, and the rule that decides
+// whether an output is within its tolerance.
 
 #ifndef BVF_BENCH_VALIDATION_H
 #define BVF_BENCH_VALIDATION_H
@@ -32,6 +33,22 @@ constexpr float TOLERANCE = 1e-3f;
 // that lies on a half level differently from the CPU reference (different floating point contraction), which is one
 // level of 8 bit RGB after the normalization (1 / 255 / 0.224, the largest of the three channels)
 constexpr float TOLERANCE_8BIT = 1.f / 255.f / 0.224f + TOLERANCE;
+
+// The timed iterations whose outputs are checked, as indices of the timed iterations (0 to timed - 1): the first, every
+// VALIDATION_STRIDE-th and the last. The regions change every iteration, so each one checks other regions; a run adds
+// its warm-up iterations to get the iterations of the regions.
+constexpr size_t VALIDATION_STRIDE = 50;
+
+inline std::vector<size_t> validatedIterations(size_t timed) {
+    std::vector<size_t> iterations;
+    for (size_t k = 0; k < timed; k += VALIDATION_STRIDE) {
+        iterations.push_back(k);
+    }
+    if (timed > 0 && iterations.back() != timed - 1) {
+        iterations.push_back(timed - 1);
+    }
+    return iterations;
+}
 
 // Errors of an output of interleaved RGB values against a reference
 struct Errors {
@@ -60,6 +77,23 @@ inline Errors compare(const std::vector<float>& output, const std::vector<float>
     }
     const size_t finite = e.values - e.nonFinite;
     e.mean = finite ? sum / static_cast<double>(finite) : 0.;
+    return e;
+}
+
+// The errors of several outputs together (of several validated iterations): the largest errors, the mean over all their
+// finite errors, and the counts summed
+inline Errors combine(const Errors& a, const Errors& b) {
+    Errors e;
+    for (size_t c = 0; c < 3; ++c) {
+        e.maxPerChannel[c] = std::max(a.maxPerChannel[c], b.maxPerChannel[c]);
+    }
+    e.nonFinite = a.nonFinite + b.nonFinite;
+    e.beyond = a.beyond + b.beyond;
+    e.values = a.values + b.values;
+    const size_t finiteA = a.values - a.nonFinite, finiteB = b.values - b.nonFinite;
+    e.mean = finiteA + finiteB ? (a.mean * static_cast<double>(finiteA) + b.mean * static_cast<double>(finiteB)) /
+                                     static_cast<double>(finiteA + finiteB)
+                               : 0.;
     return e;
 }
 

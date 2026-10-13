@@ -13,16 +13,19 @@
 
 namespace bench {
 
+// Views of the N planes of a contiguous tensor of planes of planeWidth x planeHeight, each view of width x height at the
+// top-left corner of its plane, with the pitch of the plane
 template <size_t N, typename T>
-std::array<fk::RawPtr<fk::ND::_2D, T>, N> planeViews(const fk::Tensor<T>& tensor, int width, int height) {
+std::array<fk::RawPtr<fk::ND::_2D, T>, N> planeViews(const fk::Tensor<T>& tensor, int planeWidth, int planeHeight,
+                                                     const std::array<fk::Size, N>& sizes) {
     const auto raw = tensor.ptr();
-    if (raw.dims.pitch != width * sizeof(T)) {
+    if (raw.dims.pitch != planeWidth * sizeof(T)) {
         throw std::runtime_error("Expected a contiguous Tensor");
     }
     std::array<fk::RawPtr<fk::ND::_2D, T>, N> views{};
     for (size_t i = 0; i < N; ++i) {
-        views[i].data = raw.data + i * width * height;
-        views[i].dims = fk::PtrDims<fk::ND::_2D>(width, height, width * sizeof(T));
+        views[i].data = raw.data + i * planeWidth * planeHeight;
+        views[i].dims = fk::PtrDims<fk::ND::_2D>(sizes[i].width, sizes[i].height, planeWidth * sizeof(T));
     }
     return views;
 }
@@ -30,18 +33,34 @@ std::array<fk::RawPtr<fk::ND::_2D, T>, N> planeViews(const fk::Tensor<T>& tensor
 // VF + HF without BVF: four kernels with the intermediates in DRAM, the same intermediates as the OpenCV and NPP
 // pipelines: an 8 bit RGB frame (NPP's NV12 -> RGB can only write 8 or 16 bit integers, and OpenCV CUDA has no NV12
 // conversion), quantized as in the 8 bit reference (normalize, add half a level, __saturatef, denormalize), then
-// float3 crops (like their per crop convertTo / Convert_8u32f), float3 resized crops and the float3 output.
+// float3 crops (like their per crop convertTo / Convert_8u32f) in planes of the largest region size, float3 resized
+// crops and the float3 output. The crop kernel is one batch of N crops of different sizes; an FKL batch runs the
+// threads of its largest plane in every plane (the largest region of the iteration, 48x24 as soon as N >= 3), so for
+// a smaller region the threads beyond it read the RGB frame next to it (inside the frame: positions are drawn for
+// 48x24) and write the rest of its plane, which the resize does not read: the resize reads every crop through a view
+// of its own size.
 template <size_t N>
 Implementation makeFklVfHf(Context& ctx) {
     auto rgb = std::make_shared<fk::Ptr2D<fk::uchar3>>(FRAME_W, FRAME_H, 0, fk::MemType::Device);
-    auto cropped = std::make_shared<fk::Tensor<fk::float3>>(CROP_W, CROP_H, N, 1, fk::MemType::Device);
+    auto cropped = std::make_shared<fk::Tensor<fk::float3>>(MAX_REGION_W, MAX_REGION_H, N, 1, fk::MemType::Device);
     auto resized = std::make_shared<fk::Tensor<fk::float3>>(RES_W, RES_H, N, 1, fk::MemType::Device);
     auto out = std::make_shared<fk::Tensor<fk::float3>>(OUT_W, OUT_H, N, 1, fk::MemType::Device);
-    const auto crops = firstCrops<N>(ctx);
-    const auto croppedViews = planeViews<N>(*cropped, CROP_W, CROP_H);
-    const auto resizedViews = planeViews<N>(*resized, RES_W, RES_H);
+    const auto regions = fklRegionSets<N>(ctx);
+    // The views of the crops of every iteration, made before the loops like the rectangles; the resized crops all have
+    // the same size
+    auto croppedViews = std::make_shared<std::vector<std::array<fk::RawPtr<fk::ND::_2D, fk::float3>, N>>>();
+    for (const auto& rects : *regions) {
+        std::array<fk::Size, N> sizes{};
+        for (size_t i = 0; i < N; ++i) {
+            sizes[i] = fk::Size(rects[i].width, rects[i].height);
+        }
+        croppedViews->push_back(planeViews<N>(*cropped, MAX_REGION_W, MAX_REGION_H, sizes));
+    }
+    std::array<fk::Size, N> resizedSizes{};
+    resizedSizes.fill(fk::Size(RES_W, RES_H));
+    const auto resizedViews = planeViews<N>(*resized, RES_W, RES_H, resizedSizes);
     Implementation impl{"fkl_vf_hf", Reference::Fkl8bit};
-    impl.stages.emplace_back("1_nv12_to_rgb8_full_frame", [&ctx, rgb]() {
+    impl.stages.emplace_back("1_nv12_to_rgb8_full_frame", [&ctx, rgb](size_t) {
         beforeKernel();
         fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
             fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
@@ -51,22 +70,22 @@ Implementation makeFklVfHf(Context& ctx) {
             fk::SaturateDenormalizePixel<fk::float3, fk::uchar3, fk::ColorDepth::p8bit>::build(),
             fk::PerThreadWrite<fk::ND::_2D, fk::uchar3>::build(rgb->ptr()));
     });
-    impl.stages.emplace_back("2_crop_to_float3", [&ctx, rgb, cropped, crops]() {
+    impl.stages.emplace_back("2_crop_to_float3", [&ctx, rgb, cropped, regions](size_t t) {
         beforeKernel();
         fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
             fk::PerThreadRead<fk::ND::_2D, fk::uchar3>::build(rgb->ptr()),
-            fk::Crop<>::build(crops),
+            fk::Crop<>::build((*regions)[t]),
             fk::Cast<fk::uchar3, fk::float3>::build(),
             fk::TensorWrite<fk::float3>::build(cropped->ptr()));
     });
-    impl.stages.emplace_back("3_resize", [&ctx, resized, croppedViews]() {
+    impl.stages.emplace_back("3_resize", [&ctx, resized, croppedViews](size_t t) {
         beforeKernel();
         fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
-            fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(croppedViews),
+            fk::PerThreadRead<fk::ND::_2D, fk::float3>::build((*croppedViews)[t]),
             fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(RES_W, RES_H)),
             fk::TensorWrite<fk::float3>::build(resized->ptr()));
     });
-    impl.stages.emplace_back("4_addborder_mul_sub_div_write", [&ctx, out, resizedViews]() {
+    impl.stages.emplace_back("4_addborder_mul_sub_div_write", [&ctx, out, resizedViews](size_t) {
         beforeKernel();
         fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
             fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(resizedViews),
@@ -82,9 +101,10 @@ Implementation makeFklVfHf(Context& ctx) {
     return impl;
 }
 
-// Host time of enqueuing the FKL pipelines (std::chrono, median over TIMED_ITERS iterations, synchronizing after
-// each one). FKL BVF is split into building the nine IOps, BackFuser::fuse_back and executeOperations, which then
-// only launches; FKL VF+HF is split per kernel, enqueued back to back as in its run().
+// Host time of enqueuing the FKL pipelines (std::chrono, median, p10 and p90 over the TIMED_ITERS iterations, which have
+// different regions, synchronizing after each one), on the regions of every iteration as in the timed loops. FKL BVF
+// is split into building the nine IOps, BackFuser::fuse_back and executeOperations, which then only launches; FKL
+// VF+HF is split per kernel, enqueued back to back as in its run().
 struct HostTiming {
     std::string name;
     int batch{0};
@@ -99,14 +119,14 @@ void hostOverheadBatch(Context& ctx, std::vector<HostTiming>& hostTimings) {
     const auto ms = [](Clock::time_point a, Clock::time_point b) {
         return std::chrono::duration<float, std::milli>(b - a).count();
     };
-    const auto crops = firstCrops<N>(ctx);
+    const auto regions = fklRegionSets<N>(ctx);
     fk::Tensor<fk::float3> out(OUT_W, OUT_H, N, 1, fk::MemType::Device);
     std::vector<float> build, fuse, launch, total;
     for (int i = 0; i < WARMUP_ITERS + TIMED_ITERS; ++i) {
         const auto t0 = Clock::now();
         const auto read = fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice);
         const auto convert = YUVToRGB::build();
-        const auto crop = fk::Crop<>::build(crops);
+        const auto crop = fk::Crop<>::build((*regions)[i]);
         const auto resize =
             fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(RES_W, RES_H));
         const auto border = fk::AddBorder<>::build(BORDER_TOP, BORDER_BOTTOM, 0, 0, black);
@@ -139,7 +159,7 @@ void hostOverheadBatch(Context& ctx, std::vector<HostTiming>& hostTimings) {
         Clock::time_point t = Clock::now();
         const Clock::time_point first = t;
         for (size_t k = 0; k < vfhf.stages.size(); ++k) {
-            vfhf.stages[k].second();
+            vfhf.stages[k].second(static_cast<size_t>(i));
             const Clock::time_point next = Clock::now();
             if (i >= WARMUP_ITERS) {
                 stageTimes[k].push_back(ms(t, next));
@@ -178,8 +198,13 @@ struct FklAblation {
     static void describe(std::ostream& os, const std::filesystem::path&) {
         os << "FKL VF+HF pipeline: four executeOperations calls (vertical and horizontal fusion, no BVF), with the "
               "intermediates of the OpenCV and NPP pipelines in memory: an 8 bit RGB frame (quantized as in the 8 bit "
-              "reference), float3 crops, float3 resized crops, and AddBorder + Mul + Sub + Div fused into the write of "
-              "the float3 output.\n";
+              "reference), float3 crops (planes of the largest region size), float3 resized crops, and AddBorder + "
+              "Mul + Sub + Div fused into the write of the float3 output. The crop kernel is one FKL batch of N "
+              "crops of different sizes, which runs the threads of the iteration's largest region in every plane "
+              "(48x24 as soon as N >= 3): for a smaller region, the threads beyond it write the rest of its plane, "
+              "which the resize does not read (it reads every crop through a view of its own size). Per iteration, "
+              "inside the timed region: the build() calls of the four chains with the iteration's rectangles and "
+              "crop views.\n";
     }
 
     static std::string diagnostic(const Context&) { return ""; }

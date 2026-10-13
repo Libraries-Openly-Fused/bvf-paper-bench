@@ -7,17 +7,18 @@
 #
 #     SET=<set> scripts/compile_time.sh <results directory>
 #
-#   SET=ablation      fkl-ablation: FKL's headers alone, FKL BVF, FKL BVF with CONDITIONAL_WITH_DEFAULT, FKL VF+HF
-#   SET=opencv-cuda   fkl-vs-opencv-cuda: the headers of FKL, OpenCV CUDA and NPP, the OpenCV pipeline, FKL BVF
-#   SET=npp           fkl-vs-npp: the headers of FKL and NPP, the NPP pipeline, FKL BVF
-#   SET=nppdx         fkl-vs-nppdx: the headers of FKL and NPPDx, the NPPDx kernel, FKL BVF
+#   SET=ablation      fkl-ablation: FKL's headers alone (HEADERS 1), FKL VF+HF at N = 1 and 100, FKL BVF at every N,
+#                     FKL BVF with CONDITIONAL_WITH_DEFAULT at N = 100
+#   SET=opencv-cuda   fkl-vs-opencv-cuda: the headers of FKL, OpenCV CUDA and NPP, the OpenCV pipeline at N = 100
+#   SET=npp           fkl-vs-npp: the headers of FKL and NPP, the NPP pipeline at N = 100
+#   SET=nppdx         fkl-vs-nppdx: the headers of FKL and NPPDx, FKL BVF and the NPPDx kernel at N = 100
 #
 # BUILD is the CMake build folder of the benchmark, configured with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON (default
-# build-<set> in this repository); the geometry is the one it was configured with. REPS (default 10) sets the timed
-# compiles per TU. The script waits until the 1 minute load average is below MAX_LOAD (default 0.5) before starting.
-# SET=nppdx compiles the NPPDx kernel of every N in the configuration benchmark_nppdx chose for it: NPPDX_CONFIG is the
-# benchmark_nppdx_nppdx_config_GPU_NVIDIA.csv of its run (default fkl-vs-nppdx/ of BVF_RESULTS, the results folder of
-# the workload, by default ../results).
+# build-<set> in this repository); the region sizes are the ones it was configured with (BENCH_REGIONS). REPS (default
+# 10) sets the timed compiles per TU. The script waits until the 1 minute load average is below MAX_LOAD (default 0.5)
+# before starting. SET=nppdx compiles the NPPDx kernel in the configuration benchmark_nppdx chose for N = 100 in a run
+# with the region size of the build: NPPDX_CONFIG is the benchmark_nppdx_nppdx_config_GPU_NVIDIA.csv of that run
+# (default fkl-vs-nppdx/<size>/ of BVF_RESULTS, the results folder, by default ../results).
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 OUT=$(mkdir -p "${1:?results directory}" && cd "$1" && pwd)
@@ -30,28 +31,24 @@ case "$SET" in
   ablation)
     SOURCE=$REPO/fkl-ablation/src/compile_time.cu
     ENTRY=fkl-ablation/src/benchmark_fkl_ablation.cu
-    TUS=("HEADERS 1"
-         "VFHF 1" "VFHF 4" "VFHF 16" "VFHF 50" "VFHF 100"
-         "BVF 1" "BVF 4" "BVF 16" "BVF 50" "BVF 100"
-         "BVF_CWD 100")
+    TUS=("HEADERS 1" "VFHF 1" "VFHF 100" "BVF 1" "BVF 4" "BVF 16" "BVF 50" "BVF 100" "BVF_CWD 100")
     ;;
   opencv-cuda)
     SOURCE=$REPO/fkl-vs-opencv-cuda/src/compile_time.cu
     ENTRY=fkl-vs-opencv-cuda/src/benchmark_opencv_cuda.cu
-    TUS=("HEADERS 1" "OPENCV 1" "OPENCV 100" "BVF 1" "BVF 100")
+    TUS=("HEADERS 1" "OPENCV 100")
     ;;
   npp)
     SOURCE=$REPO/fkl-vs-npp/src/compile_time.cu
     ENTRY=fkl-vs-npp/src/benchmark_npp.cu
-    TUS=("HEADERS 1" "NPP 1" "NPP 100" "BVF 1" "BVF 100")
+    TUS=("HEADERS 1" "NPP 100")
     ;;
   nppdx)
     SOURCE=$REPO/fkl-vs-nppdx/benchmarks/compile_time.cu
     ENTRY=fkl-vs-nppdx/benchmarks/benchmark_nppdx.cu
-    TUS=("HEADERS 1"
-         "NPPDX 1" "NPPDX 4" "NPPDX 16" "NPPDX 50" "NPPDX 100"
-         "BVF 1" "BVF 4" "BVF 16" "BVF 50" "BVF 100")
-    NPPDX_CONFIG=${NPPDX_CONFIG:-${BVF_RESULTS:-$(dirname "$REPO")/results}/fkl-vs-nppdx/benchmark_nppdx_nppdx_config_GPU_NVIDIA.csv}
+    TUS=("HEADERS 1" "BVF 100" "NPPDX 100")
+    REGIONS=$(sed -n 's/^BENCH_REGIONS:STRING=//p' "$BUILD/CMakeCache.txt")
+    NPPDX_CONFIG=${NPPDX_CONFIG:-${BVF_RESULTS:-$(dirname "$REPO")/results}/fkl-vs-nppdx/$REGIONS/benchmark_nppdx_nppdx_config_GPU_NVIDIA.csv}
     if [ ! -f "$NPPDX_CONFIG" ]; then
       echo "No NPPDx configuration file $NPPDX_CONFIG: run benchmark_nppdx first, or set NPPDX_CONFIG" >&2
       exit 1
@@ -67,7 +64,8 @@ case "$SET" in
     ;;
   *) echo "SET must be ablation, opencv-cuda, npp or nppdx" >&2; exit 1 ;;
 esac
-if [ -n "${ONLY:-}" ]; then  # ONLY="BVF 100;VFHF 100" restricts the TUs (for checks; not for results)
+if [ -n "${ONLY:-}" ]; then  # ONLY="BVF 100;VFHF 100" restricts the TUs (run_all.sh compiles only the NPPDx kernel in
+                             # the NPPDx builds of every size but the first)
   IFS=';' read -r -a TUS <<< "$ONLY"
 fi
 rm -rf "$WORK"
@@ -104,8 +102,7 @@ printf '%q ' "${NVCC[@]}" > "$OUT/nvcc_command.txt"
 echo >> "$OUT/nvcc_command.txt"
 FKL_DIR=$(sed -n 's/^FKL_DIR:PATH=//p' "$BUILD/CMakeCache.txt")
 NPPDX_DIR=$(sed -n 's/^NPPDX_DIR:PATH=//p' "$BUILD/CMakeCache.txt")
-GEOMETRY=$(for v in BENCH_CROP_W BENCH_CROP_H BENCH_RESIZE_W BENCH_RESIZE_H; do
-             echo -n "$v=$(sed -n "s/^$v:STRING=//p" "$BUILD/CMakeCache.txt") "; done)
+GEOMETRY="BENCH_REGIONS=$(sed -n 's/^BENCH_REGIONS:STRING=//p' "$BUILD/CMakeCache.txt") "
 
 tu_flags() {  # impl batch: the definitions of one TU; the NPPDx kernel in the configuration chosen for this batch
   echo "-DIMPL_$1 -DCT_BATCH=$2"

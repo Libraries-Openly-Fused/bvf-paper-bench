@@ -5,7 +5,7 @@ on the [workload](../README.md#workload) of every benchmark of this repository (
 
 | Implementation | What runs |
 |---|---|
-| `fkl_vf_hf` | FKL with vertical and horizontal fusion but without BVF: four `executeOperations` calls, with the intermediates of the OpenCV and NPP pipelines in memory: an 8 bit RGB frame (quantized as in the 8 bit reference), float3 crops, float3 resized crops, and AddBorder + Mul + Sub + Div fused into the write of the float3 output |
+| `fkl_vf_hf` | FKL with vertical and horizontal fusion but without BVF: four `executeOperations` calls, with the intermediates of the OpenCV and NPP pipelines in memory: an 8 bit RGB frame (quantized as in the 8 bit reference), float3 crops (planes of the largest region size, 48x24), float3 resized crops, and AddBorder + Mul + Sub + Div fused into the write of the float3 output. The crop kernel is one FKL batch of regions of different sizes, and an FKL batch runs the threads of its largest plane in every plane (48x24 as soon as N >= 3), so for a smaller region the threads beyond it read the RGB frame next to it (inside the frame: positions are drawn for 48x24) and write the rest of its plane, which the resize does not read (it reads every crop through a view of its own size) |
 | `fkl_bvf` | FKL with BVF: one `executeOperations` call, one kernel for the whole chain, with no intermediates in memory |
 
 The timings, modes, output files and validation are those of every GPU benchmark on

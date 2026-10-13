@@ -129,7 +129,7 @@ struct NppdxPipeline {
                   << Nppdx::block.x << "x" << Nppdx::block.y << "x" << Nppdx::block.z << ", dynamic shared memory " << Nppdx::smem
                   << " bytes, resize halo (l,r,t,b) " << Nppdx::halo.left_top.x << "," << Nppdx::halo.right_bottom.x
                   << "," << Nppdx::halo.left_top.y << "," << Nppdx::halo.right_bottom.y << std::endl;
-        const CropOrigins<1> origins{{int2{static_cast<int>(w.crops[0].x), static_cast<int>(w.crops[0].y)}}};
+        const CropOrigins<1> origins{{int2{static_cast<int>(w.rect(0, 0).x), static_cast<int>(w.rect(0, 0).y)}}};
         float* out = nullptr;
         gpuErrchk(cudaMalloc(&out, OUT_FLOATS * sizeof(float)));
         Nppdx::run(w.stream, w.y, w.uv, w.pitch, origins, norm, out);
@@ -139,7 +139,7 @@ struct NppdxPipeline {
         const char* names[] = {"dst*scale (FKL)", "pixel centers", "dst*scale-0.25 (NPP)"};
         for (bool clampRGB : {false, true}) {
             for (Sampling s : {Sampling::DstTimesScale, Sampling::PixelCenters, Sampling::NppMinusQuarter}) {
-                const Error e = compare(nppdx, hostVariant(w, w.crops[0], clampRGB, s, false).plane);
+                const Error e = compare(nppdx, hostVariant(w, w.rect(0, 0), clampRGB, s, false).plane);
                 std::cout << "NPPDx vs host reference, "
                           << (clampRGB ? "RGB clamped to [0,255], " : "RGB not clamped,      ")
                           << names[static_cast<int>(s)] << ": max " << e.max() << ", mean " << e.mean << std::endl;
@@ -170,7 +170,7 @@ struct NppdxPipeline {
             // Compare tile pixel (tx, ty) with crop pixel (tx - hl, ty - ht), clamped to the crop
             const int hl = Nppdx::halo.left_top.x, ht = Nppdx::halo.left_top.y;
             float maxRaw = 0.f, maxClamped = 0.f;
-            const fk::Rect& r = w.crops[0];
+            const fk::Rect r = w.rect(0, 0);
             for (int ty = 0; ty < TH; ++ty) {
                 for (int tx = 0; tx < TW; ++tx) {
                     const int cx = std::min(CROP_W - 1, std::max(0, tx - hl));
@@ -188,7 +188,7 @@ struct NppdxPipeline {
             std::cout << "Ingest + FromLimited + ColorConvert tile vs FKL conversion (8 bit levels): max diff not "
                          "clamped " << maxRaw << ", clamped to [0,255] " << maxClamped << std::endl;
         }
-        const auto ref = hostVariant(w, w.crops[0], false, Sampling::DstTimesScale, false).plane;
+        const auto ref = hostVariant(w, w.rect(0, 0), false, Sampling::DstTimesScale, false).plane;
         // The first rows of the top border and of the resized crop, the middle, the last resized row and the first row
         // of the bottom border (when there is one)
         for (const int y : {0, BORDER_TOP, BORDER_TOP + 1, OUT_H / 2 - 2, BORDER_TOP + RES_H - 1, BORDER_TOP + RES_H}) {

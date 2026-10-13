@@ -19,7 +19,9 @@
 // cvGPUSpeedup's tests/testsCommon.cuh: in every iteration the first (baseline) and the second
 // implementation are timed one after the other with CUDA events, and one CSV per benchmark is written
 // with the mean, variance, max and min of each (in ms) and the mean of the per-iteration speedups
-// (first / second). Median, p10 and p90 columns are appended for the paper.
+// (first / second). Median, p10 and p90 columns are appended for the paper. Every run function takes the
+// iteration: 0 to WARMUP_ITERS - 1 for the warm-up and WARMUP_ITERS to WARMUP_ITERS + ITERS - 1 for the
+// timed iterations, the index of the regions it runs on (common/bench_geometry.h).
 
 #include <fused_kernel/core/execution_model/parallel_architectures.h>
 #include <fused_kernel/core/utils/utils.h>
@@ -35,6 +37,7 @@
 #include <cstring>
 #include <functional>
 #include <stdexcept>
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -48,6 +51,8 @@ static_assert(WARMUP_ITERS >= 0 && ITERS >= 1, "at least one timed iteration");
 struct TimeStats {
     float mean{0.f}, variance{0.f}, max{0.f}, min{0.f}, median{0.f}, p10{0.f}, p90{0.f};
 };
+
+using Run = std::function<void(size_t)>;
 
 struct TwoExecutionsResult {
     int variableDimensionValue{0};
@@ -84,16 +89,15 @@ inline TimeStats computeStats(const std::vector<float>& times) {
     return stats;
 }
 
-// Times first() and second() back to back in every iteration, on one stream, synchronizing after each
-inline TwoExecutionsResult runTwoExecutions(cudaStream_t stream, const int variableDimensionValue,
-                                            const std::function<void()>& first,
-                                            const std::function<void()>& second) {
+// Times first(i) and second(i) back to back in every iteration i, on one stream, synchronizing after each
+inline TwoExecutionsResult runTwoExecutions(cudaStream_t stream, const int variableDimensionValue, const Run& first,
+                                            const Run& second) {
     cudaEvent_t start, stop;
     gpuErrchk(cudaEventCreate(&start));
     gpuErrchk(cudaEventCreate(&stop));
-    const auto timeOne = [&](const std::function<void()>& run) {
+    const auto timeOne = [&](const Run& run, size_t i) {
         gpuErrchk(cudaEventRecord(start, stream));
-        run();
+        run(i);
         gpuErrchk(cudaEventRecord(stop, stream));
         gpuErrchk(cudaEventSynchronize(stop));
         float ms = 0.f;
@@ -101,14 +105,14 @@ inline TwoExecutionsResult runTwoExecutions(cudaStream_t stream, const int varia
         return ms;
     };
     for (int i = 0; i < WARMUP_ITERS; ++i) {
-        timeOne(first);
-        timeOne(second);
+        timeOne(first, static_cast<size_t>(i));
+        timeOne(second, static_cast<size_t>(i));
     }
     std::vector<float> firstTimes(ITERS), secondTimes(ITERS);
     double speedupSum = 0.;
     for (int i = 0; i < ITERS; ++i) {
-        firstTimes[i] = timeOne(first);
-        secondTimes[i] = timeOne(second);
+        firstTimes[i] = timeOne(first, static_cast<size_t>(WARMUP_ITERS + i));
+        secondTimes[i] = timeOne(second, static_cast<size_t>(WARMUP_ITERS + i));
         speedupSum += firstTimes[i] / secondTimes[i];
     }
     gpuErrchk(cudaEventDestroy(start));
@@ -118,14 +122,14 @@ inline TwoExecutionsResult runTwoExecutions(cudaStream_t stream, const int varia
 }
 
 // Times one implementation alone, same protocol as runTwoExecutions
-inline TimeStats runOneExecution(cudaStream_t stream, const std::function<void()>& run) {
+inline TimeStats runOneExecution(cudaStream_t stream, const Run& run) {
     cudaEvent_t start, stop;
     gpuErrchk(cudaEventCreate(&start));
     gpuErrchk(cudaEventCreate(&stop));
     std::vector<float> times(ITERS);
     for (int i = 0; i < WARMUP_ITERS + ITERS; ++i) {
         gpuErrchk(cudaEventRecord(start, stream));
-        run();
+        run(static_cast<size_t>(i));
         gpuErrchk(cudaEventRecord(stop, stream));
         gpuErrchk(cudaEventSynchronize(stop));
         if (i >= WARMUP_ITERS) {
@@ -187,14 +191,14 @@ inline void init() {
     }
 }
 
-// Runs run() `times` times with kernel tracing on and returns the kernel records in start order
-inline std::vector<KernelSpan> trace(cudaStream_t stream, const std::function<void()>& run, int times) {
+// Runs run(i) for i from 0 to times - 1 with kernel tracing on and returns the kernel records in start order
+inline std::vector<KernelSpan> trace(cudaStream_t stream, const std::function<void(int)>& run, int times) {
     init();
     check(cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED), "cuptiActivityFlushAll");
     kernels().clear();
     check(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL), "cuptiActivityEnable");
     for (int i = 0; i < times; ++i) {
-        run();
+        run(i);
         gpuErrchk(cudaStreamSynchronize(stream));
         if (i % 100 == 99) {
             check(cuptiActivityFlushAll(0), "cuptiActivityFlushAll");
@@ -256,29 +260,29 @@ private:
 // With a flusher, the L2 is flushed before every execution; a pipeline of several kernels flushes before its other
 // kernels itself (figure1_common.h passes a flush to its run()).
 inline TwoExecutionsResult runTwoExecutionsGpuOnly(cudaStream_t stream, const int variableDimensionValue,
-                                                   const std::function<void()>& firstRun,
-                                                   const std::function<void()>& secondRun,
+                                                   const Run& firstRun, const Run& secondRun,
                                                    const L2Flusher* flusher = nullptr) {
-    const std::function<void()> first = [&]() {
+    const Run first = [&](size_t i) {
         if (flusher) flusher->flush();
-        firstRun();
+        firstRun(i);
     };
-    const std::function<void()> second = [&]() {
+    const Run second = [&](size_t i) {
         if (flusher) flusher->flush();
-        secondRun();
+        secondRun(i);
     };
-    const size_t firstKernels = cupti::trace(stream, first, 1).size();
-    const size_t secondKernels = cupti::trace(stream, second, 1).size();
+    // The kernels of one execution (on the regions of the first timed iteration; the count does not depend on them)
+    const size_t firstKernels = cupti::trace(stream, [&](int) { first(WARMUP_ITERS); }, 1).size();
+    const size_t secondKernels = cupti::trace(stream, [&](int) { second(WARMUP_ITERS); }, 1).size();
     for (int i = 0; i < WARMUP_ITERS; ++i) {
-        first();
+        first(static_cast<size_t>(i));
         gpuErrchk(cudaStreamSynchronize(stream));
-        second();
+        second(static_cast<size_t>(i));
         gpuErrchk(cudaStreamSynchronize(stream));
     }
-    const auto records = cupti::trace(stream, [&]() {
-        first();
+    const auto records = cupti::trace(stream, [&](int i) {
+        first(static_cast<size_t>(WARMUP_ITERS + i));
         gpuErrchk(cudaStreamSynchronize(stream));
-        second();
+        second(static_cast<size_t>(WARMUP_ITERS + i));
     }, ITERS);
     if (records.size() != (firstKernels + secondKernels) * ITERS) {
         throw std::runtime_error("GPU only benchmark: unexpected number of kernel records");

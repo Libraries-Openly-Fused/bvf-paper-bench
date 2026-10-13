@@ -13,7 +13,8 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# The workload of every benchmark: BENCH_CROP_W, BENCH_CROP_H, BENCH_RESIZE_W, BENCH_RESIZE_H (common/bench_geometry.h)
+# The workload of every benchmark (common/bench_geometry.h): the option BENCH_REGIONS (region sizes: mixed, the paper's,
+# or one of 20x10, 32x16, 48x24) and BENCH_GEOMETRY_DEFINITIONS
 include(${CMAKE_CURRENT_SOURCE_DIR}/../common/bench_geometry.cmake)
 # Timed and warm-up iterations, as in every benchmark of the repository (common/bench_gpu.cmake)
 set(BENCH_ITERATIONS 1000 CACHE STRING "Timed iterations of every benchmark (at least 1)")

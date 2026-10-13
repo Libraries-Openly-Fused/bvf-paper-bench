@@ -1,7 +1,9 @@
 // ROCm port of the GPU benchmarks of common/bench_gpu.h: latency and correctness benchmark for the Backwards Vertical Fusion paper, Figure 1
 // pipeline on an AMD GPU:
 // ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
-// with the frame, sizes, batch sizes and crop positions of common/bench_geometry.h.
+// with the frame, sizes, batch sizes and the regions of every iteration of common/bench_geometry.h: new regions every
+// iteration (warm-up and timed), 20x10, 32x16 and 48x24 by turns, precomputed before the loops; iteration t of every
+// loop runs every implementation on the regions of iteration t.
 //
 // Implementations: rpp (the fastest of the RPP variants below, chosen by a selection pass; the only RPP pipeline in the
 // measurements), fkl_vf_hf and fkl_bvf. RPP variants (ROCm Performance Primitives, HIP backend):
@@ -86,13 +88,22 @@
 
 namespace bench {
 
-// Frame, crop, resize, border and output sizes, batch sizes, seeds and crop positions, shared by every benchmark
+// Frame, region, resize, border and output sizes, batch sizes, seeds and the regions of every iteration, shared by
+// every benchmark
 using namespace geometry;
 // BENCH_WARMUP_ITERATIONS and BENCH_ITERATIONS come from CMake: 100 and 1000 for the paper's results, as in
 // common/bench_gpu.h (the selection pass and the event floor keep their own fixed counts)
 constexpr int WARMUP_ITERS = BENCH_WARMUP_ITERATIONS;
 constexpr int TIMED_ITERS = BENCH_ITERATIONS;
 static_assert(WARMUP_ITERS >= 0 && TIMED_ITERS >= 1, "at least one timed iteration");
+// The RPP selection pass (CPU + GPU, interleaved, SELECTION_WARMUP + SELECTION_ITERS iterations per N)
+constexpr int SELECTION_WARMUP = 20;
+constexpr int SELECTION_ITERS = 200;
+// The regions of every iteration of every loop of this program, generated before any loop (common/bench_geometry.h):
+// iteration t of a loop uses the regions of iteration t (warm-up 0 to W - 1, timed W to W + T - 1; the selection pass
+// 0 to 219)
+constexpr size_t REGION_ITERATIONS = std::max<size_t>({static_cast<size_t>(WARMUP_ITERS + TIMED_ITERS),
+                                                       static_cast<size_t>(SELECTION_WARMUP + SELECTION_ITERS), 4});
 // How outputs are checked against their references: the rules of every GPU benchmark (common/bench_validation.h)
 using validation::TOLERANCE;
 using validation::TOLERANCE_8BIT;
@@ -140,7 +151,8 @@ struct Context {
     uint8_t* y{nullptr};
     uint8_t* uv{nullptr};
     int pitch{0};
-    std::array<fk::Rect, MAX_BATCH> crops{};
+    // The regions of every iteration (common/bench_geometry.h), the same in the profiling child (same seed)
+    std::unique_ptr<RegionSets> regions;
 };
 
 void initContext(Context& ctx) {
@@ -165,11 +177,8 @@ void initContext(Context& ctx) {
     ctx.y = raw.data;
     ctx.uv = raw.data + static_cast<size_t>(FRAME_H) * ctx.pitch;
 
-    // Crop rectangles at random positions, the first N are used for batch N
-    const auto crops = makeCrops();
-    for (size_t i = 0; i < MAX_BATCH; ++i) {
-        ctx.crops[i] = fk::Rect(crops[i].x, crops[i].y, crops[i].width, crops[i].height);
-    }
+    // The regions of every iteration, before any loop; batch N uses the first N regions of every iteration
+    ctx.regions = std::make_unique<RegionSets>(REGION_ITERATIONS);
 }
 
 // Cache flush before every GPU operation, for the GPU only benchmark with flushed caches: simulates a GPU that runs
@@ -204,16 +213,21 @@ inline void beforeKernel() {
     }
 }
 
-// Each implementation enqueues one complete pipeline on ctx.stream with run(), and returns the
-// N x outH x outW x 3 float output with download(). fillNaN() poisons the output before validation.
+// Each implementation enqueues one complete pipeline on ctx.stream with run(t), for the regions of iteration t, and
+// returns the N x outH x outW x 3 float output with download(). fillNaN() poisons the output before validation. Every
+// implementation converts the regions of every iteration to its own arguments when it is created; inside run(t) there
+// is only what the library needs to receive the regions of t (FKL: build() and the fusion; RPP: the upload of its ROI
+// tensors).
+using Stage = std::function<void(size_t)>;
 struct Implementation {
     std::string name;
     std::string reference; // fkl_cpu_float, fkl_cpu_8bit_rgb or rpp_sampling_8bit
-    std::function<void()> run;
+    Stage run;
     std::function<std::vector<float>()> download;
     std::function<void()> fillNaN;
-    // The GPU operations (library calls, kernels, memsets) of the pipeline, in order, for the per operation breakdown
-    std::vector<std::pair<std::string, std::function<void()>>> stages;
+    // The GPU operations (library calls, kernels, memsets, copies) of the pipeline, in order, for the per operation
+    // breakdown
+    std::vector<std::pair<std::string, Stage>> stages;
     std::string variant; // for "rpp": the RPP variant it is
 };
 
@@ -229,24 +243,38 @@ std::vector<float> downloadDevice(hipStream_t stream, const void* data, size_t f
     return host;
 }
 
+// The first N regions of iteration t as FKL rectangles
 template <size_t N>
-std::array<fk::Rect, N> firstCrops(const Context& ctx) {
-    std::array<fk::Rect, N> crops{};
-    std::copy_n(ctx.crops.begin(), N, crops.begin());
-    return crops;
+std::array<fk::Rect, N> fklRegions(const Context& ctx, size_t t) {
+    std::array<fk::Rect, N> rects{};
+    for (size_t i = 0; i < N; ++i) {
+        const Region& r = ctx.regions->at(t, i);
+        rects[i] = fk::Rect(static_cast<uint>(r.x), static_cast<uint>(r.y), r.width, r.height);
+    }
+    return rects;
+}
+
+// The regions of every iteration as FKL rectangles, converted once when an implementation is created
+template <size_t N>
+std::shared_ptr<const std::vector<std::array<fk::Rect, N>>> fklRegionSets(const Context& ctx) {
+    auto sets = std::make_shared<std::vector<std::array<fk::Rect, N>>>(ctx.regions->iterations());
+    for (size_t t = 0; t < sets->size(); ++t) {
+        (*sets)[t] = fklRegions<N>(ctx, t);
+    }
+    return sets;
 }
 
 template <size_t N>
 Implementation makeFklBvf(Context& ctx) {
     auto out = std::make_shared<fk::Tensor<fk::float3>>(OUT_W, OUT_H, N, 1, fk::MemType::Device);
-    const auto crops = firstCrops<N>(ctx);
+    const auto sets = fklRegionSets<N>(ctx);
     Implementation impl{"fkl_bvf", "fkl_cpu_float"};
-    impl.run = [&ctx, out, crops]() {
+    impl.run = [&ctx, out, sets](size_t t) {
         beforeKernel();
         fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
             fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
             YUVToRGB::build(),
-            fk::Crop<>::build(crops),
+            fk::Crop<>::build((*sets)[t]),
             fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(RES_W, RES_H)),
             fk::AddBorder<>::build(BORDER_TOP, BORDER_BOTTOM, 0, 0, black),
             fk::Mul<fk::float3>::build(mulValue),
@@ -273,24 +301,48 @@ std::array<fk::RawPtr<fk::ND::_2D, T>, N> planeViews(const fk::Tensor<T>& tensor
     return views;
 }
 
+// The cropped regions of every iteration, as N views of a tensor of MAX_REGION_W x MAX_REGION_H planes: plane i holds
+// region i in its top left corner, with the pitch of the plane
+template <size_t N>
+std::shared_ptr<const std::vector<std::array<fk::RawPtr<fk::ND::_2D, fk::float3>, N>>>
+regionViewSets(const Context& ctx, const fk::Tensor<fk::float3>& cropped) {
+    const auto raw = cropped.ptr();
+    if (raw.dims.pitch != MAX_REGION_W * sizeof(fk::float3)) {
+        throw std::runtime_error("Expected a contiguous Tensor of MAX_REGION_W x MAX_REGION_H planes");
+    }
+    auto sets = std::make_shared<std::vector<std::array<fk::RawPtr<fk::ND::_2D, fk::float3>, N>>>(
+        ctx.regions->iterations());
+    for (size_t t = 0; t < sets->size(); ++t) {
+        for (size_t i = 0; i < N; ++i) {
+            const Region& r = ctx.regions->at(t, i);
+            (*sets)[t][i].data = raw.data + i * MAX_REGION_W * MAX_REGION_H;
+            (*sets)[t][i].dims = fk::PtrDims<fk::ND::_2D>(r.width, r.height, MAX_REGION_W * sizeof(fk::float3));
+        }
+    }
+    return sets;
+}
+
 // VF + HF without BVF: four kernels with the intermediates in memory, the same intermediates as the paper's OpenCV
 // and NPP pipelines: an 8 bit RGB frame, quantized as in the 8 bit reference (normalize, add half a level, saturate,
 // denormalize), then float3 crops, float3 resized crops and the float3 output: the four kernels of makeFklVfHf<N> of
-// fkl-ablation/src/benchmark_fkl_ablation.cu, unchanged (EIGHT_BIT_FRAME = true here). With EIGHT_BIT_FRAME = false
-// the frame is float3 instead; that variant is only used for the per kernel breakdown and the counters.
+// fkl-ablation/src/benchmark_fkl_ablation.cu (EIGHT_BIT_FRAME = true here). With EIGHT_BIT_FRAME = false the frame is
+// float3 instead; that variant is only used for the per kernel breakdown and the counters. The crops are stored in
+// planes of the largest region (MAX_REGION_W x MAX_REGION_H) and resized through views of each region's own size; an
+// FKL batch runs the grid of its largest plane, so the crop kernel's threads beyond a smaller region write the unused
+// rest of its plane (the regions are drawn so that a MAX_REGION_W x MAX_REGION_H box stays inside the frame).
 template <size_t N, bool EIGHT_BIT_FRAME>
 Implementation makeFklVfHf(Context& ctx) {
     constexpr bool EIGHT_BIT = EIGHT_BIT_FRAME;
     using RGB = std::conditional_t<EIGHT_BIT, fk::uchar3, fk::float3>;
     auto rgb = std::make_shared<fk::Ptr2D<RGB>>(FRAME_W, FRAME_H, 0, fk::MemType::Device);
-    auto cropped = std::make_shared<fk::Tensor<fk::float3>>(CROP_W, CROP_H, N, 1, fk::MemType::Device);
+    auto cropped = std::make_shared<fk::Tensor<fk::float3>>(MAX_REGION_W, MAX_REGION_H, N, 1, fk::MemType::Device);
     auto resized = std::make_shared<fk::Tensor<fk::float3>>(RES_W, RES_H, N, 1, fk::MemType::Device);
     auto out = std::make_shared<fk::Tensor<fk::float3>>(OUT_W, OUT_H, N, 1, fk::MemType::Device);
-    const auto crops = firstCrops<N>(ctx);
-    const auto croppedViews = planeViews<N>(*cropped, CROP_W, CROP_H);
+    const auto sets = fklRegionSets<N>(ctx);
+    const auto croppedViews = regionViewSets<N>(ctx, *cropped);
     const auto resizedViews = planeViews<N>(*resized, RES_W, RES_H);
     Implementation impl{EIGHT_BIT ? "fkl_vf_hf" : "fkl_vf_hf_float3_frame", EIGHT_BIT ? "fkl_cpu_8bit_rgb" : "fkl_cpu_float"};
-    impl.stages.emplace_back(EIGHT_BIT ? "1_nv12_to_rgb8_full_frame" : "1_nv12_to_rgb_float3_full_frame", [&ctx, rgb]() {
+    impl.stages.emplace_back(EIGHT_BIT ? "1_nv12_to_rgb8_full_frame" : "1_nv12_to_rgb_float3_full_frame", [&ctx, rgb](size_t) {
         if constexpr (EIGHT_BIT) {
             beforeKernel();
             fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
@@ -308,30 +360,30 @@ Implementation makeFklVfHf(Context& ctx) {
                 fk::PerThreadWrite<fk::ND::_2D, fk::float3>::build(rgb->ptr()));
         }
     });
-    impl.stages.emplace_back("2_crop_to_float3", [&ctx, rgb, cropped, crops]() {
+    impl.stages.emplace_back("2_crop_to_float3", [&ctx, rgb, cropped, sets](size_t t) {
         if constexpr (EIGHT_BIT) {
             beforeKernel();
             fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
                 fk::PerThreadRead<fk::ND::_2D, RGB>::build(rgb->ptr()),
-                fk::Crop<>::build(crops),
+                fk::Crop<>::build((*sets)[t]),
                 fk::Cast<fk::uchar3, fk::float3>::build(),
                 fk::TensorWrite<fk::float3>::build(cropped->ptr()));
         } else {
             beforeKernel();
             fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
                 fk::PerThreadRead<fk::ND::_2D, RGB>::build(rgb->ptr()),
-                fk::Crop<>::build(crops),
+                fk::Crop<>::build((*sets)[t]),
                 fk::TensorWrite<fk::float3>::build(cropped->ptr()));
         }
     });
-    impl.stages.emplace_back("3_resize", [&ctx, resized, croppedViews]() {
+    impl.stages.emplace_back("3_resize", [&ctx, resized, croppedViews](size_t t) {
         beforeKernel();
         fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
-            fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(croppedViews),
+            fk::PerThreadRead<fk::ND::_2D, fk::float3>::build((*croppedViews)[t]),
             fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(RES_W, RES_H)),
             fk::TensorWrite<fk::float3>::build(resized->ptr()));
     });
-    impl.stages.emplace_back("4_addborder_mul_sub_div_write", [&ctx, out, resizedViews]() {
+    impl.stages.emplace_back("4_addborder_mul_sub_div_write", [&ctx, out, resizedViews](size_t) {
         beforeKernel();
         fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
             fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(resizedViews),
@@ -341,9 +393,9 @@ Implementation makeFklVfHf(Context& ctx) {
             fk::Div<fk::float3>::build(divValue),
             fk::TensorWrite<fk::float3>::build(out->ptr()));
     });
-    impl.run = [stages = impl.stages]() {
+    impl.run = [stages = impl.stages](size_t t) {
         for (const auto& stage : stages) {
-            stage.second();
+            stage.second(t);
         }
     };
     impl.download = [&ctx, out]() { return downloadDevice(ctx.stream, out->ptr().data, N * OUT_FLOATS); };
@@ -357,9 +409,13 @@ Implementation makeFklVfHf(Context& ctx) {
 // size, not with the descriptors' n. Each call gets its ROIs in the format it works in (XYWH for rppt_crop and
 // rppt_crop_mirror_normalize, LTRB for rppt_resize and rppt_resize_mirror_normalize): given the other format, RPP
 // launches a conversion kernel that rewrites the caller's ROI tensor in place, so a second call would read converted
-// ROIs. RpptROI tensors are in device memory, the other parameter tensors in pinned host memory (RPP reads some of
-// them on the host). The descriptors follow RPP's element strides; the output tensor is N planes of outW x outH
-// float3, contiguous.
+// ROIs. RpptROI tensors are in device memory (RPP's kernels read them), the other parameter tensors in pinned host
+// memory (RPP reads some of them on the host). The regions change every iteration: the ROIs of every iteration are
+// converted once, when the pipeline is created, into one pinned buffer, and the first operation of every run uploads
+// the ROIs of its iteration to the device ROI tensors with one hipMemcpyAsync (what RPP needs to receive the regions,
+// like NPP's descriptors in common/bench_gpu.h). The crop buffer and its descriptor have planes of the largest region
+// (MAX_REGION_W x MAX_REGION_H); every call takes each region's size from its ROI. The descriptors follow RPP's
+// element strides; the output tensor is N planes of outW x outH float3, contiguous.
 // ------------------------------------------------------------------------------------------------
 template <typename T>
 T* hostAlloc(size_t count) {
@@ -383,10 +439,15 @@ struct RppState {
     float* cropped{nullptr};
     float* resized{nullptr};
     float* tensor{nullptr};
-    RpptROI* cropRoisXywh{nullptr}; // crops on the RGB frame, for rppt_crop_mirror_normalize (device)
-    RpptROI* cropRoisLtrb{nullptr}; // crops on the RGB frame, for rppt_resize_mirror_normalize (device)
-    RpptROI* resizeRois{nullptr};   // whole crop, LTRB for rppt_resize (device)
-    RpptROI* resizedRois{nullptr};  // whole resized crop, XYWH for rppt_crop (device, rpp_npp_like only)
+    // The ROIs of one iteration on the device (roisPerIteration of them, uploaded by every run), and those of every
+    // iteration in pinned host memory, converted when the pipeline is created
+    size_t roisPerIteration{0};
+    RpptROI* roiDevice{nullptr};
+    RpptROI* roiHostAll{nullptr};
+    RpptROI* cropRoisXywh{nullptr}; // regions on the RGB frame, for rppt_crop_mirror_normalize (in roiDevice)
+    RpptROI* cropRoisLtrb{nullptr}; // regions on the RGB frame, for rppt_resize_mirror_normalize (in roiDevice)
+    RpptROI* resizeRois{nullptr};   // whole region, LTRB for rppt_resize (in roiDevice)
+    RpptROI* resizedRois{nullptr};  // whole resized region, XYWH for rppt_crop (device, rpp_npp_like only, fixed)
     RpptImagePatch* dstSizes{nullptr};
     float* cmnOffset{nullptr};
     float* cmnMultiplier{nullptr};
@@ -412,9 +473,8 @@ struct RppState {
         (void)hipFree(cropped);
         (void)hipFree(resized);
         (void)hipFree(tensor);
-        (void)hipFree(cropRoisXywh);
-        (void)hipFree(cropRoisLtrb);
-        (void)hipFree(resizeRois);
+        (void)hipFree(roiDevice);
+        (void)hipHostFree(roiHostAll);
         (void)hipFree(resizedRois);
         (void)hipFree(subRow);
         (void)hipFree(divRow);
@@ -430,16 +490,22 @@ struct RppState {
     }
 };
 
-std::shared_ptr<RppState> makeRppState(const Context& ctx, size_t n, bool resizedBuffer = false) {
+// The ROIs a pipeline uploads every iteration: none (rppt_yuv_to_rgb only), the regions in XYWH for
+// rppt_crop_mirror_normalize followed by the whole regions in LTRB for rppt_resize (the variants built on them), or the
+// regions in LTRB for rppt_resize_mirror_normalize (the fused variants)
+enum class RppRois { None, CropAndResize, ResizeMirrorNormalize };
+
+std::shared_ptr<RppState> makeRppState(const Context& ctx, size_t n, bool resizedBuffer = false,
+                                       RppRois rois = RppRois::None) {
     auto st = std::make_shared<RppState>();
     st->n = n;
-    st->cropPitch = alignUp(CROP_W, RPP_PIXEL_ALIGN);
+    st->cropPitch = alignUp(MAX_REGION_W, RPP_PIXEL_ALIGN);
     st->resizedPitch = alignUp(RES_W, RPP_PIXEL_ALIGN);
     const int outW = OUT_W, outH = OUT_H;
     const unsigned N = static_cast<unsigned>(n);
     RPP_CHECK(static_cast<RppStatus>(rppCreate(&st->handle, n, 0, ctx.stream, RppBackend::RPP_HIP_BACKEND)));
     st->rgb8 = deviceAlloc<uint8_t>(static_cast<size_t>(FRAME_W) * FRAME_H * 3 + RPP_SLACK_BYTES);
-    st->cropped = deviceAlloc<float>(n * st->cropPitch * CROP_H * 3 * sizeof(float) + RPP_SLACK_BYTES);
+    st->cropped = deviceAlloc<float>(n * st->cropPitch * MAX_REGION_H * 3 * sizeof(float) + RPP_SLACK_BYTES);
     if (resizedBuffer) {
         st->resized = deviceAlloc<float>(n * st->resizedPitch * RES_H * 3 * sizeof(float) + RPP_SLACK_BYTES);
         std::vector<RpptROI> resizedRois(n);
@@ -453,7 +519,6 @@ std::shared_ptr<RppState> makeRppState(const Context& ctx, size_t n, bool resize
     // into the tensor: the slack covers those rows after the last plane
     st->tensor = deviceAlloc<float>(n * OUT_FLOATS * sizeof(float) + BORDER_TOP * outW * 3 * sizeof(float) + RPP_SLACK_BYTES);
 
-    std::vector<RpptROI> cropRoisXywh(n), cropRoisLtrb(n), resizeRois(n);
     st->dstSizes = hostAlloc<RpptImagePatch>(n);
     st->cmnOffset = hostAlloc<float>(n * 3);
     st->cmnMultiplier = hostAlloc<float>(n * 3);
@@ -462,11 +527,6 @@ std::shared_ptr<RppState> makeRppState(const Context& ctx, size_t n, bool resize
     st->rmnStdDevMul = hostAlloc<float>(n * 3);
     st->rmnStdDevOne = hostAlloc<float>(n * 3);
     for (size_t i = 0; i < n; ++i) {
-        const fk::Rect& r = ctx.crops[i];
-        cropRoisXywh[i].xywhROI = {{static_cast<int>(r.x), static_cast<int>(r.y)}, CROP_W, CROP_H};
-        cropRoisLtrb[i].ltrbROI = {{static_cast<int>(r.x), static_cast<int>(r.y)},
-                                   {static_cast<int>(r.x) + CROP_W - 1, static_cast<int>(r.y) + CROP_H - 1}};
-        resizeRois[i].ltrbROI = {{0, 0}, {CROP_W - 1, CROP_H - 1}};
         st->dstSizes[i] = {static_cast<Rpp32u>(RES_W), static_cast<Rpp32u>(RES_H)};
         st->mirror[i] = 0;
         for (int c = 0; c < 3; ++c) {
@@ -479,12 +539,31 @@ std::shared_ptr<RppState> makeRppState(const Context& ctx, size_t n, bool resize
             st->rmnStdDevOne[i * 3 + c] = 1.f;
         }
     }
-    st->cropRoisXywh = deviceAlloc<RpptROI>(n * sizeof(RpptROI));
-    st->cropRoisLtrb = deviceAlloc<RpptROI>(n * sizeof(RpptROI));
-    st->resizeRois = deviceAlloc<RpptROI>(n * sizeof(RpptROI));
-    gpuErrchk(hipMemcpyAsync(st->cropRoisXywh, cropRoisXywh.data(), n * sizeof(RpptROI), hipMemcpyHostToDevice, ctx.stream));
-    gpuErrchk(hipMemcpyAsync(st->cropRoisLtrb, cropRoisLtrb.data(), n * sizeof(RpptROI), hipMemcpyHostToDevice, ctx.stream));
-    gpuErrchk(hipMemcpyAsync(st->resizeRois, resizeRois.data(), n * sizeof(RpptROI), hipMemcpyHostToDevice, ctx.stream));
+    // The ROIs of every iteration, in the formats the pipeline's calls work in, and the device tensors they go to
+    if (rois != RppRois::None) {
+        st->roisPerIteration = rois == RppRois::CropAndResize ? 2 * n : n;
+        const size_t iterations = ctx.regions->iterations();
+        st->roiHostAll = hostAlloc<RpptROI>(iterations * st->roisPerIteration);
+        for (size_t t = 0; t < iterations; ++t) {
+            RpptROI* block = st->roiHostAll + t * st->roisPerIteration;
+            for (size_t i = 0; i < n; ++i) {
+                const Region& r = ctx.regions->at(t, i);
+                if (rois == RppRois::CropAndResize) {
+                    block[i].xywhROI = {{r.x, r.y}, r.width, r.height};
+                    block[n + i].ltrbROI = {{0, 0}, {r.width - 1, r.height - 1}};
+                } else {
+                    block[i].ltrbROI = {{r.x, r.y}, {r.x + r.width - 1, r.y + r.height - 1}};
+                }
+            }
+        }
+        st->roiDevice = deviceAlloc<RpptROI>(st->roisPerIteration * sizeof(RpptROI));
+        if (rois == RppRois::CropAndResize) {
+            st->cropRoisXywh = st->roiDevice;
+            st->resizeRois = st->roiDevice + n;
+        } else {
+            st->cropRoisLtrb = st->roiDevice;
+        }
+    }
 
     st->mulScalar = hostAlloc<float>(1);
     st->mulScalar[0] = MUL[0];
@@ -516,8 +595,10 @@ std::shared_ptr<RppState> makeRppState(const Context& ctx, size_t n, bool resize
     // All the batch images alias the RGB frame (zero batch stride), each with its own crop ROI
     st->frameBatchDesc = RpptDesc(N, 3, FRAME_H, FRAME_W, RpptDataType::U8, RpptLayout::NHWC, 0,
                                   RpptStrides{0, 1, static_cast<Rpp32u>(FRAME_W * 3), 3});
-    st->cropDesc = RpptDesc(N, 3, CROP_H, CROP_W, RpptDataType::F32, RpptLayout::NHWC, 0,
-                            RpptStrides{static_cast<Rpp32u>(st->cropPitch * CROP_H * 3), 1,
+    // Planes of the largest region; each call takes a region's size from its ROI (rows of a smaller region written 8
+    // pixels at a time stay inside the MAX_REGION_W pitch)
+    st->cropDesc = RpptDesc(N, 3, MAX_REGION_H, MAX_REGION_W, RpptDataType::F32, RpptLayout::NHWC, 0,
+                            RpptStrides{static_cast<Rpp32u>(st->cropPitch * MAX_REGION_H * 3), 1,
                                         static_cast<Rpp32u>(st->cropPitch * 3), 3});
     st->resizedDesc = RpptDesc(N, 3, RES_H, RES_W, RpptDataType::F32, RpptLayout::NHWC, 0,
                                RpptStrides{static_cast<Rpp32u>(st->resizedPitch * RES_H * 3), 1,
@@ -544,9 +625,18 @@ std::shared_ptr<RppState> makeRppState(const Context& ctx, size_t n, bool resize
     return st;
 }
 
-// One GPU operation of an RPP pipeline: its name in the breakdown and the call
-using Stage = std::pair<std::string, std::function<void()>>;
+// One GPU operation of an RPP pipeline: its name in the breakdown and the call (for the regions of iteration t)
+using RppStage = std::pair<std::string, Stage>;
 using RppStatePtr = std::shared_ptr<RppState>;
+
+// The ROIs of iteration t to the device ROI tensors: one hipMemcpyAsync from pinned memory on the pipeline stream
+RppStage uploadRoisStage(Context& ctx, RppStatePtr st) {
+    return {"hipMemcpyAsync_rois_of_the_iteration", [&ctx, st](size_t t) {
+                beforeKernel();
+                gpuErrchk(hipMemcpyAsync(st->roiDevice, st->roiHostAll + t * st->roisPerIteration,
+                                         st->roisPerIteration * sizeof(RpptROI), hipMemcpyHostToDevice, ctx.stream));
+            }};
+}
 
 void rppYuvToRgb(const Context& ctx, const RppState& st) {
     beforeKernel();
@@ -555,13 +645,13 @@ void rppYuvToRgb(const Context& ctx, const RppState& st) {
                               RpptColorStandard_BT601, RpptColorRange_STUDIO, st.handle, RppBackend::RPP_HIP_BACKEND));
 }
 
-Stage yuvToRgbStage(Context& ctx, RppStatePtr st) {
-    return {"rppt_yuv_to_rgb_full_frame", [&ctx, st]() { rppYuvToRgb(ctx, *st); }};
+RppStage yuvToRgbStage(Context& ctx, RppStatePtr st) {
+    return {"rppt_yuv_to_rgb_full_frame", [&ctx, st](size_t) { rppYuvToRgb(ctx, *st); }};
 }
 
 // Crop + 8u -> 32f of all the crops, every batch image aliasing the RGB frame
-Stage cropConvertStage(RppStatePtr st) {
-    return {"rppt_crop_mirror_normalize_8u32f_batch", [st]() {
+RppStage cropConvertStage(RppStatePtr st) {
+    return {"rppt_crop_mirror_normalize_8u32f_batch", [st](size_t) {
                 beforeKernel();
                 RPP_CHECK(rppt_crop_mirror_normalize(st->rgb8, &st->frameBatchDesc, st->cropped, &st->cropDesc,
                                                      st->cmnOffset, st->cmnMultiplier, st->mirror, st->cropRoisXywh,
@@ -570,16 +660,16 @@ Stage cropConvertStage(RppStatePtr st) {
 }
 
 // The whole output tensor to zero (RPP has no constant border)
-Stage zeroTensorStage(Context& ctx, RppStatePtr st) {
-    return {"hipMemsetAsync_output_tensor", [&ctx, st]() {
+RppStage zeroTensorStage(Context& ctx, RppStatePtr st) {
+    return {"hipMemsetAsync_output_tensor", [&ctx, st](size_t) {
                 beforeKernel();
                 gpuErrchk(hipMemsetAsync(st->tensor, 0, st->n * OUT_FLOATS * sizeof(float), ctx.stream));
             }};
 }
 
 // Only the top border rows of the first plane: rppt_resize_mirror_normalize zeroes everything after them itself
-Stage zeroFirstBorderStage(Context& ctx, RppStatePtr st) {
-    return {"hipMemsetAsync_first_plane_top_border", [&ctx, st]() {
+RppStage zeroFirstBorderStage(Context& ctx, RppStatePtr st) {
+    return {"hipMemsetAsync_first_plane_top_border", [&ctx, st](size_t) {
                 beforeKernel();
                 gpuErrchk(hipMemsetAsync(st->tensor, 0, static_cast<size_t>(BORDER_TOP) * OUT_W * 3 * sizeof(float),
                                          ctx.stream));
@@ -587,8 +677,8 @@ Stage zeroFirstBorderStage(Context& ctx, RppStatePtr st) {
 }
 
 // Resize of all the crops, written into rows BORDER_TOP.. of the output planes
-Stage resizeIntoOutputStage(RppStatePtr st) {
-    return {"rppt_resize_batch_into_output_rows", [st]() {
+RppStage resizeIntoOutputStage(RppStatePtr st) {
+    return {"rppt_resize_batch_into_output_rows", [st](size_t) {
                 beforeKernel();
                 RPP_CHECK(rppt_resize(st->cropped, &st->cropDesc, st->tensor, &st->outInteriorDesc, st->dstSizes,
                                       RpptInterpolationType::BILINEAR, st->resizeRois, RpptRoiType::LTRB, st->handle,
@@ -597,8 +687,8 @@ Stage resizeIntoOutputStage(RppStatePtr st) {
 }
 
 // Resize of all the crops into their own float3 buffer (rpp_npp_like)
-Stage resizeStage(RppStatePtr st) {
-    return {"rppt_resize_batch", [st]() {
+RppStage resizeStage(RppStatePtr st) {
+    return {"rppt_resize_batch", [st](size_t) {
                 beforeKernel();
                 RPP_CHECK(rppt_resize(st->cropped, &st->cropDesc, st->resized, &st->resizedDesc, st->dstSizes,
                                       RpptInterpolationType::BILINEAR, st->resizeRois, RpptRoiType::LTRB, st->handle,
@@ -607,8 +697,8 @@ Stage resizeStage(RppStatePtr st) {
 }
 
 // Copy of the resized crops into rows BORDER_TOP.. of the output planes (rpp_npp_like, NPP's CopyConstBorder)
-Stage copyIntoOutputStage(RppStatePtr st) {
-    return {"rppt_crop_f32_batch_into_output_rows", [st]() {
+RppStage copyIntoOutputStage(RppStatePtr st) {
+    return {"rppt_crop_f32_batch_into_output_rows", [st](size_t) {
                 beforeKernel();
                 RPP_CHECK(rppt_crop(st->resized, &st->resizedDesc, st->tensor, &st->outInteriorDesc, st->resizedRois,
                                     RpptRoiType::XYWH, st->handle, RppBackend::RPP_HIP_BACKEND));
@@ -619,10 +709,10 @@ Stage copyIntoOutputStage(RppStatePtr st) {
 // RPP's 8u -> 32f resize_mirror_normalize computes (x - mean) / stdDev on the 0..255 values, so the whole tail would
 // be mean = 255 * sub, stdDev = 255 * div; but it only writes the resized pixels, while the border rows must hold the
 // normalized black (0 - sub) / div, so the rest of the tail runs on the whole tensor afterwards
-Stage resizeMirrorNormalizeStage(RppStatePtr st, bool mul) {
+RppStage resizeMirrorNormalizeStage(RppStatePtr st, bool mul) {
     return {mul ? "rppt_resize_mirror_normalize_8u32f_batch_mul_into_output_rows"
                 : "rppt_resize_mirror_normalize_8u32f_batch_into_output_rows",
-            [st, mul]() {
+            [st, mul](size_t) {
                 beforeKernel();
                 RPP_CHECK(rppt_resize_mirror_normalize(st->rgb8, &st->frameBatchDesc, st->tensor, &st->outInteriorDesc,
                                                        st->dstSizes, RpptInterpolationType::BILINEAR, st->rmnMean,
@@ -632,8 +722,8 @@ Stage resizeMirrorNormalizeStage(RppStatePtr st, bool mul) {
             }};
 }
 
-Stage multiplyStage(RppStatePtr st) {
-    return {"rppt_multiply_scalar", [st]() {
+RppStage multiplyStage(RppStatePtr st) {
+    return {"rppt_multiply_scalar", [st](size_t) {
                 beforeKernel();
                 RPP_CHECK(rppt_multiply_scalar(st->tensor, &st->volumeDesc, st->tensor, &st->volumeDesc, st->mulScalar,
                                                st->volumeRoi, RpptRoi3DType::XYZWHD, st->handle,
@@ -641,8 +731,8 @@ Stage multiplyStage(RppStatePtr st) {
             }};
 }
 
-Stage subtractStage(RppStatePtr st) {
-    return {"rppt_tensor_subtract_tensor", [st]() {
+RppStage subtractStage(RppStatePtr st) {
+    return {"rppt_tensor_subtract_tensor", [st](size_t) {
                 beforeKernel();
                 RPP_CHECK(rppt_tensor_subtract_tensor(st->tensor, st->subRow, &st->rowsDesc, &st->rowDesc, st->tensor,
                                                       &st->rowsDesc, RPP_BROADCAST_ENABLE, st->rowsRoi, st->rowRoi,
@@ -650,8 +740,8 @@ Stage subtractStage(RppStatePtr st) {
             }};
 }
 
-Stage divideStage(RppStatePtr st) {
-    return {"rppt_tensor_divide_tensor", [st]() {
+RppStage divideStage(RppStatePtr st) {
+    return {"rppt_tensor_divide_tensor", [st](size_t) {
                 beforeKernel();
                 RPP_CHECK(rppt_tensor_divide_tensor(st->tensor, st->divRow, &st->rowsDesc, &st->rowDesc, st->tensor,
                                                     &st->rowsDesc, RPP_BROADCAST_ENABLE, st->rowsRoi, st->rowRoi,
@@ -661,8 +751,8 @@ Stage divideStage(RppStatePtr st) {
 
 // Mul, Sub and Div in one call on the whole tensor (borders included): rppt_normalize on the rows of outW float3 with
 // per column mean 255 * sub and stdDev 255 * div, fmaf(x - mean, 1 / stdDev, 0) = (x - 255 sub) / (255 div)
-Stage normalizeStage(RppStatePtr st) {
-    return {"rppt_normalize_mul_sub_div", [st]() {
+RppStage normalizeStage(RppStatePtr st) {
+    return {"rppt_normalize_mul_sub_div", [st](size_t) {
                 beforeKernel();
                 RPP_CHECK(rppt_normalize(st->tensor, &st->rowsDesc, st->tensor, &st->rowsDesc, 1, st->normMean,
                                          st->normStdDev, 0, 1.f, 0.f, st->rowsRoi, st->handle,
@@ -670,15 +760,17 @@ Stage normalizeStage(RppStatePtr st) {
             }};
 }
 
-Implementation makeRppImplementation(const std::string& name, Context& ctx, RppStatePtr st, std::vector<Stage> stages) {
+Implementation makeRppImplementation(const std::string& name, Context& ctx, RppStatePtr st, std::vector<RppStage> stages) {
     Implementation impl{name, "rpp_sampling_8bit"};
+    // First the upload of the iteration's ROIs
+    stages.insert(stages.begin(), uploadRoisStage(ctx, st));
     for (size_t i = 0; i < stages.size(); ++i) {
         stages[i].first = std::to_string(i + 1) + "_" + stages[i].first;
     }
     impl.stages = std::move(stages);
-    impl.run = [stages = impl.stages]() {
+    impl.run = [stages = impl.stages](size_t t) {
         for (const auto& stage : stages) {
-            stage.second();
+            stage.second(t);
         }
     };
     impl.download = [&ctx, st]() { return downloadDevice(ctx.stream, st->tensor, st->n * OUT_FLOATS); };
@@ -689,7 +781,7 @@ Implementation makeRppImplementation(const std::string& name, Context& ctx, RppS
 // One RPP call per operation of Figure 1
 template <size_t N>
 Implementation makeRpp(Context& ctx) {
-    auto st = makeRppState(ctx, N);
+    auto st = makeRppState(ctx, N, false, RppRois::CropAndResize);
     return makeRppImplementation("rpp_per_op", ctx, st, {yuvToRgbStage(ctx, st), cropConvertStage(st), zeroTensorStage(ctx, st),
                                              resizeIntoOutputStage(st), multiplyStage(st), subtractStage(st),
                                              divideStage(st)});
@@ -700,7 +792,7 @@ Implementation makeRpp(Context& ctx) {
 // into the output rows, after the memset of the tensor
 template <size_t N>
 Implementation makeRppNppLike(Context& ctx) {
-    auto st = makeRppState(ctx, N, true);
+    auto st = makeRppState(ctx, N, true, RppRois::CropAndResize);
     return makeRppImplementation("rpp_npp_like", ctx, st, {yuvToRgbStage(ctx, st), cropConvertStage(st), resizeStage(st),
                                                       zeroTensorStage(ctx, st), copyIntoOutputStage(st),
                                                       multiplyStage(st), subtractStage(st), divideStage(st)});
@@ -709,7 +801,7 @@ Implementation makeRppNppLike(Context& ctx) {
 // RPP's fused primitive: rppt_resize_mirror_normalize does crop + 8u -> 32f + resize + Mul, then Sub and Div
 template <size_t N>
 Implementation makeRppFused(Context& ctx) {
-    auto st = makeRppState(ctx, N);
+    auto st = makeRppState(ctx, N, false, RppRois::ResizeMirrorNormalize);
     return makeRppImplementation("rpp_fused", ctx, st, {yuvToRgbStage(ctx, st), zeroFirstBorderStage(ctx, st),
                                                    resizeMirrorNormalizeStage(st, true), subtractStage(st),
                                                    divideStage(st)});
@@ -718,7 +810,7 @@ Implementation makeRppFused(Context& ctx) {
 // One RPP call per operation up to the resize, then Mul + Sub + Div in one rppt_normalize
 template <size_t N>
 Implementation makeRppNormalize(Context& ctx) {
-    auto st = makeRppState(ctx, N);
+    auto st = makeRppState(ctx, N, false, RppRois::CropAndResize);
     return makeRppImplementation("rpp_normalize", ctx, st, {yuvToRgbStage(ctx, st), cropConvertStage(st),
                                                        zeroTensorStage(ctx, st), resizeIntoOutputStage(st),
                                                        normalizeStage(st)});
@@ -727,16 +819,16 @@ Implementation makeRppNormalize(Context& ctx) {
 // The fewest RPP calls: rppt_resize_mirror_normalize (crop + 8u -> 32f + resize) and rppt_normalize (Mul + Sub + Div)
 template <size_t N>
 Implementation makeRppFusedNormalize(Context& ctx) {
-    auto st = makeRppState(ctx, N);
+    auto st = makeRppState(ctx, N, false, RppRois::ResizeMirrorNormalize);
     return makeRppImplementation("rpp_fused_normalize", ctx, st, {yuvToRgbStage(ctx, st), zeroFirstBorderStage(ctx, st),
                                                              resizeMirrorNormalizeStage(st, false), normalizeStage(st)});
 }
 
-// References on FKL's CPU backend. The float reference is the Figure 1 chain itself. The 8 bit reference
-// quantizes the RGB values to 8 bit right after the color conversion, like FKL VF+HF does.
+// References on FKL's CPU backend, for the regions of iteration t. The float reference is the Figure 1 chain itself.
+// The 8 bit reference quantizes the RGB values to 8 bit right after the color conversion, like FKL VF+HF does.
 template <size_t N, bool EIGHT_BIT>
-std::vector<float> cpuReference(const Context& ctx) {
-    const auto crops = firstCrops<N>(ctx);
+std::vector<float> cpuReference(const Context& ctx, size_t t) {
+    const auto crops = fklRegions<N>(ctx, t);
     fk::Stream_<fk::ParArch::CPU> cpuStream;
     fk::Tensor<fk::float3> out(OUT_W, OUT_H, N, 1, fk::MemType::Host);
     const auto tail = [&](const auto& rgbRead) {
@@ -764,8 +856,9 @@ std::vector<float> cpuReference(const Context& ctx) {
     return std::vector<float>(data, data + N * OUT_FLOATS);
 }
 
-// Plain C++ reference with RPP's bilinear sampling convention, measured with linear ramps (--resize-convention):
-// rppt_resize and rppt_resize_mirror_normalize sample at src = (dst + 0.5) * scale - 0.5 (pixel centers), with the
+// Plain C++ reference with RPP's bilinear sampling convention, for the regions of iteration t, measured with linear ramps
+// for every region size (--resize-convention): rppt_resize and rppt_resize_mirror_normalize sample at
+// src = (dst + 0.5) * scale - 0.5 (pixel centers) with each region's own scale (its size / the resized size), with the
 // sample position clamped to [0, size - 2] in both axes (the last source column and row never get any weight).
 // The RGB values are RPP's own 8 bit frame (rppt_yuv_to_rgb's output, ctx.rppRgb8). RPP's BT.601 limited range
 // conversion is the standard formula (R = 255/219 (Y - 16) + 255/224 * 1.402 (V - 128), G and B likewise with
@@ -776,20 +869,23 @@ std::vector<float> cpuReference(const Context& ctx) {
 // conversionDiagnostic reports how many values of the benchmark frame differ from the formula. Same border and
 // pointwise tail as the other references.
 template <size_t N>
-std::vector<float> rppConventionReference8bit(const Context& ctx) {
+std::vector<float> rppConventionReference8bit(const Context& ctx, size_t t) {
     if (ctx.rppRgb8.size() != static_cast<size_t>(FRAME_W) * FRAME_H * 3) {
         throw std::runtime_error("RPP's RGB frame (ctx.rppRgb8) is not available");
     }
     const int outW = OUT_W, outH = OUT_H;
     std::vector<float> out(N * OUT_FLOATS);
-    const float scaleX = static_cast<float>(CROP_W) / RES_W;
-    const float scaleY = static_cast<float>(CROP_H) / RES_H;
-    std::vector<float> crop(static_cast<size_t>(CROP_W) * CROP_H * 3);
-    const auto at = [&](int y, int x, int c) -> float& { return crop[(static_cast<size_t>(y) * CROP_W + x) * 3 + c]; };
+    std::vector<float> crop(static_cast<size_t>(MAX_REGION_W) * MAX_REGION_H * 3);
+    const auto at = [&](int y, int x, int c) -> float& {
+        return crop[(static_cast<size_t>(y) * MAX_REGION_W + x) * 3 + c];
+    };
     for (size_t i = 0; i < N; ++i) {
-        const fk::Rect& r = ctx.crops[i];
-        for (int y = 0; y < CROP_H; ++y) {
-            for (int x = 0; x < CROP_W; ++x) {
+        const Region& r = ctx.regions->at(t, i);
+        const int cropW = r.width, cropH = r.height;
+        const float scaleX = static_cast<float>(cropW) / RES_W;
+        const float scaleY = static_cast<float>(cropH) / RES_H;
+        for (int y = 0; y < cropH; ++y) {
+            for (int x = 0; x < cropW; ++x) {
                 const size_t idx = (static_cast<size_t>(r.y + y) * FRAME_W + (r.x + x)) * 3;
                 for (int c = 0; c < 3; ++c) {
                     at(y, x, c) = ctx.rppRgb8[idx + c];
@@ -802,10 +898,10 @@ std::vector<float> rppConventionReference8bit(const Context& ctx) {
                 const int ry = y - BORDER_TOP;
                 float value[3] = {0.f, 0.f, 0.f};
                 if (ry >= 0 && ry < RES_H) {
-                    const float sx = std::min(static_cast<float>(CROP_W - 2), std::max(0.f, (x + 0.5f) * scaleX - 0.5f));
-                    const float sy = std::min(static_cast<float>(CROP_H - 2), std::max(0.f, (ry + 0.5f) * scaleY - 0.5f));
+                    const float sx = std::min(static_cast<float>(cropW - 2), std::max(0.f, (x + 0.5f) * scaleX - 0.5f));
+                    const float sy = std::min(static_cast<float>(cropH - 2), std::max(0.f, (ry + 0.5f) * scaleY - 0.5f));
                     const int x0 = static_cast<int>(sx), y0 = static_cast<int>(sy);
-                    const int x1 = std::min(x0 + 1, CROP_W - 1), y1 = std::min(y0 + 1, CROP_H - 1);
+                    const int x1 = std::min(x0 + 1, cropW - 1), y1 = std::min(y0 + 1, cropH - 1);
                     const float fx = sx - x0, fy = sy - y0;
                     for (int c = 0; c < 3; ++c) {
                         value[c] = (at(y0, x0, c) * (1.f - fx) + at(y0, x1, c) * fx) * (1.f - fy) +
@@ -858,7 +954,9 @@ TimingStats computeStats(std::vector<float> ms) {
 // Latency of each complete pipeline, the way FKL's two-execution benchmarks measure: in every iteration all the
 // implementations run one after the other, each one between two HIP events on the same stream (everything the
 // host does to enqueue it is included) and followed by a synchronization. Inputs are already in device memory.
-// Returns the TIMED_ITERS execution times of each implementation, in ms, in iteration order.
+// Iteration i (warm-up first) runs every implementation on the regions of iteration i, so the warm-up uses the regions
+// of iterations 0 to warmup - 1 and the timed iterations those of warmup to warmup + iters - 1.
+// Returns the iters execution times of each implementation, in ms, in iteration order.
 std::vector<std::vector<float>> measureInterleaved(const Context& ctx, const std::vector<Implementation>& impls,
                                                    int warmup = WARMUP_ITERS, int iters = TIMED_ITERS) {
     hipEvent_t start, stop;
@@ -868,7 +966,7 @@ std::vector<std::vector<float>> measureInterleaved(const Context& ctx, const std
     for (int i = 0; i < warmup + iters; ++i) {
         for (size_t k = 0; k < impls.size(); ++k) {
             gpuErrchk(hipEventRecord(start, ctx.stream));
-            impls[k].run();
+            impls[k].run(static_cast<size_t>(i));
             gpuErrchk(hipEventRecord(stop, ctx.stream));
             gpuErrchk(hipEventSynchronize(stop));
             if (i >= warmup) {
@@ -896,15 +994,17 @@ void measureStages(const Context& ctx, const Implementation& impl, int batch) {
     for (auto& e : events) {
         gpuErrchk(hipEventCreate(&e));
     }
+    // The regions of the warm-up and timed iterations, as in the CPU + GPU pass
     for (int i = 0; i < WARMUP_ITERS; ++i) {
-        impl.run();
+        impl.run(static_cast<size_t>(i));
         gpuErrchk(hipStreamSynchronize(ctx.stream));
     }
     std::vector<std::vector<float>> ms(numStages, std::vector<float>(TIMED_ITERS));
     for (int i = 0; i < TIMED_ITERS; ++i) {
+        const size_t t = static_cast<size_t>(WARMUP_ITERS + i);
         gpuErrchk(hipEventRecord(events[0], ctx.stream));
         for (size_t s = 0; s < numStages; ++s) {
-            impl.stages[s].second();
+            impl.stages[s].second(t);
             gpuErrchk(hipEventRecord(events[s + 1], ctx.stream));
         }
         gpuErrchk(hipEventSynchronize(events[numStages]));
@@ -1055,14 +1155,14 @@ extern "C" rocprofiler_tool_configure_result_t* rocprofiler_configure(uint32_t, 
 
 namespace bench {
 
-// Kernel launches, memsets and memcpys of one pipeline, from HIP runtime API tracing, in a separate pass after all
-// the timings
-LaunchCounts countLaunches(const Context& ctx, const Implementation& impl) {
+// Kernel launches, memsets and memcpys of one pipeline on the regions of iteration t, from HIP runtime API tracing, in
+// a separate pass after all the timings
+LaunchCounts countLaunches(const Context& ctx, const Implementation& impl, size_t t) {
     rocprof::requireConfigured();
     gpuErrchk(hipStreamSynchronize(ctx.stream));
     rocprof::counts = LaunchCounts{};
     ROCP_CHECK(rocprofiler_start_context(rocprof::apiContext));
-    impl.run();
+    impl.run(t);
     gpuErrchk(hipStreamSynchronize(ctx.stream));
     ROCP_CHECK(rocprofiler_stop_context(rocprof::apiContext));
     // The stream synchronization itself is not a launch, memset or memcpy
@@ -1073,7 +1173,7 @@ LaunchCounts countLaunches(const Context& ctx, const Implementation& impl) {
 bool kernelTracingAvailable(Context& ctx) {
     rocprof::requireConfigured();
     const auto probe = makeFklBvf<1>(ctx);
-    probe.run();
+    probe.run(0);
     gpuErrchk(hipStreamSynchronize(ctx.stream));
     rocprof::flushKernels();
     {
@@ -1081,7 +1181,7 @@ bool kernelTracingAvailable(Context& ctx) {
         rocprof::kernels.clear();
     }
     ROCP_CHECK(rocprofiler_start_context(rocprof::kernelContext));
-    probe.run();
+    probe.run(1);
     gpuErrchk(hipStreamSynchronize(ctx.stream));
     ROCP_CHECK(rocprofiler_stop_context(rocprof::kernelContext));
     rocprof::flushKernels();
@@ -1109,6 +1209,13 @@ struct Result {
     TimingStats gpuFlushedTiming;
     double meanGpuFlushedSpeedupOfBvf{NAN};
     bool gpuFlushedMeasured{false};
+    // The errors of every validated iteration (validation::validatedIterations), and all of them together
+    // (validation::combine)
+    struct IterationErrors {
+        size_t iteration{0};
+        ErrorStats own, vsFloat, vsRppConvention, vs8bit;
+    };
+    std::vector<IterationErrors> errorsPerIteration;
     ErrorStats errorVsOwnReference;
     ErrorStats errorVsFloatReference;
     ErrorStats errorVsRppConventionReference;
@@ -1118,7 +1225,20 @@ struct Result {
     LaunchCounts launches;
     // 1e-3 against the float reference, one level of 8 bit RGB against the 8 bit ones (common/bench_validation.h)
     float tolerance() const { return reference == "fkl_cpu_float" ? TOLERANCE : TOLERANCE_8BIT; }
-    bool withinTolerance() const { return validation::withinTolerance(errorVsOwnReference, tolerance()); }
+    // Within the tolerance in every validated iteration
+    bool withinTolerance(const ErrorStats& e) const { return validation::withinTolerance(e, tolerance()); }
+    bool withinTolerance() const {
+        return !errorsPerIteration.empty() &&
+               std::all_of(errorsPerIteration.begin(), errorsPerIteration.end(),
+                           [this](const IterationErrors& e) { return withinTolerance(e.own); });
+    }
+    void addIteration(const IterationErrors& e) {
+        errorsPerIteration.push_back(e);
+        errorVsOwnReference = validation::combine(errorVsOwnReference, e.own);
+        errorVsFloatReference = validation::combine(errorVsFloatReference, e.vsFloat);
+        errorVsRppConventionReference = validation::combine(errorVsRppConventionReference, e.vsRppConvention);
+        errorVs8bitReference = validation::combine(errorVs8bitReference, e.vs8bit);
+    }
 };
 
 // FKL's outputs must be within their tolerance; the RPP pipelines' are reported (they depend on the RPP build)
@@ -1191,89 +1311,103 @@ void progress(const std::string& what) {
 template <size_t N>
 void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
     std::cout << "=== N = " << N << std::endl;
-    progress("FKL CPU float reference");
-    const auto refFloat = cpuReference<N, false>(ctx);
-    progress("FKL CPU 8 bit reference");
-    const auto ref8bit = cpuReference<N, true>(ctx);
-    progress("RPP convention reference");
-    const auto refRppConvention = rppConventionReference8bit<N>(ctx);
     progress("implementations");
     const auto impls = makeImplementations<N>(ctx);
-    const auto ownReference = [&](const Implementation& impl) -> const std::vector<float>& {
-        return impl.reference == "fkl_cpu_float" ? refFloat : impl.reference == "fkl_cpu_8bit_rgb" ? ref8bit : refRppConvention;
-    };
+    const auto float3Frame = makeFklVfHf<N, false>(ctx);
     const size_t bvf = impls.size() - 1;
-    std::vector<Result> batchResults;
-    std::vector<std::vector<float>> validatedOutputs; // compared with the outputs after the timed iterations
-    for (const auto& impl : impls) {
-        Result r;
-        r.name = impl.name;
-        r.batch = static_cast<int>(N);
-        progress("validating " + impl.name);
-        impl.fillNaN();
-        if (std::getenv("BENCH_VERBOSE") != nullptr && !impl.stages.empty()) {
-            // Operation by operation, synchronizing after each one, to locate failures
-            for (const auto& stage : impl.stages) {
-                progress("  " + stage.first);
-                stage.second();
-                gpuErrchk(hipStreamSynchronize(ctx.stream));
-            }
-        } else {
-            impl.run();
-        }
-        const hipError_t launchError = hipGetLastError();
-        if (launchError != hipSuccess) {
-            throw std::runtime_error(impl.name + ": HIP error after the pipeline: " + hipGetErrorString(launchError));
-        }
-        gpuErrchk(hipStreamSynchronize(ctx.stream));
-        const auto output = impl.download();
-        validatedOutputs.push_back(output);
-        r.reference = impl.reference;
-        r.errorVsOwnReference = compare(output, ownReference(impl));
-        r.errorVsFloatReference = compare(output, refFloat);
-        r.errorVsRppConventionReference = compare(output, refRppConvention);
-        r.errorVs8bitReference = compare(output, ref8bit);
-        if (r.errorVsOwnReference.nonFinite != 0) {
-            size_t first = 0;
-            while (first < output.size() && std::isfinite(output[first])) {
-                ++first;
-            }
-            std::cerr << "  " << impl.name << ": " << r.errorVsOwnReference.nonFinite << " of " << output.size()
-                      << " output values are not finite, the first at float index " << first << " (plane "
-                      << first / OUT_FLOATS << ")" << std::endl;
-        }
-        batchResults.push_back(r);
+    std::vector<Result> batchResults(impls.size());
+    for (size_t k = 0; k < impls.size(); ++k) {
+        batchResults[k].name = impls[k].name;
+        batchResults[k].batch = static_cast<int>(N);
+        batchResults[k].reference = impls[k].reference;
     }
-    const auto checkFloat3Frame = [&](const Implementation& float3Frame) {
-        float3Frame.fillNaN();
-        float3Frame.run();
-        gpuErrchk(hipStreamSynchronize(ctx.stream));
-        const ErrorStats float3FrameError = compare(float3Frame.download(), refFloat);
-        if (float3FrameError.max() > TOLERANCE) {
-            throw std::runtime_error("fkl_vf_hf_float3_frame does not match the float reference");
+    // Validation before the timing, on the validated timed iterations (the first, every 50th and the last): every
+    // implementation runs on the regions of that iteration (into a NaN-poisoned output) and is compared with the
+    // references of those regions. The outputs of the first validated iteration are kept, for the check after the
+    // timing.
+    const auto validated = validation::validatedIterations(TIMED_ITERS);
+    std::vector<std::vector<float>> firstOutputs(impls.size());
+    for (size_t v = 0; v < validated.size(); ++v) {
+        const size_t t = static_cast<size_t>(WARMUP_ITERS) + validated[v];
+        progress("references of iteration " + std::to_string(t));
+        const auto refFloat = cpuReference<N, false>(ctx, t);
+        const auto ref8bit = cpuReference<N, true>(ctx, t);
+        const auto refRppConvention = rppConventionReference8bit<N>(ctx, t);
+        const auto ownReference = [&](const Implementation& impl) -> const std::vector<float>& {
+            return impl.reference == "fkl_cpu_float" ? refFloat
+                   : impl.reference == "fkl_cpu_8bit_rgb" ? ref8bit : refRppConvention;
+        };
+        for (size_t k = 0; k < impls.size(); ++k) {
+            const Implementation& impl = impls[k];
+            progress("validating " + impl.name + " on iteration " + std::to_string(t));
+            impl.fillNaN();
+            if (std::getenv("BENCH_VERBOSE") != nullptr && !impl.stages.empty()) {
+                // Operation by operation, synchronizing after each one, to locate failures
+                for (const auto& stage : impl.stages) {
+                    progress("  " + stage.first);
+                    stage.second(t);
+                    gpuErrchk(hipStreamSynchronize(ctx.stream));
+                }
+            } else {
+                impl.run(t);
+            }
+            const hipError_t launchError = hipGetLastError();
+            if (launchError != hipSuccess) {
+                throw std::runtime_error(impl.name + ": HIP error after the pipeline: " + hipGetErrorString(launchError));
+            }
+            gpuErrchk(hipStreamSynchronize(ctx.stream));
+            const auto output = impl.download();
+            if (v == 0) {
+                firstOutputs[k] = output;
+            }
+            Result::IterationErrors e;
+            e.iteration = t;
+            e.own = compare(output, ownReference(impl));
+            e.vsFloat = compare(output, refFloat);
+            e.vsRppConvention = compare(output, refRppConvention);
+            e.vs8bit = compare(output, ref8bit);
+            if (e.own.nonFinite != 0) {
+                size_t first = 0;
+                while (first < output.size() && std::isfinite(output[first])) {
+                    ++first;
+                }
+                std::cerr << "  " << impl.name << ", iteration " << t << ": " << e.own.nonFinite << " of "
+                          << output.size() << " output values are not finite, the first at float index " << first
+                          << " (plane " << first / OUT_FLOATS << ")" << std::endl;
+            }
+            batchResults[k].addIteration(e);
         }
-    };
+        // VF + HF with a float3 frame (per operation breakdown only) against the float reference
+        float3Frame.fillNaN();
+        float3Frame.run(t);
+        gpuErrchk(hipStreamSynchronize(ctx.stream));
+        if (compare(float3Frame.download(), refFloat).max() > TOLERANCE) {
+            throw std::runtime_error("fkl_vf_hf_float3_frame does not match the float reference on iteration " +
+                                     std::to_string(t));
+        }
+    }
     if (!timing) {
         for (const Result& r : batchResults) {
             std::cout << std::left << std::setw(12) << r.name << std::right << "  max err " << std::scientific
-                      << std::setprecision(2) << r.errorVsOwnReference.max() << " (" << r.reference << "), vs float "
-                      << r.errorVsFloatReference.max() << ", vs RPP sampling " << r.errorVsRppConventionReference.max()
-                      << ", vs 8 bit (FKL sampling) " << r.errorVs8bitReference.max() << std::defaultfloat
+                      << std::setprecision(2) << r.errorVsOwnReference.max() << " (" << r.reference << ", "
+                      << r.errorsPerIteration.size() << " iterations), vs float " << r.errorVsFloatReference.max()
+                      << ", vs RPP sampling " << r.errorVsRppConventionReference.max() << ", vs 8 bit (FKL sampling) "
+                      << r.errorVs8bitReference.max() << std::defaultfloat
                       << (r.withinTolerance() ? "" : "  NOT within its tolerance") << std::endl;
             results.push_back(r);
         }
-        checkFloat3Frame(makeFklVfHf<N, false>(ctx));
         return;
     }
     progress("CPU + GPU timing");
     const auto ms = measureInterleaved(ctx, impls);
-    // The outputs after the timed iterations must still be the validated ones, value by value (no library state, such
-    // as ROI tensors, may change from one call to the next)
+    // The outputs after the timed iterations must still be the validated ones, every value within 1e-6 and finite (no
+    // library state, such as ROI tensors, may change from one call to the next): the first validated iteration again
+    const size_t firstValidated = static_cast<size_t>(WARMUP_ITERS) + validated.front();
     for (size_t k = 0; k < impls.size(); ++k) {
         impls[k].fillNaN();
-        impls[k].run();
+        impls[k].run(firstValidated);
         gpuErrchk(hipStreamSynchronize(ctx.stream));
-        const ErrorStats after = compare(impls[k].download(), validatedOutputs[k]);
+        const ErrorStats after = compare(impls[k].download(), firstOutputs[k]);
         if (after.nonFinite != 0 || after.max() > 1e-6f) {
             throw std::runtime_error(impls[k].name + ": the output after the timed iterations differs from the validated "
                                      "one (max difference " + std::to_string(after.max()) + ", " +
@@ -1306,18 +1440,15 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
             measureStages(ctx, impl, static_cast<int>(N));
         }
     }
-    const auto float3Frame = makeFklVfHf<N, false>(ctx);
-    checkFloat3Frame(float3Frame);
     measureStages(ctx, float3Frame, static_cast<int>(N));
 }
 
 // ------------------------------------------------------------------------------------------------
-// Selection of the RPP pipeline: every RPP variant is validated against the RPP-convention reference and timed (CPU +
-// GPU, interleaved, SELECTION_WARMUP + SELECTION_ITERS iterations per N); the numerically equivalent variant with the
-// lowest geometric mean of its medians over all N is the benchmark's RPP pipeline, the only one in the measurements
+// Selection of the RPP pipeline: every RPP variant is validated against the RPP-convention reference on the validated
+// iterations of the selection pass and timed (CPU + GPU, interleaved, SELECTION_WARMUP + SELECTION_ITERS iterations per
+// N, iteration i on the regions of iteration i); the numerically equivalent variant with the lowest geometric mean of
+// its medians over all N is the benchmark's RPP pipeline, the only one in the measurements
 // ------------------------------------------------------------------------------------------------
-constexpr int SELECTION_WARMUP = 20;
-constexpr int SELECTION_ITERS = 200;
 
 struct SelectionRow {
     int batch{0};
@@ -1329,14 +1460,17 @@ std::vector<SelectionRow> selectionRows;
 
 template <size_t N>
 void selectionBatch(Context& ctx) {
-    const auto ref = rppConventionReference8bit<N>(ctx);
     const auto variants = makeRppVariants<N>(ctx);
-    std::vector<ErrorStats> errors;
-    for (const auto& v : variants) {
-        v.fillNaN();
-        v.run();
-        gpuErrchk(hipStreamSynchronize(ctx.stream));
-        errors.push_back(compare(v.download(), ref));
+    std::vector<ErrorStats> errors(variants.size());
+    for (const size_t k : validation::validatedIterations(SELECTION_ITERS)) {
+        const size_t t = static_cast<size_t>(SELECTION_WARMUP) + k;
+        const auto ref = rppConventionReference8bit<N>(ctx, t);
+        for (size_t j = 0; j < variants.size(); ++j) {
+            variants[j].fillNaN();
+            variants[j].run(t);
+            gpuErrchk(hipStreamSynchronize(ctx.stream));
+            errors[j] = validation::combine(errors[j], compare(variants[j].download(), ref));
+        }
     }
     const auto ms = measureInterleaved(ctx, variants, SELECTION_WARMUP, SELECTION_ITERS);
     std::cout << "RPP selection N = " << N << ":";
@@ -1411,13 +1545,15 @@ void writeOperationCounts(const std::filesystem::path& path) {
     }
 }
 
-// Kernel counts of every implementation for batch N, after all the timings
+// Kernel counts of every implementation for batch N, after all the timings, on the regions of the first timed iteration
+// (the counts do not depend on the regions)
 template <size_t N>
 void countBatch(Context& ctx, std::vector<Result>& results) {
+    const size_t t = static_cast<size_t>(WARMUP_ITERS);
     for (const auto& impl : makeImplementations<N>(ctx)) {
-        impl.run(); // warm-up, so that one-time work (code object loading) is not counted
+        impl.run(t); // warm-up, so that one-time work (code object loading) is not counted
         gpuErrchk(hipStreamSynchronize(ctx.stream));
-        const LaunchCounts launches = countLaunches(ctx, impl);
+        const LaunchCounts launches = countLaunches(ctx, impl, t);
         auto r = std::find_if(results.begin(), results.end(), [&](const Result& x) {
             return x.name == impl.name && x.batch == static_cast<int>(N);
         });
@@ -1433,7 +1569,7 @@ void countBatch(Context& ctx, std::vector<Result>& results) {
         for (const auto& stage : impl.stages) {
             rocprof::counts = LaunchCounts{};
             ROCP_CHECK(rocprofiler_start_context(rocprof::apiContext));
-            stage.second();
+            stage.second(t);
             gpuErrchk(hipStreamSynchronize(ctx.stream));
             ROCP_CHECK(rocprofiler_stop_context(rocprof::apiContext));
             operationCounts.push_back({impl.name, static_cast<int>(N), stage.first, rocprof::counts});
@@ -1444,7 +1580,8 @@ void countBatch(Context& ctx, std::vector<Result>& results) {
     }
 }
 
-// GPU time only benchmark: the same interleaved iterations as the CPU + GPU one, with kernel dispatch tracing on.
+// GPU time only benchmark: the same interleaved iterations as the CPU + GPU one (warm-up on the regions of iterations
+// 0 to W - 1, timed on those of W to W + T - 1), with kernel dispatch tracing on.
 // The GPU time of one execution is the sum of the execution times of its kernels: no host work and no launch gaps.
 // Only where kernelTracingAvailable(); never on WSL2.
 template <size_t N>
@@ -1453,14 +1590,14 @@ void gpuOnlyBatch(Context& ctx, std::vector<Result>& results, CacheFlusher* flus
     const size_t bvf = impls.size() - 1;
     std::vector<size_t> kernelsPerRun(impls.size());
     for (size_t k = 0; k < impls.size(); ++k) {
-        impls[k].run();
+        impls[k].run(static_cast<size_t>(WARMUP_ITERS));
         gpuErrchk(hipStreamSynchronize(ctx.stream));
-        kernelsPerRun[k] = countLaunches(ctx, impls[k]).kernels;
+        kernelsPerRun[k] = countLaunches(ctx, impls[k], static_cast<size_t>(WARMUP_ITERS)).kernels;
     }
     activeFlusher = flusher;
     for (int i = 0; i < WARMUP_ITERS; ++i) {
         for (const auto& impl : impls) {
-            impl.run();
+            impl.run(static_cast<size_t>(i));
             gpuErrchk(hipStreamSynchronize(ctx.stream));
         }
     }
@@ -1484,7 +1621,7 @@ void gpuOnlyBatch(Context& ctx, std::vector<Result>& results, CacheFlusher* flus
         for (size_t k = 0; k < impls.size(); ++k) {
             Window w{0, 0, k, i};
             ROCP_CHECK(rocprofiler_get_timestamp(&w.begin));
-            impls[k].run();
+            impls[k].run(static_cast<size_t>(WARMUP_ITERS + i));
             gpuErrchk(hipStreamSynchronize(ctx.stream));
             ROCP_CHECK(rocprofiler_get_timestamp(&w.end));
             windows.push_back(w);
@@ -1739,9 +1876,14 @@ void resizeConvention(Context& ctx, const std::filesystem::path& outDir) {
     rppHandle_t handle{};
     RPP_CHECK(static_cast<RppStatus>(rppCreate(&handle, 1, 0, ctx.stream, RppBackend::RPP_HIP_BACKEND)));
     struct Case { bool vertical; int src, dst; };
-    // The benchmark's crop -> resize in both axes, then other ratios
-    const std::array<Case, 6> cases{{{false, CROP_W, RES_W}, {true, CROP_H, RES_H}, {false, 20, 64}, {false, 10, 32},
-                                     {false, 8, 40}, {true, 20, 64}}};
+    // The benchmark's region -> resized region, for every region size of this build, in both axes
+    std::vector<Case> cases;
+    for (const RegionSize r : REGION_SIZES) {
+        cases.push_back({false, r.width, RES_W});
+    }
+    for (const RegionSize r : REGION_SIZES) {
+        cases.push_back({true, r.height, RES_H});
+    }
     std::cout << "=== RPP rppt_resize (F32, BILINEAR) sampling convention from linear ramps" << std::endl;
     for (const auto& c : cases) {
         const int sw = c.vertical ? 8 : c.src, sh = c.vertical ? c.src : 2;
@@ -1856,21 +1998,33 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << (gfxClock.empty() ? std::string("not reported") : gfxClock) << ", memory clock "
        << (memClock.empty() ? std::string("not reported") : memClock) << "; "
        << shell("amd-smi metric --gpu 0 --power 2>/dev/null | grep -m1 POWER_MANAGEMENT | sed 's/^ *//'") << "\n"
-       << "\nWorkload: " << describe() << ". NV12->RGB BT.601 limited range, AddBorder (black), then Mul "
+       << "\nWorkload: " << describe() << ". AddBorder (black), then Mul "
        << "(1/255), Sub (0.485, 0.456, 0.406), Div (0.229, 0.224, 0.225), float3 tensor of N planes " << OUT_W << "x"
        << OUT_H << "\n";
-    os << "Timing: " << WARMUP_ITERS << " warm-up then " << TIMED_ITERS << " timed iterations. In every iteration "
+    os << "Timing: " << WARMUP_ITERS << " warm-up then " << TIMED_ITERS << " timed iterations; iteration t (the "
+       << "warm-up iterations are t in [0, " << WARMUP_ITERS << "), the timed ones t in [" << WARMUP_ITERS << ", "
+       << WARMUP_ITERS + TIMED_ITERS << ")) runs every implementation on the regions of iteration t (" << REGION_ITERATIONS << " iterations of "
+       << "regions generated before any loop). In every iteration "
        << "the RPP pipeline (rpp), FKL VF+HF and FKL BVF run one after the other, each timed with HIP events on one "
        << "stream "
        << "around the complete pipeline (all host enqueue work included) and followed by a synchronization. "
        << "FKL BVF's speedup over each baseline is computed per iteration (baseline time / BVF time) and averaged "
        << "(mean speedup, FKL's two-execution convention). Median, p10, p90 with linear interpolation.\n"
+       << "Validation: before the timing, on the timed iterations " << validation::VALIDATION_STRIDE << " apart from the "
+       << "first, and the last (" << validation::validatedIterations(TIMED_ITERS).size() << " iterations: t = "
+       << WARMUP_ITERS << " + 0, " << validation::VALIDATION_STRIDE << ", ...): every implementation runs on the regions "
+       << "of that iteration into a NaN-poisoned output, compared with the references of those regions (validation.csv, "
+       << "one row per implementation, N and iteration; latency.csv's max_abs_err is the largest over them); an FKL "
+       << "output outside its tolerance in any of them fails the program. After the timed iterations, the first "
+       << "validated iteration is run again and must give the same output (every value within 1e-6).\n"
        << "RPP pipeline: rpp = " << selectedRpp << ", the fastest of the five RPP variants below, which are "
-       << "numerically equivalent (within " << RPP_EQUIVALENCE << " of the RPP-convention reference): a selection pass "
-       << "validates and times every variant (CPU + GPU, interleaved, " << SELECTION_WARMUP << " warm-up + "
-       << SELECTION_ITERS << " timed iterations per N) and picks the one with the lowest geometric mean "
+       << "numerically equivalent (within " << RPP_EQUIVALENCE << " of the RPP-convention reference, on the validated "
+       << "iterations of the selection pass): a selection pass validates and times every variant (CPU + GPU, "
+       << "interleaved, " << SELECTION_WARMUP << " warm-up + " << SELECTION_ITERS << " timed iterations per N, iteration "
+       << "i on the regions of iteration i) and picks the one with the lowest geometric mean "
        << "of its medians (rpp_selection.csv); only that one is measured afterwards.\n"
-       << "RPP variants (HIP backend): rpp_per_op = rppt_yuv_to_rgb (RpptColorStandard_BT601, RpptColorRange_STUDIO; 1 kernel plus 8 hipMemcpyToSymbol per "
+       << "RPP variants (HIP backend), each one starting with the hipMemcpyAsync of the ROIs of its iteration (below): "
+       << "rpp_per_op = rppt_yuv_to_rgb (RpptColorStandard_BT601, RpptColorRange_STUDIO; 1 kernel plus 8 hipMemcpyToSymbol per "
        << "call: its matrix and luma bias, and 6 integer constants used only by its cubic_v variant, uploaded on every "
        << "call), rppt_crop_mirror_normalize 8u->32f (one batched call, all batch images "
        << "aliasing the RGB frame with a zero batch stride, XYWH ROIs, offset 0, multiplier 1, no mirror), "
@@ -1898,19 +2052,27 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << "kept).\n"
        << "Outside the timed region (once, like NPP's batch descriptors in fkl-vs-npp): rppCreate (one handle per "
        << "pipeline with its batch size N, on the timing stream: RPP sizes its grids with the handle's batch size), all "
-       << "buffers, the RPP descriptors, the ROI tensors (device memory; XYWH for rppt_crop and "
-       << "rppt_crop_mirror_normalize, LTRB for rppt_resize and rppt_resize_mirror_normalize, the formats those calls "
-       << "work in: given the other one, RPP converts the caller's ROI tensor in place with an extra kernel), "
-       << "the destination sizes, normalization and scalar parameter tensors (pinned host memory) and the rows of "
-       << "per channel constants (device memory). Inside the timed region, because a user cannot hoist them: RPP's own "
-       << "copies inside its calls (the 8 hipMemcpyToSymbol of every rppt_yuv_to_rgb and the 6 host-to-device "
-       << "hipMemcpyAsync of every rppt_tensor_subtract_tensor / rppt_tensor_divide_tensor, the zeroing memset and the "
-       << "stream synchronization inside rppt_resize_mirror_normalize) and the hipMemsetAsync of the output tensor. RPP's "
+       << "buffers, the RPP descriptors, the ROIs of every iteration converted into one pinned host buffer (XYWH for "
+       << "rppt_crop and rppt_crop_mirror_normalize, LTRB for rppt_resize and rppt_resize_mirror_normalize, the formats "
+       << "those calls work in: given the other one, RPP converts the caller's ROI tensor in place with an extra "
+       << "kernel), the destination sizes, normalization and scalar parameter tensors (pinned host memory) and the rows "
+       << "of per channel constants (device memory); FKL's rectangles and views of every iteration. Inside the timed "
+       << "region: what each library needs to receive the regions of its iteration (RPP: one hipMemcpyAsync of the "
+       << "iteration's ROIs from the pinned buffer to the device ROI tensors, which RPP's kernels read; FKL: build() of "
+       << "the operations with the iteration's rectangles and the fusion, in every executeOperations call), and, because "
+       << "a user cannot hoist them, RPP's own copies inside its calls (the 8 hipMemcpyToSymbol of every rppt_yuv_to_rgb "
+       << "and the 6 host-to-device hipMemcpyAsync of every rppt_tensor_subtract_tensor / rppt_tensor_divide_tensor, the "
+       << "zeroing memset and the stream synchronization inside rppt_resize_mirror_normalize) and the hipMemsetAsync of "
+       << "the output tensor. Region buffers (RPP's crop buffer, FKL VF+HF's crop tensor) have planes of the largest "
+       << "region, " << MAX_REGION_W << "x" << MAX_REGION_H << "; RPP's calls take each region's size from its ROI, FKL "
+       << "VF+HF's resize reads each plane through a view of its region's size. An FKL batch runs the grid of its largest "
+       << "plane, so VF+HF's crop kernel threads beyond a smaller region write the unused rest of its plane (the regions "
+       << "are drawn so that a " << MAX_REGION_W << "x" << MAX_REGION_H << " box stays inside the frame). RPP's "
        << "HIP kernels load and store 8 pixels per thread and check only the first one against the ROI width, so RPP "
-       << "buffer rows are padded to a multiple of " << RPP_PIXEL_ALIGN << " pixels: the " << CROP_W << " pixel crop "
-       << "rows have a pitch of " << alignUp(CROP_W, RPP_PIXEL_ALIGN) << " pixels"
-       << (CROP_W % RPP_PIXEL_ALIGN == 0 ? " (no padding)" : "") << ", and the output rows (" << OUT_W << " pixels, "
-       << "contiguous like FKL's) are a multiple of 8 themselves.\n"
+       << "buffer rows are padded to a multiple of " << RPP_PIXEL_ALIGN << " pixels: the crop planes have rows of "
+       << alignUp(MAX_REGION_W, RPP_PIXEL_ALIGN) << " pixels (a " << REGION_SIZES[0].width << " pixel region row, "
+       << "written as " << alignUp(REGION_SIZES[0].width, RPP_PIXEL_ALIGN) << ", stays inside its row), and the output "
+       << "rows (" << OUT_W << " pixels, contiguous like FKL's) are a multiple of 8 themselves.\n"
        << "Intermediates: rpp_npp_like and FKL VF+HF write an 8 bit RGB frame, float3 crops, float3 resized crops and "
        << "the float3 output (the paper's NPP set). rpp_per_op and rpp_normalize write the 8 bit RGB frame and the float3 "
        << "crops, then the resized crops directly into the output tensor (after zeroing it), and then multiply, "
@@ -1918,11 +2080,14 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << "bit RGB frame and the output. FKL BVF has no intermediates in memory: float3 from the color conversion to "
        << "the write.\n"
        << "RPP-convention reference: RPP's own 8 bit RGB frame (rppt_yuv_to_rgb's output, downloaded once), RPP's "
-       << "bilinear sampling (pixel centers clamped to [0, size - 2], measured with linear ramps: --resize-convention), "
+       << "bilinear sampling with each region's own scale (pixel centers clamped to [0, size - 2], measured with linear "
+       << "ramps for every region size: --resize-convention), "
        << "then the border and Mul, Sub, Div. Every RPP pipeline is also compared with the paper's 8 bit reference "
        << "(FKL's conversion rounded to 8 bit, FKL's sampling: max_abs_err_vs_8bit_reference_fkl_sampling)\n"
        << "Kernel counts: rocprofiler-sdk HIP runtime API tracing of one pipeline (kernel launch calls, hipMemset* "
-       << "calls and hipMemcpy* calls, in separate columns) of one execution after a warm-up execution, in a child "
+       << "calls and hipMemcpy* calls, in separate columns; the RPP pipelines' copies include the upload of the "
+       << "iteration's ROIs) of one execution on the regions of the first timed iteration after a warm-up execution, in "
+       << "a child "
        << "process started after all timings: the rocprofiler-sdk tool is only registered in that child, so no profiler "
        << "wraps the HIP API during the timed runs\n"
        << "Stream: one blocking HIP stream for everything (FKL, every RPP handle, memsets, copies, events, flush "
@@ -2109,6 +2274,8 @@ bool runProfilingChild(const std::filesystem::path& outDir, std::vector<Result>&
     const std::string command = "BENCH_ROCPROFILER=1 BENCH_RPP_VARIANT=" + quote(selectedRpp) + " " + quote(exe) + " " +
                                 quote(outDir.string()) + " --profile-pass " + quote(file.string());
     std::cout << "=== Profiling pass in a child process: " << command << std::endl;
+    // Only the rows of this child: never a file left by an earlier run
+    std::filesystem::remove(file);
     if (std::system(command.c_str()) != 0) {
         throw std::runtime_error("The profiling pass failed");
     }
@@ -2136,19 +2303,23 @@ void profilePass(Context& ctx, const std::filesystem::path& outDir, const std::f
     writeProfileRows(file, results, tracing);
 }
 
-void writeValidationRow(std::ostream& validation, const Result& r) {
-    // The columns of common/bench_gpu.h's validation.csv, then the errors against the other two references
-    const auto& e = r.errorVsOwnReference;
-    validation << r.name << "," << r.batch << "," << r.reference << "," << std::scientific << std::setprecision(3)
-               << e.maxPerChannel[0] << "," << e.maxPerChannel[1] << "," << e.maxPerChannel[2] << "," << e.mean << ","
-               << e.nonFinite << "," << r.errorVsFloatReference.max() << "," << e.beyond << "," << e.values << ","
-               << r.tolerance() << "," << (r.withinTolerance() ? "yes" : "no") << ","
-               << r.errorVsRppConventionReference.max() << "," << r.errorVs8bitReference.max() << std::defaultfloat
-               << "\n";
+// One row per validated iteration: the columns of common/bench_gpu.h's validation.csv, then the errors against the
+// other two references
+void writeValidationRows(std::ostream& validation, const Result& r) {
+    for (const auto& it : r.errorsPerIteration) {
+        const auto& e = it.own;
+        validation << r.name << "," << r.batch << "," << it.iteration << "," << r.reference << "," << std::scientific
+                   << std::setprecision(3) << e.maxPerChannel[0] << "," << e.maxPerChannel[1] << ","
+                   << e.maxPerChannel[2] << "," << e.mean << "," << e.nonFinite << "," << it.vsFloat.max() << ","
+                   << e.beyond << "," << e.values << "," << r.tolerance() << ","
+                   << (r.withinTolerance(e) ? "yes" : "no") << "," << it.vsRppConvention.max() << ","
+                   << it.vs8bit.max() << std::defaultfloat << "\n";
+    }
 }
 
 // Target for hardware counter collection (rocm/scripts/rocprof_counters.sh, rocprofv3 --pmc): three warm-up executions
-// of one pipeline, then measureMarkerKernel, then one execution with the caches flushed before every GPU operation;
+// of one pipeline (on the regions of iterations 1, 2 and 3), then measureMarkerKernel, then one execution (on the
+// regions of iteration 0, as common/bench_gpu.h's --ncu-target) with the caches flushed before every GPU operation;
 // the script sums the counters of the kernels dispatched after the marker, without the flush kernels
 __global__ void measureMarkerKernel() {}
 
@@ -2170,12 +2341,12 @@ void rocprofTarget(Context& ctx, const std::string& name) {
     }
     CacheFlusher flusher = makeCacheFlusher(ctx);
     activeFlusher = &flusher;
-    for (int i = 0; i < 3; ++i) {
-        impl->run();
+    for (size_t t = 1; t <= 3; ++t) {
+        impl->run(t);
     }
     gpuErrchk(hipStreamSynchronize(ctx.stream));
     measureMarkerKernel<<<1, 1, 0, ctx.stream>>>();
-    impl->run();
+    impl->run(0);
     gpuErrchk(hipStreamSynchronize(ctx.stream));
     activeFlusher = nullptr;
     freeCacheFlusher(flusher);
@@ -2206,6 +2377,12 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string(argv[1]) == "--workload") {
             // The workload (sizes, batch sizes, seeds), for the consistency check of rocm/scripts/run_all.sh
             std::cout << describe() << std::endl;
+            return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--regions") {
+            // The MAX_BATCH regions of iteration t as CSV, as common/bench_gpu.h's --regions
+            const size_t t = std::stoul(argv[2]);
+            std::cout << regionsCsv(RegionSets(t + 1), t);
             return 0;
         }
         std::filesystem::path outDir = argc > 1 ? argv[1] : "results";
@@ -2272,15 +2449,28 @@ int main(int argc, char** argv) {
             std::cerr << "ERROR in the profiling pass: " << profilingError << std::endl;
         }
 
+        // The GPU time only files of an earlier run in this directory, which this run does not rewrite without tracing
+        if (!tracing) {
+            for (const std::string& baseline : BASELINES) {
+                for (const std::string suffix : {"gpu_only_", "gpu_only_l2_flushed_"}) {
+                    std::filesystem::remove(outDir / (baseline + "_vs_fkl_bvf_" + suffix +
+                                                      std::string(fk::toStrView(fk::defaultParArch)) + ".csv"));
+                }
+            }
+            std::filesystem::remove(outDir / "gpu_time.csv");
+            std::filesystem::remove(outDir / "gpu_time_l2_flushed.csv");
+        }
         std::ofstream latency(outDir / "latency.csv");
         latency << "implementation,N,median_us,p10_us,p90_us,iterations,max_abs_err,kernels_launched,mean_us,"
                    "fkl_bvf_mean_speedup\n";
         std::ofstream validation(outDir / "validation.csv");
-        validation << "implementation,N,reference,max_abs_err_r,max_abs_err_g,max_abs_err_b,mean_abs_err,"
+        validation << "implementation,N,iteration,reference,max_abs_err_r,max_abs_err_g,max_abs_err_b,mean_abs_err,"
                       "non_finite_values,max_abs_err_vs_float_reference,values_beyond_1e-3,values,tolerance,"
                       "within_tolerance,max_abs_err_vs_rpp_sampling_8bit_reference,"
                       "max_abs_err_vs_8bit_reference_fkl_sampling\n";
         writeSelection(outDir / "rpp_selection.csv");
+        // The statistics of the regions of the timed iterations, per N
+        writeRegionStats((outDir / "regions.csv").string(), *ctx.regions, WARMUP_ITERS, TIMED_ITERS);
         std::ofstream kernels(outDir / "kernels.csv");
         kernels << "implementation,N,kernels,memsets,memcpys\n";
         for (const auto& r : results) {
@@ -2292,7 +2482,7 @@ int main(int argc, char** argv) {
                 latency << std::setprecision(3) << r.meanSpeedupOfBvf;
             }
             latency << "\n";
-            writeValidationRow(validation, r);
+            writeValidationRows(validation, r);
             kernels << r.name << "," << r.batch << "," << r.launches.kernels << "," << r.launches.memsets << ","
                     << r.launches.memcpys << "\n";
         }

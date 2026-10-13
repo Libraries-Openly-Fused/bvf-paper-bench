@@ -22,10 +22,14 @@
 //   description()                  its pipeline, for the platform file
 //   Buffers<N>                     its buffers for N crops, with the float3 output in out
 //   poison<N>(b, stream)           fills every buffer it writes with values a correct execution never leaves
-//   reference<N>(w, crops)         its reference output
-//   run<N, C>(w, origins, b, f)    one execution in configuration C; f() runs before each of its kernels but the
-//                                  first (the L2 flush of the GPU only benchmark with the L2 flushed)
+//   reference<N>(w, crops)         its reference output for the regions crops
+//   run<N, C>(w, origins, b, f)    one execution in configuration C on the regions with the given origins; f() runs
+//                                  before each of its kernels but the first (the L2 flush of the GPU only benchmark
+//                                  with the L2 flushed)
 //   runKernel<N, C>(w, origins, b) its NPPDx kernel alone, timed to choose the configuration
+// Every loop runs both libraries on the regions of its iteration (common/bench_geometry.h), whose positions change every
+// iteration: NPPDx gets the origins of the iteration's regions (a kernel parameter) and FKL their rectangles (its
+// build() calls), both converted from the regions before the loops.
 //   kernel<N, C>                   the NPPDx kernel type of configuration C (block, grid, smem, init())
 //   analyze(w)                     its --analyze mode
 
@@ -78,6 +82,16 @@ using NV12Image = fk::Image<fk::PixelFormat::NV12>;
 // FKL's NV12 -> RGB conversion: BT.601, limited range
 using YUVToRGB = fk::ConvertYUVToRGB<fk::ColorDepth::p8bit, fk::ColorRange::Limited, fk::ColorPrimitives::bt601>;
 
+// --ncu-target: the profiled execution runs on the regions of iteration NCU_ITERATION, after NCU_WARMUP executions on
+// those of the following iterations (as common/bench_gpu.h)
+constexpr size_t NCU_ITERATION = 0;
+constexpr int NCU_WARMUP = 3;
+// The iterations whose regions are generated
+constexpr size_t REGION_ITERATIONS = std::max<size_t>(static_cast<size_t>(benchmark::WARMUP_ITERS + benchmark::ITERS),
+                                                      NCU_ITERATION + NCU_WARMUP + 1);
+// The first timed iteration, whose regions the configuration sweep validates
+constexpr size_t FIRST_TIMED = benchmark::WARMUP_ITERS;
+
 struct Workload {
     cudaStream_t stream{};
     std::unique_ptr<fk::Stream> fkStream;
@@ -87,9 +101,14 @@ struct Workload {
     const uint8_t* uv{nullptr};
     int pitch{0};
     NppStreamContext npp{};
-    // makeCrops() positions, which are even, so that both libraries read the same chroma samples: NPPDx takes the
-    // crop's chroma at (x / 2, y / 2) relative to the crop origin, FKL relative to the frame
-    std::array<fk::Rect, MAX_BATCH> crops{};
+    // The regions of every iteration, at even positions, so that both libraries read the same chroma samples: NPPDx
+    // takes the region's chroma at (x / 2, y / 2) relative to the region origin, FKL relative to the frame
+    std::unique_ptr<RegionSets> regions;
+    // Region i of iteration t as FKL's rectangle
+    fk::Rect rect(size_t t, size_t i) const {
+        const Region& r = regions->at(t, i);
+        return fk::Rect(r.x, r.y, r.width, r.height);
+    }
 };
 
 inline void initWorkload(Workload& w) {
@@ -110,16 +129,16 @@ inline void initWorkload(Workload& w) {
     w.pitch = static_cast<int>(raw.dims.pitch);
     w.y = raw.data;
     w.uv = raw.data + static_cast<size_t>(FRAME_H) * w.pitch;
-    const auto crops = makeCrops();
-    for (size_t i = 0; i < MAX_BATCH; ++i) {
-        w.crops[i] = fk::Rect(crops[i].x, crops[i].y, crops[i].width, crops[i].height);
-    }
+    w.regions = std::make_unique<RegionSets>(REGION_ITERATIONS);
 }
 
+// The first N regions of iteration t as FKL's rectangles
 template <size_t N>
-std::array<fk::Rect, N> firstCrops(const Workload& w) {
+std::array<fk::Rect, N> rectsOf(const Workload& w, size_t t) {
     std::array<fk::Rect, N> crops{};
-    std::copy_n(w.crops.begin(), N, crops.begin());
+    for (size_t i = 0; i < N; ++i) {
+        crops[i] = w.rect(t, i);
+    }
     return crops;
 }
 
@@ -131,6 +150,20 @@ CropOrigins<N> originsOf(const std::array<fk::Rect, N>& crops) {
     }
     return origins;
 }
+
+// The regions of every iteration in the arguments of each library, converted before the loops: FKL's rectangles and
+// NPPDx's origins
+template <size_t N>
+struct RegionArgs {
+    std::vector<std::array<fk::Rect, N>> rects;
+    std::vector<CropOrigins<N>> origins;
+    explicit RegionArgs(const Workload& w) {
+        for (size_t t = 0; t < w.regions->iterations(); ++t) {
+            rects.push_back(rectsOf<N>(w, t));
+            origins.push_back(originsOf<N>(rects.back()));
+        }
+    }
+};
 
 // ------------------------------------------------------------------------------------------------
 // FKL: Backwards Vertical Fusion, one kernel
@@ -280,25 +313,27 @@ struct BlockSweep {
     bool chosen{false};
 };
 
+// The errors on the regions of one validated iteration
 struct Validation {
-    size_t batch{0};
+    size_t batch{0}, iteration{0};
     unsigned nppdxBlock{0}, tileX{0}, tileY{0};
     Error nppdxVsReference, nppdxVsFkl, fkl;
 };
 
 const auto noFlush = []() {};
 
-// Validates one NPPDx configuration (the whole pipeline) against its reference and times its NPPDx kernel alone
-// (CPU + GPU; anything after the kernel is the same for every configuration)
+// Validates one NPPDx configuration (the whole pipeline) against its reference on the regions of the first timed
+// iteration, and times its NPPDx kernel alone on the regions of every iteration (CPU + GPU; anything after the kernel
+// is the same for every configuration)
 template <typename P, size_t N, NppdxConfig C>
-void sweepConfig(Workload& w, const CropOrigins<N>& origins, const typename P::template Buffers<N>& b,
+void sweepConfig(Workload& w, const RegionArgs<N>& args, const typename P::template Buffers<N>& b,
                  const std::vector<float>& reference, std::vector<BlockSweep>& sweep) {
     using K = typename P::template kernel<N, C>;
     BlockSweep s{N, C.block, C.tileX, C.tileY, K::block.x, K::grid.x * K::grid.y, K::smem};
     try {
         P::poison(b, w.stream);
         K::init();
-        P::template run<N, C>(w, origins, b, noFlush);
+        P::template run<N, C>(w, args.origins[FIRST_TIMED], b, noFlush);
         gpuErrchk(cudaStreamSynchronize(w.stream));
     } catch (const std::exception& e) {
         // A configuration that cannot be launched (more than 1024 threads, too many registers or too much shared
@@ -310,49 +345,56 @@ void sweepConfig(Workload& w, const CropOrigins<N>& origins, const typename P::t
         return;
     }
     s.vsReference = compare(download(b.out, N * OUT_FLOATS), reference);
-    s.time = benchmark::runOneExecution(w.stream, [&]() { P::template runKernel<N, C>(w, origins, b); });
+    s.time = benchmark::runOneExecution(w.stream,
+                                        [&](size_t t) { P::template runKernel<N, C>(w, args.origins[t], b); });
     sweep.push_back(s);
 }
 
+// Validates both pipelines on the regions of the validated timed iterations, then times them
 template <typename P, size_t N, NppdxConfig C>
-void compareWithFKL(Workload& w, const CropOrigins<N>& origins, const std::array<fk::Rect, N>& crops,
-                    const typename P::template Buffers<N>& b, fk::Tensor<fk::float3>& fklOut,
-                    const std::vector<float>& fklReference, const std::vector<float>& reference,
-                    std::vector<benchmark::TwoExecutionsResult>& results, std::vector<Validation>& checks) {
+void compareWithFKL(Workload& w, const RegionArgs<N>& args, const typename P::template Buffers<N>& b,
+                    fk::Tensor<fk::float3>& fklOut, std::vector<benchmark::TwoExecutionsResult>& results,
+                    std::vector<Validation>& checks) {
     using K = typename P::template kernel<N, C>;
     // The sweep initializes every configuration it tries, but --configs skips it
     K::init();
     constexpr size_t outFloats = N * OUT_FLOATS;
-    P::poison(b, w.stream);
-    gpuErrchk(cudaMemsetAsync(fklOut.ptr().data, 0xFF, outFloats * sizeof(float), w.stream));
-    P::template run<N, C>(w, origins, b, noFlush);
-    runFKL<N>(w, crops, fklOut);
-    gpuErrchk(cudaStreamSynchronize(w.stream));
-    const auto nppdx = download(b.out, outFloats);
-    const auto fkl = download(reinterpret_cast<const float*>(fklOut.ptr().data), outFloats);
-    const Validation v{N, K::block.x, C.tileX, C.tileY, compare(nppdx, reference), compare(nppdx, fklReference),
-                       compare(fkl, fklReference)};
-    checks.push_back(v);
+    Validation worst{N, 0, K::block.x, C.tileX, C.tileY};
+    for (const size_t k : bench::validation::validatedIterations(benchmark::ITERS)) {
+        const size_t t = benchmark::WARMUP_ITERS + k;
+        P::poison(b, w.stream);
+        gpuErrchk(cudaMemsetAsync(fklOut.ptr().data, 0xFF, outFloats * sizeof(float), w.stream));
+        P::template run<N, C>(w, args.origins[t], b, noFlush);
+        runFKL<N>(w, args.rects[t], fklOut);
+        gpuErrchk(cudaStreamSynchronize(w.stream));
+        const auto nppdx = download(b.out, outFloats);
+        const auto fkl = download(reinterpret_cast<const float*>(fklOut.ptr().data), outFloats);
+        const auto fklReference = cpuReference<N>(w, args.rects[t]);
+        const Validation v{N, t, K::block.x, C.tileX, C.tileY, compare(nppdx, P::template reference<N>(w, args.rects[t])),
+                           compare(nppdx, fklReference), compare(fkl, fklReference)};
+        checks.push_back(v);
+        worst.nppdxVsReference = bench::validation::combine(worst.nppdxVsReference, v.nppdxVsReference);
+        worst.nppdxVsFkl = bench::validation::combine(worst.nppdxVsFkl, v.nppdxVsFkl);
+        worst.fkl = bench::validation::combine(worst.fkl, v.fkl);
+    }
     const auto r = benchmark::runTwoExecutions(
-        w.stream, static_cast<int>(N), [&]() { P::template run<N, C>(w, origins, b, noFlush); },
-        [&]() { runFKL<N>(w, crops, fklOut); });
+        w.stream, static_cast<int>(N), [&](size_t t) { P::template run<N, C>(w, args.origins[t], b, noFlush); },
+        [&](size_t t) { runFKL<N>(w, args.rects[t], fklOut); });
     results.push_back(r);
     std::cout << "Batch " << N << ": " << P::label << " (block " << K::block.x << ", tile " << C.tileX << "x" << C.tileY
               << ") median " << r.first.median * 1000.f << " us, FKL median " << r.second.median * 1000.f
-              << " us, mean speedup " << r.meanSpeedup << " | max abs error: " << P::label << " vs its reference "
-              << v.nppdxVsReference.max() << " (" << v.nppdxVsReference.beyond << " values beyond 1e-3), vs FKL "
-              << "reference " << v.nppdxVsFkl.max() << ", FKL vs FKL reference " << v.fkl.max() << std::endl;
+              << " us, mean speedup " << r.meanSpeedup << " | max abs error over the validated iterations: " << P::label
+              << " vs its reference " << worst.nppdxVsReference.max() << " (" << worst.nppdxVsReference.beyond
+              << " values beyond 1e-3), vs FKL reference " << worst.nppdxVsFkl.max() << ", FKL vs FKL reference "
+              << worst.fkl.max() << std::endl;
 }
 
 template <typename P, size_t N>
 void runBatch(Workload& w, std::vector<benchmark::TwoExecutionsResult>& results, std::vector<Validation>& checks,
               std::vector<BlockSweep>& sweep) {
-    const auto crops = firstCrops<N>(w);
-    const CropOrigins<N> origins = originsOf(crops);
+    const RegionArgs<N> args(w);
     fk::Tensor<fk::float3> fklOut(OUT_W, OUT_H, N, 1, fk::MemType::Device);
     const typename P::template Buffers<N> buffers;
-    const auto fklReference = cpuReference<N>(w, crops);
-    const auto reference = P::template reference<N>(w, crops);
 
     // Every NPPDx configuration is validated and timed alone; the fastest correct one is compared with FKL (unless
     // --configs gave one)
@@ -361,8 +403,9 @@ void runBatch(Workload& w, std::vector<benchmark::TwoExecutionsResult>& results,
         best = pinnedConfig.at(N);
     } else {
         const size_t first = sweep.size();
+        const auto reference = P::template reference<N>(w, args.rects[FIRST_TIMED]);
         [&]<size_t... Is>(std::index_sequence<Is...>) {
-            (sweepConfig<P, N, P::configs[Is]>(w, origins, buffers, reference, sweep), ...);
+            (sweepConfig<P, N, P::configs[Is]>(w, args, buffers, reference, sweep), ...);
         }(std::make_index_sequence<P::configs.size()>{});
         float bestMedian = INFINITY;
         for (size_t i = first; i < sweep.size(); ++i) {
@@ -379,7 +422,7 @@ void runBatch(Workload& w, std::vector<benchmark::TwoExecutionsResult>& results,
     }
     chosenConfig[N] = best;
     withConfig<P::configs>(best, [&]<NppdxConfig C>() {
-        compareWithFKL<P, N, C>(w, origins, crops, buffers, fklOut, fklReference, reference, results, checks);
+        compareWithFKL<P, N, C>(w, args, buffers, fklOut, results, checks);
     });
 }
 
@@ -390,8 +433,7 @@ void compareGpuOnly(Workload& w, std::vector<benchmark::TwoExecutionsResult>& re
                     const benchmark::L2Flusher* flusher) {
     using K = typename P::template kernel<N, C>;
     K::init();
-    const auto crops = firstCrops<N>(w);
-    const CropOrigins<N> origins = originsOf(crops);
+    const RegionArgs<N> args(w);
     fk::Tensor<fk::float3> fklOut(OUT_W, OUT_H, N, 1, fk::MemType::Device);
     const typename P::template Buffers<N> buffers;
     // The harness flushes before every execution; a pipeline with NPP kernels also flushes before each of them
@@ -401,8 +443,9 @@ void compareGpuOnly(Workload& w, std::vector<benchmark::TwoExecutionsResult>& re
         }
     };
     const auto r = benchmark::runTwoExecutionsGpuOnly(
-        w.stream, static_cast<int>(N), [&]() { P::template run<N, C>(w, origins, buffers, flushBeforeNpp); },
-        [&]() { runFKL<N>(w, crops, fklOut); }, flusher);
+        w.stream, static_cast<int>(N),
+        [&](size_t t) { P::template run<N, C>(w, args.origins[t], buffers, flushBeforeNpp); },
+        [&](size_t t) { runFKL<N>(w, args.rects[t], fklOut); }, flusher);
     results.push_back(r);
     std::cout << (flusher ? "GPU only, L2 flushed, batch " : "GPU only, batch ") << N << ": " << P::label << " (block "
               << K::block.x << ", tile " << C.tileX << "x" << C.tileY << ") median " << r.first.median * 1000.f
@@ -458,32 +501,31 @@ std::map<size_t, size_t> readConfigs(const std::filesystem::path& path) {
     return configs;
 }
 
-// Target for Nsight Compute: warms up the NPPDx pipeline (its kernel in the configuration given by its index into the
-// configurations) or FKL, then runs it once more inside the NVTX range "measure", for
-// ncu --nvtx --nvtx-include "measure/"
+// Target for Nsight Compute: runs the NPPDx pipeline (its kernel in the configuration given by its index into the
+// configurations) or FKL NCU_WARMUP times on the regions of iterations NCU_ITERATION + 1 onwards, then once on those of
+// iteration NCU_ITERATION inside the NVTX range "measure", for ncu --nvtx --nvtx-include "measure/"
 template <typename P, size_t N>
 void ncuTarget(Workload& w, const std::string& name, size_t config) {
-    const auto crops = firstCrops<N>(w);
-    const CropOrigins<N> origins = originsOf(crops);
+    const RegionArgs<N> args(w);
     fk::Tensor<fk::float3> fklOut(OUT_W, OUT_H, N, 1, fk::MemType::Device);
     const typename P::template Buffers<N> buffers;
-    std::function<void()> run;
+    benchmark::Run run;
     if (name == P::implementation) {
         withConfig<P::configs>(config, [&]<NppdxConfig C>() {
             P::template kernel<N, C>::init();
-            run = [&]() { P::template run<N, C>(w, origins, buffers, noFlush); };
+            run = [&](size_t t) { P::template run<N, C>(w, args.origins[t], buffers, noFlush); };
         });
     } else if (name == "fkl_bvf") {
-        run = [&]() { runFKL<N>(w, crops, fklOut); };
+        run = [&](size_t t) { runFKL<N>(w, args.rects[t], fklOut); };
     } else {
         throw std::runtime_error("Unknown implementation " + name + ", use " + P::implementation + " or fkl_bvf");
     }
-    for (int i = 0; i < 3; ++i) {
-        run();
+    for (int i = 1; i <= NCU_WARMUP; ++i) {
+        run(NCU_ITERATION + i);
+        gpuErrchk(cudaStreamSynchronize(w.stream));
     }
-    gpuErrchk(cudaStreamSynchronize(w.stream));
     nvtxRangePushA("measure");
-    run();
+    run(NCU_ITERATION);
     gpuErrchk(cudaStreamSynchronize(w.stream));
     nvtxRangePop();
 }
@@ -517,7 +559,7 @@ template <typename P>
 int figure1Main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--batches") {
-            // The batch sizes, for the Nsight Compute scripts
+            // The batch sizes, for scripts
             std::cout << batchList() << std::endl;
             return 0;
         }
@@ -599,13 +641,13 @@ int figure1Main(int argc, char** argv) {
         benchmark::writeTwoExecutionsCSV(outDir, name, "Batch size", P::label, "FKL", results);
         benchmark::writeTwoExecutionsCSV(outDir, name + "_gpu_only", "Batch size", P::label, "FKL", gpuOnlyResults);
         std::ofstream validation(outDir / (name + "_validation_" + parArch + ".csv"));
-        validation << "Batch size, NPPDx BlockSize, NPPDx Tile, NPPDx MaxAbsError vs NPPDx reference, "
+        validation << "Batch size, Iteration, NPPDx BlockSize, NPPDx Tile, NPPDx MaxAbsError vs NPPDx reference, "
                       "NPPDx MeanAbsError vs NPPDx reference, NPPDx values beyond 1e-3 of NPPDx reference, "
                       "NPPDx MaxAbsError vs FKL reference, NPPDx MeanAbsError vs FKL reference, "
                       "FKL MaxAbsError vs FKL reference, FKL MeanAbsError vs FKL reference, Values, "
                       "NPPDx tolerance, NPPDx within tolerance, FKL within tolerance" << std::endl;
         for (const auto& v : checks) {
-            validation << v.batch << ", " << v.nppdxBlock << ", " << v.tileX << "x" << v.tileY << ", "
+            validation << v.batch << ", " << v.iteration << ", " << v.nppdxBlock << ", " << v.tileX << "x" << v.tileY << ", "
                        << v.nppdxVsReference.max() << ", " << v.nppdxVsReference.mean << ", "
                        << v.nppdxVsReference.beyond << ", " << v.nppdxVsFkl.max() << ", " << v.nppdxVsFkl.mean << ", "
                        << v.fkl.max() << ", "
@@ -616,15 +658,16 @@ int figure1Main(int argc, char** argv) {
         std::ofstream blocks(outDir / (name + "_nppdx_block_sweep_" + parArch + ".csv"));
         blocks << "Batch size, Requested BlockDim (0 = NPPDx recommended), Tile, Actual BlockSize, Blocks per crop, "
                   "Dynamic shared memory bytes, MeanTime, MedianTime, P10Time, P90Time, "
-                  "MaxAbsError vs NPPDx reference, Chosen" << std::endl;
+                  "MaxAbsError vs NPPDx reference, Within tolerance, Chosen" << std::endl;
         for (const auto& b : sweep) {
             blocks << b.batch << ", " << b.requestedBlock << ", " << b.tileX << "x" << b.tileY << ", " << b.actualBlock
                    << ", " << b.blocksPerCrop << ", " << b.smem << ", " << b.time.mean << ", " << b.time.median << ", "
                    << b.time.p10 << ", " << b.time.p90 << ", " << b.vsReference.max() << ", "
-                   << (b.chosen ? "yes" : "no") << std::endl;
+                   << (withinTolerance(b.vsReference, P::tolerance) ? "yes" : "no") << ", " << (b.chosen ? "yes" : "no")
+                   << std::endl;
         }
-        // The configuration of every batch size, read back by --gpu-only-l2-flushed, --configs, the Nsight Compute
-        // scripts and the compile-time units
+        // The configuration of every batch size, read back by --gpu-only-l2-flushed, --configs and the compile-time
+        // unit (scripts/compile_time.sh), and the tile and block to give --ncu-target
         std::ofstream chosen(configCsv);
         chosen << "Batch size, Tile, Requested BlockDim (0 = NPPDx recommended), Actual BlockSize, Blocks per crop, "
                   "Dynamic shared memory bytes" << std::endl;
@@ -655,6 +698,14 @@ int figure1Main(int argc, char** argv) {
                     "(0.229, 0.224, 0.225), float3 tensor of N planes " << OUT_W << "x" << OUT_H << "\n"
                  << P::label << " pipeline: " << P::description() << "\n"
                  << "FKL pipeline: one executeOperations call (Backwards Vertical Fusion), one kernel.\n"
+                 << "Regions: iteration t of every loop (the " << benchmark::WARMUP_ITERS
+                 << " warm-up iterations are t in [0, " << benchmark::WARMUP_ITERS << "), the " << benchmark::ITERS
+                 << " timed ones t in [" << benchmark::WARMUP_ITERS << ", "
+                 << benchmark::WARMUP_ITERS + benchmark::ITERS
+                 << ")) runs both pipelines on the regions of iteration t (all of one size, at positions that change every "
+                    "iteration), generated before the loops; NPPDx gets their origins as a kernel parameter and FKL "
+                    "their rectangles in its build() calls, both converted before the loops (statistics of the timed "
+                    "ones in regions.csv).\n"
                  << "Timing, three benchmarks: " << benchmark::WARMUP_ITERS << " warm-up and " << benchmark::ITERS
                  << " timed iterations, in each one " << P::label << " and then FKL, with a synchronization after each. "
                     "CPU + GPU (" << name << "_" << parArch << ".csv): CUDA events around everything the host does "
@@ -665,27 +716,32 @@ int figure1Main(int argc, char** argv) {
                     "computed per iteration and averaged. Times in the CSV are in ms.\n"
                  << "nvcc flags: -O3 -DNDEBUG -std=c++20 --threads 0 -rdc=false -split-compile=0 -ftemplate-depth=1000 "
                     "-lineinfo --expt-relaxed-constexpr, CUDA_ARCHITECTURES " << CUDA_ARCHITECTURES_STR << "\n"
-                 << "Correctness: FKL against FKL's CPU backend running the same chain (resize samples at dst * scale), "
-                    "tolerance " << TOLERANCE << "; " << P::label << " against " << P::referenceName << ", tolerance "
-                 << P::tolerance << "; and also against FKL's CPU backend.\n"
+                 << "Correctness: before the timing, on the regions of the first, every "
+                 << bench::validation::VALIDATION_STRIDE << "th and the last timed iteration (one row per iteration of "
+                 << name << "_validation_" << parArch << ".csv): FKL against FKL's CPU backend running the same chain "
+                    "(resize samples at dst * scale), tolerance " << TOLERANCE << "; " << P::label << " against "
+                 << P::referenceName << ", tolerance " << P::tolerance << "; and also against FKL's CPU backend.\n"
                  << "NPPDx configuration: resize " << RESIZE_J << ":" << RESIZE_K << "; the tiles NPPDx supports for "
                  << CROP_W << "x" << CROP_H << " crops among the whole crop and its successive halvings down to "
                  << MIN_TILE_PIXELS << " pixels (multiples of NPPDx's 4x2 pixel cells and of J) are " << tiles
                  << ", each with NPPDx's recommended block and with BlockDim 64, 128, 256 and 512. "
                  << (pinnedConfig.empty()
-                         ? "For every batch size every configuration is validated and its NPPDx kernel timed alone (" +
+                         ? "For every batch size every configuration is validated (regions of the first timed iteration) "
+                           "and its NPPDx kernel timed alone (on the regions of every iteration, " +
                                name + "_nppdx_block_sweep_" + parArch + ".csv), and the fastest correct one (" +
                                configCsv.filename().string() + ") is compared with FKL in all three benchmarks.\n"
                          : "This run used the configurations given with --configs " +
                                std::filesystem::absolute(configsInput).string() + " instead of choosing them (copied to " +
                                configCsv.filename().string() + ").\n");
+        writeRegionStats((outDir / "regions.csv").string(), *w.regions, benchmark::WARMUP_ITERS, benchmark::ITERS);
         std::cout << "CSV files written to " << std::filesystem::absolute(outDir) << std::endl;
         // The sweep only chooses configurations within their tolerance, but one given with --configs may not be, and
         // FKL's output is checked too: the results are written either way, and the program fails
         bool failed = false;
         for (const auto& v : checks) {
             if (!withinTolerance(v.nppdxVsReference, P::tolerance) || !withinTolerance(v.fkl, TOLERANCE)) {
-                std::cerr << "ERROR: batch " << v.batch << ": " << P::label << " (tile " << v.tileX << "x" << v.tileY
+                std::cerr << "ERROR: batch " << v.batch << ", iteration " << v.iteration << ": " << P::label << " (tile "
+                          << v.tileX << "x" << v.tileY
                           << ", block " << v.nppdxBlock << ") or FKL is not within its tolerance, see "
                           << name << "_validation_" << parArch << ".csv" << std::endl;
                 failed = true;
