@@ -14,11 +14,19 @@
 # NVTX range "measure" of the --ncu-target mode of the benchmarks) with the caches flushed before every kernel
 # (--cache-control all, cold) at every batch size N, and without flushing (--cache-control none, warm: L2 keeps what
 # the executions before it, on the regions of iterations 1 to 3, left there, as in the timed loop) at the batch sizes
-# of WARM_BATCHES (default 1 and 100). Every profile is taken REPEATS times (default 2; report names end in -<k> after
-# the first), because the DRAM counters are device-wide: a GPU that also drives a display adds other processes' traffic
-# to some profiles, and ncu_summarize.py keeps the smallest measurement of every pipeline, N and cache control. Reports go to results/ncu and are given back to
-# the user who ran sudo. Nothing on the system is changed. Summarize afterwards, without sudo, with ncu_summarize.py.
+# of WARM_BATCHES (default 1 and 100). Every profile is taken REPEATS times (a positive integer, default 2; report names
+# end in -<k> after the first), because the DRAM counters are device-wide: a GPU that also drives a display adds other
+# processes' traffic to some profiles, and ncu_summarize.py keeps the smallest measurement of every pipeline, N and
+# cache control. Reports go to results/ncu and are given back to the user who ran sudo. Nothing on the system is
+# changed. Summarize afterwards, without sudo, with ncu_summarize.py.
 set -u
+
+# Checked before anything is written or deleted
+REPEATS=${REPEATS:-2}
+if [[ ! $REPEATS =~ ^[1-9][0-9]*$ ]]; then
+    echo "REPEATS ($REPEATS) must be a positive integer: the number of times every profile is taken" >&2
+    exit 1
+fi
 
 # The paths, the workload check, the batch sizes and the profiled regions, shared with the other profiling script
 . "$(dirname "$0")/ncu_common.sh"
@@ -34,7 +42,6 @@ LOG=$OUT/ncu_dram.log
 failures=0
 total=0
 
-REPEATS=${REPEATS:-2}
 profile() { # <report name> <benchmark binary> <implementation> <N>, with the cache control and repeat of the loop below
     local name=$1_cache-$cache$suffix bin=$2 impl=$3 n=$4
     total=$((total + 1))
@@ -62,7 +69,7 @@ done
 rm -rf "$OUT/scratch"
 chown -R "$OWNER": "$OUT"
 echo "Done: $((total - failures)) of $total profiles written to $OUT ($failures failed)."
-# A partial run fails, so that its reports are not summarized as if complete
-if [ "$failures" -ne 0 ]; then
+# A partial or empty run fails, so that its reports are not summarized as if complete
+if [ "$failures" -ne 0 ] || [ "$total" -eq 0 ]; then
     exit 1
 fi

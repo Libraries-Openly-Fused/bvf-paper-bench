@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Builds and runs every benchmark of this repository, each into its own results folder: FKL vs OpenCV CUDA and FKL vs
-# NPP (main run and the GPU only run with the L2 flushed), FKL's ablation (the same, plus the host overhead and the
-# per-kernel GPU times), FKL vs NPPDx for every region size (both programs: main run, L2 flushed, and the runner-up
-# NPPDx configuration re-timed against FKL), FKL vs OpenCV on the CPU, with COMPILE_TIME=1 the compile-time units, and
-# with PROFILE=1 the memory traffic with Nsight Compute (scripts/ncu_dram.sh and ncu_l2.sh, their summaries and the
-# traffic model), which needs the driver to let every user read the GPU performance counters (RmProfilingAdminOnly=0);
-# otherwise, since those scripts then need root, their commands are printed at the end. Never uses sudo itself.
+# NPP (main run and the GPU only run with the L2 flushed), FKL's ablation (the same, plus the host overhead, the
+# per-kernel GPU times and bvf_types, the type of the fused operation), FKL vs NPPDx for every region size (both
+# programs: main run, L2 flushed, and the runner-up NPPDx configuration re-timed against FKL), FKL vs OpenCV on the CPU,
+# with COMPILE_TIME=1 the compile-time units, and with PROFILE=1 the memory traffic with Nsight Compute
+# (scripts/ncu_dram.sh and ncu_l2.sh, their summaries and the traffic model), which needs the driver to let every user
+# read the GPU performance counters (RmProfilingAdminOnly=0); otherwise, since those scripts then need root, their
+# commands are printed at the end. Never uses sudo itself.
 #
 #     OpenCV_DIR=<OpenCV build or install> scripts/run_all.sh [<results folder, default ../results>]
 #
@@ -23,8 +24,10 @@
 #                performance counters open to every user); without it, their commands are printed at the end
 #   BUILD_ROOT   where the build folders go (default this repository): build-<step>, and build-nppdx-<size>
 #   CPU_CXX      C++ compiler of the CPU benchmark (default clang++; the README recommends a recent clang)
-#   CMAKE_ARGS   more options for every CMake project (for example -DBENCH_ITERATIONS=1 for a quick check); not
-#                BENCH_REGIONS, which this script sets for every project (mixed, or the NPPDx sizes of NPPDX_SIZES)
+#   CMAKE_ARGS   more options for every CMake project (for example -DBENCH_ITERATIONS=1 for a quick check). They
+#                come before the options this script sets for each project (BENCH_REGIONS, OpenCV_DIR, and CPU_CXX for
+#                the CPU benchmark), which win. Setting or unsetting BENCH_REGIONS in them is an error: this script sets
+#                it for every project (mixed, or the NPPDx sizes of NPPDX_SIZES)
 # Results: <results>/<benchmark folder>, FKL vs NPPDx in <results>/fkl-vs-nppdx/<size> (the runner-up configurations in
 # its runner-up/), logs in <results>/logs. The GPU benchmarks run one at a time; leave the GPU otherwise idle.
 set -euo pipefail
@@ -48,16 +51,26 @@ fi
 BUILD_ROOT=${BUILD_ROOT:-$REPO}
 CPU_CXX=${CPU_CXX:-clang++}
 read -r -a EXTRA <<< "${CMAKE_ARGS:-}"
-# The region sizes are set per project below and name the results folders, so CMAKE_ARGS must not override them, in
-# CMake's joined (-DBENCH_REGIONS=...) or split (-D BENCH_REGIONS=...) form
+# The region sizes are set per project below and name the results folders. configure passes them after CMAKE_ARGS, so
+# they win, and CMAKE_ARGS must not name BENCH_REGIONS either, so that a value given there is not silently replaced:
+# neither -D (joined, -DBENCH_REGIONS=..., or split, -D BENCH_REGIONS=..., with or without a type) nor -U (joined or
+# split, with a glob pattern that matches BENCH_REGIONS, such as -U '*')
 previous=""
 for arg in "${EXTRA[@]}"; do
-    if [[ $arg == -DBENCH_REGIONS[=:]* || ( $previous == -D && $arg == BENCH_REGIONS[=:]* ) ]]; then
-        echo "CMAKE_ARGS: setting BENCH_REGIONS ($arg) is not allowed: this script sets it for every project (mixed," \
-             "and the NPPDx sizes of NPPDX_SIZES)" >&2
+    if [[ $previous == -[DU] ]]; then
+        option=$previous value=$arg # the split form
+        previous=""
+    else
+        option=${arg:0:2} value=${arg:2}
+        previous=$arg
+    fi
+    # The name of a -D option ends at its type or value; the pattern of a -U option is a glob, as in CMake
+    if [[ ( $option == -D && ${value%%[:=]*} == BENCH_REGIONS ) ||
+          ( $option == -U && -n $value && BENCH_REGIONS == $value ) ]]; then
+        echo "CMAKE_ARGS: $option $value sets or unsets BENCH_REGIONS, which this script sets for every project" \
+             "(mixed, and the NPPDx sizes of NPPDX_SIZES)" >&2
         exit 1
     fi
-    previous=$arg
 done
 GENERATOR=${GENERATOR:-"Unix Makefiles"}
 
@@ -85,13 +98,14 @@ declare -A FOLDER=([opencv-cuda]=fkl-vs-opencv-cuda [npp]=fkl-vs-npp [ablation]=
                    [opencv-cpu]=fkl-vs-opencv-cpu)
 
 # Configures and builds a project. BENCH_REGIONS is a cached CMake option, so every configure sets it (mixed, or the
-# NPPDx size): a build folder reused from an earlier configure with another value must not keep it.
+# NPPDx size): a build folder reused from an earlier configure with another value must not keep it. The project's
+# options come after CMAKE_ARGS: CMake applies -D and -U in order, so they win.
 configure() { # <source> <build folder> <options...>
     local source=$1 build=$2
     shift 2
     mkdir -p "$build"
     cmake -G "$GENERATOR" -S "$source" -B "$build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-          "$@" "${EXTRA[@]}" > "$build/run_all_configure.log" 2>&1 || { cat "$build/run_all_configure.log" >&2; exit 1; }
+          "${EXTRA[@]}" "$@" > "$build/run_all_configure.log" 2>&1 || { cat "$build/run_all_configure.log" >&2; exit 1; }
     cmake --build "$build" -j "$(nproc)" > "$build/run_all_build.log" 2>&1 ||
         { tail -50 "$build/run_all_build.log" >&2; exit 1; }
 }
@@ -134,6 +148,7 @@ for step in opencv-cuda npp ablation opencv-cpu; do
     if [ "$step" = ablation ]; then
         run "$LOGS/${program}_host_overhead.log" "$build/$program" "$out" --host-overhead
         run "$LOGS/${program}_profile_kernels.log" "$build/$program" "$out" --profile-kernels
+        run "$LOGS/bvf_types.log" "$build/bvf_types"
     fi
 done
 if has_step nppdx; then

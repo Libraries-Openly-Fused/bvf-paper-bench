@@ -25,7 +25,7 @@ METRICS=lts__t_sectors_srcunit_tex_op_read.sum,lts__t_sectors_srcunit_tex_op_wri
 
 mkdir -p "$OUT"
 # Only this invocation's reports: ncu_summarize.py merges every report of a pipeline, N and cache control in OUT, so a
-# report left by an earlier invocation (another REPEATS, another build) would be summarized with these
+# report left by an earlier invocation (another build, other WARM_BATCHES) would be summarized with these
 rm -f "$OUT"/*.ncu-rep
 LOG=$OUT/ncu_l2.log
 : > "$LOG"
@@ -51,7 +51,7 @@ done
 rm -rf "$OUT/scratch"
 chown -R "$OWNER": "$OUT"
 echo "Done: $((total - failures)) of $total profiles written to $OUT ($failures failed)."
-# A partial run fails, so that its reports are not summarized as if complete
-if [ "$failures" -ne 0 ]; then
+# A partial or empty run fails, so that its reports are not summarized as if complete
+if [ "$failures" -ne 0 ] || [ "$total" -eq 0 ]; then
     exit 1
 fi

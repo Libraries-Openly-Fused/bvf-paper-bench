@@ -8,8 +8,9 @@
 # regions for every pipeline.
 #
 # Paths: NCU, the benchmarks OPENCV_CUDA_BENCH, NPP_BENCH and ABLATION_BENCH (default build-<name>/ of this
-# repository), BVF_RESULTS (the results folder, default ../results). WARM_BATCHES (default "1 100") are the batch sizes
-# of the warm DRAM profiles and of the SM-L2 profiles; the cold DRAM profiles cover every batch size.
+# repository), BVF_RESULTS (the results folder, default ../results). WARM_BATCHES (default "1 100"; at least one, each
+# a batch size of the benchmarks, listed once) are the batch sizes of the warm DRAM profiles and of the SM-L2 profiles;
+# the cold DRAM profiles cover every batch size.
 # Root is only needed while the driver restricts the GPU performance counters to admin users
 # (RmProfilingAdminOnly=1, the default; the nvidia module option NVreg_RestrictProfilingToAdminUsers=0 opens them)
 if [ "$(id -u)" -ne 0 ] && ! grep -q "RmProfilingAdminOnly: 0" /proc/driver/nvidia/params 2>/dev/null; then
@@ -37,6 +38,23 @@ for bench in "$OPENCV_CUDA_BENCH" "$NPP_BENCH"; do
     fi
 done
 BATCHES=$("$ABLATION_BENCH" --batches) || exit 1
+# Checked before the scripts delete earlier reports. A batch size listed twice would overwrite its own reports.
+warm_seen=" "
+for n in $WARM_BATCHES; do
+    if [[ " $BATCHES " != *" $n "* ]]; then
+        echo "WARM_BATCHES: $n is not one of the batch sizes of the benchmarks ($BATCHES)" >&2
+        exit 1
+    fi
+    if [[ $warm_seen == *" $n "* ]]; then
+        echo "WARM_BATCHES: $n is listed twice" >&2
+        exit 1
+    fi
+    warm_seen+="$n "
+done
+if [ "$warm_seen" = " " ]; then
+    echo "WARM_BATCHES is empty: it needs at least one batch size of the benchmarks ($BATCHES)" >&2
+    exit 1
+fi
 mkdir -p "$RESULTS"
 "$ABLATION_BENCH" --regions 0 > "$RESULTS/ncu_regions.csv" || exit 1
 chown "$OWNER": "$RESULTS/ncu_regions.csv"
