@@ -201,11 +201,11 @@ and a `results` folder next to it, with the results of every benchmark in a fold
     ./build-npp/benchmark_npp ../results/fkl-vs-npp                          # CPU + GPU and GPU only
     ./build-npp/benchmark_npp ../results/fkl-vs-npp --gpu-only-l2-flushed    # adds the *_l2_flushed* files
 
-The README of every folder has its commands. `scripts/run_all.sh` builds and runs every benchmark but `rocm/` (which
-has its own `rocm/scripts/run_all.sh`): the main run and the GPU only run with the L2 flushed of every GPU benchmark,
-FKL's host overhead and per-kernel times, FKL vs NPPDx for every region size (`NPPDX_SIZES`) with the runner-up NPPDx
-configuration of every N re-timed against FKL (`nppdx_runner_up.py`, then `--configs`, into `runner-up/`), and the CPU
-benchmark; `COMPILE_TIME=1` adds the compile-time units and `PROFILE=1` the Nsight Compute scripts, their summaries
+The README of every folder has its commands. `scripts/run_all.sh` builds and runs every benchmark but `rocm/` (which has
+its own `rocm/scripts/run_all.sh`): the main run and the GPU only run with the L2 flushed of every GPU benchmark, FKL's
+host overhead and per-kernel times, `bvf_types`, FKL vs NPPDx for every region size (`NPPDX_SIZES`) with the runner-up
+NPPDx configuration of every N re-timed against FKL (`nppdx_runner_up.py`, then `--configs`, into `runner-up/`), and the
+CPU benchmark; `COMPILE_TIME=1` adds the compile-time units and `PROFILE=1` the Nsight Compute scripts, their summaries
 and the traffic model, when the driver lets every user read the GPU performance counters (`RmProfilingAdminOnly: 0`);
 otherwise it prints their commands, which then need sudo:
 
