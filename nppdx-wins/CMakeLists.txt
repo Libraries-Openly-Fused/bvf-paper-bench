@@ -27,10 +27,18 @@ find_package(nppdx CONFIG REQUIRED)
 execute_process(COMMAND git -C ${NPPDX_DIR} describe --always --tags
                 OUTPUT_VARIABLE NPPDX_GIT_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE)
 
-foreach(PROGRAM regions frame)
-    add_bench_target(benchmark_wins_${PROGRAM} src/benchmark_wins_${PROGRAM}.cu)
-    target_compile_definitions(benchmark_wins_${PROGRAM} PRIVATE NPPDX_SM=${NPPDX_SM}
-                                                                 NPPDX_GIT_VERSION="${NPPDX_GIT_VERSION}")
-    target_link_libraries(benchmark_wins_${PROGRAM} PRIVATE nppdx::nppdx CUDA::nppc CUDA::nppicc CUDA::nppidei
-                                                            CUDA::nppial)
-endforeach()
+function(add_wins_target TARGET_NAME SOURCE)
+    add_bench_target(${TARGET_NAME} ${SOURCE})
+    target_compile_definitions(${TARGET_NAME} PRIVATE NPPDX_SM=${NPPDX_SM} NPPDX_GIT_VERSION="${NPPDX_GIT_VERSION}")
+    target_link_libraries(${TARGET_NAME} PRIVATE nppdx::nppdx CUDA::nppc CUDA::nppicc CUDA::nppidei CUDA::nppial)
+endfunction()
+
+add_wins_target(benchmark_wins_regions src/benchmark_wins_regions.cu)
+# W2 with the 5x5 box, a 9x9 box, the 5x5 box in two passes and NPPDx's 21-tap Gaussian
+add_wins_target(benchmark_wins_frame src/benchmark_wins_frame.cu)
+add_wins_target(benchmark_wins_frame_k9 src/benchmark_wins_frame.cu)
+target_compile_definitions(benchmark_wins_frame_k9 PRIVATE WINS_BOX_K=9)
+add_wins_target(benchmark_wins_frame_k5_p2 src/benchmark_wins_frame.cu)
+target_compile_definitions(benchmark_wins_frame_k5_p2 PRIVATE WINS_PASSES=2)
+add_wins_target(benchmark_wins_frame_gauss21 src/benchmark_wins_frame.cu)
+target_compile_definitions(benchmark_wins_frame_gauss21 PRIVATE WINS_GAUSSIAN=1)

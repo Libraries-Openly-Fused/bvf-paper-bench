@@ -12,16 +12,49 @@
    See the License for the specific language governing permissions and
    limitations under the License. */
 
-// nppdx-wins, W2 (wins_common.h): ReadNV12 -> YUVtoRGB -> Box 5x5 -> Resize 2:1 to 1920x1080 -> Mul -> Sub -> Div ->
+// nppdx-wins, W2 (wins_common.h): ReadNV12 -> YUVtoRGB -> filter -> Resize 2:1 to 1920x1080 -> Mul -> Sub -> Div ->
 // one float3 plane, the whole 3840x2160 frame (batch "1": one frame; the harness's regions are not used). nppdx and
 // fkl_inline are the baselines of fkl_staged in the harness's files; every median is in latency.csv, gpu_time.csv and
-// gpu_time_l2_flushed.csv.
+// gpu_time_l2_flushed.csv. The filter (CMake target):
+//   WINS_GAUSSIAN 0   a WINS_BOX_K x WINS_BOX_K box in WINS_PASSES passes (benchmark_wins_frame: 5x5, one pass;
+//                     _k9: 9x9; _k5_p2: 5x5 twice). fkl_inline: BoxBVF<K> per pass; fkl_staged: executeBoxBlur<PASSES>
+//   WINS_GAUSSIAN 1   NPPDx's GaussianBlur<50, wide>, 21 taps, sigma 5 (benchmark_wins_frame_gauss21). fkl_staged:
+//                     LinearFilterDPP 21x21 with the products of NPPDx's taps; FKL has no inline Gaussian, so no
+//                     fkl_inline; instead fkl_staged_separable, LinearFilterDPP 21x1 then 1x21 (three kernels)
 
 #include "wins_common.h"
 
 #include <iostream>
 
+#ifndef WINS_GAUSSIAN
+#define WINS_GAUSSIAN 0
+#endif
+#ifndef WINS_BOX_K
+#define WINS_BOX_K 5
+#endif
+#ifndef WINS_PASSES
+#define WINS_PASSES 1
+#endif
+
 namespace bench::wins {
+
+#if WINS_GAUSSIAN
+using Spec = GaussianSpec<50, nppdx::gaussian_tail_width::wide>;
+static_assert(Spec::K == 21 && Spec::K == nppdx::GaussianBlur<50, nppdx::gaussian_tail_width::wide>::value.taps(),
+              "GaussianSpec's tap count is NPPDx's");
+#else
+using Spec = BoxSpec<WINS_BOX_K, WINS_PASSES>;
+#endif
+static_assert(Spec::PASSES == 1 || Spec::PASSES == 2, "One or two passes");
+
+inline std::string filterName() {
+    if constexpr (Spec::GAUSSIAN) {
+        return "Gaussian, NPPDx's GaussianBlur<50, wide> (21 taps, sigma 5)";
+    } else {
+        return "box " + std::to_string(Spec::K) + "x" + std::to_string(Spec::K) +
+               (Spec::PASSES == 2 ? " in two passes" : "");
+    }
+}
 
 constexpr std::array<NppdxConfig, 20> CONFIGS{{{64, 32, 0}, {64, 32, 128}, {64, 32, 256}, {64, 32, 512},
                                                {32, 32, 0}, {32, 32, 128}, {32, 32, 256}, {32, 32, 512},
@@ -36,7 +69,7 @@ std::shared_ptr<fk::Tensor<fk::float3>> outputPlane() {
 // NPPDx: one kernel over the frame
 template <NppdxConfig C>
 Implementation makeNppdx(Context& ctx) {
-    using Ops = BoxResizeOps<C.tileX, C.tileY, C.block, 2, 1>;
+    using Ops = FilterResizeOps<C.tileX, C.tileY, C.block, 2, 1, Spec>;
     constexpr auto kernel = nppdxFrameKernel<Ops>;
     allowSharedMemory<kernel, Ops::smem>();
     auto out = outputPlane();
@@ -54,24 +87,56 @@ Implementation makeNppdx(Context& ctx) {
     return impl;
 }
 
-// FKL, the box as a BVF operation before the resize: one kernel, 100 frame evaluations per output value
-inline Implementation makeFklInline(Context& ctx) {
+// FKL, the box as a BVF operation before the resize (one BoxBVF per pass): one kernel, 4 x (K^2)^PASSES frame
+// evaluations per output value
+template <typename S = Spec>
+Implementation makeFklInline(Context& ctx) {
+    static_assert(!S::GAUSSIAN, "FKL has no inline Gaussian");
     auto out = outputPlane();
     Implementation impl{"fkl_inline", Reference::FklFloat};
     impl.stages.emplace_back("1_box_resize_normalize", [&ctx, out](size_t) {
         beforeKernel();
-        fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream, fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
-                                                  YUVToRGB::build(), fk::BoxBVF<BOX_K>::build(),
-                                                  Bilinear::build(fk::Size(W2_OUT_W, W2_OUT_H)),
-                                                  normalizedWrite(*out));
+        if constexpr (Spec::PASSES == 1) {
+            fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
+                                                      fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
+                                                      YUVToRGB::build(), fk::BoxBVF<Spec::K>::build(),
+                                                      Bilinear::build(fk::Size(W2_OUT_W, W2_OUT_H)),
+                                                      normalizedWrite(*out));
+        } else {
+            fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
+                                                      fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
+                                                      YUVToRGB::build(), fk::BoxBVF<Spec::K>::build(),
+                                                      fk::BoxBVF<Spec::K>::build(),
+                                                      Bilinear::build(fk::Size(W2_OUT_W, W2_OUT_H)),
+                                                      normalizedWrite(*out));
+        }
     });
     impl.run = runStages(impl.stages);
     setFloatIO<1>(impl, out, W2_FLOATS);
     return impl;
 }
 
-// FKL staged: MorphologyDPP's box of the frame into a float3 frame in memory (3840x2160x12 bytes), then one
-// TransformDPP kernel Resize -> normalize reading it
+// FKL's 21x21 coefficients: the products of NPPDx's taps (Gaussian only)
+template <typename S>
+std::shared_ptr<fk::Ptr2D<fk::float3>> gaussianCoefficients(Context& ctx) {
+    static std::shared_ptr<fk::Ptr2D<fk::float3>> coefficients;
+    if (!coefficients) {
+        const auto taps = S::taps();
+        const int n = static_cast<int>(taps.size());
+        coefficients = std::make_shared<fk::Ptr2D<fk::float3>>(n, n);
+        for (int y = 0; y < n; ++y) {
+            for (int x = 0; x < n; ++x) {
+                coefficients->at(fk::Point{x, y, 0}) = fk::make_set<fk::float3>(static_cast<float>(taps[y] * taps[x]));
+            }
+        }
+        coefficients->upload(*ctx.fkStream);
+        gpuErrchk(cudaStreamSynchronize(ctx.stream));
+    }
+    return coefficients;
+}
+
+// FKL staged: the DPP of the filter (MorphologyDPP's box, or LinearFilterDPP for the Gaussian) of the frame into a
+// float3 frame in memory (3840x2160x12 bytes), then one TransformDPP kernel Resize -> normalize reading it
 template <int TW, int TH>
 Implementation makeFklStaged(Context& ctx) {
     auto inter = std::make_shared<fk::Tensor<fk::float3>>(FRAME_W, FRAME_H, 1, 1, fk::MemType::Device);
@@ -79,15 +144,33 @@ Implementation makeFklStaged(Context& ctx) {
     const fk::RawPtr<fk::ND::_2D, fk::float3> frame{inter->ptr().data,
                                                      {FRAME_W, FRAME_H, FRAME_W * sizeof(fk::float3)}};
     Implementation impl{"fkl_staged", Reference::FklFloat};
-    impl.stages.emplace_back("1_morphology_dpp_box_of_the_frame", [&ctx, inter, frame](size_t) {
-        using Details = fk::MorphologyDPPDetails<fk::float3, TW, TH, BOX_K, BOX_K>;
-        const Details details{FRAME_W, FRAME_H, BOX_K, BOX_K, BOX_R, BOX_R};
-        beforeKernel();
-        if (!fk::executeBoxBlur<1>(details, rgbRead(ctx), fk::PerThreadWrite<fk::ND::_2D, fk::float3>::build(frame),
-                                   *ctx.fkStream)) {
-            throw std::runtime_error("executeBoxBlur rejected its details");
-        }
-    });
+    if constexpr (Spec::GAUSSIAN) {
+        const auto coefficients = gaussianCoefficients<Spec>(ctx);
+        impl.stages.emplace_back("1_linear_filter_dpp_of_the_frame", [&ctx, inter, frame, coefficients](size_t) {
+            using Details = fk::LinearFilterDPPDetails<fk::float3, TW, TH, Spec::K, Spec::K>;
+            const Details details{FRAME_W, FRAME_H, Spec::K, Spec::K, Spec::STEP_HALO, Spec::STEP_HALO};
+            beforeKernel();
+            if (!fk::executeLinearFilter(details,
+                                         fk::make_tuple(rgbRead(ctx), fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(
+                                                                          coefficients->ptr())),
+                                         fk::Mul<fk::float3, fk::float3, fk::float3, fk::UnaryType>::build(),
+                                         fk::Add<fk::float3, fk::float3, fk::float3, fk::UnaryType>::build(),
+                                         fk::PerThreadWrite<fk::ND::_2D, fk::float3>::build(frame), *ctx.fkStream)) {
+                throw std::runtime_error("executeLinearFilter rejected its details");
+            }
+        });
+    } else {
+        impl.stages.emplace_back("1_morphology_dpp_box_of_the_frame", [&ctx, inter, frame](size_t) {
+            using Details = fk::MorphologyDPPDetails<fk::float3, TW, TH, Spec::K, Spec::K>;
+            const Details details{FRAME_W, FRAME_H, Spec::K, Spec::K, Spec::STEP_HALO, Spec::STEP_HALO};
+            beforeKernel();
+            if (!fk::executeBoxBlur<Spec::PASSES>(details, rgbRead(ctx),
+                                                  fk::PerThreadWrite<fk::ND::_2D, fk::float3>::build(frame),
+                                                  *ctx.fkStream)) {
+                throw std::runtime_error("executeBoxBlur rejected its details");
+            }
+        });
+    }
     impl.stages.emplace_back("2_resize_normalize", [&ctx, out, frame](size_t) {
         beforeKernel();
         fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
@@ -101,7 +184,7 @@ Implementation makeFklStaged(Context& ctx) {
 }
 
 inline Implementation nppdx(Context& ctx) {
-    const auto reference = frameReference(ctx, Reference::NppdxPixelCenterFloat);
+    const auto reference = frameReference<Spec>(ctx, Reference::NppdxPixelCenterFloat);
     const size_t index = chooseFastest(
         ctx, "nppdx_frame", CONFIGS.size(),
         [&](size_t i) {
@@ -115,8 +198,91 @@ inline Implementation nppdx(Context& ctx) {
     return impl;
 }
 
+// The Gaussian with FKL's DPPs used separably (not one of the two forms asked for: LinearFilterDPP has no separable
+// path, so this is the best FKL can do with existing components): LinearFilterDPP 21x1 of the frame into a float3
+// frame, LinearFilterDPP 1x21 of it into a second one, then TransformDPP Resize -> normalize: three kernels, two
+// intermediates of 3840x2160x12 bytes
+template <int TW, int TH, typename S = Spec>
+Implementation makeFklStagedSeparable(Context& ctx) {
+    static_assert(S::GAUSSIAN, "The separable form is the Gaussian's");
+    auto rowsPassed = std::make_shared<fk::Tensor<fk::float3>>(FRAME_W, FRAME_H, 1, 1, fk::MemType::Device);
+    auto filtered = std::make_shared<fk::Tensor<fk::float3>>(FRAME_W, FRAME_H, 1, 1, fk::MemType::Device);
+    auto out = outputPlane();
+    const auto view = [](const std::shared_ptr<fk::Tensor<fk::float3>>& t) {
+        return fk::RawPtr<fk::ND::_2D, fk::float3>{t->ptr().data, {FRAME_W, FRAME_H, FRAME_W * sizeof(fk::float3)}};
+    };
+    const auto rowsView = view(rowsPassed);
+    const auto filteredView = view(filtered);
+    // The 1D taps as a 21x1 and a 1x21 coefficient image
+    const auto taps = S::taps();
+    auto rowTaps = std::make_shared<fk::Ptr2D<fk::float3>>(Spec::K, 1);
+    auto columnTaps = std::make_shared<fk::Ptr2D<fk::float3>>(1, Spec::K);
+    for (int i = 0; i < Spec::K; ++i) {
+        rowTaps->at(fk::Point{i, 0, 0}) = fk::make_set<fk::float3>(static_cast<float>(taps[i]));
+        columnTaps->at(fk::Point{0, i, 0}) = fk::make_set<fk::float3>(static_cast<float>(taps[i]));
+    }
+    rowTaps->upload(*ctx.fkStream);
+    columnTaps->upload(*ctx.fkStream);
+    gpuErrchk(cudaStreamSynchronize(ctx.stream));
+    using Mul3 = fk::Mul<fk::float3, fk::float3, fk::float3, fk::UnaryType>;
+    using Add3 = fk::Add<fk::float3, fk::float3, fk::float3, fk::UnaryType>;
+    Implementation impl{"fkl_staged_separable", Reference::FklFloat};
+    impl.stages.emplace_back("1_linear_filter_dpp_rows", [&ctx, rowsPassed, rowsView, rowTaps](size_t) {
+        using Details = fk::LinearFilterDPPDetails<fk::float3, TW, TH, Spec::K, 1>;
+        const Details details{FRAME_W, FRAME_H, Spec::K, 1, Spec::STEP_HALO, 0};
+        beforeKernel();
+        if (!fk::executeLinearFilter(details,
+                                     fk::make_tuple(rgbRead(ctx),
+                                                    fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(rowTaps->ptr())),
+                                     Mul3::build(), Add3::build(),
+                                     fk::PerThreadWrite<fk::ND::_2D, fk::float3>::build(rowsView), *ctx.fkStream)) {
+            throw std::runtime_error("executeLinearFilter rejected its details");
+        }
+    });
+    impl.stages.emplace_back("2_linear_filter_dpp_columns",
+                             [&ctx, rowsPassed, filtered, rowsView, filteredView, columnTaps](size_t) {
+        using Details = fk::LinearFilterDPPDetails<fk::float3, TW, TH, 1, Spec::K>;
+        const Details details{FRAME_W, FRAME_H, 1, Spec::K, 0, Spec::STEP_HALO};
+        beforeKernel();
+        if (!fk::executeLinearFilter(details,
+                                     fk::make_tuple(fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(rowsView),
+                                                    fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(
+                                                        columnTaps->ptr())),
+                                     Mul3::build(), Add3::build(),
+                                     fk::PerThreadWrite<fk::ND::_2D, fk::float3>::build(filteredView),
+                                     *ctx.fkStream)) {
+            throw std::runtime_error("executeLinearFilter rejected its details");
+        }
+    });
+    impl.stages.emplace_back("3_resize_normalize", [&ctx, filtered, filteredView, out](size_t) {
+        beforeKernel();
+        fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
+                                                  fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(filteredView),
+                                                  Bilinear::build(fk::Size(W2_OUT_W, W2_OUT_H)),
+                                                  normalizedWrite(*out));
+    });
+    impl.run = runStages(impl.stages);
+    setFloatIO<1>(impl, out, W2_FLOATS);
+    return impl;
+}
+
+template <typename S = Spec>
+Implementation fklStagedSeparable(Context& ctx) {
+    const auto reference = frameReference<S>(ctx, Reference::FklFloat);
+    const auto make = [&](size_t i) {
+        Implementation impl;
+        [&]<size_t... Is>(std::index_sequence<Is...>) {
+            ((Is == i ? (impl = makeFklStagedSeparable<DPP_TILES[Is].width, DPP_TILES[Is].height, S>(ctx), 0) : 0),
+             ...);
+        }(std::make_index_sequence<DPP_TILES.size()>{});
+        return impl;
+    };
+    return make(chooseFastest(ctx, "fkl_staged_separable_frame", DPP_TILES.size(), make, dppLabel, reference,
+                              TOLERANCE));
+}
+
 inline Implementation fklStaged(Context& ctx) {
-    const auto reference = frameReference(ctx, Reference::FklFloat);
+    const auto reference = frameReference<Spec>(ctx, Reference::FklFloat);
     const auto make = [&](size_t i) {
         Implementation impl;
         [&]<size_t... Is>(std::index_sequence<Is...>) {
@@ -128,7 +294,7 @@ inline Implementation fklStaged(Context& ctx) {
 }
 
 struct WinsFrame {
-    static constexpr const char* title = "nppdx-wins W2: box 5x5 before a 2:1 resize of the 4K frame (smoke test)";
+    static constexpr const char* title = "nppdx-wins W2: a filter before a 2:1 resize of the 4K frame (smoke test)";
     static constexpr const char* fklName = "fkl_staged";
     static constexpr const char* fklLabel = "FKL staged";
     static constexpr const char* fklShortLabel = "staged";
@@ -139,7 +305,11 @@ struct WinsFrame {
         static_assert(N == 1, "One frame");
         std::vector<Implementation> impls;
         impls.push_back(nppdx(ctx));
-        impls.push_back(makeFklInline(ctx));
+        if constexpr (!Spec::GAUSSIAN) {
+            impls.push_back(makeFklInline(ctx));
+        } else {
+            impls.push_back(fklStagedSeparable(ctx));
+        }
         return impls;
     }
 
@@ -150,7 +320,7 @@ struct WinsFrame {
 
     template <size_t N>
     static std::vector<float> reference(const Context& ctx, Reference r, size_t) {
-        return frameReference(ctx, r);
+        return frameReference<Spec>(ctx, r);
     }
 
     static void setup(const std::filesystem::path& outDir, const std::string& mode) { setupChoices(outDir, mode); }
@@ -158,8 +328,9 @@ struct WinsFrame {
     static void workload(std::ostream& os) {
         os << "bvf-paper-bench: commit " << BENCH_REPO_COMMIT << "\n"
            << "Workload (nppdx-wins W2, smoke test): the " << FRAME_W << "x" << FRAME_H << " NV12 frame (seed "
-           << FRAME_SEED << "), NV12->RGB BT.601 limited range, box 5x5 (the mean, per channel, replicating the frame "
-           << "edge), resized 2:1 (bilinear) to " << W2_OUT_W << "x" << W2_OUT_H << ", then Mul (1/255), Sub (0.485, "
+           << FRAME_SEED << "), NV12->RGB BT.601 limited range, " << filterName() << " (per channel, replicating the "
+           << "frame edge; with two passes FKL replicates the edge of every pass and NPPDx filters the extended frame), "
+           << "resized 2:1 (bilinear) to " << W2_OUT_W << "x" << W2_OUT_H << ", then Mul (1/255), Sub (0.485, "
            << "0.456, 0.406), Div (0.229, 0.224, 0.225), one float3 plane. Batch 1 is the frame (the harness's "
            << "regions are not used).\n"
            << "Semantics (documented, not matched): FKL's 2:1 bilinear samples at (2x, 2y), i.e. the boxed pixel; "
@@ -169,13 +340,16 @@ struct WinsFrame {
 
     static void describe(std::ostream& os, const std::filesystem::path&) {
         os << "NPPDx: " << NPPDX_GIT_VERSION << ", operations for SM " << NPPDX_SM << "\n"
-           << "nppdx: one kernel over the frame (wins_common.h): NV12 ingest of the tile with the halo of the box and "
-              "the resize, FromLimitedLuma/Chroma, ColorConvert BT.601, BoxBlur<5, 5>, Resize<2, 1, bilinear>, the "
+           << "Filter: " << filterName() << "\n"
+           << "nppdx: one kernel over the frame (wins_common.h): NV12 ingest of the tile with the halo of the filter "
+              "and the resize, FromLimitedLuma/Chroma, ColorConvert BT.601, the filter (BoxBlur steps or "
+              "GaussianBlur), Resize<2, 1, bilinear>, the "
               "normalization and float3 write written by hand; the fastest validated of tiles 64x32, 32x32, 32x16, "
               "16x16, 16x8 with the recommended block and 128, 256, 512 (choices.csv, choice_sweep.csv).\n"
-           << "fkl_inline: one kernel, ReadNV12 -> YUVtoRGB -> BoxBVF<5> -> Resize -> Mul -> Sub -> Div -> "
-              "TensorWrite (100 NV12 reads and conversions per output value).\n"
-           << "fkl_staged: two kernels, MorphologyDPP box (executeBoxBlur) of the frame into a float3 frame in memory "
+           << "fkl_inline: one kernel, ReadNV12 -> YUVtoRGB -> BoxBVF<K> per pass -> Resize -> Mul -> Sub -> Div -> "
+              "TensorWrite (4 x (K^2)^passes NV12 reads and conversions per output value; none for the Gaussian).\n"
+           << "fkl_staged: two kernels, the DPP of the filter (MorphologyDPP, executeBoxBlur; LinearFilterDPP 21x21 "
+              "for the Gaussian) of the frame into a float3 frame in memory "
               "(" << static_cast<size_t>(FRAME_W) * FRAME_H * 12 << " bytes written, then read by the resize), then "
               "TransformDPP Resize -> Mul -> Sub -> Div -> TensorWrite; the fastest validated MorphologyDPP tile of "
               "16x8, 32x8, 32x16.\n";

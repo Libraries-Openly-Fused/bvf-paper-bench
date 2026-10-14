@@ -44,9 +44,11 @@
 #define BVF_BENCH_WINS_COMMON_H
 
 #include <fused_kernel/core/utils/utils.h> // gpuErrchk
+#include <fused_kernel/algorithms/image_processing/linear_filter.h>
 #include <fused_kernel/algorithms/image_processing/morphology.h>
 
 #include <nppdx.hpp>
+#include <nppdx/detail/backend/gaussian_blur_coeff_tables.hpp>
 
 #include "bench_gpu.h"
 #include "bench_neighborhood_ops.h"
@@ -189,41 +191,99 @@ std::vector<float> regionsReference(const Context& ctx, const Reference r, const
     return out;
 }
 
-// W2: the boxed frame (double, replicating the frame edge), computed once with separable sums
-inline const std::vector<double>& boxedFrame(const Context& ctx) {
-    static std::vector<double> boxed;
-    if (boxed.empty()) {
-        const auto& rgb = frameRgb(ctx);
-        std::vector<double> rows(static_cast<size_t>(FRAME_W) * FRAME_H * 3);
-        for (int y = 0; y < FRAME_H; ++y) {
-            for (int x = 0; x < FRAME_W; ++x) {
-                for (int c = 0; c < 3; ++c) {
-                    double sum = 0.0;
-                    for (int dx = -BOX_R; dx <= BOX_R; ++dx) {
-                        sum += rgb[(static_cast<size_t>(y) * FRAME_W + std::clamp(x + dx, 0, FRAME_W - 1)) * 3 + c];
-                    }
-                    rows[(static_cast<size_t>(y) * FRAME_W + x) * 3 + c] = sum;
+// One separable pass (rows, then columns) of the 1D weights wts (centered) over a w x h image of 3 channels, in double.
+// clamp: replicating the image edge, the output is w x h; otherwise only where the window is inside the image, the
+// output is (w - n + 1) x (h - n + 1)
+inline std::vector<double> separablePass(const std::vector<double>& in, const int w, const int h,
+                                         const std::vector<double>& wts, const bool clamp, int& ow, int& oh) {
+    const int n = static_cast<int>(wts.size());
+    const int r = n / 2;
+    ow = clamp ? w : w - n + 1;
+    oh = clamp ? h : h - n + 1;
+    std::vector<double> rows(static_cast<size_t>(ow) * h * 3);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < ow; ++x) {
+            for (int c = 0; c < 3; ++c) {
+                double sum = 0.0;
+                for (int i = 0; i < n; ++i) {
+                    const int sx = clamp ? std::clamp(x + i - r, 0, w - 1) : x + i;
+                    sum += wts[i] * in[(static_cast<size_t>(y) * w + sx) * 3 + c];
                 }
-            }
-        }
-        boxed.resize(rows.size());
-        for (int y = 0; y < FRAME_H; ++y) {
-            for (int x = 0; x < FRAME_W; ++x) {
-                for (int c = 0; c < 3; ++c) {
-                    double sum = 0.0;
-                    for (int dy = -BOX_R; dy <= BOX_R; ++dy) {
-                        sum += rows[(static_cast<size_t>(std::clamp(y + dy, 0, FRAME_H - 1)) * FRAME_W + x) * 3 + c];
-                    }
-                    boxed[(static_cast<size_t>(y) * FRAME_W + x) * 3 + c] = sum / (BOX_K * BOX_K);
-                }
+                rows[(static_cast<size_t>(y) * ow + x) * 3 + c] = sum;
             }
         }
     }
-    return boxed;
+    std::vector<double> out(static_cast<size_t>(ow) * oh * 3);
+    for (int y = 0; y < oh; ++y) {
+        for (int x = 0; x < ow; ++x) {
+            for (int c = 0; c < 3; ++c) {
+                double sum = 0.0;
+                for (int i = 0; i < n; ++i) {
+                    const int sy = clamp ? std::clamp(y + i - r, 0, h - 1) : y + i;
+                    sum += wts[i] * rows[(static_cast<size_t>(sy) * ow + x) * 3 + c];
+                }
+                out[(static_cast<size_t>(y) * ow + x) * 3 + c] = sum;
+            }
+        }
+    }
+    return out;
+}
+
+// W2: the filtered frame (double), computed once per semantics.
+// - FKL (both forms): every pass replicates the edge of the image it reads (BoxBVF clamps to the image before it;
+//   MorphologyDPP replicates the border of every pass; LinearFilterDPP replicates the frame edge).
+// - NPPDx: the ingest replicates the frame edge into the halo, and every step filters the whole tile with its halo, so
+//   a second pass reads the first pass's values beyond the frame instead of replicating its edge: the passes run on the
+//   frame extended by the total halo, keeping only the values whose window is inside it.
+// With one pass the two are the same.
+template <typename Spec>
+const std::vector<double>& filteredFrame(const Context& ctx, const bool nppdxSemantics) {
+    static std::map<bool, std::vector<double>> cache;
+    if (cache.count(nppdxSemantics)) {
+        return cache.at(nppdxSemantics);
+    }
+    const auto& rgb = frameRgb(ctx);
+    std::vector<double> wts;
+    if constexpr (Spec::GAUSSIAN) {
+        wts = Spec::taps();
+    } else {
+        wts.assign(Spec::K, 1.0 / Spec::K);
+    }
+    std::vector<double> image;
+    int w = FRAME_W, h = FRAME_H;
+    if (nppdxSemantics) {
+        const int pad = Spec::HALO;
+        w = FRAME_W + 2 * pad;
+        h = FRAME_H + 2 * pad;
+        image.resize(static_cast<size_t>(w) * h * 3);
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                const int sx = std::clamp(x - pad, 0, FRAME_W - 1);
+                const int sy = std::clamp(y - pad, 0, FRAME_H - 1);
+                for (int c = 0; c < 3; ++c) {
+                    image[(static_cast<size_t>(y) * w + x) * 3 + c] = rgb[(static_cast<size_t>(sy) * FRAME_W + sx) * 3 + c];
+                }
+            }
+        }
+    } else {
+        image.assign(rgb.begin(), rgb.end());
+    }
+    for (int pass = 0; pass < Spec::PASSES; ++pass) {
+        int ow = 0, oh = 0;
+        image = separablePass(image, w, h, wts, !nppdxSemantics, ow, oh);
+        w = ow;
+        h = oh;
+    }
+    if (w != FRAME_W || h != FRAME_H) {
+        throw std::runtime_error("The filtered frame has the wrong size");
+    }
+    cache[nppdxSemantics] = std::move(image);
+    return cache.at(nppdxSemantics);
 }
 
 // W2: the output plane with FKL's or NPPDx's semantics (the same in every iteration: no regions)
-inline std::vector<float> frameReference(const Context& ctx, const Reference r) {
+template <typename Spec>
+std::vector<float> frameReference(const Context& ctx, const Reference r) {
     if (r != Reference::FklFloat && r != Reference::NppdxPixelCenterFloat) {
         throw std::runtime_error("nppdx-wins has float references only");
     }
@@ -231,10 +291,10 @@ inline std::vector<float> frameReference(const Context& ctx, const Reference r) 
     if (cache.count(r)) {
         return cache.at(r);
     }
-    const auto& boxed = boxedFrame(ctx);
+    const auto& filtered = filteredFrame<Spec>(ctx, r == Reference::NppdxPixelCenterFloat);
     const auto g = [&](const int x, const int y, const int c) {
-        return boxed[(static_cast<size_t>(std::clamp(y, 0, FRAME_H - 1)) * FRAME_W + std::clamp(x, 0, FRAME_W - 1)) *
-                         3 + c];
+        return filtered[(static_cast<size_t>(std::clamp(y, 0, FRAME_H - 1)) * FRAME_W + std::clamp(x, 0, FRAME_W - 1)) *
+                            3 + c];
     };
     std::vector<float> out(W2_FLOATS);
     const float fx = fklFactor(FRAME_W, W2_OUT_W);
@@ -390,17 +450,54 @@ using NppdxBlock = std::conditional_t<BlockX == 0, decltype(nppdx::Block()),
     nppdx::TileSize<TX, TY>() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, MH)() +                                             \
         NPPDX_MAKE_HALO(nppdx::CumulativeHalo, CH)() + nppdx::SM<NPPDX_SM>() + NppdxBlock<BX>()
 
-// The NPPDx operations of one TX x TY tile: NV12 ingest with the halo of the box and the resize, the conversion,
-// BoxBlur<5, 5>, Resize<J, K, bilinear> (as fused_resize.cu and fkl-vs-nppdx/benchmarks/nppdx_common.h)
-template <unsigned TX_, unsigned TY_, unsigned BlockX, unsigned J, unsigned K>
-struct BoxResizeOps {
+// The filter before the resize, for NPPDx and the references: a K x K box in PASSES passes (the second NPPDx BoxBlur
+// step reads the first one's output with the halo that is left), or NPPDx's GaussianBlur<RT, TAIL> (separable FIR)
+template <int K_, int PASSES_>
+struct BoxSpec {
+    static constexpr bool GAUSSIAN = false;
+    static constexpr int K = K_;
+    static constexpr int PASSES = PASSES_;
+    static constexpr int STEP_HALO = K_ / 2;
+    static constexpr int HALO = STEP_HALO * PASSES_;
+    using Operator = nppdx::BoxBlur<K_, K_>;
+    static constexpr nppdx::function FUNCTION = nppdx::function::box_blur;
+};
+template <int RT, nppdx::gaussian_tail_width TAIL>
+struct GaussianSpec {
+    static constexpr bool GAUSSIAN = true;
+    // NPPDx's bands (operators/function.hpp, tap_configs): the standard tap count and the first RadiusTenths of the band
+    // of RT, written out here: calling NPPDx's get_tap_config in this program made nvcc emit its device version, which
+    // reads a host-only table
+    static constexpr int BAND_TAPS = RT <= 9 ? 3 : RT <= 20 ? 5 : 7 + 2 * ((RT - 21) / 10);
+    static constexpr int BAND_MIN = RT <= 9 ? 1 : RT <= 20 ? 10 : 21 + 10 * ((RT - 21) / 10);
+    static constexpr int K = TAIL == nppdx::gaussian_tail_width::wide ? 2 * BAND_TAPS - 1 : BAND_TAPS;
+    static constexpr int ROW = RT - BAND_MIN;
+    static constexpr int PASSES = 1;
+    static constexpr int STEP_HALO = K / 2;
+    static constexpr int HALO = STEP_HALO;
+    using Operator = nppdx::GaussianBlur<RT, TAIL>;
+    static constexpr nppdx::function FUNCTION = nppdx::function::gaussian_blur;
+    // NPPDx's taps (detail/backend/gaussian_blur_coeff_tables.hpp), for FKL's coefficients and the references
+    static std::vector<double> taps() {
+        const auto& row = nppdx::detail::backend::gaussian_blur::gaussian_fir_1d_weights<K, TAIL>[ROW];
+        return std::vector<double>(row.begin(), row.end());
+    }
+};
+
+// The NPPDx operations of one TX x TY tile: NV12 ingest with the halo of the filter and the resize, the conversion,
+// the filter, Resize<J, K, bilinear> (as fused_resize.cu and fkl-vs-nppdx/benchmarks/nppdx_common.h)
+template <unsigned TX_, unsigned TY_, unsigned BlockX, unsigned J, unsigned K, typename Spec>
+struct FilterResizeOps {
     static constexpr unsigned TX = TX_;
     static constexpr unsigned TY = TY_;
     using ResizePre = decltype(nppdx::Function<nppdx::function::resize>() +
                                nppdx::Resize<J, K, nppdx::interpolation_method::bilinear>() +
                                nppdx::TileSize<TX, TY>() + nppdx::SM<NPPDX_SM>() + NppdxBlock<BlockX>());
     static constexpr nppdx::Halo4 resizeHalo = ResizePre::local_halo;
-    static constexpr nppdx::Halo4 total = nppdx::Halo4::make_uniform(BOX_R) + resizeHalo;
+    static constexpr nppdx::Halo4 total = nppdx::Halo4::make_uniform(Spec::HALO) + resizeHalo;
+    // The halo left in the input of the second pass (with one pass, Blur2 is Blur and is not run)
+    static constexpr nppdx::Halo4 second =
+        Spec::PASSES == 2 ? nppdx::Halo4::make_uniform(Spec::HALO - Spec::STEP_HALO) + resizeHalo : total;
     using Ingest = decltype(nppdx::InputOutput<nppdx::input_output_direction::ingest>() +
                             nppdx::InputFormat<nppdx::packing_format::nv12>() +
                             WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
@@ -414,8 +511,10 @@ struct BoxResizeOps {
                              nppdx::ColorConvert<nppdx::color_space::yuv_bt601, nppdx::color_space::rgb,
                                                  nppdx::bit_depth::bpp_8u, nppdx::bit_depth::bpp_8u>() +
                              WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
-    using Blur = decltype(nppdx::Function<nppdx::function::box_blur>() + nppdx::BoxBlur<BOX_K, BOX_K>() +
+    using Blur = decltype(nppdx::Function<Spec::FUNCTION>() + typename Spec::Operator() +
                           WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
+    using Blur2 = decltype(nppdx::Function<Spec::FUNCTION>() + typename Spec::Operator() +
+                           WINS_NPPDX_LAYOUT(TX, TY, total, second, BlockX));
     using Resize = decltype(ResizePre() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, total)() +
                             NPPDX_MAKE_HALO(nppdx::CumulativeHalo, resizeHalo)());
     using InTile = nppdx::input_storage_of_t<Ingest>;
@@ -427,7 +526,7 @@ struct BoxResizeOps {
     static constexpr size_t smem = nppdx::shared_memory::compute_total_tile_storage<InTile, BlurTile, TmpTile, OutTile>();
     static constexpr unsigned block = std::max({Ingest::block_dim.x, FromLimitedY::block_dim.x,
                                                 FromLimitedUV::block_dim.x, Convert::block_dim.x, Blur::block_dim.x,
-                                                Resize::block_dim.x});
+                                                Blur2::block_dim.x, Resize::block_dim.x});
 
     template <typename Image, typename Tiles>
     __device__ static void run(const Image& image, Tiles& tiles, const int w, const int h) {
@@ -437,10 +536,21 @@ struct BoxResizeOps {
         FromLimitedUV().execute(in, w, h);
         Convert().execute(in, w, h);
         Blur().execute(in, std::get<1>(tiles), w, h);
-        Resize().execute(std::get<1>(tiles), std::get<2>(tiles), std::get<3>(tiles), w, h);
+        if constexpr (Spec::PASSES == 2) {
+            // The second pass writes into the input tile, which is no longer needed
+            Blur2().execute(std::get<1>(tiles), in, w, h);
+            Resize().execute(in, std::get<2>(tiles), std::get<3>(tiles), w, h);
+        } else {
+            Resize().execute(std::get<1>(tiles), std::get<2>(tiles), std::get<3>(tiles), w, h);
+        }
         __syncthreads();
     }
 };
+static_assert(BoxSpec<5, 2>::HALO == 4 && BoxSpec<9, 1>::HALO == 4, "Box halos");
+
+// W1's operations: the 5x5 box, one pass
+template <unsigned TX, unsigned TY, unsigned BlockX, unsigned J, unsigned K>
+using BoxResizeOps = FilterResizeOps<TX, TY, BlockX, J, K, BoxSpec<BOX_K, 1>>;
 
 template <typename Ops>
 __device__ auto sliceTiles() {
@@ -541,7 +651,7 @@ struct DppTile {
 };
 constexpr std::array<DppTile, 3> DPP_TILES{{{16, 8}, {32, 8}, {32, 16}}};
 inline std::string dppLabel(const size_t i) {
-    return "MorphologyDPP tile " + std::to_string(DPP_TILES[i].width) + "x" + std::to_string(DPP_TILES[i].height);
+    return "DPP tile " + std::to_string(DPP_TILES[i].width) + "x" + std::to_string(DPP_TILES[i].height);
 }
 
 template <size_t N>
