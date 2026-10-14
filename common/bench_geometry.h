@@ -36,6 +36,7 @@
 #include <fstream>
 #include <random>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -156,26 +157,41 @@ struct Region {
 // construction from REGION_SEED: for every iteration in order and every region in order, an even x and an even y
 // drawn uniformly so that a MAX_REGION_W x MAX_REGION_H box at (x, y) is at least REGION_MARGIN pixels from the frame
 // edges, and the size regionSize(t, i). The regions of iteration t are the same whatever the number of iterations.
+// With a fixed size (the crops of the neighborhood experiment, common/bench_neighborhood.h), every region has that
+// size, and the positions are drawn the same way for a box of that size.
 class RegionSets {
 public:
-    explicit RegionSets(size_t iterations) : m_iterations(iterations), m_regions(iterations * MAX_BATCH) {
+    explicit RegionSets(size_t iterations) : RegionSets(iterations, RegionSize{MAX_REGION_W, MAX_REGION_H}, false) {}
+    RegionSets(size_t iterations, RegionSize fixedSize) : RegionSets(iterations, fixedSize, true) {}
+    size_t iterations() const { return m_iterations; }
+    // Region i of iteration t
+    const Region& at(size_t t, size_t i) const { return m_regions.at(t * MAX_BATCH + i); }
+    // Whether every region has the size fixedSize() (the second constructor)
+    bool fixed() const { return m_fixed; }
+    RegionSize fixedSize() const { return m_box; }
+
+private:
+    RegionSets(size_t iterations, RegionSize box, bool fixed)
+        : m_iterations(iterations), m_regions(iterations * MAX_BATCH), m_box(box), m_fixed(fixed) {
+        if (box.width <= 0 || box.height <= 0 || box.width % 2 || box.height % 2 ||
+            box.width + 2 * REGION_MARGIN > FRAME_W || box.height + 2 * REGION_MARGIN > FRAME_H) {
+            throw std::invalid_argument("Regions are even sized and fit in the frame with their margins");
+        }
         std::mt19937 gen(REGION_SEED);
         for (size_t t = 0; t < iterations; ++t) {
             for (size_t i = 0; i < MAX_BATCH; ++i) {
-                const int x = 2 * uniformInt(gen, REGION_MARGIN / 2, (FRAME_W - MAX_REGION_W - REGION_MARGIN) / 2);
-                const int y = 2 * uniformInt(gen, REGION_MARGIN / 2, (FRAME_H - MAX_REGION_H - REGION_MARGIN) / 2);
-                const RegionSize s = regionSize(t, i);
+                const int x = 2 * uniformInt(gen, REGION_MARGIN / 2, (FRAME_W - box.width - REGION_MARGIN) / 2);
+                const int y = 2 * uniformInt(gen, REGION_MARGIN / 2, (FRAME_H - box.height - REGION_MARGIN) / 2);
+                const RegionSize s = fixed ? box : regionSize(t, i);
                 m_regions[t * MAX_BATCH + i] = Region{x, y, s.width, s.height};
             }
         }
     }
-    size_t iterations() const { return m_iterations; }
-    // Region i of iteration t
-    const Region& at(size_t t, size_t i) const { return m_regions.at(t * MAX_BATCH + i); }
 
-private:
     size_t m_iterations;
     std::vector<Region> m_regions;
+    RegionSize m_box;
+    bool m_fixed;
 };
 
 // The batch sizes, separated by sep (by spaces: what the --batches mode of the GPU benchmarks prints for the scripts)
@@ -196,12 +212,13 @@ inline std::string regionSizeList() {
     return os.str();
 }
 
-// The workload, for the platform files of every benchmark
-inline std::string describe() {
+// The workload, for the platform files of every benchmark. Without letterbox (the neighborhood experiment), the
+// resized regions are the output, with no rows added; batches is the list of batch sizes (default BATCHES).
+inline std::string describe(const bool letterbox = true, const std::string& batches = batchList(", ")) {
     std::ostringstream os;
     os << FRAME_W << "x" << FRAME_H << " NV12 frame (uniform random limited-range values, Y in [" << LUMA_MIN << ", "
        << LUMA_MAX << "], U and V in [" << CHROMA_MIN << ", " << CHROMA_MAX << "], seed " << FRAME_SEED
-       << "), NV12->RGB BT.601 limited range, N in {" << batchList(", ") << "} regions per iteration, new every "
+       << "), NV12->RGB BT.601 limited range, N in {" << batches << "} regions per iteration, new every "
        << "iteration (warm-up and timed) and precomputed before the loop (seed " << REGION_SEED
        << ", batch N uses the first N of every iteration): ";
     if (MIXED_SIZES) {
@@ -212,9 +229,14 @@ inline std::string describe() {
     }
     os << ", at uniform random even positions at least " << REGION_MARGIN << " pixels from the frame edges (drawn for a "
        << MAX_REGION_W << "x" << MAX_REGION_H << " box, the same positions for every size), bilinear resize to " << RES_W
-       << "x" << RES_H << " (aspect ratio ignored), " << BORDER_TOP << " black rows added on top and " << BORDER_BOTTOM
-       << " at the bottom, output " << OUT_W << "x" << OUT_H << " per region (CMake option BENCH_REGIONS="
-       << (MIXED_SIZES ? std::string("mixed") : regionSizeList()) << ")";
+       << "x" << RES_H << " (aspect ratio ignored), ";
+    if (letterbox) {
+        os << BORDER_TOP << " black rows added on top and " << BORDER_BOTTOM << " at the bottom, output " << OUT_W << "x"
+           << OUT_H;
+    } else {
+        os << "no rows added, output " << RES_W << "x" << RES_H;
+    }
+    os << " per region (CMake option BENCH_REGIONS=" << (MIXED_SIZES ? std::string("mixed") : regionSizeList()) << ")";
     return os.str();
 }
 
@@ -255,12 +277,22 @@ inline void writeRegionStats(const std::string& path, const RegionSets& sets, si
     for (const RegionSize s : PAPER_REGION_SIZES) {
         csv << ",regions_" << s.width << "x" << s.height;
     }
+    // Fixed-size regions of another size (the neighborhood experiment's crops) get a column of their own
+    const RegionSize fixedSize = sets.fixedSize();
+    const bool otherSize = sets.fixed() && std::none_of(PAPER_REGION_SIZES.begin(), PAPER_REGION_SIZES.end(),
+        [&](const RegionSize s) { return s.width == fixedSize.width && s.height == fixedSize.height; });
+    if (otherSize) {
+        csv << ",regions_" << fixedSize.width << "x" << fixedSize.height;
+    }
     csv << ",mean_region_area_px,mean_iteration_area_px,min_iteration_area_px,max_iteration_area_px\n";
     for (const size_t n : BATCHES) {
         const RegionStats s = regionStats(sets, n, first, count);
         csv << n << "," << count << "," << first;
         for (const size_t c : s.perSize) {
             csv << "," << c;
+        }
+        if (otherSize) {
+            csv << "," << n * count;
         }
         csv << "," << s.meanRegionArea << "," << s.meanIterationArea << "," << s.minIterationArea << ","
             << s.maxIterationArea << "\n";

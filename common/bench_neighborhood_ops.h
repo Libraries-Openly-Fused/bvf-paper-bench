@@ -12,52 +12,46 @@
    See the License for the specific language governing permissions and
    limitations under the License. */
 
-// The morphology of the neighborhood experiment (bench_neighborhood.h) written as plain Backwards Vertical Fusion
-// operations: ErodeBVF<K> and DilateBVF<K> are ReadBack operations, like Crop and Resize. Each output value reads the
-// K x K window of the operation before it, so the whole chain before it runs K x K times per output value: an opening
-// (DilateBVF after ErodeBVF) runs it K^4 times, and a bilinear Resize before them reads four values of its own source
-// for each of those. This is the case that FKL's MorphologyDPP avoids by staging the values in shared memory.
+// The box blur of the neighborhood experiment (bench_neighborhood.h) written as a plain Backwards Vertical Fusion
+// operation: BoxBVF<K> is a ReadBack operation, like Crop and Resize. Each output value reads the K x K window of the
+// operation before it, so the whole chain before it runs K x K times per output value: two passes (BoxBVF after
+// BoxBVF) run it K^4 times. This is the case that FKL's MorphologyDPP avoids by staging the values in shared memory.
 //
 //   executeOperations<TransformDPP<>>(stream, ReadYUV<...>::build(frame), YUVToRGB::build(), Crop<>::build(regions),
-//                                     Resize<...>::build(Size(PLANE_W, PLANE_H)), ErodeBVF<5>::build(),
-//                                     DilateBVF<5>::build(), Mul..., Sub..., Div..., TensorWrite...);
+//                                     BoxBVF<5>::build(), Mul..., Sub..., Div..., TensorWrite...);
 //
 // The window is centered on the output value, and its coordinates are clamped to the size of the operation before
-// (NumElems): every operation replicates the border of the image it reads, so DilateBVF after ErodeBVF replicates the
-// border of the eroded image, as MorphologyDPP does in every pass. The minimum and the maximum are per channel for
+// (NumElems): it replicates the edge of the image it reads (the crop), so a second BoxBVF replicates the edge of the
+// blurred crop, as MorphologyDPP does in every pass. The value is the sum of the window times 1 / K^2, per channel for
 // vector types. With a batched read (Crop of an array of regions), z selects the region, as in every BVF chain.
 
 #ifndef BVF_BENCH_NEIGHBORHOOD_OPS_H
 #define BVF_BENCH_NEIGHBORHOOD_OPS_H
 
-#include <fused_kernel/core/constexpr_libs/constexpr_cmath.h>
 #include <fused_kernel/core/data/point.h>
 #include <fused_kernel/core/execution_model/operation_model/operation_model.h>
 
 // Inside namespace fk, as FKL's own operations: the DECLARE_*_PARENT macros use FKL's names unqualified
 namespace fk {
 
-enum class MorphReduction { Min, Max };
+// No runtime parameters: the box size is the template parameter K and the anchor is its center
+struct BoxBVFParams {};
 
-// No runtime parameters: the mask size is the template parameter K and the anchor is its center
-struct MorphBVFParams {};
-
-template <int K, MorphReduction R, typename BackIOp_ = NullType>
-struct MorphBVF {
-    static_assert(K > 0 && K % 2 == 1, "MorphBVF needs an odd mask size, centered on the output value");
+template <int K, typename BackIOp_ = NullType>
+struct BoxBVF {
+    static_assert(K > 0 && K % 2 == 1, "BoxBVF needs an odd box size, centered on the output value");
     static_assert(isAnyCompleteReadType<BackIOp_>, "The BackIOp_ must be a complete Read type");
 
 private:
-    using SelfType = MorphBVF<K, R, BackIOp_>;
-
+    using SelfType = BoxBVF<K, BackIOp_>;
     FK_HOST_DEVICE_FUSE int clamp(const int value, const int high) {
         return value < 0 ? 0 : (value > high ? high : value);
     }
 
 public:
-    FK_STATIC_STRUCT(MorphBVF, SelfType)
-    using Parent = ReadBackOperation<typename BackIOp_::Operation::OutputType, MorphBVFParams, BackIOp_,
-                                     typename BackIOp_::Operation::OutputType, MorphBVF<K, R, BackIOp_>>;
+    FK_STATIC_STRUCT(BoxBVF, SelfType)
+    using Parent = ReadBackOperation<typename BackIOp_::Operation::OutputType, BoxBVFParams, BackIOp_,
+                                     typename BackIOp_::Operation::OutputType, BoxBVF<K, BackIOp_>>;
     DECLARE_READBACK_PARENT
 
     FK_HOST_DEVICE_FUSE OutputType exec(const Point thread, const ParamsType& params, const BackIOp& backIOp) {
@@ -65,7 +59,7 @@ public:
         const int lastX = static_cast<int>(NumElems::x(thread, backIOp)) - 1;
         const int lastY = static_cast<int>(NumElems::y(thread, backIOp)) - 1;
         constexpr int ANCHOR = K / 2;
-        OutputType value = BackIOp::Operation::exec(
+        OutputType sum = BackIOp::Operation::exec(
             Point{clamp(thread.x - ANCHOR, lastX), clamp(thread.y - ANCHOR, lastY), thread.z}, backIOp);
         for (int ky = 0; ky < K; ++ky) {
             const int y = clamp(thread.y + ky - ANCHOR, lastY);
@@ -73,16 +67,10 @@ public:
                 if (kx == 0 && ky == 0) {
                     continue;
                 }
-                const OutputType sample =
-                    BackIOp::Operation::exec(Point{clamp(thread.x + kx - ANCHOR, lastX), y, thread.z}, backIOp);
-                if constexpr (R == MorphReduction::Min) {
-                    value = cxp::min::f(value, sample);
-                } else {
-                    value = cxp::max::f(value, sample);
-                }
+                sum = sum + BackIOp::Operation::exec(Point{clamp(thread.x + kx - ANCHOR, lastX), y, thread.z}, backIOp);
             }
         }
-        return value;
+        return sum * (1.f / static_cast<float>(K * K));
     }
 
     // The size of the operation before: the window moves over it, it does not crop it
@@ -103,29 +91,23 @@ public:
 
 // The version users build, with no operation before it yet: fusion (then(), executeOperations) gives it the
 // operation before, as with Crop<> and Resize<>
-template <int K, MorphReduction R>
-struct MorphBVF<K, R, NullType> {
+template <int K>
+struct BoxBVF<K, NullType> {
 private:
-    using SelfType = MorphBVF<K, R, NullType>;
+    using SelfType = BoxBVF<K, NullType>;
 
 public:
-    FK_STATIC_STRUCT(MorphBVF, SelfType)
-    using Parent = IncompleteReadBackOperation<NullType, MorphBVFParams, NullType, NullType, MorphBVF<K, R, NullType>>;
+    FK_STATIC_STRUCT(BoxBVF, SelfType)
+    using Parent = IncompleteReadBackOperation<NullType, BoxBVFParams, NullType, NullType, BoxBVF<K, NullType>>;
     DECLARE_INCOMPLETEREADBACK_PARENT
 
-    FK_HOST_FUSE auto build() { return InstantiableType{{MorphBVFParams{}, NullType{}}}; }
+    FK_HOST_FUSE auto build() { return InstantiableType{{BoxBVFParams{}, NullType{}}}; }
 
     template <typename BackIOp>
     FK_HOST_FUSE auto build(const BackIOp& backIOp, const InstantiableType& iOp) {
-        return MorphBVF<K, R, BackIOp>::build(iOp.params, backIOp);
+        return BoxBVF<K, BackIOp>::build(iOp.params, backIOp);
     }
 };
-
-// Erosion and dilation with a K x K mask anchored at its center
-template <int K>
-using ErodeBVF = MorphBVF<K, MorphReduction::Min>;
-template <int K>
-using DilateBVF = MorphBVF<K, MorphReduction::Max>;
 
 } // namespace fk
 

@@ -32,6 +32,15 @@
 //   describe(os, outDir)                  library versions and pipelines, for the platform file
 //   diagnostic(ctx)                       anything worth recording about the libraries (or an empty string)
 //   extraMode(ctx, mode, outDir)          handles a mode of its own (true) or not (false)
+// and, for a pipeline other than Figure 1 (fkl-neighborhood/), optionally (without them, the defaults are Figure 1's):
+//   fklImplementation<N>(ctx)             the FKL implementation the baselines are compared with (FKL BVF)
+//   fklName, fklLabel, fklShortLabel      its name in the files ("fkl_bvf") and in the text ("FKL BVF", "BVF")
+//   reference<N>(ctx, r, t)               the reference of conventions r on the regions of iteration t
+//   workload(os)                          the pipeline and its output, for the platform file
+//   batches                               the batch sizes to run, a subset of BATCHES in the same order
+//   setup(outDir, mode)                   called before any run, with the mode argument (empty for the main run)
+//   regionSize                            every region of this size (RegionSets' fixed-size constructor) instead of
+//                                         the sizes of BENCH_REGIONS
 
 #ifndef BVF_BENCH_GPU_H
 #define BVF_BENCH_GPU_H
@@ -132,7 +141,8 @@ struct Context {
     std::unique_ptr<RegionSets> regions;
 };
 
-inline void initContext(Context& ctx) {
+// regions: the regions of every iteration (regionSetsOf<P>), or nullptr for those of common/bench_geometry.h
+inline void initContext(Context& ctx, std::unique_ptr<RegionSets> regions = nullptr) {
     gpuErrchk(cudaStreamCreateWithFlags(&ctx.stream, cudaStreamNonBlocking));
     ctx.fkStream = std::make_unique<fk::Stream>(ctx.stream);
     ctx.npp = npp::streamContext(ctx.stream);
@@ -159,7 +169,7 @@ inline void initContext(Context& ctx) {
     ctx.uv = raw.data + static_cast<size_t>(FRAME_H) * ctx.pitch;
 
     // The regions of every iteration, generated before any loop; batch N uses the first N of every iteration
-    ctx.regions = std::make_unique<RegionSets>(REGION_ITERATIONS);
+    ctx.regions = regions ? std::move(regions) : std::make_unique<RegionSets>(REGION_ITERATIONS);
 }
 
 // L2 flush before every kernel, for the GPU only benchmark with a flushed L2: simulates a GPU that runs other kernels
@@ -203,13 +213,18 @@ inline void nv12ToRgb8(const Context& ctx, Npp8u* dst, int dstStep) {
 
 // The reference an implementation is checked against, with its tolerance: the Figure 1 chain on FKL's CPU backend in
 // float (FKL BVF); the same with the RGB rounded to 8 bits, for the pipelines with an 8 bit RGB frame (OpenCV, FKL
-// VF+HF), which resize at dst * scale like FKL; or that with NPP's resize sampling (NPP, nppConventionReference8bit)
-enum class Reference { FklFloat, Fkl8bit, NppSampling8bit };
+// VF+HF), which resize at dst * scale like FKL; or that with NPP's resize sampling (NPP, nppConventionReference8bit).
+// Fkl8bitFloorBox (the 8 bit RGB and a box filter that rounds down, NPP's 8 bit one) and FklFloatRounded (the float
+// chain with the filtered RGB rounded half up to 8 bits, NPPDx's 8 bit write) are only for programs with their own
+// reference() (fkl-neighborhood/).
+enum class Reference { FklFloat, Fkl8bit, NppSampling8bit, Fkl8bitFloorBox, FklFloatRounded };
 
 inline const char* referenceName(Reference r) {
     switch (r) {
         case Reference::FklFloat: return "fkl_cpu_float";
         case Reference::Fkl8bit: return "fkl_cpu_8bit_rgb";
+        case Reference::Fkl8bitFloorBox: return "fkl_cpu_8bit_rgb_floor_box";
+        case Reference::FklFloatRounded: return "fkl_cpu_float_rounded_8bit";
         default: return "npp_sampling_8bit";
     }
 }
@@ -296,22 +311,38 @@ inline Stage runStages(const std::vector<std::pair<std::string, Stage>>& stages)
 
 // References on FKL's CPU backend, for the regions of iteration t. The float reference is the Figure 1 chain itself. The
 // 8 bit reference quantizes the RGB values to 8 bit right after the color conversion, like the 8 bit RGB frame
-// pipelines do.
-template <size_t N, bool EIGHT_BIT>
+// pipelines do. Without LETTERBOX, the chain has no AddBorder and the output planes are RES_W x RES_H.
+template <size_t N, bool EIGHT_BIT, bool LETTERBOX = true>
 std::vector<float> cpuReference(const Context& ctx, size_t t) {
     const auto crops = fklRects<N>(ctx, t);
+    constexpr int outW = LETTERBOX ? OUT_W : RES_W;
+    constexpr int outH = LETTERBOX ? OUT_H : RES_H;
+    constexpr size_t outFloats = static_cast<size_t>(outW) * outH * 3;
     fk::Stream_<fk::ParArch::CPU> cpuStream;
-    fk::Tensor<fk::float3> out(OUT_W, OUT_H, N, 1, fk::MemType::Host);
+    fk::Tensor<fk::float3> out(outW, outH, N, 1, fk::MemType::Host);
     const auto tail = [&](const auto& rgbRead) {
-        fk::executeOperations<fk::TransformDPP<fk::ParArch::CPU>>(cpuStream,
-            rgbRead,
-            fk::Crop<>::build(crops),
-            fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(RES_W, RES_H)),
-            fk::AddBorder<>::build(BORDER_TOP, BORDER_BOTTOM, 0, 0, black),
-            fk::Mul<fk::float3>::build(mulValue),
-            fk::Sub<fk::float3>::build(subValue),
-            fk::Div<fk::float3>::build(divValue),
-            fk::TensorWrite<fk::float3>::build(out.ptr()));
+        const auto resize =
+            fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(RES_W, RES_H));
+        if constexpr (LETTERBOX) {
+            fk::executeOperations<fk::TransformDPP<fk::ParArch::CPU>>(cpuStream,
+                rgbRead,
+                fk::Crop<>::build(crops),
+                resize,
+                fk::AddBorder<>::build(BORDER_TOP, BORDER_BOTTOM, 0, 0, black),
+                fk::Mul<fk::float3>::build(mulValue),
+                fk::Sub<fk::float3>::build(subValue),
+                fk::Div<fk::float3>::build(divValue),
+                fk::TensorWrite<fk::float3>::build(out.ptr()));
+        } else {
+            fk::executeOperations<fk::TransformDPP<fk::ParArch::CPU>>(cpuStream,
+                rgbRead,
+                fk::Crop<>::build(crops),
+                resize,
+                fk::Mul<fk::float3>::build(mulValue),
+                fk::Sub<fk::float3>::build(subValue),
+                fk::Div<fk::float3>::build(divValue),
+                fk::TensorWrite<fk::float3>::build(out.ptr()));
+        }
     };
     const auto rgbRead = fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameHost).then(YUVToRGB::build());
     if constexpr (EIGHT_BIT) {
@@ -324,7 +355,7 @@ std::vector<float> cpuReference(const Context& ctx, size_t t) {
     }
     cpuStream.sync();
     const float* data = reinterpret_cast<const float*>(out.ptr().data);
-    return std::vector<float>(data, data + N * OUT_FLOATS);
+    return std::vector<float>(data, data + N * outFloats);
 }
 
 // Plain C++ reference with NPP's bilinear sampling convention. FKL and OpenCV CUDA sample at src = dst * scale.
@@ -333,13 +364,14 @@ std::vector<float> cpuReference(const Context& ctx, size_t t) {
 // (dst + 0.5) * scale - 0.5, only for an exact 2x upscale (scale 0.5); at 3.2x pixel centers would be
 // dst * scale - 0.34375. Same 8 bit RGB, border and pointwise tail as the 8 bit reference, for the regions of
 // iteration t, each with its own size and scale. Only measured for upscales, which every region size of
-// common/bench_geometry.h is.
+// common/bench_geometry.h is. Without LETTERBOX, the output planes are RES_W x RES_H, without the border rows.
 constexpr float NPP_SAMPLE_OFFSET = -0.25f;
 
-template <size_t N>
+template <size_t N, bool LETTERBOX = true>
 std::vector<float> nppConventionReference8bit(const Context& ctx, size_t t) {
-    const int outW = OUT_W, outH = OUT_H;
-    std::vector<float> out(N * OUT_FLOATS);
+    const int outW = LETTERBOX ? OUT_W : RES_W, outH = LETTERBOX ? OUT_H : RES_H;
+    const int borderTop = LETTERBOX ? BORDER_TOP : 0;
+    std::vector<float> out(N * static_cast<size_t>(outW) * outH * 3);
     for (size_t i = 0; i < N; ++i) {
         const Region& r = ctx.regions->at(t, i);
         const int w = r.width, h = r.height;
@@ -362,7 +394,7 @@ std::vector<float> nppConventionReference8bit(const Context& ctx, size_t t) {
         for (int y = 0; y < outH; ++y) {
             for (int x = 0; x < outW; ++x) {
                 float* dst = &out[((i * outH + y) * outW + x) * 3];
-                const int ry = y - BORDER_TOP;
+                const int ry = y - borderTop;
                 float value[3] = {0.f, 0.f, 0.f};
                 if (ry >= 0 && ry < RES_H) {
                     const float sx = std::min(static_cast<float>(w - 1), std::max(0.f, x * scaleX + NPP_SAMPLE_OFFSET));
@@ -390,7 +422,67 @@ std::vector<float> referenceOutput(const Context& ctx, Reference r, size_t t) {
     switch (r) {
         case Reference::FklFloat: return cpuReference<N, false>(ctx, t);
         case Reference::Fkl8bit: return cpuReference<N, true>(ctx, t);
+        case Reference::Fkl8bitFloorBox:
+        case Reference::FklFloatRounded:
+            throw std::runtime_error("This reference is only computed by programs with their own reference()");
         default: return nppConventionReference8bit<N>(ctx, t);
+    }
+}
+
+// The optional members of a Program (see the top of this file), or the Figure 1 defaults
+template <typename P, size_t N>
+std::vector<float> referenceOf(const Context& ctx, Reference r, size_t t) {
+    if constexpr (requires { P::template reference<N>(ctx, r, t); }) {
+        return P::template reference<N>(ctx, r, t);
+    } else {
+        return referenceOutput<N>(ctx, r, t);
+    }
+}
+
+template <typename P>
+constexpr const char* fklNameOf() {
+    if constexpr (requires { P::fklName; }) {
+        return P::fklName;
+    } else {
+        return "fkl_bvf";
+    }
+}
+
+template <typename P>
+constexpr const char* fklLabelOf() {
+    if constexpr (requires { P::fklLabel; }) {
+        return P::fklLabel;
+    } else {
+        return "FKL BVF";
+    }
+}
+
+// The FKL implementation in "baseline time / BVF time"
+template <typename P>
+constexpr const char* fklShortLabelOf() {
+    if constexpr (requires { P::fklShortLabel; }) {
+        return P::fklShortLabel;
+    } else {
+        return "BVF";
+    }
+}
+
+// The regions of iterations 0 to iterations - 1: of size P::regionSize, or those of common/bench_geometry.h
+template <typename P>
+std::unique_ptr<RegionSets> regionSetsOf(size_t iterations) {
+    if constexpr (requires { P::regionSize; }) {
+        return std::make_unique<RegionSets>(iterations, P::regionSize);
+    } else {
+        return std::make_unique<RegionSets>(iterations);
+    }
+}
+
+template <typename P>
+constexpr auto batchesOf() {
+    if constexpr (requires { P::batches; }) {
+        return P::batches;
+    } else {
+        return BATCHES;
     }
 }
 
@@ -717,11 +809,15 @@ struct Result {
 };
 
 // The implementations of a program for batch N: its baselines, then FKL BVF, which has no intermediates in memory and
-// keeps float3 from the color conversion to the write
+// keeps float3 from the color conversion to the write (or the program's own FKL implementation)
 template <typename P, size_t N>
 std::vector<Implementation> implementationsOf(Context& ctx) {
     auto impls = P::template implementations<N>(ctx);
-    impls.push_back(makeFklBvf<N>(ctx));
+    if constexpr (requires { P::template fklImplementation<N>(ctx); }) {
+        impls.push_back(P::template fklImplementation<N>(ctx));
+    } else {
+        impls.push_back(makeFklBvf<N>(ctx));
+    }
     return impls;
 }
 
@@ -729,7 +825,7 @@ std::vector<Implementation> implementationsOf(Context& ctx) {
 template <typename P>
 std::vector<std::string> baselineNames(Context& ctx) {
     std::vector<std::string> names;
-    for (const auto& impl : P::template implementations<BATCHES[0]>(ctx)) {
+    for (const auto& impl : P::template implementations<batchesOf<P>()[0]>(ctx)) {
         names.push_back(impl.name);
     }
     return names;
@@ -755,7 +851,7 @@ void runBatch(Context& ctx, std::vector<Result>& results) {
         std::map<Reference, std::vector<float>> references;
         const auto referenceFor = [&](Reference r) -> const std::vector<float>& {
             if (!references.count(r)) {
-                references[r] = referenceOutput<N>(ctx, r, t);
+                references[r] = referenceOf<P, N>(ctx, r, t);
             }
             return references.at(r);
         };
@@ -791,7 +887,8 @@ void runBatch(Context& ctx, std::vector<Result>& results) {
                   << " median " << std::setw(7) << r.timing.median << " us  mean " << std::setw(7) << r.timing.mean
                   << " us  p10 " << std::setw(7) << r.timing.p10 << "  p90 " << std::setw(7) << r.timing.p90;
         if (k != bvf) {
-            std::cout << "  FKL BVF mean speedup " << std::setw(6) << std::setprecision(2) << r.meanSpeedupOfBvf << "x";
+            std::cout << "  " << fklLabelOf<P>() << " mean speedup " << std::setw(6) << std::setprecision(2)
+                      << r.meanSpeedupOfBvf << "x";
         }
         std::cout << "  max err " << std::scientific << std::setprecision(2) << r.errorVsOwnReference.max() << " ("
                   << referenceName(r.reference) << ")" << std::defaultfloat << std::endl;
@@ -941,7 +1038,7 @@ void gpuOnlyBatch(Context& ctx, std::vector<Result>& results, L2Flusher* flusher
                   << std::setw(7) << timing.median << " us  p10 " << std::setw(7) << timing.p10 << "  p90 "
                   << std::setw(7) << timing.p90;
         if (k != bvf) {
-            std::cout << "  FKL BVF mean speedup " << std::setw(6) << speedup << "x";
+            std::cout << "  " << fklLabelOf<P>() << " mean speedup " << std::setw(6) << speedup << "x";
         }
         std::cout << std::defaultfloat << std::endl;
     }
@@ -955,11 +1052,20 @@ void forEachBatch(F&& f) {
     }(std::make_index_sequence<BATCHES.size()>{});
 }
 
-// Calls f.template operator()<N>() for the batch size N == batch, or throws
-template <typename F>
+// Calls f.template operator()<N>() for every batch size of program P (batchesOf), in order
+template <typename P, typename F>
+void forEachBatchOf(F&& f) {
+    constexpr auto batches = batchesOf<P>();
+    [&]<size_t... Is>(std::index_sequence<Is...>) {
+        (f.template operator()<batches[Is]>(), ...);
+    }(std::make_index_sequence<batches.size()>{});
+}
+
+// Calls f.template operator()<N>() for the batch size N == batch of program P, or throws
+template <typename P, typename F>
 void withBatch(size_t batch, F&& f) {
     bool found = false;
-    forEachBatch([&]<size_t N>() {
+    forEachBatchOf<P>([&]<size_t N>() {
         if (N == batch) {
             f.template operator()<N>();
             found = true;
@@ -993,14 +1099,15 @@ inline void freeL2Flusher(L2Flusher& flusher) {
 }
 
 // FKL's two-execution CSV format (times in ms): one row per value of the first column
-inline void writeTwoExecutionHeader(std::ostream& two, const std::string& firstColumn, const std::string& baseline) {
+inline void writeTwoExecutionHeader(std::ostream& two, const std::string& firstColumn, const std::string& baseline,
+                                    const std::string& fkl) {
     two << firstColumn;
-    for (const std::string label : {baseline, std::string("fkl_bvf")}) {
+    for (const std::string label : {baseline, fkl}) {
         two << ", " << label << " MeanTime, " << label << " TimeVariance, " << label << " MaxTime, " << label
             << " MinTime";
     }
     two << ", Mean Speedup";
-    for (const std::string label : {baseline, std::string("fkl_bvf")}) {
+    for (const std::string label : {baseline, fkl}) {
         two << ", " << label << " MedianTime, " << label << " P10Time, " << label << " P90Time";
     }
     two << std::endl;
@@ -1019,20 +1126,22 @@ inline void writeTwoExecutionRow(std::ostream& two, long long key, const TimingS
     two << std::endl;
 }
 
-// One CSV per baseline in FKL's two-execution format: <baseline>_vs_fkl_bvf_<suffix><ParArch>.csv
+// One CSV per baseline in FKL's two-execution format: <baseline>_vs_<fkl>_<suffix><ParArch>.csv, with fkl the name of
+// the FKL implementation (fkl_bvf)
 template <typename Field>
 void writeTwoExecutionFiles(const std::filesystem::path& outDir, const std::vector<std::string>& baselines,
-                            const std::vector<Result>& results, const std::string& suffix, Field&& field) {
+                            const std::string& fkl, const std::vector<Result>& results, const std::string& suffix,
+                            Field&& field) {
     const std::string parArch(fk::toStrView(fk::defaultParArch));
     for (const std::string& baseline : baselines) {
-        std::ofstream two(outDir / (baseline + "_vs_fkl_bvf_" + suffix + parArch + ".csv"));
-        writeTwoExecutionHeader(two, "Batch size", baseline);
+        std::ofstream two(outDir / (baseline + "_vs_" + fkl + "_" + suffix + parArch + ".csv"));
+        writeTwoExecutionHeader(two, "Batch size", baseline, fkl);
         for (const auto& b : results) {
             if (b.name != baseline) {
                 continue;
             }
             const auto f = std::find_if(results.begin(), results.end(), [&](const Result& r) {
-                return r.name == "fkl_bvf" && r.batch == b.batch;
+                return r.name == fkl && r.batch == b.batch;
             });
             const auto [baseTiming, bvfTiming, speedup] = field(b, *f);
             writeTwoExecutionRow(two, b.batch, baseTiming, bvfTiming, speedup);
@@ -1070,12 +1179,17 @@ void writePlatform(const std::filesystem::path& outDir, const std::vector<std::s
        << "OS: " << bench::osName() << ", kernel " << bench::kernelVersion() << "\n"
        << "GPU clocks: not locked (locking needs root); application clocks as reported by nvidia-smi: "
        << bench::shell("nvidia-smi --query-gpu=clocks.max.sm,clocks.max.mem --format=csv,noheader") << "\n"
-       << "\nWorkload: " << geometry::describe() << ". AddBorder (black), then Mul "
-       << "(1/255), Sub (0.485, 0.456, 0.406), Div (0.229, 0.224, 0.225), float3 tensor of N planes " << OUT_W << "x"
-       << OUT_H << "\n"
-       << "FKL BVF: one executeOperations call, one kernel: no intermediates in memory, float3 from the color "
-          "conversion to the write.\n"
-       << "Regions: iteration t of every loop (the " << WARMUP_ITERS << " warm-up iterations are t in [0, " << WARMUP_ITERS
+       << "\n";
+    if constexpr (requires { P::workload(os); }) {
+        P::workload(os);
+    } else {
+        os << "Workload: " << geometry::describe() << ". AddBorder (black), then Mul "
+           << "(1/255), Sub (0.485, 0.456, 0.406), Div (0.229, 0.224, 0.225), float3 tensor of N planes " << OUT_W
+           << "x" << OUT_H << "\n"
+           << "FKL BVF: one executeOperations call, one kernel: no intermediates in memory, float3 from the color "
+              "conversion to the write.\n";
+    }
+    os << "Regions: iteration t of every loop (the " << WARMUP_ITERS << " warm-up iterations are t in [0, " << WARMUP_ITERS
        << "), the " << TIMED_ITERS << " timed ones t in [" << WARMUP_ITERS << ", " << WARMUP_ITERS + TIMED_ITERS
        << ")) runs every pipeline on the regions of "
        << "iteration t, generated before the loops and the same for every implementation, program and machine "
@@ -1084,16 +1198,20 @@ void writePlatform(const std::filesystem::path& outDir, const std::vector<std::s
        << "iteration: FKL's build() calls and the fusion of the chain, and the per-region arguments and calls of "
        << "the baselines (see their pipelines).\n"
        << "Timing: " << WARMUP_ITERS << " warm-up then " << TIMED_ITERS << " timed iterations. In every iteration "
-       << names << "then FKL BVF run one after the other, each timed with CUDA events on one stream around the "
-       << "complete pipeline (all host enqueue work included) and followed by a synchronization. FKL BVF's speedup "
-       << "over each baseline is computed per iteration (baseline time / BVF time) and averaged (mean speedup, FKL's "
+       << names << "then " << fklLabelOf<P>() << " run one after the other, each timed with CUDA events on one stream "
+       << "around the complete pipeline (all host enqueue work included) and followed by a synchronization. "
+       << fklLabelOf<P>() << "'s speedup "
+       << "over each baseline is computed per iteration (baseline time / " << fklShortLabelOf<P>()
+       << " time) and averaged (mean speedup, FKL's "
        << "two-execution convention). Median, p10, p90 with linear interpolation.\n"
        << "GPU time only: a second pass with the same interleaved iterations and regions and CUPTI kernel tracing on; "
        << "the GPU time of one execution is the sum of the execution times of its kernels (no host work, no launch "
-       << "gaps, no memory copies), and FKL BVF's speedups are again computed per execution and averaged.\n"
+       << "gaps, no memory copies), and " << fklLabelOf<P>()
+       << "'s speedups are again computed per execution and averaged.\n"
        << "Validation: before the timing, every pipeline on the regions of the first, every "
        << validation::VALIDATION_STRIDE << "th and the last timed iteration, against its reference (validation.csv, "
-       << "one row per iteration): 1e-3 for FKL BVF against the float reference, one level of 8 bit RGB for the 8 bit "
+       << "one row per iteration): 1e-3 for " << fklLabelOf<P>()
+       << " against the float reference, one level of 8 bit RGB for the 8 bit "
        << "pipelines against theirs.\n"
        << "Kernel counts: CUPTI activity tracing of one pipeline (regions of the first timed iteration), in a "
           "separate pass after all timings\n";
@@ -1109,25 +1227,36 @@ int gpuBenchMain(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--batches") {
             // The batch sizes, for the Nsight Compute scripts
-            std::cout << batchList() << std::endl;
+            const auto batches = batchesOf<P>();
+            for (size_t i = 0; i < batches.size(); ++i) {
+                std::cout << (i ? " " : "") << batches[i];
+            }
+            std::cout << std::endl;
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--workload") {
             // The workload this binary was built for, so that scripts can check that binaries and results match
-            std::cout << describe() << std::endl;
+            if constexpr (requires { P::workload(std::cout); }) {
+                P::workload(std::cout);
+            } else {
+                std::cout << describe() << std::endl;
+            }
             return 0;
         }
         if (argc == 3 && std::string(argv[1]) == "--regions") {
             // The regions of one iteration as CSV, for the traffic model of the Nsight Compute profiles
             const size_t t = std::stoul(argv[2]);
-            std::cout << regionsCsv(RegionSets(t + 1), t);
+            std::cout << regionsCsv(*regionSetsOf<P>(t + 1), t);
             return 0;
         }
         std::filesystem::path outDir = argc > 1 ? argv[1] : "results";
         std::filesystem::create_directories(outDir);
+        if constexpr (requires { P::setup(outDir, std::string()); }) {
+            P::setup(outDir, argc > 2 ? std::string(argv[2]) : std::string());
+        }
 
         Context ctx;
-        initContext(ctx);
+        initContext(ctx, regionSetsOf<P>(REGION_ITERATIONS));
         const auto baselines = baselineNames<P>(ctx);
 
         if (argc > 2 && std::string(argv[2]) == "--gpu-only-l2-flushed") {
@@ -1136,10 +1265,10 @@ int gpuBenchMain(int argc, char** argv) {
             L2Flusher flusher = makeL2Flusher(ctx);
             cupti::init();
             std::vector<Result> flushed;
-            forEachBatch([&]<size_t N>() { gpuOnlyBatch<P, N>(ctx, flushed, &flusher); });
+            forEachBatchOf<P>([&]<size_t N>() { gpuOnlyBatch<P, N>(ctx, flushed, &flusher); });
             std::ofstream csv(outDir / "gpu_time_l2_flushed.csv");
             csv << "implementation,N,gpu_median_us,gpu_p10_us,gpu_p90_us,gpu_mean_us,iterations,kernels_launched,"
-                   "fkl_bvf_mean_gpu_speedup\n";
+                << fklNameOf<P>() << "_mean_gpu_speedup\n";
             for (const auto& r : flushed) {
                 csv << r.name << "," << r.batch << "," << std::fixed << std::setprecision(2) << r.gpuFlushedTiming.median
                     << "," << r.gpuFlushedTiming.p10 << "," << r.gpuFlushedTiming.p90 << ","
@@ -1149,7 +1278,8 @@ int gpuBenchMain(int argc, char** argv) {
                 }
                 csv << "\n";
             }
-            writeTwoExecutionFiles(outDir, baselines, flushed, "gpu_only_l2_flushed_", [](const Result& b, const Result& f) {
+            writeTwoExecutionFiles(outDir, baselines, fklNameOf<P>(), flushed, "gpu_only_l2_flushed_",
+                                   [](const Result& b, const Result& f) {
                 return std::make_tuple(b.gpuFlushedTiming, f.gpuFlushedTiming, b.meanGpuFlushedSpeedupOfBvf);
             });
             freeL2Flusher(flusher);
@@ -1158,13 +1288,13 @@ int gpuBenchMain(int argc, char** argv) {
         }
         if (argc > 4 && std::string(argv[2]) == "--ncu-target") {
             const std::string name = argv[3];
-            withBatch(std::stoul(argv[4]), [&]<size_t N>() { ncuTarget<P, N>(ctx, name); });
+            withBatch<P>(std::stoul(argv[4]), [&]<size_t N>() { ncuTarget<P, N>(ctx, name); });
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "--profile-kernels") {
             // GPU execution time of every kernel (CUPTI), without touching the latency results
             cupti::init();
-            forEachBatch([&]<size_t N>() { profileBatch<P, N>(ctx); });
+            forEachBatchOf<P>([&]<size_t N>() { profileBatch<P, N>(ctx); });
             std::ofstream summary(outDir / "kernel_gpu_times.csv");
             summary << "implementation,N,kernels_per_pipeline,gpu_busy_us,first_kernel_start_to_last_kernel_end_us\n";
             std::ofstream details(outDir / "kernel_gpu_times_fkl.csv");
@@ -1198,16 +1328,16 @@ int gpuBenchMain(int argc, char** argv) {
         std::cout << diagnostic;
 
         std::vector<Result> results;
-        forEachBatch([&]<size_t N>() { runBatch<P, N>(ctx, results); });
+        forEachBatchOf<P>([&]<size_t N>() { runBatch<P, N>(ctx, results); });
         cupti::init();
         std::cout << "=== GPU time only (CUPTI kernel execution times, after all CPU + GPU timings)" << std::endl;
-        forEachBatch([&]<size_t N>() { gpuOnlyBatch<P, N>(ctx, results); });
+        forEachBatchOf<P>([&]<size_t N>() { gpuOnlyBatch<P, N>(ctx, results); });
         std::cout << "=== Kernel counts (CUPTI activity tracing, after all timings)" << std::endl;
-        forEachBatch([&]<size_t N>() { countBatch<P, N>(ctx, results); });
+        forEachBatchOf<P>([&]<size_t N>() { countBatch<P, N>(ctx, results); });
 
         std::ofstream latency(outDir / "latency.csv");
         latency << "implementation,N,median_us,p10_us,p90_us,iterations,max_abs_err,kernels_launched,mean_us,"
-                   "fkl_bvf_mean_speedup\n";
+                << fklNameOf<P>() << "_mean_speedup\n";
         std::ofstream validationCsv(outDir / "validation.csv");
         validationCsv << "implementation,N,iteration,reference,max_abs_err_r,max_abs_err_g,max_abs_err_b,mean_abs_err,"
                       "non_finite_values,max_abs_err_vs_float_reference,values_beyond_1e-3,values,tolerance,"
@@ -1239,15 +1369,16 @@ int gpuBenchMain(int argc, char** argv) {
         }
         // One CSV per baseline in FKL's two-execution format (times in ms), for both benchmarks:
         // <baseline>_vs_fkl_bvf_GPU_NVIDIA.csv (CPU + GPU) and <baseline>_vs_fkl_bvf_gpu_only_GPU_NVIDIA.csv
-        writeTwoExecutionFiles(outDir, baselines, results, "", [](const Result& b, const Result& f) {
+        writeTwoExecutionFiles(outDir, baselines, fklNameOf<P>(), results, "", [](const Result& b, const Result& f) {
             return std::make_tuple(b.timing, f.timing, b.meanSpeedupOfBvf);
         });
-        writeTwoExecutionFiles(outDir, baselines, results, "gpu_only_", [](const Result& b, const Result& f) {
+        writeTwoExecutionFiles(outDir, baselines, fklNameOf<P>(), results, "gpu_only_",
+                               [](const Result& b, const Result& f) {
             return std::make_tuple(b.gpuTiming, f.gpuTiming, b.meanGpuSpeedupOfBvf);
         });
         std::ofstream gpuTime(outDir / "gpu_time.csv");
         gpuTime << "implementation,N,gpu_median_us,gpu_p10_us,gpu_p90_us,gpu_mean_us,iterations,kernels_launched,"
-                   "fkl_bvf_mean_gpu_speedup\n";
+                << fklNameOf<P>() << "_mean_gpu_speedup\n";
         for (const auto& r : results) {
             gpuTime << r.name << "," << r.batch << "," << std::fixed << std::setprecision(2) << r.gpuTiming.median << ","
                     << r.gpuTiming.p10 << "," << r.gpuTiming.p90 << "," << r.gpuTiming.mean << "," << TIMED_ITERS << ","
