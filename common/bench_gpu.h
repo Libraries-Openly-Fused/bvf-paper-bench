@@ -41,6 +41,9 @@
 //   setup(outDir, mode)                   called before any run, with the mode argument (empty for the main run)
 //   regionSize                            every region of this size (RegionSets' fixed-size constructor) instead of
 //                                         the sizes of BENCH_REGIONS
+//   perIterationTimes                     also write every timed iteration's time of every implementation
+//                                         (per_iteration_<mode>.csv), for per-iteration speedups between any two
+//                                         implementations (nppdx-wins/)
 
 #ifndef BVF_BENCH_GPU_H
 #define BVF_BENCH_GPU_H
@@ -784,6 +787,30 @@ inline PipelineProfile profilePipeline(const Context& ctx, const Implementation&
 
 inline std::vector<PipelineProfile> profiles;
 
+// Every timed iteration's time of every implementation, one file per mode (per_iteration_latency.csv,
+// per_iteration_gpu_only.csv, per_iteration_gpu_only_l2_flushed.csv), when the Program has perIterationTimes: the
+// directory is set by gpuBenchMain; each file is truncated by the first batch of a process and appended by the others
+inline std::filesystem::path perIterationDir;
+inline void writePerIteration(const std::string& mode, const size_t batch, const std::vector<Implementation>& impls,
+                              const std::vector<std::vector<float>>& ms) {
+    if (perIterationDir.empty()) {
+        return;
+    }
+    static std::map<std::string, bool> started;
+    const auto file = perIterationDir / ("per_iteration_" + mode + ".csv");
+    std::ofstream os(file, started[mode] ? std::ios::app : std::ios::trunc);
+    if (!started[mode]) {
+        os << "N,iteration,implementation,us\n";
+        started[mode] = true;
+    }
+    for (size_t k = 0; k < impls.size(); ++k) {
+        for (size_t i = 0; i < ms[k].size(); ++i) {
+            os << batch << "," << WARMUP_ITERS + i << "," << impls[k].name << "," << std::fixed << std::setprecision(3)
+               << ms[k][i] * 1000.f << "\n";
+        }
+    }
+}
+
 struct Result {
     std::string name;
     int batch{0};
@@ -877,6 +904,7 @@ void runBatch(Context& ctx, std::vector<Result>& results) {
         }
     }
     const auto ms = measureInterleaved(ctx, impls);
+    writePerIteration("latency", N, impls, ms);
     for (size_t k = 0; k < impls.size(); ++k) {
         Result& r = batchResults[k];
         r.timing = computeStats(ms[k]);
@@ -1016,6 +1044,7 @@ void gpuOnlyBatch(Context& ctx, std::vector<Result>& results, L2Flusher* flusher
         }
     }
     records.clear();
+    writePerIteration(flusher ? "gpu_only_l2_flushed" : "gpu_only", N, impls, ms);
     for (size_t k = 0; k < impls.size(); ++k) {
         auto r = std::find_if(results.begin(), results.end(),
                               [&](const Result& x) { return x.name == impls[k].name && x.batch == static_cast<int>(N); });
@@ -1255,6 +1284,9 @@ int gpuBenchMain(int argc, char** argv) {
         }
         std::filesystem::path outDir = argc > 1 ? argv[1] : "results";
         std::filesystem::create_directories(outDir);
+        if constexpr (requires { P::perIterationTimes; }) {
+            perIterationDir = outDir;
+        }
         if constexpr (requires { P::setup(outDir, std::string()); }) {
             P::setup(outDir, argc > 2 ? std::string(argv[2]) : std::string());
         }

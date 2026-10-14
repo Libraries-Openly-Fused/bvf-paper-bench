@@ -315,6 +315,8 @@ struct WinsFrame {
     static constexpr const char* fklLabel = "FKL staged";
     static constexpr const char* fklShortLabel = "staged";
     static constexpr std::array<size_t, 1> batches{1};
+    // per_iteration_<mode>.csv, for the per-iteration speedups in both directions (full_report.py)
+    static constexpr bool perIterationTimes = true;
 
     template <size_t N>
     static std::vector<Implementation> implementations(Context& ctx) {

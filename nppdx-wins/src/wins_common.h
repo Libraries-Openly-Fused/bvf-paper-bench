@@ -56,6 +56,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -318,34 +319,63 @@ std::vector<float> frameReference(const Context& ctx, const Reference r) {
 // The fastest validated configuration (NPPDx tile and block, MorphologyDPP tile): every candidate is validated on the
 // first timed iteration and timed alone (latency, every iteration); the fastest correct one is used. The main run
 // writes the choices to choices.csv and every candidate to choice_sweep.csv; the other modes read choices.csv.
+// A main run can also take some choices as given (pinned): WINS_PINNED_CHOICES=<file> with lines "key,index" (the
+// header line is skipped); those keys are not swept, and choices.csv says "pinned".
 // ------------------------------------------------------------------------------------------------
 struct Choices {
     std::filesystem::path outDir;
     bool sweep{true};
     std::map<std::string, size_t> chosen;
+    std::map<std::string, bool> pinned;
     std::vector<std::string> sweepRows;
 };
 inline Choices choices;
 
-inline void setupChoices(const std::filesystem::path& outDir, const std::string& mode) {
-    choices.outDir = outDir;
-    choices.sweep = mode.empty();
-    if (choices.sweep) {
-        return;
+inline void writeChoices() {
+    std::ofstream file(choices.outDir / "choices.csv");
+    file << "key,index,how\n";
+    for (const auto& [k, index] : choices.chosen) {
+        file << k << "," << index << "," << (choices.pinned[k] ? "pinned" : "swept") << "\n";
     }
-    std::ifstream in(outDir / "choices.csv");
+}
+
+// Reads "key,index[,...]" lines after a header
+inline std::map<std::string, size_t> readChoiceFile(const std::filesystem::path& path) {
+    std::ifstream in(path);
     if (!in) {
-        throw std::runtime_error("Run the main benchmark first: it writes " + (outDir / "choices.csv").string());
+        throw std::runtime_error("Cannot read " + path.string());
     }
+    std::map<std::string, size_t> read;
     std::string line;
     std::getline(in, line); // header
     while (std::getline(in, line)) {
         std::istringstream row(line);
         std::string key, index;
         if (std::getline(row, key, ',') && std::getline(row, index, ',')) {
-            choices.chosen[key] = std::stoul(index);
+            read[key] = std::stoul(index);
         }
     }
+    return read;
+}
+
+inline void setupChoices(const std::filesystem::path& outDir, const std::string& mode) {
+    choices.outDir = outDir;
+    choices.sweep = mode.empty();
+    if (choices.sweep) {
+        if (const char* pinned = std::getenv("WINS_PINNED_CHOICES")) {
+            for (const auto& [key, index] : readChoiceFile(pinned)) {
+                choices.chosen[key] = index;
+                choices.pinned[key] = true;
+                std::cout << key << ": candidate " << index << " pinned (" << pinned << ")" << std::endl;
+            }
+            writeChoices();
+        }
+        return;
+    }
+    if (!std::filesystem::exists(outDir / "choices.csv")) {
+        throw std::runtime_error("Run the main benchmark first: it writes " + (outDir / "choices.csv").string());
+    }
+    choices.chosen = readChoiceFile(outDir / "choices.csv");
 }
 
 template <typename Make, typename Label>
@@ -398,11 +428,7 @@ size_t chooseFastest(Context& ctx, const std::string& key, const size_t count, c
         choices.sweepRows.push_back(rows[i] + (i == best ? ",yes" : ",no"));
     }
     choices.chosen[key] = best;
-    std::ofstream file(choices.outDir / "choices.csv");
-    file << "key,index\n";
-    for (const auto& [k, index] : choices.chosen) {
-        file << k << "," << index << "\n";
-    }
+    writeChoices();
     std::ofstream sweep(choices.outDir / "choice_sweep.csv");
     sweep << "key,candidate,launched,median_us,max_abs_err,within_tolerance,chosen\n";
     for (const auto& r : choices.sweepRows) {
