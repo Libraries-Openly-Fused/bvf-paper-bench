@@ -366,7 +366,8 @@ void describeWorkload(std::ostream& os, const int k, const MorphOp op, const std
     for (size_t i = 0; i < B; ++i) {
         list << (i ? ", " : "") << batches[i];
     }
-    os << "Workload (Experiment 3, neighborhood operations): " << geometry::describe(false, list.str())
+    os << "bvf-paper-bench: commit " << BENCH_REPO_COMMIT << " (FKL: the commit above)\n"
+       << "Workload (Experiment 3, neighborhood operations): " << geometry::describe(false, list.str())
        << ". Unlike Figure 1 there is no AddBorder: the resized regions go to the morphology, " << name(op) << " with a "
        << k << "x" << k
        << " rectangular mask anchored at its center ("
