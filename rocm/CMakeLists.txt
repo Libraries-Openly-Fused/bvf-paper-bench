@@ -74,4 +74,13 @@ function(add_bench_program name source)
 endfunction()
 
 add_bench_program(rocm_bench src/rocm_bench.hip)
-add_bench_program(rocm_neighborhood src/rocm_neighborhood.hip)
+# rocm_neighborhood needs the batched MorphologyDPP (FKL PR #393: grid z over the planes of its input), which FKL
+# 63782f6 does not have: it processes one plane there, so the program is only built with an FKL that has it
+file(STRINGS "${FKL_DIR}/include/fused_kernel/algorithms/image_processing/morphology.h" FKL_BATCHED_MORPHOLOGY
+     REGEX "getActiveThreads\\(\\)\\.z")
+if(FKL_BATCHED_MORPHOLOGY)
+    add_bench_program(rocm_neighborhood src/rocm_neighborhood.hip)
+else()
+    message(STATUS "rocm_neighborhood (Experiment 3) not built: the MorphologyDPP of FKL_DIR (${FKL_COMMIT}) is not "
+                   "batched; it needs the commit of the repository's fkl submodule")
+endif()

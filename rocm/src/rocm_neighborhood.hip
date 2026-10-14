@@ -44,6 +44,13 @@ using neighborhood::PLANE_FLOATS;
 using neighborhood::PLANE_H;
 using neighborhood::PLANE_W;
 
+// The batched MorphologyDPP (FKL PR #393), which processes every plane of its input (grid z) and sizes its staging per
+// number of passes (STAGE_ELEMENTS<passes>): an FKL without it (63782f6) would process the first region only
+template <typename Details>
+concept BatchedMorphologyDetails = requires { Details::template STAGE_ELEMENTS<1>; };
+static_assert(BatchedMorphologyDetails<fk::MorphologyDPPDetails<fk::float3>>,
+              "rocm_neighborhood needs FKL with the batched MorphologyDPP: the commit of the repository's fkl submodule");
+
 // RPP's HIP morphology refuses a source descriptor with offsetInBytes < 12 * (kernelSize / 2) (RPP_ERROR_LOW_OFFSET;
 // rppt_tensor_morphological_operations.cpp in RPP 3.2.0): its sources (the resized planes, and the eroded planes of
 // the open) start this many bytes into their allocation, given to RPP through the descriptor's offsetInBytes

@@ -96,7 +96,8 @@ the border, followed by `hostMorphPlane` on every plane (the normalization is mo
 the morphology commutes with it exactly). RPP's HIP morphology needs at least 12 x (K / 2) bytes before the first
 pixel of its source (`RPP_ERROR_LOW_OFFSET`): its sources start 256 bytes into their buffers, given in the
 descriptor's `offsetInBytes`. It needs FKL with the batched MorphologyDPP: the commit recorded for the repository's
-`fkl` submodule.
+`fkl` submodule (CMake builds `rocm_neighborhood` only with an FKL whose MorphologyDPP is batched, so FKL `63782f6`
+builds `rocm_bench` alone).
 
 Output files (in `<results dir>/neighborhood` with `run_all.sh`): `latency.csv`, `validation.csv`, `gpu_time.csv`,
 `gpu_time_l2_flushed.csv`, `kernel_breakdown.csv`, `kernel_counts_per_operation.csv`, `regions.csv` and `platform.txt`,

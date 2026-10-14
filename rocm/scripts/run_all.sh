@@ -164,6 +164,7 @@ if ! allowed SKIP_CPU; then
 fi
 BENCH=$BUILD_GPU/rocm_bench
 [ "$EXPERIMENT" = 3 ] && BENCH=$BUILD_GPU/rocm_neighborhood
+[ -x "$BENCH" ] || die "$BENCH was not built (Experiment 3 needs FKL with the batched MorphologyDPP, see $OUT/logs/build_gpu.log)"
 WORKLOAD=$("$BENCH" --workload) || die "$BENCH --workload failed"
 if ! allowed SKIP_CPU && [ "$WORKLOAD" != "$("$BUILD_CPU/rpp_cpu_bench" --workload)" ]; then
     die "rocm_bench and rpp_cpu_bench have different workloads (region sizes or batch sizes): build both from the same checkout and options"
