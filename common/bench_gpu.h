@@ -210,13 +210,16 @@ inline void nv12ToRgb8(const Context& ctx, Npp8u* dst, int dstStep) {
 
 // The reference an implementation is checked against, with its tolerance: the Figure 1 chain on FKL's CPU backend in
 // float (FKL BVF); the same with the RGB rounded to 8 bits, for the pipelines with an 8 bit RGB frame (OpenCV, FKL
-// VF+HF), which resize at dst * scale like FKL; or that with NPP's resize sampling (NPP, nppConventionReference8bit)
-enum class Reference { FklFloat, Fkl8bit, NppSampling8bit };
+// VF+HF), which resize at dst * scale like FKL; or that with NPP's resize sampling (NPP, nppConventionReference8bit).
+// NppdxPixelCenters8bit (NPPDx's resize sampling at pixel centers and its 8 bit resized RGB) is only for programs with
+// their own reference() (fkl-neighborhood/).
+enum class Reference { FklFloat, Fkl8bit, NppSampling8bit, NppdxPixelCenters8bit };
 
 inline const char* referenceName(Reference r) {
     switch (r) {
         case Reference::FklFloat: return "fkl_cpu_float";
         case Reference::Fkl8bit: return "fkl_cpu_8bit_rgb";
+        case Reference::NppdxPixelCenters8bit: return "nppdx_pixel_centers_8bit";
         default: return "npp_sampling_8bit";
     }
 }
@@ -414,6 +417,8 @@ std::vector<float> referenceOutput(const Context& ctx, Reference r, size_t t) {
     switch (r) {
         case Reference::FklFloat: return cpuReference<N, false>(ctx, t);
         case Reference::Fkl8bit: return cpuReference<N, true>(ctx, t);
+        case Reference::NppdxPixelCenters8bit:
+            throw std::runtime_error("The NPPDx reference is only computed by programs with their own reference()");
         default: return nppConventionReference8bit<N>(ctx, t);
     }
 }

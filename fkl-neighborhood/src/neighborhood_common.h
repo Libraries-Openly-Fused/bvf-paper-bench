@@ -44,15 +44,57 @@ namespace bench::neighborhood {
 // References
 // ------------------------------------------------------------------------------------------------
 
+// NPPDx's conventions, as the reference of fkl-vs-nppdx (figure1::hostVariant with the RGB not clamped, the resize
+// sampled at pixel centers, (dst + 0.5) * scale - 0.5, and the resized RGB rounded to 8 bits as NPPDx writes it: + 0.5,
+// clamped to [0, 255]), without the letterbox: the normalized RES_W x RES_H planes of the regions of iteration t
+template <size_t N>
+std::vector<float> nppdxPixelCenterReference(const Context& ctx, const size_t t) {
+    std::vector<float> out(N * PLANE_FLOATS);
+    for (size_t i = 0; i < N; ++i) {
+        const Region& r = ctx.regions->at(t, i);
+        const int cw = r.width, ch = r.height;
+        std::vector<float> crop(static_cast<size_t>(cw) * ch * 3);
+        const auto at = [&](int y, int x, int c) -> float& { return crop[(static_cast<size_t>(y) * cw + x) * 3 + c]; };
+        for (int y = 0; y < ch; ++y) {
+            for (int x = 0; x < cw; ++x) {
+                const fk::float3 rgb = YUVToRGB::exec(
+                    ctx.frameHost->readAt(fk::Point{static_cast<int>(r.x) + x, static_cast<int>(r.y) + y, 0}));
+                at(y, x, 0) = rgb.x;
+                at(y, x, 1) = rgb.y;
+                at(y, x, 2) = rgb.z;
+            }
+        }
+        const float sx = static_cast<float>(cw) / PLANE_W, sy = static_cast<float>(ch) / PLANE_H;
+        for (int y = 0; y < PLANE_H; ++y) {
+            for (int x = 0; x < PLANE_W; ++x) {
+                const float fxs = std::min<float>(cw - 1, std::max(0.f, (x + 0.5f) * sx - 0.5f));
+                const float fys = std::min<float>(ch - 1, std::max(0.f, (y + 0.5f) * sy - 0.5f));
+                const int x0 = static_cast<int>(fxs), y0 = static_cast<int>(fys);
+                const int x1 = std::min(x0 + 1, cw - 1), y1 = std::min(y0 + 1, ch - 1);
+                const float ax = fxs - x0, ay = fys - y0;
+                for (int c = 0; c < 3; ++c) {
+                    float v = (at(y0, x0, c) * (1.f - ax) + at(y0, x1, c) * ax) * (1.f - ay) +
+                              (at(y1, x0, c) * (1.f - ax) + at(y1, x1, c) * ax) * ay;
+                    v = std::min(255.f, std::max(0.f, std::floor(v + 0.5f)));
+                    out[i * PLANE_FLOATS + (static_cast<size_t>(y) * PLANE_W + x) * 3 + c] =
+                        ((v * MUL[c]) - SUB[c]) / DIV[c];
+                }
+            }
+        }
+    }
+    return out;
+}
+
 // The reference of conventions r for the regions of iteration t: the one of Figure 1 without the letterbox
-// (cpuReference / nppConventionReference8bit of common/bench_gpu.h, normalized), then the morphology on every plane
-// (hostMorph, exact after the normalization: see bench_neighborhood.h)
+// (cpuReference / nppConventionReference8bit of common/bench_gpu.h, or nppdxPixelCenterReference, normalized), then
+// the morphology on every plane (hostMorph, exact after the normalization: see bench_neighborhood.h)
 template <size_t N>
 std::vector<float> morphReference(const Context& ctx, const Reference r, const size_t t, const int k, const MorphOp op) {
     std::vector<float> base;
     switch (r) {
         case Reference::FklFloat: base = cpuReference<N, false, false>(ctx, t); break;
         case Reference::Fkl8bit: base = cpuReference<N, true, false>(ctx, t); break;
+        case Reference::NppdxPixelCenters8bit: base = nppdxPixelCenterReference<N>(ctx, t); break;
         default: base = nppConventionReference8bit<N, false>(ctx, t); break;
     }
     if (base.size() != N * PLANE_FLOATS) {
