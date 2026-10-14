@@ -68,6 +68,45 @@ areas of the regions of the timed iterations per N, as in every results folder);
 include the upload of the ROIs (9 per execution: that one and the 8 of `rppt_yuv_to_rgb`); `validation.csv` has an
 `iteration` column after N, and two more columns, the errors against the RPP-convention reference and against the paper's 8 bit reference, and `gpu_time*.csv` five more, the GPU time and dispatches of the HIP runtime's blit kernels (memsets, copies) of each execution, which the GPU time only sums leave out. `--validate` validates every RPP variant.
 
+## Experiment 3: neighborhood operations (`rocm/src/rocm_neighborhood.hip`)
+
+The Figure 1 pipeline with a neighborhood operation after the resize and without AddBorder: ReadNV12 -> YUVtoRGB ->
+Crop -> Resize 64x32 -> Morph -> Mul -> Sub -> Div -> Write, into N planes of 64x32 float3. The operation is an erode or
+an open (erode, then dilate), K x K with a centred anchor, replicating at the 64x32 edge in every pass; the parameters
+are those of `common/bench_neighborhood.h`, shared with the CUDA side. Same frame, regions, batch sizes, timing protocol
+and validation rules as `rocm_bench` (it includes `rocm_bench.hip` for its harness). Two parts, each a set of groups
+(part, operation, K, N) whose implementations compute the same output:
+
+- Part (b), the library comparison: K = `MORPH_K` (5), erode and open, every N.
+  - `rpp_normalize`: `rppt_yuv_to_rgb`, `rppt_crop_mirror_normalize` 8u->32f, `rppt_resize` F32 into N float3 planes,
+    `rppt_erode` (open: then `rppt_dilate`) batched over the planes into the output tensor, `rppt_normalize`.
+  - `rpp_fused_normalize`: `rppt_yuv_to_rgb`, `rppt_resize_mirror_normalize` 8u->32f into the planes, then the same
+    morphology and `rppt_normalize`.
+  - `fkl_dpp_<W>x<H>`: one FKL kernel, `MorphologyDPP<float3, W, H, K, K>` batched over the regions, reading the BVF
+    chain up to the resize and writing through Mul, Sub, Div, for every tile of `DPP_TILES`.
+- Part (a), the micro-experiment, FKL only: K = 3, 5, 7, 1 pass (erode) and 2 passes (open), N = 1 and 16:
+  `fkl_bvf_naive` (the naive ReadBack operations `ErodeBVF` / `DilateBVF` of `common/bench_neighborhood_ops.h` in the BVF
+  chain, one kernel) against the DPP tiles.
+
+In every group every implementation is validated and timed in the same interleaved iterations; the chosen DPP tile is
+the fastest (median, CPU + GPU) within its tolerance and the chosen RPP variant the fastest within `RPP_EQUIVALENCE` of
+the RPP-convention reference (`chosen` column); every one is recorded, and the speedups are per iteration over the
+chosen DPP tile. References: FKL's CPU float chain without AddBorder, or `rocm_bench`'s RPP-convention reference without
+the border, followed by `hostMorphPlane` on every plane (the normalization is monotone non-decreasing per channel, so
+the morphology commutes with it exactly). RPP's HIP morphology needs at least 12 x (K / 2) bytes before the first
+pixel of its source (`RPP_ERROR_LOW_OFFSET`): its sources start 256 bytes into their buffers, given in the
+descriptor's `offsetInBytes`. It needs FKL with the batched MorphologyDPP: the commit recorded for the repository's
+`fkl` submodule.
+
+Output files (in `<results dir>/neighborhood` with `run_all.sh`): `latency.csv`, `validation.csv`, `gpu_time.csv`,
+`gpu_time_l2_flushed.csv`, `kernel_breakdown.csv`, `kernel_counts_per_operation.csv`, `regions.csv` and `platform.txt`,
+with the group in the first columns (`part,operation,K,passes,N,implementation,chosen`) or in the implementation name
+(`<part>_<operation>_k<K>_n<N>/<implementation>`). `--validate` only validates every group.
+
+    EXPERIMENT=3 rocm/scripts/run_all.sh ../results/rocm-neighborhood
+
+or, after the build below, `./build-rocm/rocm_neighborhood ../results/rocm-neighborhood`.
+
 ## CPU benchmark (`rocm/cpu/`)
 
 RPP's HOST backend against FKL's CPU backends, with the same number of threads on both sides: RPP with 1 thread
@@ -112,9 +151,10 @@ thread pool, so that the idle gap before every timed run puts both pools to slee
 - The ROCm 10.1 packages `amdrocm-rpp10.1` and `amdrocm-rpp-dev10.1` (RPP 3.2.0: the library and its headers),
   `amdrocm-profiler-base10.1` (rocprofiler-sdk, rocprofv3) and `amdrocm-amdsmi10.1`. Without root, unpack them with
   `apt-get download <package> && dpkg -x <package>_*.deb <prefix>` and set `ROCM_EXTRA=<prefix>/opt/rocm/core-10.1`.
-- FusedKernelLibrary at `63782f6`, the commit of every benchmark of this repository: by default the repository's `fkl`
-  submodule with its `thread-pool` submodule (`git submodule update --init --recursive fkl`), for both the GPU and the
-  CPU benchmark; `run_all.sh` takes other checkouts with `FKL_GPU_DIR` / `FKL_CPU_DIR` and checks the commit.
+- FusedKernelLibrary at `63782f6` for Experiments 1 and 2 and the CPU benchmark, and at the commit recorded for the
+  repository's `fkl` submodule (with the batched MorphologyDPP) for Experiment 3: by default the repository's `fkl`
+  submodule with its `thread-pool` submodule (`git submodule update --init --recursive fkl`); `run_all.sh` takes other
+  checkouts with `FKL_GPU_DIR` / `FKL_CPU_DIR` and checks the commit of the experiment it runs.
 
 ## Build and run
 
