@@ -153,6 +153,9 @@ fi
 # directory by an earlier run or a manual configure (BENCH_REGIONS, the iteration counts, compiler flags, architecture
 # flags) leaks into this run: the defaults of the CMake projects, unless BENCH_CMAKE_ARGS sets them
 GEOMETRY_ARGS="${BENCH_CMAKE_ARGS:-}"
+# cmake --fresh does not delete the programs of an earlier build, and rocm_neighborhood is only a target with an FKL
+# that has executeBoxBlur: remove them, so that the check below sees this build's programs only
+rm -f "$BUILD_GPU/rocm_bench" "$BUILD_GPU/rocm_neighborhood"
 step build_gpu bash -c "cmake --fresh -S '$REPO/rocm' -B '$BUILD_GPU' -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER='$ROCM_PATH/bin/amdclang++' -DCMAKE_HIP_COMPILER='$ROCM_PATH/bin/amdclang++' \
     -DROCM_PATH='$ROCM_PATH' -DFKL_DIR='$FKL_GPU_DIR' -DRPP_ROOT='$ROCM_EXTRA' -DROCPROFILER_SDK_ROOT='$ROCM_EXTRA' \
