@@ -13,19 +13,17 @@
    limitations under the License. */
 // Experiment 3, part (b): FKL's MorphologyDPP box blur against NPPDx on the pipeline of the neighborhood experiment
 // (common/bench_neighborhood.h): BOX_K x BOX_K box, one pass. NPPDx has the box (BoxBlur) between its color conversion
-// and its write, so its kernel does the whole pipeline up to the write (nppdx_box.h). One source, two programs
-// (NPPDX_FLOAT_WRITE, fkl-neighborhood/CMakeLists.txt), as fkl-vs-nppdx's two:
+// and its write, so its kernel does the whole pipeline (nppdx_box.h):
 //
-//   nppdx       NPPDX_FLOAT_WRITE 1: one kernel, the NPPDx operations (NV12 ingest of the crop, limited to full range,
-//               ColorConvert BT.601, BoxBlur) and the normalization and float3 write written by hand, as
-//               fkl-vs-nppdx's NPPDx kernel (NPPDx has no float output): 1 kernel
-//   nppdx_npp   NPPDX_FLOAT_WRITE 0: without hand written pixel processing code: the same NPPDx operations with NPPDx's
-//               8 bit RGB write (rounded half up), then NPP for the rest: nppiConvert_8u32f_C3R, nppiMulC, nppiSubC
-//               and nppiDivC_32f_C3IR on the N planes as one image: 5 kernels
+//   nppdx       one kernel, the NPPDx operations (NV12 ingest of the crop, limited to full range, ColorConvert BT.601,
+//               BoxBlur) and the normalization and float3 write written by hand, as fkl-vs-nppdx's NPPDx kernel (NPPDx
+//               has no float output): 1 kernel
 //   fkl_dpp     FKL's MorphologyDPP box blur, one kernel (neighborhood_common.h)
 //
-// Every tile and block size NPPDx supports for the crops is validated (the whole pipeline) and its NPPDx kernel timed
-// alone, for every batch size; the fastest correct one is used. The harness is common/bench_gpu.h.
+// Every tile and block size NPPDx supports for the crops is validated and its NPPDx kernel timed alone, for every batch
+// size; the fastest correct one is used. The harness is common/bench_gpu.h. (The kernel of nppdx_box.h also has NPPDx's
+// 8 bit write, which an NPPDx+NPP program used until it left the experiment; this program instantiates the float
+// write only.)
 
 #include "nppdx_box.h"
 
@@ -33,31 +31,24 @@
 
 #include <cstdio>
 
-#ifndef NPPDX_FLOAT_WRITE
-#error "Define NPPDX_FLOAT_WRITE, 1 (nppdx) or 0 (nppdx_npp) (fkl-neighborhood/CMakeLists.txt does)"
-#endif
-
 namespace bench::neighborhood {
 
 using namespace nppdx_box;
 
-constexpr bool FLOAT_WRITE = NPPDX_FLOAT_WRITE != 0;
+// The kernel with the hand written float write (nppdx_box.h)
+constexpr bool FLOAT_WRITE = true;
 constexpr int K = BOX_K;
-constexpr const char* NPPDX_NAME = FLOAT_WRITE ? "nppdx" : "nppdx_npp";
-// nppdx keeps float from the conversion to the write; nppdx_npp rounds the blurred RGB to 8 bits (half up)
-constexpr Reference NPPDX_REFERENCE = FLOAT_WRITE ? Reference::FklFloat : Reference::FklFloatRounded;
+constexpr const char* NPPDX_NAME = "nppdx";
+// Float from the conversion to the write
+constexpr Reference NPPDX_REFERENCE = Reference::FklFloat;
 
 // The NPPDx configurations (tile and block) of the kernel for the crops
 inline constexpr auto NPPDX_CONFIGS = nppdxConfigs<NPPDX_SM, FLOAT_WRITE>();
 
 struct NppdxState {
-    // The 8 bit planes the NPPDx kernel writes (nppdx_npp) and the float output
-    uint8_t* planes8{nullptr};
+    // The float output
     float* out{nullptr};
-    ~NppdxState() {
-        cudaFree(planes8);
-        cudaFree(out);
-    }
+    ~NppdxState() { cudaFree(out); }
 };
 
 // The origins of the crops of every iteration, NPPDx's argument (a kernel parameter), converted before the loops
@@ -77,48 +68,24 @@ inline Normalization normalization() {
     return Normalization{{MUL[0], MUL[1], MUL[2]}, {SUB[0], SUB[1], SUB[2]}, {DIV[0], DIV[1], DIV[2]}};
 }
 
-// The NPPDx pipeline with the configuration C; with KERNEL_ONLY, only its NPPDx kernel (timed alone to choose C)
-template <size_t N, NppdxConfig C, bool KERNEL_ONLY = false>
+// The NPPDx pipeline with the configuration C (one kernel)
+template <size_t N, NppdxConfig C>
 Implementation makeNppdx(Context& ctx) {
     using Kernel = NppdxBox<NPPDX_SM, N, FLOAT_WRITE, C.block, C.tileX, C.tileY>;
     Kernel::init();
     auto st = std::make_shared<NppdxState>();
-    if constexpr (!FLOAT_WRITE) {
-        gpuErrchk(cudaMalloc(&st->planes8, N * PLANE_BYTES));
-    }
     gpuErrchk(cudaMalloc(&st->out, N * PLANE_FLOATS * sizeof(float)));
     const auto origins = nppdxOrigins<N>(ctx);
     const Normalization n = normalization();
 
     Implementation impl{NPPDX_NAME, NPPDX_REFERENCE};
-    impl.stages.emplace_back(FLOAT_WRITE ? "1_nppdx_kernel_with_float_write" : "1_nppdx_kernel",
-                             [&ctx, st, origins, n](size_t t) {
+    impl.stages.emplace_back("1_nppdx_kernel_with_float_write", [&ctx, st, origins, n](size_t t) {
         beforeKernel();
-        Kernel::run(ctx.stream, ctx.y, ctx.uv, ctx.pitch, (*origins)[t], n, st->out, st->planes8);
+        Kernel::run(ctx.stream, ctx.y, ctx.uv, ctx.pitch, (*origins)[t], n, st->out, nullptr);
     });
-    if constexpr (!FLOAT_WRITE && !KERNEL_ONLY) {
-        impl.stages.emplace_back("2_convert_mulc_subc_divc", [&ctx, st](size_t) {
-            const NppiSize planes{PLANE_W, static_cast<int>(N) * PLANE_H};
-            const int step = PLANE_W * 3 * static_cast<int>(sizeof(float));
-            beforeKernel();
-            NPP_CHECK(nppiConvert_8u32f_C3R_Ctx(st->planes8, PLANE_W * 3, st->out, step, planes, ctx.npp));
-            beforeKernel();
-            NPP_CHECK(nppiMulC_32f_C3IR_Ctx(MUL, st->out, step, planes, ctx.npp));
-            beforeKernel();
-            NPP_CHECK(nppiSubC_32f_C3IR_Ctx(SUB, st->out, step, planes, ctx.npp));
-            beforeKernel();
-            NPP_CHECK(nppiDivC_32f_C3IR_Ctx(DIV, st->out, step, planes, ctx.npp));
-        });
-    }
     impl.run = runStages(impl.stages);
     impl.download = [st]() { return downloadDevice(st->out, N * PLANE_FLOATS); };
-    impl.fillNaN = [st]() {
-        // Every buffer the pipeline writes: values no correct execution leaves (NaN floats)
-        if (st->planes8) {
-            gpuErrchk(cudaMemset(st->planes8, 0xAB, N * PLANE_BYTES));
-        }
-        gpuErrchk(cudaMemset(st->out, 0xFF, N * PLANE_FLOATS * sizeof(float)));
-    };
+    impl.fillNaN = [st]() { gpuErrchk(cudaMemset(st->out, 0xFF, N * PLANE_FLOATS * sizeof(float))); };
     return impl;
 }
 
@@ -220,7 +187,8 @@ ConfigSweepRow sweepConfig(Context& ctx, const size_t index, const std::vector<f
             gpuErrchk(cudaGetLastError());
             return;
         }
-        row.timing = computeStats(measureInterleaved(ctx, {makeNppdx<N, C, true>(ctx)})[0]);
+        // The pipeline is the NPPDx kernel alone
+        row.timing = computeStats(measureInterleaved(ctx, {makeNppdx<N, C>(ctx)})[0]);
     });
     return row;
 }
@@ -258,9 +226,7 @@ size_t chooseConfig(Context& ctx) {
 }
 
 struct NppdxVsFklDpp {
-    static constexpr const char* title = FLOAT_WRITE
-        ? "FKL MorphologyDPP box blur vs NPPDx, neighborhood experiment (fkl-neighborhood)"
-        : "FKL MorphologyDPP box blur vs NPPDx+NPP, neighborhood experiment (fkl-neighborhood)";
+    static constexpr const char* title = "FKL MorphologyDPP box blur vs NPPDx, neighborhood experiment (fkl-neighborhood)";
     static constexpr const char* fklName = "fkl_dpp";
     static constexpr const char* fklLabel = "FKL DPP";
     static constexpr const char* fklShortLabel = "DPP";
@@ -291,26 +257,14 @@ struct NppdxVsFklDpp {
     static void workload(std::ostream& os) { describeWorkload(os, K, 1, BATCHES); }
 
     static void describe(std::ostream& os, const std::filesystem::path&) {
-        os << "NPPDx: " << NPPDX_GIT_VERSION << ", operations for SM " << NPPDX_SM << "\n";
-        if constexpr (FLOAT_WRITE) {
-            os << "NPPDx pipeline (nppdx): one kernel (nppdx_box.h): NPPDx's NV12 ingest of the crop (the crop is the "
-                  "image, so the halo of " << HALO << " pixels replicates its edge), FromLimitedLuma and "
-                  "FromLimitedChroma, ColorConvert BT.601 and BoxBlur<" << K << ", " << K << "> on a shared memory "
-                  "tile with the halo, then the normalization (Mul, Sub, Div) and the float3 write written by hand, "
-                  "as fkl-vs-nppdx's NPPDx kernel (NPPDx has no float output); one launch for the N crops, blockIdx.z "
-                  "the crop: 1 kernel. Float from the conversion to the write; checked against "
-               << referenceName(NPPDX_REFERENCE) << ".\n";
-        } else {
-            const NppLibraryVersion* npp = nppGetLibVersion();
-            os << "NPP: " << npp->major << "." << npp->minor << "." << npp->build << "\n"
-               << "NPPDx+NPP pipeline (nppdx_npp), without hand written pixel processing code: the NPPDx kernel of "
-                  "nppdx_box.h (NV12 ingest of the crop with the halo of " << HALO << " pixels replicating its edge, "
-                  "FromLimitedLuma and FromLimitedChroma, ColorConvert BT.601, BoxBlur<" << K << ", " << K << ">) "
-                  "with NPPDx's 8 bit RGB write (RGB24 exgest: + 0.5, clamped, truncated: rounded half up) into packed "
-                  "planes, one launch for the N crops; then nppiConvert_8u32f_C3R, nppiMulC, nppiSubC and "
-                  "nppiDivC_32f_C3IR on the N planes as one image: 5 kernels. The blurred RGB is rounded to 8 bits "
-                  "before the normalization; checked against " << referenceName(NPPDX_REFERENCE) << ".\n";
-        }
+        os << "NPPDx: " << NPPDX_GIT_VERSION << ", operations for SM " << NPPDX_SM << "\n"
+           << "NPPDx pipeline (nppdx): one kernel (nppdx_box.h): NPPDx's NV12 ingest of the crop (the crop is the "
+              "image, so the halo of " << HALO << " pixels replicates its edge), FromLimitedLuma and "
+              "FromLimitedChroma, ColorConvert BT.601 and BoxBlur<" << K << ", " << K << "> on a shared memory "
+              "tile with the halo, then the normalization (Mul, Sub, Div) and the float3 write written by hand, "
+              "as fkl-vs-nppdx's NPPDx kernel (NPPDx has no float output); one launch for the N crops, blockIdx.z "
+              "the crop: 1 kernel. Float from the conversion to the write; checked against "
+           << referenceName(NPPDX_REFERENCE) << ".\n";
         os << "NPPDx configurations: every tile of the crop that NPPDx supports (the whole crop, then halvings of the "
               "longer side down to 64 pixels, in 4x2 pixel cells) with NPPDx's recommended block and BlockDim 64, "
               "128, 256 and 512, validated and its kernel timed alone for every batch size, the fastest correct one "

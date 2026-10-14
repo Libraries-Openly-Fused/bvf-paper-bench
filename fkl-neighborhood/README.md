@@ -71,13 +71,13 @@ These programs use a 5x5 box, one pass, and every batch size.
 | `benchmark_opencv_cuda_neighborhood` | `opencv_cuda` | NPP NV12->RGB of the frame (OpenCV CUDA has none); per crop `convertTo` 32FC3 of the crop, then `createSeparableLinearFilter` (`CV_32FC3`, 5 taps of 1/5 for the rows and the columns, `BORDER_REPLICATE`; a row and a column kernel) into its plane; `multiply`, `subtract`, `divide` on the float3 output | 3N + 4 |
 | | `opencv_cuda_rgba` | NPP NV12->RGB; `cvtColor` RGB2RGBA of the frame; per crop `convertTo` 32FC4, then `createLinearFilter` (`CV_32FC4`, 5x5 taps of 1/25, `BORDER_REPLICATE`; one kernel) into its plane of a 4 channel output; `multiply`, `subtract`, `divide` on it; `cvtColor` RGBA2RGB into the float3 output | 2N + 6 |
 | `benchmark_nppdx_neighborhood` | `nppdx` | one kernel ([`src/nppdx_box.h`](src/nppdx_box.h)): NPPDx's NV12 ingest of the crop (the crop is the image, so the halo replicates its edge), `FromLimitedLuma` / `FromLimitedChroma`, `ColorConvert` BT.601 and `BoxBlur<5, 5>`, then the normalization and the float3 write written by hand, as `fkl-vs-nppdx`'s NPPDx kernel (NPPDx has no float output); one launch for the N crops | 1 |
-| `benchmark_nppdx_npp_neighborhood` | `nppdx_npp` | without hand written pixel processing code: the same NPPDx operations with NPPDx's 8 bit RGB write (rounded half up) into packed planes, then `nppiConvert_8u32f_C3R`, `nppiMulC`, `nppiSubC`, `nppiDivC` on all planes | 5 |
 | every program | `fkl_dpp` | one kernel (see above) | 1 |
 
-**NPPDx configurations:** for both NPPDx programs, every tile of the crop that NPPDx supports (64x32, then halvings of
+**NPPDx configurations:** every tile of the crop that NPPDx supports (64x32, then halvings of
 the longer side down to 8x8, in 4x2 pixel cells) runs with NPPDx's recommended block and with `BlockDim` 64, 128, 256
 and 512. Each one is validated and its kernel timed alone for every batch size, and the fastest correct one is used
-(`<name>_configs.csv`, `<name>_config_sweep.csv`).
+(`nppdx_configs.csv`, `nppdx_config_sweep.csv`). NPPDx's kernel fuses the whole pipeline, so there is no NPPDx+NPP
+program in this experiment.
 
 ### Notes on the libraries
 
@@ -100,7 +100,6 @@ is computed in double and rounded as the implementation rounds it (`boxReference
 | Reference | Crops | Box | Implementations |
 |---|---|---|---|
 | `fkl_cpu_float` | float (with the resize for the `_resize` programs) | float | `fkl_dpp`, `fkl_bvf_ops`, `nppdx` |
-| `fkl_cpu_float_rounded_8bit` | float | rounded half up to 8 bits | `nppdx_npp` |
 | `fkl_cpu_8bit_rgb` | the RGB rounded to 8 bits after the conversion (the 8 bit frame of NPP's conversion) | float | `npp_32f`, `npp_32f_frame`, `opencv_cuda`, `opencv_cuda_rgba` |
 | `fkl_cpu_8bit_rgb_floor_box` | the same 8 bit RGB | rounded down, floor(sum / 25) | `npp` |
 

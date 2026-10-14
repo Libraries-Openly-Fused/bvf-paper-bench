@@ -187,8 +187,7 @@ if has_step neighborhood; then
             programs+=("benchmark_fkl_neighborhood_k${k}_p$passes" "benchmark_fkl_neighborhood_k${k}_p${passes}_resize")
         done
     done
-    programs+=(benchmark_npp_neighborhood benchmark_opencv_cuda_neighborhood benchmark_nppdx_neighborhood
-               benchmark_nppdx_npp_neighborhood)
+    programs+=(benchmark_npp_neighborhood benchmark_opencv_cuda_neighborhood benchmark_nppdx_neighborhood)
     for program in "${programs[@]}"; do
         run "$LOGS/$program.log" "$build/$program" "$out/${program#benchmark_}"
         run "$LOGS/${program}_l2_flushed.log" "$build/$program" "$out/${program#benchmark_}" --gpu-only-l2-flushed

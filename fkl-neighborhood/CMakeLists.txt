@@ -48,9 +48,8 @@ if(BENCH_OPENCV)
                                                                      opencv_cudafilters opencv_cudaimgproc)
 endif()
 
-# Part (b): MorphologyDPP against NPPDx (hand written normalization and float write: benchmark_nppdx_neighborhood)
-# and NPPDx+NPP (no hand written pixel code: benchmark_nppdx_npp_neighborhood), with NPPDx (the nppdx submodule)
-# specialized for one SM version, as in fkl-vs-nppdx
+# Part (b): MorphologyDPP against NPPDx (hand written normalization and float write: benchmark_nppdx_neighborhood),
+# with NPPDx (the nppdx submodule) specialized for one SM version, as in fkl-vs-nppdx
 if(BENCH_NPPDX)
     if(CMAKE_VERSION VERSION_LESS 3.30)
         message(FATAL_ERROR "NPPDx requires CMake 3.30 or newer (or configure with -DBENCH_NPPDX=OFF)")
@@ -76,15 +75,9 @@ if(BENCH_NPPDX)
         add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:__cplusplus>)
         add_compile_definitions(NOMINMAX)
     endif()
-    foreach(FLOAT_WRITE 1 0)
-        if(FLOAT_WRITE)
-            set(TARGET_NAME benchmark_nppdx_neighborhood)
-        else()
-            set(TARGET_NAME benchmark_nppdx_npp_neighborhood)
-        endif()
-        add_bench_target(${TARGET_NAME} src/benchmark_nppdx_neighborhood.cu)
-        target_compile_definitions(${TARGET_NAME} PRIVATE NPPDX_FLOAT_WRITE=${FLOAT_WRITE} NPPDX_SM=${NPPDX_SM}
-                                                          NPPDX_GIT_VERSION="${NPPDX_GIT_VERSION}")
-        target_link_libraries(${TARGET_NAME} PRIVATE nppdx::nppdx CUDA::nppc CUDA::nppicc CUDA::nppidei CUDA::nppial)
-    endforeach()
+    add_bench_target(benchmark_nppdx_neighborhood src/benchmark_nppdx_neighborhood.cu)
+    target_compile_definitions(benchmark_nppdx_neighborhood PRIVATE NPPDX_SM=${NPPDX_SM}
+                                                                    NPPDX_GIT_VERSION="${NPPDX_GIT_VERSION}")
+    target_link_libraries(benchmark_nppdx_neighborhood PRIVATE nppdx::nppdx CUDA::nppc CUDA::nppicc CUDA::nppidei
+                                                               CUDA::nppial)
 endif()

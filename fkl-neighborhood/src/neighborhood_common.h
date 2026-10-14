@@ -80,7 +80,7 @@ std::vector<double> cropRgb(const Context& ctx, const size_t t) {
 // bit RGB), the box in double, rounded as the implementation rounds it, then normalized (boxReference,
 // common/bench_neighborhood.h)
 //   FklFloat         FKL's float RGB, float box (FKL, NPPDx with its float write)
-//   FklFloatRounded  FKL's float RGB, box rounded half up to 8 bits (NPPDx's 8 bit write: NPPDx+NPP)
+//   FklFloatRounded  FKL's float RGB, box rounded half up to 8 bits (NPPDx's 8 bit write; no program uses it now)
 //   Fkl8bit          8 bit RGB, float box (NPP's 32f box, OpenCV's float filters)
 //   Fkl8bitFloorBox  8 bit RGB, box rounded down, floor(sum / k^2) (NPP's 8 bit box)
 // With RESIZE (part (a)'s variant with the resize, FKL only), the float reference of the resized regions.

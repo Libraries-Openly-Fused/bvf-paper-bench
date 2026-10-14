@@ -557,8 +557,8 @@ else()
         endif()
     endforeach()
     # The neighborhood experiment (fkl-neighborhood/): the tests of its BVF box operation and of MorphologyDPP's box,
-    # then every program (part (a), MorphologyDPP against NPP and OpenCV CUDA, and with NPPDx against NPPDx and
-    # NPPDx+NPP) with the checks of the benchmarks above; the NPPDx programs must match their references too
+    # then every program (part (a), MorphologyDPP against NPP and OpenCV CUDA, and with NPPDx against NPPDx) with the
+    # checks of the benchmarks above; the NPPDx program must match its reference too
     if(NPPDX)
         set(neighborhoodNppdx ON)
     else()
@@ -578,7 +578,7 @@ else()
     endforeach()
     list(APPEND neighborhoodPrograms benchmark_npp_neighborhood benchmark_opencv_cuda_neighborhood)
     if(NPPDX)
-        list(APPEND neighborhoodPrograms benchmark_nppdx_neighborhood benchmark_nppdx_npp_neighborhood)
+        list(APPEND neighborhoodPrograms benchmark_nppdx_neighborhood)
     endif()
     foreach(program IN LISTS neighborhoodPrograms)
         set(bench "${BUILD_DIR}/neighborhood/${program}${EXE}")
