@@ -1,75 +1,52 @@
 cmake_minimum_required(VERSION 3.28)
-# The neighborhood experiment (Experiment 3, see README.md): the Figure 1 pipeline with a morphology stage after the
-# resize, FKL's BVF morphology operations against MorphologyDPP, and MorphologyDPP against the libraries:
+# The neighborhood experiment (Experiment 3, see README.md): 64x32 crops of the frame, a box blur and the
+# normalization, FKL's BVF box operation against MorphologyDPP, and MorphologyDPP against the libraries:
 #   cmake -S fkl-neighborhood -B build-neighborhood -DOpenCV_DIR=<OpenCV build or install>
-#   cmake -S fkl-neighborhood -B build-neighborhood-nppdx-32x16 -DBENCH_NPPDX=ON -DBENCH_REGIONS=32x16
+# The crops have a fixed size (common/bench_neighborhood.h), so every program, the NPPDx ones too, is built once, and
+# BENCH_REGIONS (the sizes of the other experiments) does not change them.
 project(fkl_neighborhood LANGUAGES CXX CUDA)
 include(${CMAKE_CURRENT_SOURCE_DIR}/../common/bench_gpu.cmake)
 
-# The NPPDx+NPP programs, like fkl-vs-nppdx, are compiled for one region size: with BENCH_NPPDX=ON (and BENCH_REGIONS
-# set to one size) this folder builds only them, otherwise every other program
-option(BENCH_NPPDX "Build only the NPPDx+NPP programs (needs BENCH_REGIONS set to one size)" OFF)
-# The OpenCV CUDA programs need OpenCV 4.14 with CUDA and the opencv_contrib modules cudaarithm, cudafilters,
-# cudaimgproc and cudawarping (-DOpenCV_DIR=<OpenCV build or install>), and NPP for the NV12 conversion
-option(BENCH_OPENCV "Build the OpenCV CUDA programs" ON)
+# The OpenCV CUDA program needs OpenCV 4.14 with CUDA and the opencv_contrib modules cudaarithm, cudafilters and
+# cudaimgproc (-DOpenCV_DIR=<OpenCV build or install>), and NPP for the NV12 conversion
+option(BENCH_OPENCV "Build the OpenCV CUDA program" ON)
+# The NPPDx programs need CMake 3.30 or newer and the nppdx submodule (or NPPDX_DIR)
+option(BENCH_NPPDX "Build the NPPDx programs" ON)
 
-# The programs of part (b), one per operation: <prefix>_erode (NEIGHBORHOOD_OP 0) and <prefix>_open (1)
-function(add_neighborhood_targets PREFIX SOURCE)
-    foreach(OP_INDEX 0 1)
-        if(OP_INDEX EQUAL 0)
-            set(TARGET_NAME ${PREFIX}_erode)
-        else()
-            set(TARGET_NAME ${PREFIX}_open)
-        endif()
-        add_bench_target(${TARGET_NAME} ${SOURCE})
-        target_compile_definitions(${TARGET_NAME} PRIVATE NEIGHBORHOOD_OP=${OP_INDEX})
-        list(APPEND TARGETS ${TARGET_NAME})
+# BoxBVF and MorphologyDPP's box blur against the host reference of common/bench_neighborhood.h
+add_bench_target(test_neighborhood_ops src/test_neighborhood_ops.cu)
+
+# Part (a): one program per box size and number of passes (PART_A_KS, PART_A_PASSES of common/bench_neighborhood.h)
+foreach(K 3 5 7)
+    foreach(PASSES 1 2)
+        set(TARGET_NAME benchmark_fkl_neighborhood_k${K}_p${PASSES})
+        add_bench_target(${TARGET_NAME} src/benchmark_fkl_neighborhood.cu)
+        target_compile_definitions(${TARGET_NAME} PRIVATE NEIGHBORHOOD_K=${K} NEIGHBORHOOD_PASSES=${PASSES})
     endforeach()
-    set(NEIGHBORHOOD_TARGETS ${TARGETS} PARENT_SCOPE)
-endfunction()
+endforeach()
 
-if(NOT BENCH_NPPDX)
-    # ErodeBVF and DilateBVF (common/bench_neighborhood_ops.h) against the host reference of common/bench_neighborhood.h
-    add_bench_target(test_neighborhood_ops src/test_neighborhood_ops.cu)
+# Part (b): MorphologyDPP against NPP
+add_bench_target(benchmark_npp_neighborhood src/benchmark_npp_neighborhood.cu)
+target_link_libraries(benchmark_npp_neighborhood PRIVATE CUDA::nppc CUDA::nppicc CUDA::nppidei CUDA::nppial
+                                                         CUDA::nppif)
 
-    # Part (a): one program per mask size and number of passes (PART_A_KS, PART_A_PASSES of
-    # common/bench_neighborhood.h)
-    foreach(K 3 5 7)
-        foreach(PASSES 1 2)
-            set(TARGET_NAME benchmark_fkl_neighborhood_k${K}_p${PASSES})
-            add_bench_target(${TARGET_NAME} src/benchmark_fkl_neighborhood.cu)
-            target_compile_definitions(${TARGET_NAME} PRIVATE NEIGHBORHOOD_K=${K} NEIGHBORHOOD_PASSES=${PASSES})
-        endforeach()
-    endforeach()
+# Part (b): MorphologyDPP against OpenCV CUDA
+if(BENCH_OPENCV)
+    # OpenCVConfig.cmake still calls find_package(CUDA), which needs the legacy FindCUDA module
+    cmake_policy(SET CMP0146 OLD)
+    find_package(OpenCV 4.14 REQUIRED COMPONENTS core imgproc cudaarithm cudafilters cudaimgproc)
+    add_bench_target(benchmark_opencv_cuda_neighborhood src/benchmark_opencv_cuda_neighborhood.cu)
+    target_link_libraries(benchmark_opencv_cuda_neighborhood PRIVATE CUDA::nppc CUDA::nppicc opencv_core
+                                                                     opencv_imgproc opencv_cudaarithm
+                                                                     opencv_cudafilters opencv_cudaimgproc)
+endif()
 
-    # Part (b): MorphologyDPP against NPP
-    add_neighborhood_targets(benchmark_npp_neighborhood src/benchmark_npp_neighborhood.cu)
-    foreach(TARGET_NAME ${NEIGHBORHOOD_TARGETS})
-        target_link_libraries(${TARGET_NAME} PRIVATE CUDA::nppc CUDA::nppicc CUDA::nppidei CUDA::nppial CUDA::nppig
-                                                     CUDA::nppif CUDA::nppim)
-    endforeach()
-
-    # Part (b): MorphologyDPP against OpenCV CUDA
-    if(BENCH_OPENCV)
-        # OpenCVConfig.cmake still calls find_package(CUDA), which needs the legacy FindCUDA module
-        cmake_policy(SET CMP0146 OLD)
-        find_package(OpenCV 4.14 REQUIRED COMPONENTS core imgproc cudaarithm cudafilters cudaimgproc cudawarping)
-        add_neighborhood_targets(benchmark_opencv_cuda_neighborhood src/benchmark_opencv_cuda_neighborhood.cu)
-        foreach(TARGET_NAME ${NEIGHBORHOOD_TARGETS})
-            target_link_libraries(${TARGET_NAME} PRIVATE CUDA::nppc CUDA::nppicc opencv_core opencv_imgproc
-                                                         opencv_cudaarithm opencv_cudafilters opencv_cudaimgproc
-                                                         opencv_cudawarping)
-        endforeach()
-    endif()
-else()
-    # Part (b): MorphologyDPP against NPPDx+NPP, for one region size, with NPPDx (the nppdx submodule) specialized for
-    # one SM version, as in fkl-vs-nppdx
+# Part (b): MorphologyDPP against NPPDx (hand written normalization and float write: benchmark_nppdx_neighborhood)
+# and NPPDx+NPP (no hand written pixel code: benchmark_nppdx_npp_neighborhood), with NPPDx (the nppdx submodule)
+# specialized for one SM version, as in fkl-vs-nppdx
+if(BENCH_NPPDX)
     if(CMAKE_VERSION VERSION_LESS 3.30)
-        message(FATAL_ERROR "NPPDx requires CMake 3.30 or newer")
-    endif()
-    if(BENCH_REGIONS STREQUAL "mixed")
-        message(FATAL_ERROR "The NPPDx kernels are compiled for one region size: set BENCH_REGIONS to 20x10, 32x16 or "
-                            "48x24")
+        message(FATAL_ERROR "NPPDx requires CMake 3.30 or newer (or configure with -DBENCH_NPPDX=OFF)")
     endif()
     # NPPDx operations are specialized for one SM version (SM<890> for compute capability 8.9)
     execute_process(COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader
@@ -92,12 +69,15 @@ else()
         add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:__cplusplus>)
         add_compile_definitions(NOMINMAX)
     endif()
-    add_neighborhood_targets(benchmark_nppdx_npp_neighborhood src/benchmark_nppdx_npp_neighborhood.cu)
-    foreach(TARGET_NAME ${NEIGHBORHOOD_TARGETS})
-        # The NPPDx kernel of fkl-vs-nppdx (benchmarks/nppdx_npp_figure1.h)
-        target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../fkl-vs-nppdx)
-        target_compile_definitions(${TARGET_NAME} PRIVATE NPPDX_SM=${NPPDX_SM} NPPDX_GIT_VERSION="${NPPDX_GIT_VERSION}")
-        target_link_libraries(${TARGET_NAME} PRIVATE nppdx::nppdx CUDA::nppc CUDA::nppidei CUDA::nppial CUDA::nppim
-                                                     CUDA::nppicc)
+    foreach(FLOAT_WRITE 1 0)
+        if(FLOAT_WRITE)
+            set(TARGET_NAME benchmark_nppdx_neighborhood)
+        else()
+            set(TARGET_NAME benchmark_nppdx_npp_neighborhood)
+        endif()
+        add_bench_target(${TARGET_NAME} src/benchmark_nppdx_neighborhood.cu)
+        target_compile_definitions(${TARGET_NAME} PRIVATE NPPDX_FLOAT_WRITE=${FLOAT_WRITE} NPPDX_SM=${NPPDX_SM}
+                                                          NPPDX_GIT_VERSION="${NPPDX_GIT_VERSION}")
+        target_link_libraries(${TARGET_NAME} PRIVATE nppdx::nppdx CUDA::nppc CUDA::nppicc CUDA::nppidei CUDA::nppial)
     endforeach()
 endif()

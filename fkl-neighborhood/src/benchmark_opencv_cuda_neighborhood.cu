@@ -12,64 +12,55 @@
    See the License for the specific language governing permissions and
    limitations under the License. */
 
-// Experiment 3, part (b): FKL's MorphologyDPP against OpenCV CUDA on the pipeline of the neighborhood experiment
-// (common/bench_neighborhood.h), with a MORPH_K x MORPH_K mask and the operation NEIGHBORHOOD_OP (0: erode, 1: open;
-// one build each, fkl-neighborhood/CMakeLists.txt). The harness is common/bench_gpu.h.
+// Experiment 3, part (b): FKL's MorphologyDPP box blur against OpenCV CUDA on the pipeline of the neighborhood
+// experiment (common/bench_neighborhood.h): BOX_K x BOX_K box, one pass. The harness is common/bench_gpu.h.
 //
-// OpenCV CUDA's morphology filters (cudafilters) take 8UC1, 8UC4, 32FC1 and 32FC4 images, not 3 channels, so the
-// pipeline of Figure 1 (fkl-vs-opencv-cuda: per region convertTo to float, resize) works on 4 channels here, and the
-// alpha channel is dropped at the end:
-//   opencv_cuda                  NPP NV12->RGB of the whole frame, cvtColor RGB2RGBA of the whole frame, then per
-//                                region convertTo 32FC4, resize and the morphology filter (createMorphologyFilter,
-//                                MORPH_ERODE or MORPH_OPEN, into its output plane), then multiply, subtract and divide
-//                                on the whole 4 channel output and one cvtColor RGBA2RGB into the float3 output
-//   opencv_cuda_rgba_per_region  the same with cvtColor RGB2RGBA per region (of the region of the RGB frame) instead
-//                                of the whole frame
-//   fkl_dpp                      FKL's MorphologyDPP, one kernel (neighborhood_common.h)
+// OpenCV CUDA's box filter (createBoxFilter) takes 8UC1, 8UC4 and 32FC1 only, so the box is a linear filter: the
+// separable filter takes 3 channels, the 2D one (createLinearFilter) 1 or 4. Its filters build their border from the
+// image they are given (a view of the crop), so REPLICATE replicates the edge of the crop.
+//   opencv_cuda       NPP NV12->RGB of the whole frame (OpenCV CUDA has no NV12 conversion); per crop convertTo
+//                     32FC3 of the crop of the 8 bit frame, then createSeparableLinearFilter (CV_32FC3, row and column
+//                     taps 1/5, BORDER_REPLICATE; a row and a column kernel) into its plane of the float3 output; then
+//                     multiply, subtract and divide on the whole output: 3N + 4 kernels
+//   opencv_cuda_rgba  NPP NV12->RGB; cvtColor RGB2RGBA of the whole frame; per crop convertTo 32FC4, then
+//                     createLinearFilter (CV_32FC4, 5x5 taps 1/25, BORDER_REPLICATE; one kernel) into its plane of a
+//                     4 channel output; multiply, subtract and divide on it; cvtColor RGBA2RGB into the float3 output:
+//                     2N + 6 kernels
+//   fkl_dpp           FKL's MorphologyDPP box blur, one kernel (neighborhood_common.h)
 
 #include <opencv2/core/cuda_stream_accessor.hpp>
 #include <opencv2/cudaarithm.hpp>
 #include <opencv2/cudafilters.hpp>
 #include <opencv2/cudaimgproc.hpp>
-#include <opencv2/cudawarping.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include "neighborhood_common.h"
 
-#ifndef NEIGHBORHOOD_OP
-#error "Define NEIGHBORHOOD_OP, 0 (erode) or 1 (open) (fkl-neighborhood/CMakeLists.txt does)"
-#endif
-
 namespace bench::neighborhood {
 
-constexpr MorphOp OP = NEIGHBORHOOD_OP == 0 ? MorphOp::Erode : MorphOp::Open;
-static_assert(NEIGHBORHOOD_OP == 0 || NEIGHBORHOOD_OP == 1, "0 (erode) or 1 (open)");
-constexpr int K = MORPH_K;
+constexpr int K = BOX_K;
 
 struct OpenCVState {
     cv::cuda::Stream stream;
     cv::cuda::GpuMat rgb8;
-    // The whole frame with 4 channels (opencv_cuda), or one 8UC4 region of the largest size per region
-    // (opencv_cuda_rgba_per_region)
+    // The whole frame with 4 channels (opencv_cuda_rgba)
     cv::cuda::GpuMat rgba8;
-    std::vector<cv::cuda::GpuMat> rgba8Regions;
-    // The regions of every iteration, N per iteration (rects[t * N + i])
+    // The crops of every iteration, N per iteration (rects[t * N + i])
     std::vector<cv::Rect> rects;
-    // One 32FC4 crop of the largest region size per region; a region of another size uses its top-left corner
+    // One float crop per crop
     std::vector<cv::cuda::GpuMat> cropped;
-    std::vector<cv::cuda::GpuMat> resized;
-    cv::Ptr<cv::cuda::Filter> morphology;
-    // The 4 channel output of the morphology and the normalization, and the float3 output
+    cv::Ptr<cv::cuda::Filter> box;
+    // The 4 channel output of the box and the normalization (opencv_cuda_rgba), and the float3 output
     cv::cuda::GpuMat tensor4;
     cv::cuda::GpuMat tensor;
 };
 
-template <size_t N, bool RGBA_PER_REGION>
+template <size_t N, bool RGBA>
 Implementation makeOpenCV(Context& ctx) {
     auto st = std::make_shared<OpenCVState>();
     st->stream = cv::cuda::StreamAccessor::wrapStream(ctx.stream);
     st->rgb8.create(FRAME_H, FRAME_W, CV_8UC3);
-    if constexpr (!RGBA_PER_REGION) {
+    if constexpr (RGBA) {
         st->rgba8.create(FRAME_H, FRAME_W, CV_8UC4);
     }
     for (size_t t = 0; t < ctx.regions->iterations(); ++t) {
@@ -78,69 +69,72 @@ Implementation makeOpenCV(Context& ctx) {
             st->rects.emplace_back(r.x, r.y, r.width, r.height);
         }
     }
+    const int floatType = RGBA ? CV_32FC4 : CV_32FC3;
     for (size_t i = 0; i < N; ++i) {
-        if constexpr (RGBA_PER_REGION) {
-            st->rgba8Regions.emplace_back(MAX_REGION_H, MAX_REGION_W, CV_8UC4);
-        }
-        st->cropped.emplace_back(MAX_REGION_H, MAX_REGION_W, CV_32FC4);
-        st->resized.emplace_back(PLANE_H, PLANE_W, CV_32FC4);
+        st->cropped.emplace_back(CROP_H, CROP_W, floatType);
     }
-    st->morphology = cv::cuda::createMorphologyFilter(OP == MorphOp::Erode ? cv::MORPH_ERODE : cv::MORPH_OPEN,
-                                                      CV_32FC4, cv::Mat::ones(K, K, CV_8U));
-    cv::cuda::createContinuous(static_cast<int>(N) * PLANE_H, PLANE_W, CV_32FC4, st->tensor4);
+    if constexpr (RGBA) {
+        st->box = cv::cuda::createLinearFilter(CV_32FC4, CV_32FC4,
+                                               cv::Mat(K, K, CV_32F, cv::Scalar(1. / (K * K))), cv::Point(-1, -1),
+                                               cv::BORDER_REPLICATE);
+        cv::cuda::createContinuous(static_cast<int>(N) * PLANE_H, PLANE_W, CV_32FC4, st->tensor4);
+    } else {
+        const cv::Mat taps(1, K, CV_32F, cv::Scalar(1. / K));
+        st->box = cv::cuda::createSeparableLinearFilter(CV_32FC3, CV_32FC3, taps, taps, cv::Point(-1, -1),
+                                                        cv::BORDER_REPLICATE, cv::BORDER_REPLICATE);
+    }
     cv::cuda::createContinuous(static_cast<int>(N) * PLANE_H, PLANE_W, CV_32FC3, st->tensor);
 
-    Implementation impl{RGBA_PER_REGION ? "opencv_cuda_rgba_per_region" : "opencv_cuda", Reference::Fkl8bit};
+    Implementation impl{RGBA ? "opencv_cuda_rgba" : "opencv_cuda", Reference::Fkl8bit};
     impl.stages.emplace_back("1_nv12_to_rgb8_full_frame_npp", [&ctx, st](size_t) {
         nv12ToRgb8(ctx, st->rgb8.data, static_cast<int>(st->rgb8.step));
     });
-    if constexpr (!RGBA_PER_REGION) {
+    if constexpr (RGBA) {
         impl.stages.emplace_back("2_rgb_to_rgba_full_frame", [st](size_t) {
             beforeKernel();
             cv::cuda::cvtColor(st->rgb8, st->rgba8, cv::COLOR_RGB2RGBA, 0, st->stream);
         });
     }
-    const std::string perRegion = RGBA_PER_REGION ? "3_per_crop_cvtColor_convertTo_resize_morphology"
-                                                  : "3_per_crop_convertTo_resize_morphology";
-    impl.stages.emplace_back(perRegion, [st](size_t t) {
+    impl.stages.emplace_back(RGBA ? "3_per_crop_convertTo_linear_filter" : "3_per_crop_convertTo_separable_filter",
+                             [st](size_t t) {
+        cv::cuda::GpuMat& output = RGBA ? st->tensor4 : st->tensor;
         for (size_t i = 0; i < N; ++i) {
             const cv::Rect& r = st->rects[t * N + i];
-            const cv::Rect regionSize(0, 0, r.width, r.height);
-            cv::cuda::GpuMat rgba;
-            if constexpr (RGBA_PER_REGION) {
-                rgba = st->rgba8Regions[i](regionSize);
-                beforeKernel();
-                cv::cuda::cvtColor(st->rgb8(r), rgba, cv::COLOR_RGB2RGBA, 0, st->stream);
-            } else {
-                rgba = st->rgba8(r);
-            }
-            cv::cuda::GpuMat cropped = st->cropped[i](regionSize);
             beforeKernel();
-            rgba.convertTo(cropped, CV_32F, st->stream);
+            (RGBA ? st->rgba8 : st->rgb8)(r).convertTo(st->cropped[i], CV_32F, st->stream);
+            cv::cuda::GpuMat plane = output.rowRange(static_cast<int>(i) * PLANE_H, static_cast<int>(i + 1) * PLANE_H);
+            // The separable filter is a row and a column kernel in one call: with the L2 flushed, the flush runs
+            // before the call only
             beforeKernel();
-            cv::cuda::resize(cropped, st->resized[i], cv::Size(PLANE_W, PLANE_H), 0., 0., cv::INTER_LINEAR, st->stream);
-            cv::cuda::GpuMat plane =
-                st->tensor4.rowRange(static_cast<int>(i) * PLANE_H, static_cast<int>(i + 1) * PLANE_H);
-            // A copyMakeBorder and an NPP kernel per pass in one call: with the L2 flushed, the flush runs before the
-            // call only
-            beforeKernel();
-            st->morphology->apply(st->resized[i], plane, st->stream);
+            st->box->apply(st->cropped[i], plane, st->stream);
         }
     });
     impl.stages.emplace_back("4_multiply_subtract_divide", [st](size_t) {
-        // The alpha channel is multiplied and divided by 1 and has 0 subtracted
-        beforeKernel();
-        cv::cuda::multiply(st->tensor4, cv::Scalar(MUL[0], MUL[1], MUL[2], 1.), st->tensor4, 1., -1, st->stream);
-        beforeKernel();
-        cv::cuda::subtract(st->tensor4, cv::Scalar(SUB[0], SUB[1], SUB[2], 0.), st->tensor4, cv::noArray(), -1,
-                           st->stream);
-        beforeKernel();
-        cv::cuda::divide(st->tensor4, cv::Scalar(DIV[0], DIV[1], DIV[2], 1.), st->tensor4, 1., -1, st->stream);
+        if constexpr (RGBA) {
+            // The alpha channel is multiplied and divided by 1 and has 0 subtracted
+            beforeKernel();
+            cv::cuda::multiply(st->tensor4, cv::Scalar(MUL[0], MUL[1], MUL[2], 1.), st->tensor4, 1., -1, st->stream);
+            beforeKernel();
+            cv::cuda::subtract(st->tensor4, cv::Scalar(SUB[0], SUB[1], SUB[2], 0.), st->tensor4, cv::noArray(), -1,
+                               st->stream);
+            beforeKernel();
+            cv::cuda::divide(st->tensor4, cv::Scalar(DIV[0], DIV[1], DIV[2], 1.), st->tensor4, 1., -1, st->stream);
+        } else {
+            beforeKernel();
+            cv::cuda::multiply(st->tensor, cv::Scalar(MUL[0], MUL[1], MUL[2]), st->tensor, 1., -1, st->stream);
+            beforeKernel();
+            cv::cuda::subtract(st->tensor, cv::Scalar(SUB[0], SUB[1], SUB[2]), st->tensor, cv::noArray(), -1,
+                               st->stream);
+            beforeKernel();
+            cv::cuda::divide(st->tensor, cv::Scalar(DIV[0], DIV[1], DIV[2]), st->tensor, 1., -1, st->stream);
+        }
     });
-    impl.stages.emplace_back("5_rgba_to_rgb", [st](size_t) {
-        beforeKernel();
-        cv::cuda::cvtColor(st->tensor4, st->tensor, cv::COLOR_RGBA2RGB, 0, st->stream);
-    });
+    if constexpr (RGBA) {
+        impl.stages.emplace_back("5_rgba_to_rgb", [st](size_t) {
+            beforeKernel();
+            cv::cuda::cvtColor(st->tensor4, st->tensor, cv::COLOR_RGBA2RGB, 0, st->stream);
+        });
+    }
     impl.run = runStages(impl.stages);
     impl.download = [st]() { return downloadDevice(st->tensor.data, N * PLANE_FLOATS); };
     impl.fillNaN = [st]() { gpuErrchk(cudaMemset(st->tensor.data, 0xFF, N * PLANE_FLOATS * sizeof(float))); };
@@ -149,10 +143,11 @@ Implementation makeOpenCV(Context& ctx) {
 
 struct OpenCVCudaVsFklDpp {
     static constexpr const char* title =
-        "FKL MorphologyDPP vs OpenCV CUDA, neighborhood experiment (fkl-neighborhood)";
+        "FKL MorphologyDPP box blur vs OpenCV CUDA, neighborhood experiment (fkl-neighborhood)";
     static constexpr const char* fklName = "fkl_dpp";
     static constexpr const char* fklLabel = "FKL DPP";
     static constexpr const char* fklShortLabel = "DPP";
+    static constexpr geometry::RegionSize regionSize = CROP_SIZE;
 
     template <size_t N>
     static std::vector<Implementation> implementations(Context& ctx) {
@@ -164,23 +159,22 @@ struct OpenCVCudaVsFklDpp {
 
     template <size_t N>
     static Implementation fklImplementation(Context& ctx) {
-        return fklDpp<N, K, OP>(ctx);
+        return fklDpp<N, K, 1>(ctx);
     }
 
     template <size_t N>
     static std::vector<float> reference(const Context& ctx, Reference r, size_t t) {
-        return morphReference<N>(ctx, r, t, K, OP);
+        return boxReferenceOf<N>(ctx, r, t, K, 1);
     }
 
     static void setup(const std::filesystem::path& outDir, const std::string& mode) { setupTileChoice(outDir, mode); }
 
-    static void workload(std::ostream& os) { describeWorkload(os, K, OP, BATCHES); }
+    static void workload(std::ostream& os) { describeWorkload(os, K, 1, BATCHES); }
 
     static void describe(std::ostream& os, const std::filesystem::path& outDir) {
         const std::string opencvBuild = cv::getBuildInformation();
         std::ofstream(outDir / "opencv_build_information.txt") << opencvBuild;
         const NppLibraryVersion* npp = nppGetLibVersion();
-        const bool erode = OP == MorphOp::Erode;
         os << "OpenCV: " << cv::getVersionString() << " (opencv_contrib "
            << bench::buildInfoValue(opencvBuild, "Version control (extra):") << ", CUDA_ARCH_BIN "
            << bench::buildInfoValue(opencvBuild, "NVIDIA GPU arch:") << ", C++ compiler "
@@ -188,21 +182,22 @@ struct OpenCVCudaVsFklDpp {
            << "; full configuration in opencv_build_information.txt)\n"
            << "NPP: " << npp->major << "." << npp->minor << "." << npp->build
            << " (the NV12 -> RGB of the OpenCV pipelines: OpenCV CUDA has no NV12 conversion)\n"
-           << "OpenCV CUDA pipelines: OpenCV CUDA's morphology filters take 8UC1, 8UC4, 32FC1 and 32FC4 images (not "
-              "3 channels), so the pipeline of fkl-vs-opencv-cuda works on 4 channels: NPP NV12->RGB of the whole "
-              "frame into an 8 bit RGB frame, then per region convertTo 32FC4 (into a buffer of the largest region "
-              "size through a view of the region's size), resize and the morphology filter (createMorphologyFilter("
-           << (erode ? "MORPH_ERODE" : "MORPH_OPEN") << ", CV_32FC4, " << K << "x" << K << " ones), whose apply "
-              "copies the plane with copyMakeBorder (BORDER_REFLECT_101, which gives the same minimum and maximum as "
-              "replicating the border for a centered rectangular mask) and runs nppiErode / nppiDilate_32f_C4R on it, "
-              "one copy and one NPP kernel per pass) into its plane of a 4 channel output, then multiply, subtract and "
-              "divide on the whole 4 channel output and one cvtColor RGBA2RGB into the float3 output.\n"
-           << "  opencv_cuda: cvtColor RGB2RGBA of the whole 8 bit frame before the per-region calls: "
-           << (erode ? "4N + 6" : "6N + 6") << " kernels\n"
-           << "  opencv_cuda_rgba_per_region: cvtColor RGB2RGBA of the region of the 8 bit frame, per region, into a "
-              "buffer of the largest region size: " << (erode ? "5N + 5" : "7N + 5") << " kernels\n"
-           << "With the L2 flushed, the flush runs before every OpenCV call, not between the kernels of one call (the "
-              "morphology filter launches " << (erode ? 2 : 4) << " per call).\n";
+           << "OpenCV CUDA pipelines: NPP NV12->RGB of the whole frame into an 8 bit RGB frame, then per crop "
+              "convertTo of the crop of the frame (a view of it) into a float crop and the box as a linear filter on "
+              "it, written into the crop's plane of the output (OpenCV CUDA's createBoxFilter takes 8UC1, 8UC4 and "
+              "32FC1 only). The filters build their border from the float crop, so BORDER_REPLICATE replicates the "
+              "edge of the crop.\n"
+           << "  opencv_cuda: convertTo 32FC3 and createSeparableLinearFilter(CV_32FC3, CV_32FC3, " << K << " taps of "
+              "1/" << K << " for the rows and the columns, BORDER_REPLICATE), a row and a column kernel per call, "
+              "then multiply, subtract and divide on the float3 output: 3N + 4 kernels\n"
+           << "  opencv_cuda_rgba: cvtColor RGB2RGBA of the whole 8 bit frame, convertTo 32FC4 and "
+              "createLinearFilter(CV_32FC4, CV_32FC4, " << K << "x" << K << " taps of 1/" << K * K << ", "
+              "BORDER_REPLICATE), one kernel per call, then multiply, subtract and divide on the 4 channel output and "
+              "one cvtColor RGBA2RGB into the float3 output: 2N + 6 kernels\n"
+           << "With the L2 flushed, the flush runs before every OpenCV call, not between the two kernels of the "
+              "separable filter.\n"
+           << "References: the 8 bit RGB of NPP's conversion (FKL's conversion rounded to nearest, see the diagnostic "
+              "below) with the box in float.\n";
     }
 
     static std::string diagnostic(const Context& ctx) { return nppConversionDiagnostic(ctx); }
