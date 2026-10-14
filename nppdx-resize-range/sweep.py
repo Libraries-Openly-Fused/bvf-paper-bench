@@ -24,6 +24,7 @@ No timing: this is capability data, one launch per point.
 import argparse
 import concurrent.futures
 import csv
+import json
 import os
 import re
 import subprocess
@@ -216,10 +217,13 @@ def main():
     results = {}
     print(f"{len(order)} points, {args.jobs} jobs", flush=True)
     start = time.time()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool, \
+            open(out / "results.jsonl", "w") as raw:
         futures = {pool.submit(run_point, p, nppdx, bindir, not args.no_launch): p for p in order}
         for i, fut in enumerate(concurrent.futures.as_completed(futures), 1):
             results[futures[fut]] = fut.result()
+            raw.write(json.dumps(results[futures[fut]]) + "\n")
+            raw.flush()
             if i % 200 == 0 or i == len(order):
                 print(f"  {i}/{len(order)} after {time.time() - start:.0f} s", flush=True)
 
@@ -229,10 +233,10 @@ def main():
                "box_halo", "resize_halo", "input_storage", "blurred_storage", "intermediate_storage", "output_storage",
                "smem_bytes", "shared_memory_limit", "fits_smem", "block", "example_block_fits", "j_divides_tile",
                "probe_matches_rules", "device_max_shared_memory_per_block_optin",
-               "launch_result", "launch_error", "launch_block", "launch_image", "launch_output", "launch_max_diff",
-               "launch_max_diff_interior", "launch_interior_values_over_1",
-               "launch32_result", "launch32_error", "launch32_max_diff", "launch32_max_diff_interior",
-               "launch32_interior_values_over_1"]
+               "launch_result", "launch_error", "launch_block", "launch_grid", "launch_image", "launch_output",
+               "launch_max_diff", "launch_values_over_1", "launch_interior_pixels", "launch_max_diff_interior",
+               "launch_interior_values_over_1", "launch32_result", "launch32_error", "launch32_max_diff",
+               "launch32_max_diff_interior", "launch32_interior_values_over_1"]
     disagreements, mismatches, rows = [], [], []
     for key in keys:
         r, p = results[key], predicted[key]
@@ -266,9 +270,8 @@ def main():
             row[f"{tag}_max_diff"] = r.get(f"{tag}_max_diff", "")
             row[f"{tag}_max_diff_interior"] = r.get(f"{tag}_max_diff_interior", "")
             row[f"{tag}_interior_values_over_1"] = r.get(f"{tag}_interior_values_over_1", "")
-        row["launch_block"] = r.get("launch_block", "")
-        row["launch_image"] = r.get("launch_image", "")
-        row["launch_output"] = r.get("launch_output", "")
+        for c in ("block", "grid", "image", "output", "values_over_1", "interior_pixels"):
+            row[f"launch_{c}"] = r.get(f"launch_{c}", "")
         rows.append(row)
     with open(out / "sweep.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
