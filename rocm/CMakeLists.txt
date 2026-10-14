@@ -44,9 +44,15 @@ if(NOT FKL_COMMIT MATCHES "^63782f6" AND (NOT FKL_SUBMODULE_COMMIT OR NOT FKL_CO
                     "nor ${FKL_SUBMODULE_COMMIT} (the repository's fkl submodule, the FKL commit of Experiment 3)")
 endif()
 execute_process(COMMAND git -C ${FKL_DIR} rev-parse --abbrev-ref HEAD OUTPUT_VARIABLE FKL_BRANCH OUTPUT_STRIP_TRAILING_WHITESPACE)
-# The commit of this repository (--dirty: local changes show up in platform.txt)
-execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR}/.. describe --always --dirty --abbrev=7
-                OUTPUT_VARIABLE BENCH_REPO_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE)
+# The commit of this repository (its SHA even at a tag), and whether its checkout has changes, as in
+# common/bench_gpu.cmake: both show up in platform.txt
+execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR}/.. rev-parse --short HEAD OUTPUT_VARIABLE BENCH_REPO_COMMIT
+                OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR}/.. status --porcelain --untracked-files=no
+                OUTPUT_VARIABLE BENCH_REPO_CHANGES OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(BENCH_REPO_CHANGES)
+    string(APPEND BENCH_REPO_COMMIT " (with uncommitted changes)")
+endif()
 
 # FKL's own HIP target options (cmake/libs/hip/target_generation.cmake, debug.cmake): HIP_STANDARD 20 (required),
 # -ftemplate-depth=1000 (TEMPLATE_DEPTH), -gline-tables-only (ENABLE_HIP_LINE_INFO); Release adds -O3 -DNDEBUG
