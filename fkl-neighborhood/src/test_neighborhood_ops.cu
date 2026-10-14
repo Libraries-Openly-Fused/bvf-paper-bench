@@ -14,7 +14,9 @@
 
 // Tests of BoxBVF (common/bench_neighborhood_ops.h) and of FKL's MorphologyDPP box blur (executeBoxBlur, and
 // MorphologyDPP<ParArch::CPU> with its passes) against the host reference of common/bench_neighborhood.h
-// (hostBoxPlane, sums in double), for every box size and number of passes of the experiment:
+// (hostBoxPlane, sums in double), for every box size and number of passes of the experiment, and of GaussianBVF
+// (common/bench_neighborhood_ops.h, nppdx-wins/) against a separable host reference in double: Gaussians of 5 and 21
+// taps, asymmetric taps that do not sum to 1, and a batch with one set of taps per crop:
 //   - one PLANE_W x PLANE_H plane read directly (PerThreadRead);
 //   - a batch of CROP_W x CROP_H crops of a larger image, one of them at its corner (the chain of the experiment,
 //     without the color conversion): each crop replicates its own edge, it does not read the image around it.
@@ -29,6 +31,7 @@
 #include "bench_neighborhood.h"
 #include "bench_neighborhood_ops.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -232,6 +235,198 @@ bool runCase() {
     return ok;
 }
 
+// ------------------------------------------------------------------------------------------------
+// GaussianBVF
+// ------------------------------------------------------------------------------------------------
+
+// The K taps of a Gaussian of standard deviation sigma, centered, normalized to a sum of 1
+template <int K>
+fk::Array<float, K> gaussianTaps(const double sigma) {
+    double taps[K];
+    double sum = 0.0;
+    for (int i = 0; i < K; ++i) {
+        const double d = i - K / 2;
+        taps[i] = std::exp(-d * d / (2.0 * sigma * sigma));
+        sum += taps[i];
+    }
+    fk::Array<float, K> out{};
+    for (int i = 0; i < K; ++i) {
+        out[i] = static_cast<float>(taps[i] / sum);
+    }
+    return out;
+}
+
+// The separable filter of the taps on planes planes of fk::float3, one after the other, each replicating its own
+// edge: rows, then columns, in double (the taps as float, as GaussianBVF uses them)
+template <int K>
+std::vector<fk::float3> hostGaussian(const std::vector<fk::float3>& planes, const size_t count,
+                                     const fk::Array<float, K>& taps) {
+    std::vector<fk::float3> out(planes.size());
+    std::vector<double> rows(PLANE_FLOATS);
+    const auto channel = [](const fk::float3& v, const int c) { return c == 0 ? v.x : (c == 1 ? v.y : v.z); };
+    for (size_t p = 0; p < count; ++p) {
+        const fk::float3* plane = planes.data() + p * PLANE_PIXELS;
+        for (int y = 0; y < PLANE_H; ++y)
+            for (int x = 0; x < PLANE_W; ++x)
+                for (int c = 0; c < 3; ++c) {
+                    double sum = 0.0;
+                    for (int k = 0; k < K; ++k) {
+                        const int sx = std::clamp(x + k - K / 2, 0, PLANE_W - 1);
+                        sum += static_cast<double>(taps[k]) * channel(plane[static_cast<size_t>(y) * PLANE_W + sx], c);
+                    }
+                    rows[(static_cast<size_t>(y) * PLANE_W + x) * 3 + c] = sum;
+                }
+        for (int y = 0; y < PLANE_H; ++y)
+            for (int x = 0; x < PLANE_W; ++x) {
+                double v[3];
+                for (int c = 0; c < 3; ++c) {
+                    double sum = 0.0;
+                    for (int k = 0; k < K; ++k) {
+                        const int sy = std::clamp(y + k - K / 2, 0, PLANE_H - 1);
+                        sum += static_cast<double>(taps[k]) * rows[(static_cast<size_t>(sy) * PLANE_W + x) * 3 + c];
+                    }
+                    v[c] = sum;
+                }
+                out[p * PLANE_PIXELS + static_cast<size_t>(y) * PLANE_W + x] = {
+                    static_cast<float>(v[0]), static_cast<float>(v[1]), static_cast<float>(v[2])};
+            }
+    }
+    return out;
+}
+
+// Asymmetric taps that do not sum to 1 (a ramp times the Gaussian, times 1.7): a reversed tap index or a normalization
+// in the operation would not match the reference
+template <int K>
+fk::Array<float, K> asymmetricTaps() {
+    const fk::Array<float, K> g = gaussianTaps<K>(1.0);
+    fk::Array<float, K> out{};
+    for (int i = 0; i < K; ++i) {
+        out[i] = static_cast<float>(1.7 * g[i] * (0.5 + i / (K - 1.0)));
+    }
+    return out;
+}
+
+template <int K>
+bool runGaussianCase(const char* what, const fk::Array<float, K>& taps) {
+    char name[128];
+    bool ok = true;
+    const auto check = [&](const char* where, const std::vector<fk::float3>& got,
+                           const std::vector<fk::float3>& expected) {
+        std::snprintf(name, sizeof(name), "%s, %s", where, what);
+        ok = matches(name, got, expected) && ok;
+    };
+    const auto planeRead = [](const auto& ptr) { return fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(ptr); };
+
+    // One plane, read directly
+    std::vector<fk::float3> plane = randomImage(PLANE_PIXELS, 101u + K);
+    const std::vector<fk::float3> expected = hostGaussian<K>(plane, 1, taps);
+    {
+        fk::Tensor<fk::float3> out(PLANE_W, PLANE_H, 1, 1, fk::MemType::Host);
+        fk::Stream_<fk::ParArch::CPU> cpu;
+        fk::executeOperations<fk::TransformDPP<fk::ParArch::CPU>>(cpu, planeRead(hostPtr<PLANE_W, PLANE_H>(plane)),
+                                                                  fk::GaussianBVF<K>::build(taps),
+                                                                  fk::TensorWrite<fk::float3>::build(out.ptr()));
+        check("CPU GaussianBVF plane", tensorValues(out, 1), expected);
+    }
+    {
+        fk::Ptr2D<fk::float3> in(PLANE_W, PLANE_H);
+        for (int y = 0; y < PLANE_H; ++y)
+            for (int x = 0; x < PLANE_W; ++x) in.at(fk::Point{x, y, 0}) = plane[static_cast<size_t>(y) * PLANE_W + x];
+        fk::Tensor<fk::float3> out(PLANE_W, PLANE_H, 1);
+        fk::Stream stream;
+        in.upload(stream);
+        fk::executeOperations<fk::TransformDPP<>>(stream, planeRead(in.ptr()), fk::GaussianBVF<K>::build(taps),
+                                                  fk::TensorWrite<fk::float3>::build(out.ptr()));
+        out.download(stream);
+        stream.sync();
+        check("GPU GaussianBVF plane", tensorValues(out, 1), expected);
+    }
+
+    // A batch of crops of a larger image, each replicating its own edge
+    std::vector<fk::float3> source = randomImage(static_cast<size_t>(SOURCE_W) * SOURCE_H, 103u + K);
+    std::vector<fk::float3> crops(BATCH * PLANE_PIXELS);
+    for (size_t i = 0; i < BATCH; ++i)
+        for (int y = 0; y < CROP_H; ++y)
+            for (int x = 0; x < CROP_W; ++x)
+                crops[i * PLANE_PIXELS + static_cast<size_t>(y) * PLANE_W + x] =
+                    source[static_cast<size_t>(CROPS[i].y + y) * SOURCE_W + CROPS[i].x + x];
+    const std::vector<fk::float3> batchExpected = hostGaussian<K>(crops, BATCH, taps);
+    const auto cropOf = [](const auto& sourcePtr) {
+        return fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(sourcePtr).then(fk::Crop<>::build(CROPS));
+    };
+    {
+        fk::Tensor<fk::float3> out(PLANE_W, PLANE_H, BATCH, 1, fk::MemType::Host);
+        fk::Stream_<fk::ParArch::CPU> cpu;
+        fk::executeOperations<fk::TransformDPP<fk::ParArch::CPU>>(cpu, cropOf(hostPtr<SOURCE_W, SOURCE_H>(source)),
+                                                                  fk::GaussianBVF<K>::build(taps),
+                                                                  fk::TensorWrite<fk::float3>::build(out.ptr()));
+        check("CPU GaussianBVF batch", tensorValues(out, BATCH), batchExpected);
+    }
+    {
+        fk::Ptr2D<fk::float3> in(SOURCE_W, SOURCE_H);
+        for (int y = 0; y < SOURCE_H; ++y)
+            for (int x = 0; x < SOURCE_W; ++x)
+                in.at(fk::Point{x, y, 0}) = source[static_cast<size_t>(y) * SOURCE_W + x];
+        fk::Tensor<fk::float3> out(PLANE_W, PLANE_H, BATCH);
+        fk::Stream stream;
+        in.upload(stream);
+        fk::executeOperations<fk::TransformDPP<>>(stream, cropOf(in.ptr()), fk::GaussianBVF<K>::build(taps),
+                                                  fk::TensorWrite<fk::float3>::build(out.ptr()));
+        out.download(stream);
+        stream.sync();
+        check("GPU GaussianBVF batch", tensorValues(out, BATCH), batchExpected);
+    }
+    std::printf("GaussianBVF %s: %s\n", what, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// One set of taps per crop of a batch (the std::array builder of the incomplete GaussianBVF): every plane is filtered
+// with its own taps
+bool runPerPlaneTapsCase() {
+    constexpr int K = 5;
+    const std::array<fk::Array<float, K>, BATCH> taps{gaussianTaps<K>(1.0), asymmetricTaps<K>(),
+                                                      fk::Array<float, K>{{0.f, 0.f, 1.f, 0.f, 0.f}}};
+    std::vector<fk::float3> source = randomImage(static_cast<size_t>(SOURCE_W) * SOURCE_H, 107u);
+    std::vector<fk::float3> expected(BATCH * PLANE_PIXELS);
+    for (size_t i = 0; i < BATCH; ++i) {
+        std::vector<fk::float3> crop(PLANE_PIXELS);
+        for (int y = 0; y < CROP_H; ++y)
+            for (int x = 0; x < CROP_W; ++x)
+                crop[static_cast<size_t>(y) * PLANE_W + x] =
+                    source[static_cast<size_t>(CROPS[i].y + y) * SOURCE_W + CROPS[i].x + x];
+        const auto planeExpected = hostGaussian<K>(crop, 1, taps[i]);
+        std::copy(planeExpected.begin(), planeExpected.end(), expected.begin() + i * PLANE_PIXELS);
+    }
+    const auto cropOf = [](const auto& sourcePtr) {
+        return fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(sourcePtr).then(fk::Crop<>::build(CROPS));
+    };
+    bool ok = true;
+    {
+        fk::Tensor<fk::float3> out(PLANE_W, PLANE_H, BATCH, 1, fk::MemType::Host);
+        fk::Stream_<fk::ParArch::CPU> cpu;
+        fk::executeOperations<fk::TransformDPP<fk::ParArch::CPU>>(cpu, cropOf(hostPtr<SOURCE_W, SOURCE_H>(source)),
+                                                                  fk::GaussianBVF<K>::build(taps),
+                                                                  fk::TensorWrite<fk::float3>::build(out.ptr()));
+        ok = matches("CPU GaussianBVF batch with per-plane taps", tensorValues(out, BATCH), expected) && ok;
+    }
+    {
+        fk::Ptr2D<fk::float3> in(SOURCE_W, SOURCE_H);
+        for (int y = 0; y < SOURCE_H; ++y)
+            for (int x = 0; x < SOURCE_W; ++x)
+                in.at(fk::Point{x, y, 0}) = source[static_cast<size_t>(y) * SOURCE_W + x];
+        fk::Tensor<fk::float3> out(PLANE_W, PLANE_H, BATCH);
+        fk::Stream stream;
+        in.upload(stream);
+        fk::executeOperations<fk::TransformDPP<>>(stream, cropOf(in.ptr()), fk::GaussianBVF<K>::build(taps),
+                                                  fk::TensorWrite<fk::float3>::build(out.ptr()));
+        out.download(stream);
+        stream.sync();
+        ok = matches("GPU GaussianBVF batch with per-plane taps", tensorValues(out, BATCH), expected) && ok;
+    }
+    std::printf("GaussianBVF batch with per-plane taps: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 template <size_t... I>
 bool runAll(std::index_sequence<I...>) {
     constexpr auto KS = bench::neighborhood::PART_A_KS;
@@ -244,7 +439,11 @@ bool runAll(std::index_sequence<I...>) {
 
 int main() {
     using namespace bench::neighborhood;
-    const bool ok = runAll(std::make_index_sequence<PART_A_KS.size() * PART_A_PASSES.size()>{});
-    std::printf("%s\n", ok ? "All BoxBVF and MorphologyDPP box tests passed" : "Box tests FAILED");
+    bool ok = runAll(std::make_index_sequence<PART_A_KS.size() * PART_A_PASSES.size()>{});
+    ok = runGaussianCase<5>("Gaussian 5 taps, sigma 1", gaussianTaps<5>(1.0)) & ok;
+    ok = runGaussianCase<21>("Gaussian 21 taps, sigma 5", gaussianTaps<21>(5.0)) & ok;
+    ok = runGaussianCase<5>("asymmetric 5 taps, not normalized", asymmetricTaps<5>()) & ok;
+    ok = runPerPlaneTapsCase() & ok;
+    std::printf("%s\n", ok ? "All BoxBVF, GaussianBVF and MorphologyDPP box tests passed" : "Tests FAILED");
     return ok ? 0 : 1;
 }

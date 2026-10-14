@@ -13,14 +13,15 @@
    limitations under the License. */
 
 // nppdx-wins, W2 (wins_common.h): ReadNV12 -> YUVtoRGB -> filter -> Resize 2:1 to 1920x1080 -> Mul -> Sub -> Div ->
-// one float3 plane, the whole 3840x2160 frame (batch "1": one frame; the harness's regions are not used). nppdx and
-// fkl_inline are the baselines of fkl_staged in the harness's files; every median is in latency.csv, gpu_time.csv and
-// gpu_time_l2_flushed.csv. The filter (CMake target):
+// one float3 plane, the whole 3840x2160 frame (batch "1": one frame; the harness's regions are not used). nppdx,
+// fkl_inline (and fkl_staged_separable for the Gaussian) are the baselines of fkl_staged in the harness's files; every
+// median is in latency.csv, gpu_time.csv and gpu_time_l2_flushed.csv. The filter (CMake target):
 //   WINS_GAUSSIAN 0   a WINS_BOX_K x WINS_BOX_K box in WINS_PASSES passes (benchmark_wins_frame: 5x5, one pass;
 //                     _k9: 9x9; _k5_p2: 5x5 twice). fkl_inline: BoxBVF<K> per pass; fkl_staged: executeBoxBlur<PASSES>
-//   WINS_GAUSSIAN 1   NPPDx's GaussianBlur<50, wide>, 21 taps, sigma 5 (benchmark_wins_frame_gauss21). fkl_staged:
-//                     LinearFilterDPP 21x21 with the products of NPPDx's taps; FKL has no inline Gaussian, so no
-//                     fkl_inline; instead fkl_staged_separable, LinearFilterDPP 21x1 then 1x21 (three kernels)
+//   WINS_GAUSSIAN 1   NPPDx's GaussianBlur<50, wide>, 21 taps, sigma 5 (benchmark_wins_frame_gauss21). fkl_inline:
+//                     GaussianBVF<21> with NPPDx's taps (common/bench_neighborhood_ops.h); fkl_staged: LinearFilterDPP
+//                     21x21 with the products of NPPDx's taps; and fkl_staged_separable, LinearFilterDPP 21x1 then 1x21
+//                     (three kernels)
 
 #include "wins_common.h"
 
@@ -75,7 +76,8 @@ Implementation makeNppdx(Context& ctx) {
     auto out = outputPlane();
     const Normalization n = normalization();
     Implementation impl{"nppdx", Reference::NppdxPixelCenterFloat};
-    impl.stages.emplace_back("1_nppdx_box_resize_normalize", [&ctx, out, n](size_t) {
+    impl.stages.emplace_back(Spec::GAUSSIAN ? "1_nppdx_gaussian_resize_normalize" : "1_nppdx_box_resize_normalize",
+                             [&ctx, out, n](size_t) {
         const dim3 grid{(FRAME_W + Ops::TX - 1) / Ops::TX, (FRAME_H + Ops::TY - 1) / Ops::TY, 1};
         beforeKernel();
         kernel<<<grid, dim3(Ops::block), Ops::smem, ctx.stream>>>(ctx.y, ctx.uv, ctx.pitch, n,
@@ -87,26 +89,40 @@ Implementation makeNppdx(Context& ctx) {
     return impl;
 }
 
-// FKL, the box as a BVF operation before the resize (one BoxBVF per pass): one kernel, 4 x (K^2)^PASSES frame
-// evaluations per output value
+// FKL, the filter as a BVF operation before the resize (one BoxBVF per pass, or GaussianBVF with NPPDx's taps): one
+// kernel, 4 x (K^2)^PASSES frame evaluations per output value
 template <typename S = Spec>
 Implementation makeFklInline(Context& ctx) {
-    static_assert(!S::GAUSSIAN, "FKL has no inline Gaussian");
     auto out = outputPlane();
+    // The Gaussian's taps (NPPDx's), the parameter of GaussianBVF; unused by the box
+    fk::Array<float, S::K> taps{};
+    if constexpr (S::GAUSSIAN) {
+        const auto values = S::taps();
+        for (int i = 0; i < S::K; ++i) {
+            taps[i] = static_cast<float>(values[i]);
+        }
+    }
     Implementation impl{"fkl_inline", Reference::FklFloat};
-    impl.stages.emplace_back("1_box_resize_normalize", [&ctx, out](size_t) {
+    impl.stages.emplace_back(S::GAUSSIAN ? "1_gaussian_resize_normalize" : "1_box_resize_normalize",
+                             [&ctx, out, taps](size_t) {
         beforeKernel();
-        if constexpr (Spec::PASSES == 1) {
+        if constexpr (S::GAUSSIAN) {
             fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
                                                       fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
-                                                      YUVToRGB::build(), fk::BoxBVF<Spec::K>::build(),
+                                                      YUVToRGB::build(), fk::GaussianBVF<S::K>::build(taps),
+                                                      Bilinear::build(fk::Size(W2_OUT_W, W2_OUT_H)),
+                                                      normalizedWrite(*out));
+        } else if constexpr (S::PASSES == 1) {
+            fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
+                                                      fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
+                                                      YUVToRGB::build(), fk::BoxBVF<S::K>::build(),
                                                       Bilinear::build(fk::Size(W2_OUT_W, W2_OUT_H)),
                                                       normalizedWrite(*out));
         } else {
             fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
                                                       fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
-                                                      YUVToRGB::build(), fk::BoxBVF<Spec::K>::build(),
-                                                      fk::BoxBVF<Spec::K>::build(),
+                                                      YUVToRGB::build(), fk::BoxBVF<S::K>::build(),
+                                                      fk::BoxBVF<S::K>::build(),
                                                       Bilinear::build(fk::Size(W2_OUT_W, W2_OUT_H)),
                                                       normalizedWrite(*out));
         }
@@ -305,9 +321,8 @@ struct WinsFrame {
         static_assert(N == 1, "One frame");
         std::vector<Implementation> impls;
         impls.push_back(nppdx(ctx));
-        if constexpr (!Spec::GAUSSIAN) {
-            impls.push_back(makeFklInline(ctx));
-        } else {
+        impls.push_back(makeFklInline(ctx));
+        if constexpr (Spec::GAUSSIAN) {
             impls.push_back(fklStagedSeparable(ctx));
         }
         return impls;
@@ -346,13 +361,20 @@ struct WinsFrame {
               "GaussianBlur), Resize<2, 1, bilinear>, the "
               "normalization and float3 write written by hand; the fastest validated of tiles 64x32, 32x32, 32x16, "
               "16x16, 16x8 with the recommended block and 128, 256, 512 (choices.csv, choice_sweep.csv).\n"
-           << "fkl_inline: one kernel, ReadNV12 -> YUVtoRGB -> BoxBVF<K> per pass -> Resize -> Mul -> Sub -> Div -> "
-              "TensorWrite (4 x (K^2)^passes NV12 reads and conversions per output value; none for the Gaussian).\n"
+           << "fkl_inline: one kernel, ReadNV12 -> YUVtoRGB -> BoxBVF<K> per pass (GaussianBVF<21> with NPPDx's taps "
+              "for the Gaussian) -> Resize -> Mul -> Sub -> Div -> TensorWrite (4 x (K^2)^passes NV12 reads and "
+              "conversions per output value).\n"
            << "fkl_staged: two kernels, the DPP of the filter (MorphologyDPP, executeBoxBlur; LinearFilterDPP 21x21 "
               "for the Gaussian) of the frame into a float3 frame in memory "
               "(" << static_cast<size_t>(FRAME_W) * FRAME_H * 12 << " bytes written, then read by the resize), then "
-              "TransformDPP Resize -> Mul -> Sub -> Div -> TensorWrite; the fastest validated MorphologyDPP tile of "
-              "16x8, 32x8, 32x16.\n";
+              "TransformDPP Resize -> Mul -> Sub -> Div -> TensorWrite; the fastest validated DPP tile of 16x8, 32x8, "
+              "32x16.\n";
+        if constexpr (Spec::GAUSSIAN) {
+            os << "fkl_staged_separable (an extra, not one of the two FKL forms): three kernels, LinearFilterDPP 21x1 "
+                  "of the frame into a float3 frame, LinearFilterDPP 1x21 of it into a second one (two intermediates "
+                  "of " << static_cast<size_t>(FRAME_W) * FRAME_H * 12 << " bytes), then TransformDPP Resize -> Mul -> "
+                  "Sub -> Div -> TensorWrite; the fastest validated LinearFilterDPP tile of 16x8, 32x8, 32x16.\n";
+        }
     }
 
     static std::string diagnostic(const Context&) { return std::string(); }
