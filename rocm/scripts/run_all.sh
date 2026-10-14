@@ -48,7 +48,7 @@ REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 EXPERIMENT=${EXPERIMENT:-1}
 [ "$EXPERIMENT" = 1 ] || [ "$EXPERIMENT" = 3 ] || { echo "run_all.sh: STOP: EXPERIMENT is 1 or 3, not $EXPERIMENT" >&2; exit 1; }
 # The paper's FKL commit of Experiments 1 and 2 (and of the CPU benchmark); Experiment 3 uses the commit recorded for
-# the repository's fkl submodule, which has the batched MorphologyDPP
+# the repository's fkl submodule, which has MorphologyDPP's executeBoxBlur
 if [ "$EXPERIMENT" = 1 ]; then
     FKL_PAPER_COMMIT=63782f6
 else
@@ -164,7 +164,7 @@ if ! allowed SKIP_CPU; then
 fi
 BENCH=$BUILD_GPU/rocm_bench
 [ "$EXPERIMENT" = 3 ] && BENCH=$BUILD_GPU/rocm_neighborhood
-[ -x "$BENCH" ] || die "$BENCH was not built (Experiment 3 needs FKL with the batched MorphologyDPP, see $OUT/logs/build_gpu.log)"
+[ -x "$BENCH" ] || die "$BENCH was not built (Experiment 3 needs FKL with MorphologyDPP's executeBoxBlur, see $OUT/logs/build_gpu.log)"
 WORKLOAD=$("$BENCH" --workload) || die "$BENCH --workload failed"
 if ! allowed SKIP_CPU && [ "$WORKLOAD" != "$("$BUILD_CPU/rpp_cpu_bench" --workload)" ]; then
     die "rocm_bench and rpp_cpu_bench have different workloads (region sizes or batch sizes): build both from the same checkout and options"

@@ -34,7 +34,7 @@ find_library(ROCPROFILER_SDK_LIBRARY rocprofiler-sdk HINTS "${ROCPROFILER_SDK_RO
 execute_process(COMMAND git -C ${FKL_DIR} describe --always --dirty --abbrev=7 OUTPUT_VARIABLE FKL_COMMIT
                 OUTPUT_STRIP_TRAILING_WHITESPACE)
 # The paper's FKL commits: 63782f6 for Experiments 1 and 2 (rocm_bench), the commit recorded for the repository's fkl
-# submodule for Experiment 3 (rocm_neighborhood, which needs the batched MorphologyDPP)
+# submodule for Experiment 3 (rocm_neighborhood, which needs MorphologyDPP's batched box blur)
 execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR}/.. ls-tree HEAD fkl OUTPUT_VARIABLE FKL_SUBMODULE_ENTRY
                 OUTPUT_STRIP_TRAILING_WHITESPACE)
 string(REGEX MATCH "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]" FKL_SUBMODULE_COMMIT
@@ -74,13 +74,13 @@ function(add_bench_program name source)
 endfunction()
 
 add_bench_program(rocm_bench src/rocm_bench.hip)
-# rocm_neighborhood needs the batched MorphologyDPP (FKL PR #393: grid z over the planes of its input), which FKL
-# 63782f6 does not have: it processes one plane there, so the program is only built with an FKL that has it
-file(STRINGS "${FKL_DIR}/include/fused_kernel/algorithms/image_processing/morphology.h" FKL_BATCHED_MORPHOLOGY
-     REGEX "getActiveThreads\\(\\)\\.z")
-if(FKL_BATCHED_MORPHOLOGY)
+# rocm_neighborhood needs MorphologyDPP's box blur (executeBoxBlur, FKL PR #393, batched over the planes of its input),
+# which FKL 63782f6 does not have, so the program is only built with an FKL that has it
+file(STRINGS "${FKL_DIR}/include/fused_kernel/algorithms/image_processing/morphology.h" FKL_BOX_BLUR
+     REGEX "executeBoxBlur")
+if(FKL_BOX_BLUR)
     add_bench_program(rocm_neighborhood src/rocm_neighborhood.hip)
 else()
-    message(STATUS "rocm_neighborhood (Experiment 3) not built: the MorphologyDPP of FKL_DIR (${FKL_COMMIT}) is not "
-                   "batched; it needs the commit of the repository's fkl submodule")
+    message(STATUS "rocm_neighborhood (Experiment 3) not built: the MorphologyDPP of FKL_DIR (${FKL_COMMIT}) has no "
+                   "executeBoxBlur; it needs the commit of the repository's fkl submodule")
 endif()

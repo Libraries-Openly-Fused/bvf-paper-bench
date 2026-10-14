@@ -1,29 +1,33 @@
-// Experiment 3 of the Backwards Vertical Fusion paper on an AMD GPU: a neighborhood operation (erode, or open = erode
-// then dilate; K x K, centred, replicate at the 64x32 edge in every pass) after the resize of the Figure 1 pipeline,
-// without AddBorder:
-// ReadNV12 -> YUVtoRGB -> Crop -> Resize 64x32 -> Morph -> Mul -> Sub -> Div -> Write (N planes of 64x32 float3)
-// with the frame, region sizes, batch sizes and the regions of every iteration of common/bench_geometry.h, and the
-// parameters of common/bench_neighborhood.h.
+// Experiment 3 of the Backwards Vertical Fusion paper on an AMD GPU: a neighborhood operation, the K x K box blur
+// (mean of the window centred on the value, per channel, replicating the edge of the crop in every pass), on fixed-size
+// crops of the frame, without the resize and the border of Figure 1:
+// ReadNV12 -> YUVtoRGB -> Crop 64x32 -> Box K x K -> Mul -> Sub -> Div -> Write (N planes of 64x32 float3)
+// with the frame and batch sizes of common/bench_geometry.h and the crops (cropRegionSets: 64x32 at random even
+// positions, new every iteration) and parameters of common/bench_neighborhood.h.
 //
-// Part (b), the library comparison (K = MORPH_K, every N of BATCHES, erode and open):
-//   rpp_normalize        rppt_yuv_to_rgb (full frame), rppt_crop_mirror_normalize 8u->32f (batched), rppt_resize F32
-//                        bilinear into a float3 plane buffer, rppt_erode (open: then rppt_dilate) batched over the N
-//                        planes into the output tensor, rppt_normalize (Mul + Sub + Div) on the whole tensor
-//   rpp_fused_normalize  rppt_yuv_to_rgb, rppt_resize_mirror_normalize 8u->32f (crop + convert + resize, batched) into
-//                        the plane buffer, then the same morphology and rppt_normalize
-//   fkl_dpp_<W>x<H>      one FKL kernel: MorphologyDPP<float3, W, H, K, K> batched over the regions, reading the BVF
-//                        chain ReadNV12 -> YUVtoRGB -> Crop -> Resize and writing through Mul -> Sub -> Div -> Write,
-//                        one for every tile of DPP_TILES
+// Part (b), the library comparison (K = BOX_K, one pass, every N of BATCHES):
+//   rpp_u8box_cmn         rppt_yuv_to_rgb (full frame), rppt_box_filter U8 on the frame with the crops as per-image
+//                         XYWH ROIs (crop + box in one call, into N 64x32 U8 images), rppt_crop_mirror_normalize
+//                         8u->32f with the whole normalization (per channel multiplier Mul / Div and offset -Sub / Div)
+//                         into the output tensor
+//   rpp_u8box_normalize   the same with rppt_crop_mirror_normalize 8u->32f converting only, then rppt_normalize (Mul +
+//                         Sub + Div) on the whole tensor
+//   rpp_f32box_cmn        rppt_yuv_to_rgb, rppt_crop_mirror_normalize 8u->32f of the crops (aliased frame, XYWH ROIs)
+//                         with the whole normalization, rppt_box_filter F32 of the normalized crops into the output
+//   rpp_f32box_normalize  the same with rppt_crop_mirror_normalize converting only, then rppt_normalize
+//   fkl_dpp_<W>x<H>       one FKL kernel: MorphologyDPP's executeBoxBlur<passes> (an Add reducer per pass, the 1 / K^2
+//                         of every pass in the write) batched over the crops, reading the BVF chain ReadNV12 -> YUVtoRGB
+//                         -> Crop and writing through Mul -> Sub -> Div -> Write, one for every tile of DPP_TILES
 // Part (a), the micro-experiment (FKL only, K of PART_A_KS, 1 or 2 passes, N of PART_A_BATCHES):
-//   fkl_bvf_naive        one FKL kernel with the naive ReadBack operations of common/bench_neighborhood_ops.h
-//                        (ErodeBVF, then DilateBVF for the open) in the BVF chain after the Resize
-//   fkl_dpp_<W>x<H>      as in part (b)
-// In every group (part, operation, K, N) all of them are validated and timed in the same interleaved iterations; the
-// RPP variant and the DPP tile of a group are the fastest (median of the CPU + GPU pass) of those that pass their
-// check, and every one is recorded. The speedups are per iteration (baseline / chosen DPP tile), averaged.
+//   fkl_bvf_naive         one FKL kernel with the naive ReadBack operation BoxBVF<K> of common/bench_neighborhood_ops.h
+//                         (twice for two passes) in the BVF chain after the Crop
+//   fkl_dpp_<W>x<H>       as in part (b), with executeBoxBlur<passes>
+// In every group (part, K, passes, N) all of them are validated and timed in the same interleaved iterations; the RPP
+// variant and the DPP tile of a group are the fastest (median of the CPU + GPU pass) of those that pass their checks,
+// and every one is recorded. The speedups are per iteration (baseline / chosen DPP tile), averaged.
 //
-// The harness (context, references of Experiment 1, timing, rocprofiler-sdk tool, cache flusher) is the one of
-// rocm_bench.hip, which this file includes. No HIP graphs anywhere.
+// The harness (context, timing, rocprofiler-sdk tool, cache flusher) is the one of rocm_bench.hip, which this file
+// includes. No HIP graphs anywhere.
 
 #define BENCH_NO_MAIN
 #include "rocm_bench.hip"
@@ -37,26 +41,19 @@
 
 namespace bench::nb {
 
+using neighborhood::BOX_K;
 using neighborhood::DPP_TILES;
-using neighborhood::MORPH_K;
-using neighborhood::MorphOp;
 using neighborhood::PLANE_FLOATS;
 using neighborhood::PLANE_H;
+using neighborhood::PLANE_PIXELS;
 using neighborhood::PLANE_W;
 
-// The batched MorphologyDPP (FKL PR #393), which processes every plane of its input (grid z) and sizes its staging per
-// number of passes (STAGE_ELEMENTS<passes>): an FKL without it (63782f6) would process the first region only
-template <typename Details>
-concept BatchedMorphologyDetails = requires { Details::template STAGE_ELEMENTS<1>; };
-static_assert(BatchedMorphologyDetails<fk::MorphologyDPPDetails<fk::float3>>,
-              "rocm_neighborhood needs FKL with the batched MorphologyDPP: the commit of the repository's fkl submodule");
-
-// RPP's HIP morphology refuses a source descriptor with offsetInBytes < 12 * (kernelSize / 2) (RPP_ERROR_LOW_OFFSET;
-// rppt_tensor_morphological_operations.cpp in RPP 3.2.0): its sources (the resized planes, and the eroded planes of
-// the open) start this many bytes into their allocation, given to RPP through the descriptor's offsetInBytes
+// RPP's HIP box filter refuses a source descriptor with offsetInBytes < 12 * (kernelSize / 2) (RPP_ERROR_LOW_OFFSET;
+// rppt_tensor_filter_augmentations.cpp in RPP 3.2.0): its sources (the RGB frame, and the converted crops of the F32
+// variants) start this many bytes into their allocation, given to RPP through the descriptor's offsetInBytes
 constexpr size_t RPP_LEAD_BYTES = 256;
-constexpr int RPP_MAX_KERNEL = 9; // the largest kernelSize of RPP's HIP morphology
-static_assert(RPP_LEAD_BYTES >= 12 * (RPP_MAX_KERNEL / 2), "RPP's HIP morphology needs the lead bytes");
+constexpr int RPP_MAX_KERNEL = 9; // the largest kernelSize of RPP's HIP box filter
+static_assert(RPP_LEAD_BYTES >= 12 * (RPP_MAX_KERNEL / 2), "RPP's HIP box filter needs the lead bytes");
 static_assert(PLANE_W % RPP_PIXEL_ALIGN == 0, "RPP's kernels write the plane rows 8 pixels at a time");
 // rppt_normalize reuses Experiment 1's rows of per column constants (OUT_W float3)
 static_assert(PLANE_W == OUT_W, "the normalize constants are rows of OUT_W float3");
@@ -64,32 +61,41 @@ static_assert(PLANE_W == OUT_W, "the normalize constants are rows of OUT_W float
 // One group of the experiment: every implementation of a group computes the same output
 struct Group {
     char part{'b'};
-    MorphOp op{MorphOp::Erode};
     int k{0};
+    int passes{1};
     int batch{0};
     std::string label() const {
-        return std::string(1, part) + "_" + neighborhood::name(op) + "_k" + std::to_string(k) + "_n" + std::to_string(batch);
+        return std::string(1, part) + "_box_k" + std::to_string(k) + "_p" + std::to_string(passes) + "_n" +
+               std::to_string(batch);
     }
 };
 
 // ------------------------------------------------------------------------------------------------
-// References. The Figure 1 chain without AddBorder (FKL's CPU backend, float; or RPP's sampling convention on RPP's
-// own 8 bit frame, as in Experiment 1), normalized, then the morphology of every plane with hostMorphPlane: x ->
-// (x * mul - sub) / div is monotone non-decreasing per channel (mul, div > 0) in IEEE round-to-nearest, so per channel
-// min and max commute with it exactly, and morphology after the normalization is the morphology before it.
+// References (common/bench_neighborhood.h): the crops blurred, then normalized.
+// The float reference: FKL's CPU float chain ReadNV12 -> YUVtoRGB -> Crop, then boxReference (sums in double, no
+// rounding, the normalization in float); FKL is checked against it with TOLERANCE. RPP's frame is 8 bit RGB, saturated:
+// it is checked with TOLERANCE_8BIT (one level of 8 bit RGB) against the same chain with the RGB saturated and rounded
+// to 8 bits (eightBitReference).
+// The RPP-convention references: each RPP variant's own arithmetic on RPP's 8 bit frame (ctx.rppRgb8, the output of
+// rppt_yuv_to_rgb), operation by operation, as RPP 3.2.0's HIP kernels compute it:
+//   rppt_box_filter U8   the window sum of 8 bit values (exact in float) times RPP's float 1 / K^2, to 8 bits with
+//                        v_cvt_pk_u8_f32 (round to nearest even, saturated): rint(float(sum) * scale)
+//                        (box_filter.cpp: box_filter_row_hip_compute, rpp_hip_pack_float24_pln3_and_store24_pkd3)
+//   rppt_box_filter F32  the window summed in float from 0, row after row, left to right, times RPP's float 1 / K^2
+//   rppt_crop_mirror_normalize 8u->32f   fmaf(x, multiplier, offset) per channel (crop_mirror_normalize.cpp)
+//   rppt_normalize       fmaf(x - mean, 1 * (1 / stdDev), 0) (normalize.cpp), mean = Sub / Mul and stdDev = Div / Mul
+//                        in float, as rocm_bench.hip uploads them
+// They are bit-exact by construction; an RPP variant is equivalent when it is within RPP_EQUIVALENCE of its own.
 // ------------------------------------------------------------------------------------------------
 static_assert(sizeof(fk::float3) == 3 * sizeof(float), "the planes are copied as float3");
 
-void morphPlanes(std::vector<float>& planes, int k, MorphOp op) {
-    const size_t count = planes.size() / PLANE_FLOATS;
-    std::vector<fk::float3> in(count * PLANE_W * PLANE_H), out(in.size());
-    std::memcpy(in.data(), planes.data(), planes.size() * sizeof(float));
-    neighborhood::hostMorph(in.data(), out.data(), count, k, op);
-    std::memcpy(planes.data(), out.data(), planes.size() * sizeof(float));
+inline size_t at(size_t plane, int y, int x, int c) {
+    return (plane * PLANE_PIXELS + static_cast<size_t>(y) * PLANE_W + x) * 3 + c;
 }
 
+// The crops of iteration t on FKL's CPU float chain ReadNV12 -> YUVtoRGB -> Crop (RGB values, not saturated)
 template <size_t N>
-std::vector<float> floatReference(const Context& ctx, size_t t, int k, MorphOp op) {
+std::vector<double> fklFloatCrops(const Context& ctx, size_t t) {
     const auto crops = fklRegions<N>(ctx, t);
     fk::Stream_<fk::ParArch::CPU> cpuStream;
     fk::Tensor<fk::float3> out(PLANE_W, PLANE_H, N, 1, fk::MemType::Host);
@@ -97,50 +103,145 @@ std::vector<float> floatReference(const Context& ctx, size_t t, int k, MorphOp o
         fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameHost),
         YUVToRGB::build(),
         fk::Crop<>::build(crops),
-        fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(PLANE_W, PLANE_H)),
-        fk::Mul<fk::float3>::build(mulValue),
-        fk::Sub<fk::float3>::build(subValue),
-        fk::Div<fk::float3>::build(divValue),
         fk::TensorWrite<fk::float3>::build(out.ptr()));
     cpuStream.sync();
     const float* data = reinterpret_cast<const float*>(out.ptr().data);
-    std::vector<float> planes(data, data + N * PLANE_FLOATS);
-    morphPlanes(planes, k, op);
-    return planes;
+    return std::vector<double>(data, data + N * PLANE_FLOATS);
 }
 
-// rppConventionReference8bit of rocm_bench.hip (RPP's 8 bit frame, RPP's bilinear sampling) without the border
 template <size_t N>
-std::vector<float> rppConventionReference(const Context& ctx, size_t t, int k, MorphOp op) {
+std::vector<float> floatReference(const Context& ctx, size_t t, int k, int passes) {
+    return neighborhood::boxReference(fklFloatCrops<N>(ctx, t), N, k, passes, neighborhood::Rounding::None, MUL, SUB,
+                                      DIV);
+}
+
+// The reference of RPP's tolerance check (its frame is 8 bit RGB): FKL's conversion saturated and rounded to nearest
+// 8 bit (Experiment 1's fkl_cpu_8bit_rgb), the box in double, its output rounded half up to 8 bits for the U8 box
+// (RPP's U8 box rounds to nearest; a 5 x 5 window sum of 8 bit values is never a half level from an integer), then the
+// normalization in float
+template <size_t N>
+std::vector<float> eightBitReference(const Context& ctx, size_t t, int k, int passes, bool roundedBox) {
+    std::vector<double> rgb = fklFloatCrops<N>(ctx, t);
+    for (auto& v : rgb) {
+        v = neighborhood::round8bit(v, neighborhood::Rounding::HalfUp);
+    }
+    return neighborhood::boxReference(rgb, N, k, passes,
+                                      roundedBox ? neighborhood::Rounding::HalfUp : neighborhood::Rounding::None, MUL,
+                                      SUB, DIV);
+}
+
+// The float 1 / K^2 of RPP 3.2.0's HIP box filter (box_filter.cpp: kernelSize<K>InverseSquare); 0.04f is 1.0f / 25
+float rppBoxScale(int k) {
+    switch (k) {
+        case 3: return 0.1111111f;
+        case 5: return 0.04f;
+        case 7: return 0.02040816f;
+        case 9: return 0.01234568f;
+        default: throw std::runtime_error("RPP's HIP box filter has no kernel size " + std::to_string(k));
+    }
+}
+
+// The RPP variants of part (b): which box (U8 on the frame, or F32 on the converted crops) and where the
+// normalization is (in rppt_crop_mirror_normalize, or rppt_normalize after the box)
+enum class RppBox { U8, F32 };
+enum class RppNorm { InCmn, Normalize };
+struct RppVariant {
+    const char* name;
+    RppBox box;
+    RppNorm norm;
+};
+constexpr std::array<RppVariant, 4> RPP_VARIANTS_NB{{{"rpp_u8box_cmn", RppBox::U8, RppNorm::InCmn},
+                                                     {"rpp_u8box_normalize", RppBox::U8, RppNorm::Normalize},
+                                                     {"rpp_f32box_cmn", RppBox::F32, RppNorm::InCmn},
+                                                     {"rpp_f32box_normalize", RppBox::F32, RppNorm::Normalize}}};
+
+const RppVariant& rppVariant(const std::string& name) {
+    for (const auto& v : RPP_VARIANTS_NB) {
+        if (name == v.name) {
+            return v;
+        }
+    }
+    throw std::runtime_error("Unknown RPP variant " + name);
+}
+
+// rppt_crop_mirror_normalize's per channel multiplier and offset for the whole normalization: x * Mul / Div - Sub / Div
+float cmnMultiplier(int c) { return MUL[c] / DIV[c]; }
+float cmnOffset(int c) { return -SUB[c] / DIV[c]; }
+
+template <size_t N>
+std::vector<float> rppConventionReference(const Context& ctx, size_t t, const RppVariant& variant) {
     if (ctx.rppRgb8.size() != static_cast<size_t>(FRAME_W) * FRAME_H * 3) {
         throw std::runtime_error("RPP's RGB frame (ctx.rppRgb8) is not available");
     }
-    std::vector<float> out(N * PLANE_FLOATS);
+    const int k = BOX_K, anchor = k / 2;
+    const float scale = rppBoxScale(k);
+    const bool normInCmn = variant.norm == RppNorm::InCmn;
+    std::vector<float> m(3), o(3), mean(3), invStdDev(3);
+    for (int c = 0; c < 3; ++c) {
+        m[c] = normInCmn ? cmnMultiplier(c) : 1.f;
+        o[c] = normInCmn ? cmnOffset(c) : 0.f;
+        mean[c] = SUB[c] / MUL[c];
+        invStdDev[c] = 1.f * (1.f / (DIV[c] / MUL[c]));
+    }
+    // The 8 bit crops
+    std::vector<uint8_t> rgb(N * PLANE_FLOATS);
     for (size_t i = 0; i < N; ++i) {
         const Region& r = ctx.regions->at(t, i);
-        const int cropW = r.width, cropH = r.height;
-        const float scaleX = static_cast<float>(cropW) / PLANE_W;
-        const float scaleY = static_cast<float>(cropH) / PLANE_H;
-        const auto at = [&](int y, int x, int c) {
-            return static_cast<float>(ctx.rppRgb8[(static_cast<size_t>(r.y + y) * FRAME_W + (r.x + x)) * 3 + c]);
-        };
         for (int y = 0; y < PLANE_H; ++y) {
             for (int x = 0; x < PLANE_W; ++x) {
-                float* dst = &out[((i * PLANE_H + y) * PLANE_W + x) * 3];
-                const float sx = std::min(static_cast<float>(cropW - 2), std::max(0.f, (x + 0.5f) * scaleX - 0.5f));
-                const float sy = std::min(static_cast<float>(cropH - 2), std::max(0.f, (y + 0.5f) * scaleY - 0.5f));
-                const int x0 = static_cast<int>(sx), y0 = static_cast<int>(sy);
-                const int x1 = std::min(x0 + 1, cropW - 1), y1 = std::min(y0 + 1, cropH - 1);
-                const float fx = sx - x0, fy = sy - y0;
                 for (int c = 0; c < 3; ++c) {
-                    const float value = (at(y0, x0, c) * (1.f - fx) + at(y0, x1, c) * fx) * (1.f - fy) +
-                                        (at(y1, x0, c) * (1.f - fx) + at(y1, x1, c) * fx) * fy;
-                    dst[c] = (value * MUL[c] - SUB[c]) / DIV[c];
+                    rgb[at(i, y, x, c)] = ctx.rppRgb8[(static_cast<size_t>(r.y + y) * FRAME_W + (r.x + x)) * 3 + c];
                 }
             }
         }
     }
-    morphPlanes(out, k, op);
+    const auto clampY = [](int v) { return std::clamp(v, 0, PLANE_H - 1); };
+    const auto clampX = [](int v) { return std::clamp(v, 0, PLANE_W - 1); };
+    std::vector<float> out(N * PLANE_FLOATS);
+    if (variant.box == RppBox::U8) {
+        for (size_t i = 0; i < N; ++i) {
+            for (int y = 0; y < PLANE_H; ++y) {
+                for (int x = 0; x < PLANE_W; ++x) {
+                    for (int c = 0; c < 3; ++c) {
+                        int sum = 0;
+                        for (int dy = -anchor; dy <= anchor; ++dy) {
+                            for (int dx = -anchor; dx <= anchor; ++dx) {
+                                sum += rgb[at(i, clampY(y + dy), clampX(x + dx), c)];
+                            }
+                        }
+                        const float boxed = std::clamp(std::rint(static_cast<float>(sum) * scale), 0.f, 255.f);
+                        out[at(i, y, x, c)] = std::fmaf(boxed, m[c], o[c]);
+                    }
+                }
+            }
+        }
+    } else {
+        std::vector<float> converted(N * PLANE_FLOATS);
+        for (size_t j = 0; j < converted.size(); ++j) {
+            converted[j] = std::fmaf(static_cast<float>(rgb[j]), m[j % 3], o[j % 3]);
+        }
+        for (size_t i = 0; i < N; ++i) {
+            for (int y = 0; y < PLANE_H; ++y) {
+                for (int x = 0; x < PLANE_W; ++x) {
+                    for (int c = 0; c < 3; ++c) {
+                        float sum = 0.f;
+                        for (int dy = -anchor; dy <= anchor; ++dy) {
+                            for (int dx = -anchor; dx <= anchor; ++dx) {
+                                sum += converted[at(i, clampY(y + dy), clampX(x + dx), c)];
+                            }
+                        }
+                        out[at(i, y, x, c)] = sum * scale;
+                    }
+                }
+            }
+        }
+    }
+    if (!normInCmn) {
+        for (size_t j = 0; j < out.size(); ++j) {
+            const int c = static_cast<int>(j % 3);
+            out[j] = std::fmaf(out[j] - mean[c], invStdDev[c], 0.f);
+        }
+    }
     return out;
 }
 
@@ -158,9 +259,9 @@ void planeIo(Implementation& impl, Context& ctx, const std::shared_ptr<fk::Tenso
     impl.fillNaN = [&ctx, out]() { poisonDevice(ctx.stream, out->ptr().data, N * PLANE_FLOATS); };
 }
 
-// MorphologyDPP with the BVF chain up to the Resize as its input and the pointwise tail and the write as its output,
-// batched over the regions (grid z), with a W x H tile and a K x K maximum mask
-template <size_t N, int K, MorphOp OP, int TW, int TH>
+// MorphologyDPP's box blur with the BVF chain up to the Crop as its input and the pointwise tail and the write as its
+// output, batched over the crops (grid z), with a W x H tile and a K x K mask, P passes
+template <size_t N, int K, int P, int TW, int TH>
 Implementation makeFklDpp(Context& ctx) {
     auto out = planeTensor<N>();
     const auto sets = fklRegionSets<N>(ctx);
@@ -168,24 +269,15 @@ Implementation makeFklDpp(Context& ctx) {
     impl.run = [&ctx, out, sets](size_t t) {
         using Details = fk::MorphologyDPPDetails<fk::float3, TW, TH, K, K>;
         const Details details{PLANE_W, PLANE_H, K, K, K / 2, K / 2};
-        const auto input =
-            fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice)
-                .then(YUVToRGB::build())
-                .then(fk::Crop<>::build((*sets)[t]))
-                .then(fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(
-                    fk::Size(PLANE_W, PLANE_H)));
+        const auto input = fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice)
+                               .then(YUVToRGB::build())
+                               .then(fk::Crop<>::build((*sets)[t]));
         const auto output = fk::Mul<fk::float3>::build(mulValue)
                                 .then(fk::Sub<fk::float3>::build(subValue))
                                 .then(fk::Div<fk::float3>::build(divValue))
                                 .then(fk::TensorWrite<fk::float3>::build(out->ptr()));
         beforeKernel();
-        bool launched = false;
-        if constexpr (OP == MorphOp::Erode) {
-            launched = fk::executeErode(details, input, output, *ctx.fkStream);
-        } else {
-            launched = fk::executeOpen(details, input, output, *ctx.fkStream);
-        }
-        if (!launched) {
+        if (!fk::executeBoxBlur<P>(details, input, output, *ctx.fkStream)) {
             throw std::runtime_error("MorphologyDPP rejected its details");
         }
     };
@@ -193,24 +285,22 @@ Implementation makeFklDpp(Context& ctx) {
     return impl;
 }
 
-// The naive operations of common/bench_neighborhood_ops.h in the BVF chain: every output value reads K x K resized
-// values (K^4 for the open), each of them 4 bilinear taps of the color conversion
-template <size_t N, int K, MorphOp OP>
+// The naive operation of common/bench_neighborhood_ops.h in the BVF chain: every output value reads K x K cropped
+// values (K^4 for two passes), each of them the color conversion of its NV12 values
+template <size_t N, int K, int P>
 Implementation makeFklNaive(Context& ctx) {
+    static_assert(P == 1 || P == 2, "part (a) runs one or two passes");
     auto out = planeTensor<N>();
     const auto sets = fklRegionSets<N>(ctx);
     Implementation impl{"fkl_bvf_naive", "fkl_cpu_float"};
     impl.run = [&ctx, out, sets](size_t t) {
-        const auto resize =
-            fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(PLANE_W, PLANE_H));
         beforeKernel();
-        if constexpr (OP == MorphOp::Erode) {
+        if constexpr (P == 1) {
             fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
                 fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
                 YUVToRGB::build(),
                 fk::Crop<>::build((*sets)[t]),
-                resize,
-                fk::ErodeBVF<K>::build(),
+                fk::BoxBVF<K>::build(),
                 fk::Mul<fk::float3>::build(mulValue),
                 fk::Sub<fk::float3>::build(subValue),
                 fk::Div<fk::float3>::build(divValue),
@@ -220,9 +310,8 @@ Implementation makeFklNaive(Context& ctx) {
                 fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
                 YUVToRGB::build(),
                 fk::Crop<>::build((*sets)[t]),
-                resize,
-                fk::ErodeBVF<K>::build(),
-                fk::DilateBVF<K>::build(),
+                fk::BoxBVF<K>::build(),
+                fk::BoxBVF<K>::build(),
                 fk::Mul<fk::float3>::build(mulValue),
                 fk::Sub<fk::float3>::build(subValue),
                 fk::Div<fk::float3>::build(divValue),
@@ -234,52 +323,84 @@ Implementation makeFklNaive(Context& ctx) {
 }
 
 // ------------------------------------------------------------------------------------------------
-// RPP (HIP backend), on Experiment 1's RppState (rocm_bench.hip): its frame, crop buffer, ROIs of every iteration,
-// parameter tensors and handle (batch size N), plus the float3 planes of the resized regions and the planes of the
-// eroded ones (open), each RPP_LEAD_BYTES into its allocation, and the fixed XYWH ROIs of the whole planes for the
-// morphology (uploaded once, outside the timing: in XYWH, the format rppt_erode and rppt_dilate work in). The output
-// is the first N planes of 64x32 float3 of RppState's tensor, contiguous.
+// RPP (HIP backend), on Experiment 1's RppState (rocm_bench.hip) for its handle (batch size N), output tensor,
+// conversion-only crop_mirror_normalize parameters, mirror flags and rppt_normalize constants; plus the RGB frame
+// RPP_LEAD_BYTES into its own allocation (the box filter's source), the crops of every iteration (XYWH on the frame,
+// in pinned memory, uploaded by every run), the fixed XYWH ROIs of the whole 64x32 images (uploaded once), the 8 bit
+// boxed crops (U8 variants) or the converted crops RPP_LEAD_BYTES into their allocation (F32 variants), and the
+// crop_mirror_normalize parameters of the whole normalization. The output is the first N planes of 64x32 float3 of
+// RppState's tensor, contiguous.
 // ------------------------------------------------------------------------------------------------
-struct RppPlanes {
+struct RppBox8 {
     std::shared_ptr<RppState> st;
-    uint8_t* resized{nullptr};
-    uint8_t* eroded{nullptr};
-    RpptROI* planeRois{nullptr};
-    RpptDesc leadDesc, outDesc;
-    ~RppPlanes() {
-        (void)hipFree(resized);
-        (void)hipFree(eroded);
+    uint8_t* rgb{nullptr};       // the RGB frame at RPP_LEAD_BYTES
+    uint8_t* boxed{nullptr};     // U8: N boxed crops of 64x32
+    uint8_t* converted{nullptr}; // F32: N converted crops of 64x32 at RPP_LEAD_BYTES
+    RpptROI* crops{nullptr};     // device: the crops of the iteration
+    RpptROI* cropsAll{nullptr};  // pinned: the crops of every iteration
+    RpptROI* planeRois{nullptr}; // device: (0, 0, 64, 32) of every image
+    float* normMultiplier{nullptr};
+    float* normOffset{nullptr};
+    RpptDesc frameDesc, boxedDesc, convertedDesc, outDesc;
+    ~RppBox8() {
+        (void)hipFree(rgb);
+        (void)hipFree(boxed);
+        (void)hipFree(converted);
+        (void)hipFree(crops);
+        (void)hipHostFree(cropsAll);
         (void)hipFree(planeRois);
+        (void)hipHostFree(normMultiplier);
+        (void)hipHostFree(normOffset);
     }
 };
 
-const std::array<std::string, 2> RPP_VARIANTS_NB{"rpp_normalize", "rpp_fused_normalize"};
-
-template <size_t N, int K, MorphOp OP>
-Implementation makeRppPlanes(Context& ctx, const std::string& variant) {
-    const bool fused = variant == "rpp_fused_normalize";
-    if (!fused && variant != "rpp_normalize") {
-        throw std::runtime_error("Unknown RPP variant " + variant);
-    }
-    auto st = makeRppState(ctx, N, false, fused ? RppRois::ResizeMirrorNormalize : RppRois::CropAndResize);
-    auto p = std::make_shared<RppPlanes>();
+template <size_t N>
+Implementation makeRppBox(Context& ctx, const RppVariant& variant) {
+    constexpr int K = BOX_K;
+    auto st = makeRppState(ctx, N, false, RppRois::None);
+    auto p = std::make_shared<RppBox8>();
     p->st = st;
-    const size_t bytes = RPP_LEAD_BYTES + N * PLANE_FLOATS * sizeof(float) + RPP_SLACK_BYTES;
-    p->resized = deviceAlloc<uint8_t>(bytes);
-    if (OP == MorphOp::Open) {
-        p->eroded = deviceAlloc<uint8_t>(bytes);
+    p->rgb = deviceAlloc<uint8_t>(RPP_LEAD_BYTES + static_cast<size_t>(FRAME_W) * FRAME_H * 3 + RPP_SLACK_BYTES);
+    const size_t iterations = ctx.regions->iterations();
+    p->cropsAll = hostAlloc<RpptROI>(iterations * N);
+    for (size_t t = 0; t < iterations; ++t) {
+        for (size_t i = 0; i < N; ++i) {
+            const Region& r = ctx.regions->at(t, i);
+            if (r.width != PLANE_W || r.height != PLANE_H) {
+                throw std::runtime_error("The crops must be " + std::to_string(PLANE_W) + "x" + std::to_string(PLANE_H));
+            }
+            p->cropsAll[t * N + i].xywhROI = {{r.x, r.y}, r.width, r.height};
+        }
     }
-    std::vector<RpptROI> rois(N);
-    for (auto& r : rois) {
+    p->crops = deviceAlloc<RpptROI>(N * sizeof(RpptROI));
+    std::vector<RpptROI> whole(N);
+    for (auto& r : whole) {
         r.xywhROI = {{0, 0}, PLANE_W, PLANE_H};
     }
     p->planeRois = deviceAlloc<RpptROI>(N * sizeof(RpptROI));
-    gpuErrchk(hipMemcpyAsync(p->planeRois, rois.data(), N * sizeof(RpptROI), hipMemcpyHostToDevice, ctx.stream));
+    gpuErrchk(hipMemcpyAsync(p->planeRois, whole.data(), N * sizeof(RpptROI), hipMemcpyHostToDevice, ctx.stream));
+    p->normMultiplier = hostAlloc<float>(N * 3);
+    p->normOffset = hostAlloc<float>(N * 3);
+    for (size_t i = 0; i < N; ++i) {
+        for (int c = 0; c < 3; ++c) {
+            p->normMultiplier[i * 3 + c] = cmnMultiplier(c);
+            p->normOffset[i * 3 + c] = cmnOffset(c);
+        }
+    }
     gpuErrchk(hipStreamSynchronize(ctx.stream));
-    const RpptStrides strides{static_cast<Rpp32u>(PLANE_FLOATS), 1, static_cast<Rpp32u>(PLANE_W * 3), 3};
-    p->leadDesc = RpptDesc(static_cast<Rpp32u>(N), 3, PLANE_H, PLANE_W, RpptDataType::F32, RpptLayout::NHWC,
-                           static_cast<Rpp32u>(RPP_LEAD_BYTES), strides);
-    p->outDesc = RpptDesc(static_cast<Rpp32u>(N), 3, PLANE_H, PLANE_W, RpptDataType::F32, RpptLayout::NHWC, 0, strides);
+    // Every batch image aliases the RGB frame (zero batch stride), each with its crop as ROI
+    p->frameDesc = st->frameBatchDesc;
+    p->frameDesc.offsetInBytes = static_cast<Rpp32u>(RPP_LEAD_BYTES);
+    const RpptStrides planes{static_cast<Rpp32u>(PLANE_FLOATS), 1, static_cast<Rpp32u>(PLANE_W * 3), 3};
+    p->boxedDesc = RpptDesc(static_cast<Rpp32u>(N), 3, PLANE_H, PLANE_W, RpptDataType::U8, RpptLayout::NHWC, 0, planes);
+    p->convertedDesc = RpptDesc(static_cast<Rpp32u>(N), 3, PLANE_H, PLANE_W, RpptDataType::F32, RpptLayout::NHWC,
+                                static_cast<Rpp32u>(RPP_LEAD_BYTES), planes);
+    p->outDesc = RpptDesc(static_cast<Rpp32u>(N), 3, PLANE_H, PLANE_W, RpptDataType::F32, RpptLayout::NHWC, 0, planes);
+    if (variant.box == RppBox::U8) {
+        p->boxed = deviceAlloc<uint8_t>(N * PLANE_FLOATS + RPP_SLACK_BYTES);
+    } else {
+        p->converted = deviceAlloc<uint8_t>(RPP_LEAD_BYTES + N * PLANE_FLOATS * sizeof(float) + RPP_SLACK_BYTES);
+    }
     // rppt_normalize on the rows of the N planes: N * PLANE_H rows of PLANE_W float3
     const Rpp32u rows = static_cast<Rpp32u>(N * PLANE_H), cols = static_cast<Rpp32u>(PLANE_W * 3);
     if (st->rowsRoi[3] != cols) {
@@ -289,53 +410,64 @@ Implementation makeRppPlanes(Context& ctx, const std::string& variant) {
     st->rowsDesc.strides[0] = rows * cols;
     st->rowsRoi[2] = rows;
 
-    std::vector<RppStage> stages{yuvToRgbStage(ctx, st)};
-    if (fused) {
-        stages.push_back({"rppt_resize_mirror_normalize_8u32f_batch_into_planes", [p](size_t) {
-                              RppState& s = *p->st;
-                              beforeKernel();
-                              RPP_CHECK(rppt_resize_mirror_normalize(s.rgb8, &s.frameBatchDesc, p->resized, &p->leadDesc,
-                                                                     s.dstSizes, RpptInterpolationType::BILINEAR,
-                                                                     s.rmnMean, s.rmnStdDevOne, s.mirror, s.cropRoisLtrb,
-                                                                     RpptRoiType::LTRB, s.handle,
-                                                                     RppBackend::RPP_HIP_BACKEND));
-                          }});
-    } else {
-        stages.push_back(cropConvertStage(st));
-        stages.push_back({"rppt_resize_batch_into_planes", [p](size_t) {
-                              RppState& s = *p->st;
-                              beforeKernel();
-                              RPP_CHECK(rppt_resize(s.cropped, &s.cropDesc, p->resized, &p->leadDesc, s.dstSizes,
-                                                    RpptInterpolationType::BILINEAR, s.resizeRois, RpptRoiType::LTRB,
-                                                    s.handle, RppBackend::RPP_HIP_BACKEND));
-                          }});
-    }
+    const bool normInCmn = variant.norm == RppNorm::InCmn;
+    float* multiplier = normInCmn ? p->normMultiplier : st->cmnMultiplier;
+    float* offset = normInCmn ? p->normOffset : st->cmnOffset;
     const std::string k = std::to_string(K);
-    if constexpr (OP == MorphOp::Erode) {
-        stages.push_back({"rppt_erode_" + k + "x" + k + "_batch", [p](size_t) {
+    const std::string cmnWhat = normInCmn ? "_normalizing" : "_converting";
+    std::vector<RppStage> stages;
+    stages.push_back({"hipMemcpyAsync_rois_of_the_iteration", [&ctx, p](size_t t) {
+                          beforeKernel();
+                          gpuErrchk(hipMemcpyAsync(p->crops, p->cropsAll + t * N, N * sizeof(RpptROI),
+                                                   hipMemcpyHostToDevice, ctx.stream));
+                      }});
+    stages.push_back({"rppt_yuv_to_rgb_full_frame", [&ctx, p](size_t) {
+                          RppState& s = *p->st;
+                          beforeKernel();
+                          RPP_CHECK(rppt_yuv_to_rgb(ctx.y, ctx.uv, &s.nv12Desc, p->rgb + RPP_LEAD_BYTES, &s.rgbDesc,
+                                                    ctx.pitch, ctx.pitch, FRAME_W * 3, FRAME_W, FRAME_H,
+                                                    RpptColorStandard_BT601, RpptColorRange_STUDIO, s.handle,
+                                                    RppBackend::RPP_HIP_BACKEND));
+                      }});
+    if (variant.box == RppBox::U8) {
+        stages.push_back({"rppt_box_filter_u8_" + k + "x" + k + "_crops_of_the_frame", [p](size_t) {
+                              beforeKernel();
+                              RPP_CHECK(rppt_box_filter(p->rgb, &p->frameDesc, p->boxed, &p->boxedDesc, K,
+                                                        RpptImageBorderType::REPLICATE, p->crops, RpptRoiType::XYWH,
+                                                        p->st->handle, RppBackend::RPP_HIP_BACKEND));
+                          }});
+        stages.push_back({"rppt_crop_mirror_normalize_8u32f" + cmnWhat, [p, multiplier, offset](size_t) {
                               RppState& s = *p->st;
                               beforeKernel();
-                              RPP_CHECK(rppt_erode(p->resized, &p->leadDesc, s.tensor, &p->outDesc, K, p->planeRois,
-                                                   RpptRoiType::XYWH, s.handle, RppBackend::RPP_HIP_BACKEND));
+                              RPP_CHECK(rppt_crop_mirror_normalize(p->boxed, &p->boxedDesc, s.tensor, &p->outDesc,
+                                                                   offset, multiplier, s.mirror, p->planeRois,
+                                                                   RpptRoiType::XYWH, s.handle,
+                                                                   RppBackend::RPP_HIP_BACKEND));
                           }});
     } else {
-        stages.push_back({"rppt_erode_" + k + "x" + k + "_batch_into_planes", [p](size_t) {
+        stages.push_back({"rppt_crop_mirror_normalize_8u32f" + cmnWhat + "_crops_of_the_frame",
+                          [p, multiplier, offset](size_t) {
                               RppState& s = *p->st;
                               beforeKernel();
-                              RPP_CHECK(rppt_erode(p->resized, &p->leadDesc, p->eroded, &p->leadDesc, K, p->planeRois,
-                                                   RpptRoiType::XYWH, s.handle, RppBackend::RPP_HIP_BACKEND));
+                              RPP_CHECK(rppt_crop_mirror_normalize(p->rgb, &p->frameDesc, p->converted,
+                                                                   &p->convertedDesc, offset, multiplier, s.mirror,
+                                                                   p->crops, RpptRoiType::XYWH, s.handle,
+                                                                   RppBackend::RPP_HIP_BACKEND));
                           }});
-        stages.push_back({"rppt_dilate_" + k + "x" + k + "_batch", [p](size_t) {
+        stages.push_back({"rppt_box_filter_f32_" + k + "x" + k, [p](size_t) {
                               RppState& s = *p->st;
                               beforeKernel();
-                              RPP_CHECK(rppt_dilate(p->eroded, &p->leadDesc, s.tensor, &p->outDesc, K, p->planeRois,
-                                                    RpptRoiType::XYWH, s.handle, RppBackend::RPP_HIP_BACKEND));
+                              RPP_CHECK(rppt_box_filter(p->converted, &p->convertedDesc, s.tensor, &p->outDesc, K,
+                                                        RpptImageBorderType::REPLICATE, p->planeRois, RpptRoiType::XYWH,
+                                                        s.handle, RppBackend::RPP_HIP_BACKEND));
                           }});
     }
-    stages.push_back(normalizeStage(st));
+    if (!normInCmn) {
+        stages.push_back(normalizeStage(st));
+    }
 
-    Implementation impl{variant, "rpp_sampling_8bit"};
-    stages.insert(stages.begin(), uploadRoisStage(ctx, st));
+    // Checked against the float reference with TOLERANCE_8BIT, and against its own RPP-convention reference
+    Implementation impl{variant.name, variant.box == RppBox::U8 ? "fkl_cpu_8bit_rgb_rounded_box" : "fkl_cpu_8bit_rgb"};
     for (size_t i = 0; i < stages.size(); ++i) {
         stages[i].first = std::to_string(i + 1) + "_" + stages[i].first;
     }
@@ -353,23 +485,24 @@ Implementation makeRppPlanes(Context& ctx, const std::string& variant) {
 // ------------------------------------------------------------------------------------------------
 // Groups
 // ------------------------------------------------------------------------------------------------
-template <size_t N, int K, MorphOp OP, size_t... Is>
+template <size_t N, int K, int P, size_t... Is>
 void addDppTiles(Context& ctx, std::vector<Implementation>& impls, std::index_sequence<Is...>) {
-    (impls.push_back(makeFklDpp<N, K, OP, DPP_TILES[Is].width, DPP_TILES[Is].height>(ctx)), ...);
+    (impls.push_back(makeFklDpp<N, K, P, DPP_TILES[Is].width, DPP_TILES[Is].height>(ctx)), ...);
 }
 
 // Part (b): the RPP variants, then the DPP tiles; part (a): the naive FKL pipeline, then the DPP tiles
-template <char PART, size_t N, int K, MorphOp OP>
+template <char PART, size_t N, int K, int P>
 std::vector<Implementation> makeGroup(Context& ctx) {
+    static_assert(PART == 'a' || (K == BOX_K && P == 1), "part (b) is one pass of the BOX_K x BOX_K box");
     std::vector<Implementation> impls;
     if constexpr (PART == 'b') {
         for (const auto& v : RPP_VARIANTS_NB) {
-            impls.push_back(makeRppPlanes<N, K, OP>(ctx, v));
+            impls.push_back(makeRppBox<N>(ctx, v));
         }
     } else {
-        impls.push_back(makeFklNaive<N, K, OP>(ctx));
+        impls.push_back(makeFklNaive<N, K, P>(ctx));
     }
-    addDppTiles<N, K, OP>(ctx, impls, std::make_index_sequence<DPP_TILES.size()>{});
+    addDppTiles<N, K, P>(ctx, impls, std::make_index_sequence<DPP_TILES.size()>{});
     return impls;
 }
 
@@ -382,7 +515,7 @@ struct GroupResult {
     Group group;
     Result r;
     bool chosen{false};
-    bool equivalent{false}; // RPP: within RPP_EQUIVALENCE of the RPP-convention reference in every validated iteration
+    bool equivalent{false}; // RPP: within RPP_EQUIVALENCE of its RPP-convention reference in every validated iteration
 };
 std::vector<GroupResult> groupResults;
 // The chosen DPP tile of every group (label -> implementation), from the CPU + GPU pass; the profiling child gets
@@ -391,12 +524,12 @@ std::map<std::string, std::string> chosenDpp;
 
 std::string flatName(const Group& g, const std::string& impl) { return g.label() + "/" + impl; }
 
-template <char PART, size_t N, int K, MorphOp OP>
+template <char PART, size_t N, int K, int P>
 void runGroup(Context& ctx, bool timing) {
-    const Group g{PART, OP, K, static_cast<int>(N)};
+    const Group g{PART, K, P, static_cast<int>(N)};
     std::cout << "=== " << g.label() << std::endl;
     progress("implementations");
-    const auto impls = makeGroup<PART, N, K, OP>(ctx);
+    const auto impls = makeGroup<PART, N, K, P>(ctx);
     std::vector<GroupResult> rs(impls.size());
     for (size_t k = 0; k < impls.size(); ++k) {
         rs[k].group = g;
@@ -409,9 +542,10 @@ void runGroup(Context& ctx, bool timing) {
     std::vector<std::vector<float>> firstOutputs(impls.size());
     for (size_t v = 0; v < validated.size(); ++v) {
         const size_t t = static_cast<size_t>(WARMUP_ITERS) + validated[v];
-        progress("references of iteration " + std::to_string(t));
-        const auto refFloat = floatReference<N>(ctx, t, K, OP);
-        const auto refRpp = PART == 'b' ? rppConventionReference<N>(ctx, t, K, OP) : std::vector<float>{};
+        progress("float reference of iteration " + std::to_string(t));
+        const auto refFloat = floatReference<N>(ctx, t, K, P);
+        const auto ref8bit = PART == 'b' ? eightBitReference<N>(ctx, t, K, P, false) : std::vector<float>{};
+        const auto ref8bitRoundedBox = PART == 'b' ? eightBitReference<N>(ctx, t, K, P, true) : std::vector<float>{};
         for (size_t k = 0; k < impls.size(); ++k) {
             const Implementation& impl = impls[k];
             progress("validating " + impl.name + " on iteration " + std::to_string(t));
@@ -430,23 +564,25 @@ void runGroup(Context& ctx, bool timing) {
             Result::IterationErrors e;
             e.iteration = t;
             e.vsFloat = compare(output, refFloat);
-            if (PART == 'b') {
-                e.vsRppConvention = compare(output, refRpp);
-            }
-            e.own = impl.reference == "fkl_cpu_float" ? e.vsFloat : e.vsRppConvention;
-            rs[k].r.addIteration(e);
+            e.own = e.vsFloat;
             if (isRpp(impl.name)) {
+                e.own = compare(output, rppVariant(impl.name).box == RppBox::U8 ? ref8bitRoundedBox : ref8bit);
+                e.vsRppConvention = compare(output, rppConventionReference<N>(ctx, t, rppVariant(impl.name)));
                 rs[k].equivalent = rs[k].equivalent && e.vsRppConvention.nonFinite == 0 &&
                                    e.vsRppConvention.max() <= RPP_EQUIVALENCE;
             }
+            rs[k].r.addIteration(e);
         }
     }
     if (!timing) {
         for (auto& gr : rs) {
-            std::cout << "  " << std::left << std::setw(20) << gr.r.name << std::right << "  max err " << std::scientific
-                      << std::setprecision(2) << gr.r.errorVsOwnReference.max() << " (" << gr.r.reference << ")"
-                      << std::defaultfloat << (gr.r.withinTolerance() ? "" : "  NOT within its tolerance")
-                      << (isRpp(gr.r.name) && !gr.equivalent ? "  NOT equivalent to the RPP-convention reference" : "")
+            std::cout << "  " << std::left << std::setw(22) << gr.r.name << std::right << "  max err " << std::scientific
+                      << std::setprecision(2) << gr.r.errorVsOwnReference.max() << " (" << gr.r.reference << ")";
+            if (isRpp(gr.r.name)) {
+                std::cout << ", vs its RPP-convention reference " << gr.r.errorVsRppConventionReference.max();
+            }
+            std::cout << std::defaultfloat << (gr.r.withinTolerance() ? "" : "  NOT within its tolerance")
+                      << (isRpp(gr.r.name) && !gr.equivalent ? "  NOT equivalent to its RPP-convention reference" : "")
                       << std::endl;
             groupResults.push_back(gr);
         }
@@ -466,7 +602,8 @@ void runGroup(Context& ctx, bool timing) {
                                      ": the output after the timed iterations differs from the validated one");
         }
     }
-    // The chosen DPP tile (fastest within its tolerance) and RPP variant (fastest equivalent one)
+    // The chosen DPP tile (fastest within its tolerance) and RPP variant (fastest within its tolerance and equivalent
+    // to its RPP-convention reference)
     size_t dpp = impls.size();
     for (size_t k = 0; k < impls.size(); ++k) {
         rs[k].r.timing = computeStats(ms[k]);
@@ -484,13 +621,14 @@ void runGroup(Context& ctx, bool timing) {
     chosenDpp[g.label()] = impls[dpp].name;
     size_t rpp = impls.size();
     for (size_t k = 0; k < impls.size(); ++k) {
-        if (isRpp(impls[k].name) && rs[k].equivalent &&
+        if (isRpp(impls[k].name) && rs[k].equivalent && rs[k].r.withinTolerance() &&
             (rpp == impls.size() || rs[k].r.timing.median < rs[rpp].r.timing.median)) {
             rpp = k;
         }
     }
     if (PART == 'b' && rpp == impls.size()) {
-        throw std::runtime_error(g.label() + ": no RPP variant is equivalent to the RPP-convention reference");
+        throw std::runtime_error(g.label() + ": no RPP variant is within its tolerance and equivalent to its "
+                                             "RPP-convention reference");
     }
     for (size_t k = 0; k < impls.size(); ++k) {
         GroupResult& gr = rs[k];
@@ -502,7 +640,7 @@ void runGroup(Context& ctx, bool timing) {
             }
             gr.r.meanSpeedupOfBvf = sum / TIMED_ITERS;
         }
-        std::cout << "  " << std::left << std::setw(20) << gr.r.name << std::right << (gr.chosen ? " *" : "  ")
+        std::cout << "  " << std::left << std::setw(22) << gr.r.name << std::right << (gr.chosen ? " *" : "  ")
                   << std::fixed << std::setprecision(1) << " median " << std::setw(8) << gr.r.timing.median
                   << " us  mean " << std::setw(8) << gr.r.timing.mean << " us  p10 " << std::setw(8) << gr.r.timing.p10
                   << "  p90 " << std::setw(8) << gr.r.timing.p90;
@@ -524,28 +662,28 @@ void runGroup(Context& ctx, bool timing) {
     }
 }
 
-// Every group of the experiment, part (b) first: f.template operator()<part, N, K, operation>() for every group
+// Every group of the experiment, part (b) first: f.template operator()<part, N, K, passes>() for every group
 template <typename F>
 void forEachGroup(F&& f) {
-    // Part (b): every N, erode then open
+    // Part (b): every N, one pass of the BOX_K x BOX_K box
     [&]<size_t... Is>(std::index_sequence<Is...>) {
-        ((f.template operator()<'b', BATCHES[Is], MORPH_K, MorphOp::Erode>(),
-          f.template operator()<'b', BATCHES[Is], MORPH_K, MorphOp::Open>()), ...);
+        (f.template operator()<'b', BATCHES[Is], BOX_K, 1>(), ...);
     }(std::make_index_sequence<BATCHES.size()>{});
-    // Part (a): every K, 1 then 2 passes, every N
+    // Part (a): every K, every number of passes, every N
     [&]<size_t... Ks>(std::index_sequence<Ks...>) {
         ([&]<size_t KI>() {
             constexpr int K = neighborhood::PART_A_KS[KI];
-            [&]<size_t... Ns>(std::index_sequence<Ns...>) {
-                ((f.template operator()<'a', neighborhood::PART_A_BATCHES[Ns], K, MorphOp::Erode>()), ...);
-                ((f.template operator()<'a', neighborhood::PART_A_BATCHES[Ns], K, MorphOp::Open>()), ...);
-            }(std::make_index_sequence<neighborhood::PART_A_BATCHES.size()>{});
+            [&]<size_t... Ps>(std::index_sequence<Ps...>) {
+                ([&]<size_t PI>() {
+                    constexpr int P = neighborhood::PART_A_PASSES[PI];
+                    [&]<size_t... Ns>(std::index_sequence<Ns...>) {
+                        (f.template operator()<'a', neighborhood::PART_A_BATCHES[Ns], K, P>(), ...);
+                    }(std::make_index_sequence<neighborhood::PART_A_BATCHES.size()>{});
+                }.template operator()<Ps>(), ...);
+            }(std::make_index_sequence<neighborhood::PART_A_PASSES.size()>{});
         }.template operator()<Ks>(), ...);
     }(std::make_index_sequence<neighborhood::PART_A_KS.size()>{});
 }
-static_assert(neighborhood::PART_A_PASSES.size() == 2 && neighborhood::PART_A_PASSES[0] == 1 &&
-                  neighborhood::PART_A_PASSES[1] == 2,
-              "part (a) runs 1 pass (erode) and 2 passes (open)");
 
 // ------------------------------------------------------------------------------------------------
 // Profiling child: kernel counts, GPU time only and GPU time only with the caches flushed, of every implementation of
@@ -568,11 +706,11 @@ Result& profileRow(const Group& g, const std::string& impl) {
     return *r;
 }
 
-template <char PART, size_t N, int K, MorphOp OP>
+template <char PART, size_t N, int K, int P>
 void countGroup(Context& ctx) {
-    const Group g{PART, OP, K, static_cast<int>(N)};
+    const Group g{PART, K, P, static_cast<int>(N)};
     const size_t t = static_cast<size_t>(WARMUP_ITERS);
-    for (const auto& impl : makeGroup<PART, N, K, OP>(ctx)) {
+    for (const auto& impl : makeGroup<PART, N, K, P>(ctx)) {
         impl.run(t); // warm-up: code object loading is not counted
         gpuErrchk(hipStreamSynchronize(ctx.stream));
         profileRow(g, impl.name).launches = countLaunches(ctx, impl, t);
@@ -588,10 +726,10 @@ void countGroup(Context& ctx) {
 }
 
 // rocm_bench.hip's gpuOnlyBatch for the implementations of one group, with the speedups over the chosen DPP tile
-template <char PART, size_t N, int K, MorphOp OP>
+template <char PART, size_t N, int K, int P>
 void gpuOnlyGroup(Context& ctx, CacheFlusher* flusher) {
-    const Group g{PART, OP, K, static_cast<int>(N)};
-    const auto impls = makeGroup<PART, N, K, OP>(ctx);
+    const Group g{PART, K, P, static_cast<int>(N)};
+    const auto impls = makeGroup<PART, N, K, P>(ctx);
     const auto chosen = chosenDpp.find(g.label());
     if (chosen == chosenDpp.end()) {
         throw std::runtime_error("No chosen DPP tile for " + g.label());
@@ -729,7 +867,7 @@ void gpuOnlyGroup(Context& ctx, CacheFlusher* flusher) {
             speedup = sum / TIMED_ITERS;
         }
         std::cout << (flusher ? "GPU only, L2 + MALL flushed " : "GPU only ") << g.label() << " " << std::left
-                  << std::setw(20) << impls[k].name << std::right << std::fixed << std::setprecision(2) << "  median "
+                  << std::setw(22) << impls[k].name << std::right << std::fixed << std::setprecision(2) << "  median "
                   << std::setw(8) << timing.median << " us  p10 " << std::setw(8) << timing.p10 << "  p90 "
                   << std::setw(8) << timing.p90;
         if (k != dpp) {
@@ -796,14 +934,14 @@ void profilePass(Context& ctx, const std::filesystem::path& outDir, const std::f
                  const std::filesystem::path& choicesFile) {
     readChoices(choicesFile);
     std::cout << "=== Kernel counts (HIP runtime API tracing)" << std::endl;
-    forEachGroup([&]<char PART, size_t N, int K, MorphOp OP>() { countGroup<PART, N, K, OP>(ctx); });
+    forEachGroup([&]<char PART, size_t N, int K, int P>() { countGroup<PART, N, K, P>(ctx); });
     writeOperationCounts(outDir / "kernel_counts_per_operation.csv");
     const bool tracing = kernelTracingWorks(ctx);
     if (tracing) {
         std::cout << "=== GPU time only (kernel dispatch tracing)" << std::endl;
-        forEachGroup([&]<char PART, size_t N, int K, MorphOp OP>() { gpuOnlyGroup<PART, N, K, OP>(ctx, nullptr); });
+        forEachGroup([&]<char PART, size_t N, int K, int P>() { gpuOnlyGroup<PART, N, K, P>(ctx, nullptr); });
         CacheFlusher flusher = makeCacheFlusher(ctx);
-        forEachGroup([&]<char PART, size_t N, int K, MorphOp OP>() { gpuOnlyGroup<PART, N, K, OP>(ctx, &flusher); });
+        forEachGroup([&]<char PART, size_t N, int K, int P>() { gpuOnlyGroup<PART, N, K, P>(ctx, &flusher); });
         freeCacheFlusher(flusher);
     } else {
         std::cout << "=== GPU time only: NOT MEASURED (no kernel dispatch records from rocprofiler-sdk on this system)"
@@ -864,8 +1002,8 @@ bool runProfilingChild(const std::filesystem::path& outDir) {
 // Output files
 // ------------------------------------------------------------------------------------------------
 void writeGroupColumns(std::ostream& os, const GroupResult& gr) {
-    os << gr.group.part << "," << neighborhood::name(gr.group.op) << "," << gr.group.k << "," << neighborhood::passes(gr.group.op)
-       << "," << gr.r.batch << "," << gr.r.name << "," << (gr.chosen ? "yes" : "no");
+    os << gr.group.part << ",box," << gr.group.k << "," << gr.group.passes << "," << gr.r.batch << "," << gr.r.name
+       << "," << (gr.chosen ? "yes" : "no");
 }
 
 constexpr const char* GROUP_HEADER = "part,operation,K,passes,N,implementation,chosen";
@@ -915,7 +1053,7 @@ void writeValidation(const std::filesystem::path& path) {
     std::ofstream os(path);
     os << GROUP_HEADER << ",iteration,reference,max_abs_err_r,max_abs_err_g,max_abs_err_b,mean_abs_err,"
                           "non_finite_values,max_abs_err_vs_float_reference,values_beyond_1e-3,values,tolerance,"
-                          "within_tolerance,max_abs_err_vs_rpp_sampling_8bit_reference\n";
+                          "within_tolerance,max_abs_err_vs_rpp_convention_reference\n";
     for (const auto& gr : groupResults) {
         const Result& r = gr.r;
         for (const auto& it : r.errorsPerIteration) {
@@ -925,12 +1063,27 @@ void writeValidation(const std::filesystem::path& path) {
                << e.maxPerChannel[0] << "," << e.maxPerChannel[1] << "," << e.maxPerChannel[2] << "," << e.mean << ","
                << e.nonFinite << "," << it.vsFloat.max() << "," << e.beyond << "," << e.values << "," << r.tolerance()
                << "," << (r.withinTolerance(e) ? "yes" : "no") << ",";
-            if (gr.group.part == 'b') {
+            if (isRpp(r.name)) {
                 os << it.vsRppConvention.max();
             }
             os << std::defaultfloat << "\n";
         }
     }
+}
+
+// The workload, for --workload and the platform file
+std::string workloadNb() {
+    std::ostringstream os;
+    os << FRAME_W << "x" << FRAME_H << " NV12 frame (uniform random limited-range values, Y in [" << LUMA_MIN << ", "
+       << LUMA_MAX << "], U and V in [" << CHROMA_MIN << ", " << CHROMA_MAX << "], seed " << FRAME_SEED
+       << "), NV12->RGB BT.601 limited range, N in {" << batchList(", ") << "} crops of " << PLANE_W << "x" << PLANE_H
+       << " per iteration at uniform random even positions at least " << REGION_MARGIN
+       << " pixels from the frame edges, new every iteration (warm-up and timed) and precomputed before the loop (seed "
+       << REGION_SEED << ", batch N uses the first N of every iteration; common/bench_neighborhood.h cropRegionSets), "
+       << "box blur K x K (mean of the window centred on the value, per channel, replicating the edge of the crop in "
+       << "every pass; part (b) K = " << BOX_K << ", one pass), Mul (1/255), Sub (0.485, 0.456, 0.406), Div (0.229, "
+       << "0.224, 0.225), output N planes of " << PLANE_W << "x" << PLANE_H << " float3, no resize, no border";
+    return os.str();
 }
 
 void writePlatformNb(const std::filesystem::path& path, const std::string& diagnostic, bool kernelTracing,
@@ -950,7 +1103,7 @@ void writePlatformNb(const std::filesystem::path& path, const std::string& diagn
     const std::string gfxClock = shell("amd-smi metric --gpu 0 --clock 2>/dev/null | awk '$1 == \"GFX_0:\" {f=1; next} "
                                        "f && $1 == \"CLK:\" {print $2 \" MHz\"; exit}'");
     std::ofstream os(path);
-    os << "Experiment 3 (neighborhood operations), AMD\n"
+    os << "Experiment 3 (neighborhood operation: box blur of fixed-size crops), AMD\n"
        << "GPU: " << prop.name << " (" << prop.gcnArchName << "), " << (prop.totalGlobalMem >> 20) << " MiB, L2 "
        << prop.l2CacheSize / 1024 << " KiB, MALL " << mall.kib << " KiB (" << mall.source << "), "
        << (onWsl() ? "WSL2" : "bare metal") << ", kernel driver " << (driverVersion.empty() ? "unknown" : driverVersion)
@@ -966,46 +1119,53 @@ void writePlatformNb(const std::filesystem::path& path, const std::string& diagn
        << "GPU clocks: not changed by the benchmark. Performance level: "
        << (perfLevel.empty() ? std::string("not reported") : perfLevel) << "; GFX clock at the end of the run "
        << (gfxClock.empty() ? std::string("not reported") : gfxClock) << "\n\n"
-       << "Workload: the frame, regions and batch sizes of common/bench_geometry.h (" << describe()
-       << "), without its border and its square output: each region is resized (bilinear, aspect ratio ignored) to "
-       << PLANE_W << "x" << PLANE_H << ", then the neighborhood operation (K x K, centred anchor, replicate at the " << PLANE_W << "x"
-       << PLANE_H << " edge in every pass; erode = per channel min, open = min then max), then Mul (1/255), Sub (0.485, "
-       << "0.456, 0.406), Div (0.229, 0.224, 0.225), float3 tensor of N planes " << PLANE_W << "x" << PLANE_H
-       << " (no AddBorder).\n"
-       << "Groups: part (b) K = " << MORPH_K << ", erode and open, N = " << batchList(", ")
-       << ": rpp_normalize, rpp_fused_normalize and the FKL MorphologyDPP tiles; part (a) K = 3, 5, 7, erode and open, N "
-       << "= 1, 16: fkl_bvf_naive (ErodeBVF / DilateBVF of common/bench_neighborhood_ops.h) and the DPP tiles. DPP tiles: ";
+       << "Workload: " << workloadNb() << ".\n"
+       << "Pipeline: ReadNV12 -> YUVtoRGB -> Crop " << PLANE_W << "x" << PLANE_H << " -> Box K x K -> Mul -> Sub -> Div "
+       << "-> Write.\n"
+       << "Groups: part (b) K = " << BOX_K << ", one pass, N = " << batchList(", ")
+       << ": the RPP variants and the FKL MorphologyDPP tiles; part (a) K = 3, 5, 7, one and two passes, N = 1, 16: "
+       << "fkl_bvf_naive (BoxBVF<K> of common/bench_neighborhood_ops.h, twice for two passes) and the DPP tiles. DPP "
+       << "tiles: ";
     for (size_t i = 0; i < DPP_TILES.size(); ++i) {
         os << (i ? ", " : "") << DPP_TILES[i].width << "x" << DPP_TILES[i].height;
     }
-    os << " (MorphologyDPPDetails<float3, W, H, K, K>).\n"
+    os << " (MorphologyDPPDetails<float3, W, H, K, K>, executeBoxBlur<passes>: an Add reducer per pass, the 1 / K^2 of "
+       << "every pass in the write).\n"
        << "Timing (CPU + GPU): as rocm_bench.hip: " << WARMUP_ITERS << " warm-up then " << TIMED_ITERS
-       << " timed iterations; iteration t runs every implementation of the group on the regions of iteration t, each "
+       << " timed iterations; iteration t runs every implementation of the group on the crops of iteration t, each "
        << "between two HIP events on one stream and followed by a synchronization. Chosen per group: the DPP tile with "
        << "the lowest median among those within the float tolerance, and the RPP variant with the lowest median among "
-       << "those within " << RPP_EQUIVALENCE << " of the RPP-convention reference (chosen = yes in the CSV files; every "
-       << "implementation is recorded). Speedups: per iteration, implementation time / chosen DPP time, averaged over "
-       << "the timed iterations (the chosen DPP's own row has none).\n"
+       << "those within their tolerance and within " << RPP_EQUIVALENCE << " of their RPP-convention reference "
+       << "(chosen = yes in the CSV files; every implementation is recorded). Speedups: per iteration, implementation "
+       << "time / chosen DPP time, averaged over the timed iterations (the chosen DPP's own row has none).\n"
        << "Validation: as rocm_bench.hip, on the timed iterations " << validation::VALIDATION_STRIDE << " apart and the "
-       << "last, into NaN-poisoned outputs: FKL against FKL's CPU float chain (Figure 1 without AddBorder) followed by "
-       << "the morphology of every plane (bench::neighborhood::hostMorphPlane; morphology after the normalization equals "
-       << "morphology before it, because the normalization is monotone non-decreasing per channel), tolerance "
-       << TOLERANCE << "; RPP against the same morphology of the RPP-convention reference of rocm_bench.hip (RPP's 8 bit "
-       << "frame, RPP's bilinear sampling) without the border, tolerance " << TOLERANCE_8BIT << ". After the timing, "
-       << "the first validated iteration again (every value within 1e-6).\n"
-       << "RPP (HIP backend): rpp_normalize = rppt_yuv_to_rgb (full frame; 1 kernel and 8 hipMemcpyToSymbol per call), "
-       << "rppt_crop_mirror_normalize 8u->32f (batched, the batch images aliasing the RGB frame, XYWH ROIs), "
-       << "rppt_resize F32 bilinear (batched, LTRB ROIs) into N float3 planes of " << PLANE_W << "x" << PLANE_H
-       << ", rppt_erode (open: rppt_erode into a second plane buffer, then rppt_dilate) batched over the N planes into "
-       << "the output tensor, rppt_normalize (Mul + Sub + Div, rows of " << PLANE_W << " float3, per column mean 255*sub "
-       << "and stdDev 255*div). rpp_fused_normalize = rppt_yuv_to_rgb, rppt_resize_mirror_normalize 8u->32f (crop + "
-       << "convert + resize, mean 0, stdDev 1, batched, LTRB ROIs; it zeroes its destination and synchronizes the stream "
-       << "inside the call) into the planes, then the same morphology and rppt_normalize. The morphology sources start "
-       << RPP_LEAD_BYTES << " bytes into their allocations (descriptor offsetInBytes; RPP's HIP morphology refuses an "
-       << "offset below 12 * (kernelSize / 2) bytes), the morphology ROIs are the whole planes in XYWH, uploaded once. "
-       << "Every RPP pipeline starts with the hipMemcpyAsync of the ROIs of its iteration, as in rocm_bench.hip; no "
-       << "memset of the output (no border), the only memset is the one inside rppt_resize_mirror_normalize "
-       << "(rpp_fused_normalize). One RPP handle per pipeline with batch size N.\n"
+       << "last, into NaN-poisoned outputs. FKL against the float reference: FKL's CPU float chain ReadNV12 -> YUVtoRGB -> "
+       << "Crop, then bench::neighborhood::boxReference (the box in double, no rounding, then the normalization in float; "
+       << "the box is linear and the normalization rounds, so the references blur before they normalize, as the "
+       << "pipelines do), tolerance " << TOLERANCE << ". RPP, whose frame is 8 bit RGB, against the same chain with the "
+       << "RGB saturated and rounded to nearest 8 bit (fkl_cpu_8bit_rgb, as in Experiment 1), and for the U8 box its "
+       << "output rounded half up to 8 bit (fkl_cpu_8bit_rgb_rounded_box), tolerance " << TOLERANCE_8BIT
+       << " (one level of 8 bit RGB); its error against the float reference, whose RGB is not saturated, is recorded "
+       << "too (max_abs_err_vs_float_reference). RPP also against its RPP-convention reference: RPP 3.2.0's HIP "
+       << "arithmetic, operation by operation, on RPP's 8 bit frame (the U8 box rint(float(window sum) * RPP's float "
+       << "1 / K^2); the F32 box the window summed in float, row after row, times that scale; crop_mirror_normalize "
+       << "fmaf(x, multiplier, offset); rppt_normalize fmaf(x - mean, 1 / stdDev, 0)), equivalent within "
+       << RPP_EQUIVALENCE << " (max_abs_err_vs_rpp_convention_reference in validation.csv). After the timing, the first "
+       << "validated iteration again (every value within 1e-6).\n"
+       << "RPP (HIP backend): every variant starts with the hipMemcpyAsync of the crops of its iteration (XYWH ROIs on "
+       << "the frame, from pinned memory) and rppt_yuv_to_rgb (full frame; 1 kernel and 8 hipMemcpyToSymbol per call) "
+       << "into a buffer that starts " << RPP_LEAD_BYTES << " bytes into its allocation (descriptor offsetInBytes; "
+       << "RPP's HIP box filter refuses an offset below 12 * (kernelSize / 2) bytes). rpp_u8box_cmn: rppt_box_filter U8 "
+       << "on the frame with the crops as per-image ROIs (every batch image aliasing the frame; the box replicates the "
+       << "ROI edge and writes each crop at (0, 0) of its own 64x32 U8 image: crop + box in one call), then "
+       << "rppt_crop_mirror_normalize 8u->32f of the boxed crops (whole-image XYWH ROIs, uploaded once) with the whole "
+       << "normalization, multiplier Mul / Div and offset -Sub / Div per channel, into the output tensor. "
+       << "rpp_u8box_normalize: the same with rppt_crop_mirror_normalize converting only (multiplier 1, offset 0), then "
+       << "rppt_normalize (rows of " << PLANE_W << " float3, per column mean Sub / Mul and stdDev Div / Mul). "
+       << "rpp_f32box_cmn: rppt_crop_mirror_normalize 8u->32f of the crops of the frame with the whole normalization "
+       << "into converted crops that start " << RPP_LEAD_BYTES << " bytes into their allocation, then rppt_box_filter "
+       << "F32 of the whole images into the output tensor. rpp_f32box_normalize: the same with the conversion only, "
+       << "then rppt_normalize. No memset. One RPP handle per pipeline with batch size N.\n"
        << "Kernel counts, GPU time only and GPU time only with L2 + MALL flushed: as rocm_bench.hip, in a profiling child "
        << "process, every implementation of every group"
        << (kernelTracing ? "" : onWsl() ? " (GPU time only NOT MEASURED on WSL2)" : " (GPU time only NOT MEASURED)") << ".\n";
@@ -1025,15 +1185,15 @@ int main(int argc, char** argv) {
     using namespace bench::nb;
     try {
         if (argc == 2 && std::string(argv[1]) == "--workload") {
-            std::cout << describe() << "; Experiment 3 instead: no border, output N planes of " << PLANE_W << "x"
-                      << PLANE_H << " float3, neighborhood operation after the resize (K = " << MORPH_K
-                      << " in part (b))" << std::endl;
+            std::cout << workloadNb() << std::endl;
             return 0;
         }
         const std::filesystem::path outDir = argc > 1 ? argv[1] : "results_neighborhood";
         std::filesystem::create_directories(outDir);
         Context ctx;
         initContext(ctx);
+        // The experiment's crops instead of Experiment 1's regions (the same in the profiling child)
+        ctx.regions = std::make_unique<RegionSets>(neighborhood::cropRegionSets(REGION_ITERATIONS));
         if (argc > 4 && std::string(argv[2]) == "--profile-pass") {
             nb::profilePass(ctx, outDir, argv[3], argv[4]);
             return 0;
@@ -1057,7 +1217,7 @@ int main(int argc, char** argv) {
             });
         };
         if (validateOnly) {
-            forEachGroup([&]<char PART, size_t N, int K, MorphOp OP>() { runGroup<PART, N, K, OP>(ctx, false); });
+            forEachGroup([&]<char PART, size_t N, int K, int P>() { runGroup<PART, N, K, P>(ctx, false); });
             writeValidation(outDir / "validation.csv");
             if (fklFailed()) {
                 std::cerr << "ERROR: an FKL output is not within its tolerance" << std::endl;
@@ -1066,7 +1226,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         measureEventFloor(ctx);
-        forEachGroup([&]<char PART, size_t N, int K, MorphOp OP>() { runGroup<PART, N, K, OP>(ctx, true); });
+        forEachGroup([&]<char PART, size_t N, int K, int P>() { runGroup<PART, N, K, P>(ctx, true); });
         bool tracing = false;
         std::string profilingError;
         try {
