@@ -32,6 +32,8 @@
 
 #include "neighborhood_common.h"
 
+#include <cstdio>
+
 #ifndef NEIGHBORHOOD_OP
 #error "Define NEIGHBORHOOD_OP, 0 (erode) or 1 (open) (fkl-neighborhood/CMakeLists.txt does)"
 #endif

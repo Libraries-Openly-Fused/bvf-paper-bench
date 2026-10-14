@@ -9,7 +9,7 @@
 # On Windows, run it from a Visual Studio developer shell (cl, link and ninja in the PATH).
 #
 #   BENCHMARKS           cpu: FKL vs OpenCV on the CPU (fkl-vs-opencv-cpu/); gpu: the GPU benchmarks (fkl-vs-opencv-cuda/,
-#                        fkl-vs-npp/, fkl-ablation/ and fkl-vs-nppdx/)
+#                        fkl-vs-npp/, fkl-ablation/, fkl-vs-nppdx/ and fkl-neighborhood/)
 #   CXX_COMPILER         C++ compiler of the benchmarks; for gpu also the host compiler of nvcc (except with cl, which
 #                        nvcc finds in the PATH)
 #   CUDA_COMPILER        nvcc, for gpu
@@ -18,9 +18,10 @@
 #   DEPS_DIR             where OpenCV is built once and reused by later runs (default <home>/bvf-paper-bench-deps)
 #   BUILD_DIR            build folders of the benchmarks (default <repo>/build-ci)
 #   OUT_DIR              results and logs (default <repo>/ci-results)
-#   NPPDX_SIZES          the region sizes FKL vs NPPDx is built and run for, separated by spaces (default
-#                        "20x10 32x16 48x24"; its kernels are compiled for one size); every other benchmark runs the
-#                        paper's workload, the three sizes by turns (common/bench_geometry.h)
+#   NPPDX_SIZES          the region sizes FKL vs NPPDx and the NPPDx+NPP neighborhood programs are built and run for,
+#                        separated by spaces (default "20x10 32x16 48x24"; their kernels are compiled for one size);
+#                        every other benchmark runs the paper's workload, the three sizes by turns
+#                        (common/bench_geometry.h)
 #   GENERATOR            CMake generator (default Ninja)
 #   ITERATIONS           timed iterations of every benchmark (default 1: the CI checks the results, it does not
 #                        measure; 1000 for the paper's numbers)
@@ -234,9 +235,11 @@ function(build_opencv RESULT)
         string(APPEND compiler "${CMAKE_MATCH_1}")
     endif()
     if(BENCHMARKS STREQUAL "gpu")
-        set(modules core,imgproc,cudev,cudaarithm,cudawarping)
+        # cudafilters and cudaimgproc for the morphology of fkl-neighborhood/; the tag names them, so that a build
+        # without them, made before they were needed, is not reused
+        set(modules core,imgproc,cudev,cudaarithm,cudawarping,cudafilters,cudaimgproc)
         string(REPLACE "." "" sm "${CUDA_ARCH_BIN}")
-        set(tag "${OPENCV_VERSION}-cuda${CUDA_VERSION}-sm${sm}-${HOST_TAG}-${compiler}")
+        set(tag "${OPENCV_VERSION}-cuda${CUDA_VERSION}-sm${sm}-filters-${HOST_TAG}-${compiler}")
     else()
         set(modules core,imgproc)
         set(tag "${OPENCV_VERSION}-cpu-${HOST_TAG}-${compiler}")
@@ -553,6 +556,33 @@ else()
             run(${program}_host_overhead COMMAND "${bench}" "${out}" --host-overhead)
         endif()
     endforeach()
+    # The neighborhood experiment (fkl-neighborhood/): the tests of its BVF morphology operations, then every program
+    # (part (a) and MorphologyDPP against NPP and OpenCV CUDA) with the checks of the benchmarks above
+    build_benchmark(neighborhood "${REPO}/fkl-neighborhood" ${cudaOptions} -DBENCH_REGIONS=mixed)
+    set(test "${BUILD_DIR}/neighborhood/test_neighborhood_ops${EXE}")
+    find_dlls("${test}")
+    run(test_neighborhood_ops COMMAND "${test}")
+    set(neighborhoodPrograms "")
+    foreach(k IN ITEMS 3 5 7)
+        foreach(passes IN ITEMS 1 2)
+            list(APPEND neighborhoodPrograms benchmark_fkl_neighborhood_k${k}_p${passes})
+        endforeach()
+    endforeach()
+    foreach(library IN ITEMS npp opencv_cuda)
+        foreach(op IN ITEMS erode open)
+            list(APPEND neighborhoodPrograms benchmark_${library}_neighborhood_${op})
+        endforeach()
+    endforeach()
+    foreach(program IN LISTS neighborhoodPrograms)
+        set(bench "${BUILD_DIR}/neighborhood/${program}${EXE}")
+        string(REPLACE "benchmark_" "" name "${program}")
+        set(out "${OUT_DIR}/fkl-neighborhood/${name}")
+        find_dlls("${bench}")
+        run(${program} COMMAND "${bench}" "${out}")
+        run(${program}_l2_flushed COMMAND "${bench}" "${out}" --gpu-only-l2-flushed)
+        check_csv("${out}/validation.csv" within_tolerance yes FILTER_COLUMN implementation FILTER "^fkl_")
+        check_csv("${out}/validation.csv" non_finite_values 0)
+    endforeach()
     if(NPPDX)
         foreach(size IN LISTS nppdxSizes)
             build_benchmark(nppdx_${size} "${REPO}/fkl-vs-nppdx" ${cudaOptions} -DBENCH_REGIONS=${size})
@@ -579,6 +609,20 @@ else()
                     check_csv("${validation}" "FKL within tolerance" yes)
                     check_csv("${validation}" "NPPDx within tolerance" yes)
                 endforeach()
+            endforeach()
+            # The NPPDx+NPP programs of the neighborhood experiment, built for this size; NPPDx+NPP must match its
+            # reference too, as above
+            build_benchmark(neighborhood_nppdx_${size} "${REPO}/fkl-neighborhood" ${cudaOptions}
+                            -DBENCH_REGIONS=${size} -DBENCH_NPPDX=ON)
+            foreach(op IN ITEMS erode open)
+                set(program benchmark_nppdx_npp_neighborhood_${op})
+                set(bench "${BUILD_DIR}/neighborhood_nppdx_${size}/${program}${EXE}")
+                set(out "${OUT_DIR}/fkl-neighborhood/nppdx_npp_neighborhood_${op}/${size}")
+                find_dlls("${bench}")
+                run(${program}_${size} COMMAND "${bench}" "${out}")
+                run(${program}_l2_flushed_${size} COMMAND "${bench}" "${out}" --gpu-only-l2-flushed)
+                check_csv("${out}/validation.csv" within_tolerance yes)
+                check_csv("${out}/validation.csv" non_finite_values 0)
             endforeach()
         endforeach()
     endif()
