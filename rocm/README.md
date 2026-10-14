@@ -174,10 +174,9 @@ thread pool, so that the idle gap before every timed run puts both pools to slee
   repository's `fkl` submodule (with MorphologyDPP's `executeBoxBlur`) for Experiment 3. `run_all.sh` uses the
   repository's `fkl` submodule with its `thread-pool` submodule (`git submodule update --init --recursive fkl`) unless
   `FKL_GPU_DIR` / `FKL_CPU_DIR` name other checkouts, and stops if FKL is not at the commit of the experiment it runs.
-  The submodule is at Experiment 3's commit, so Experiments 1 and 2 need a checkout at `63782f6` in both, e.g.
-  `git clone https://github.com/Libraries-Openly-Fused/FusedKernelLibrary.git ../fkl-63782f6 && git -C ../fkl-63782f6
-  checkout 63782f6 && git -C ../fkl-63782f6 submodule update --init --recursive`, then
-  `FKL_GPU_DIR=../fkl-63782f6 FKL_CPU_DIR=../fkl-63782f6 rocm/scripts/run_all.sh <results dir>`.
+  The submodule is at Experiment 3's commit, so for Experiments 1 and 2 the default is a detached worktree of the
+  submodule at `63782f6` with its submodules, which `run_all.sh` makes the first time in `build-fkl-63782f6` (ignored
+  by git) and reuses.
 
 ## Build and run
 

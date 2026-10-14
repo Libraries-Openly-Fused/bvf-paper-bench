@@ -54,13 +54,15 @@ if [ "$EXPERIMENT" = 1 ]; then
 else
     FKL_PAPER_COMMIT=$(git -C "$REPO" ls-tree HEAD fkl | awk '{print substr($3, 1, 7)}')
 fi
-FKL_GPU_DIR=${FKL_GPU_DIR:-$REPO/fkl}
-FKL_CPU_DIR=${FKL_CPU_DIR:-$REPO/fkl}
-# The repository's fkl submodule is at Experiment 3's FKL: Experiments 1 and 2 take another checkout, at 63782f6
-FKL_HINT=""
-[ "$EXPERIMENT" = 1 ] && FKL_HINT="; Experiments 1 and 2 need an FKL checkout at $FKL_PAPER_COMMIT with its submodules \
-in FKL_GPU_DIR and FKL_CPU_DIR (the repository's fkl submodule is at Experiment 3's FKL, \
-$(git -C "$REPO" ls-tree HEAD fkl | awk '{print substr($3, 1, 7)}'))"
+# FKL_GPU_DIR / FKL_CPU_DIR, or by default the repository's fkl submodule. The submodule is at Experiment 3's FKL: when
+# it is not at 63782f6, Experiments 1 and 2 default to a detached worktree of it at 63782f6, with its submodules, made
+# once next to the build directories (build-fkl-63782f6, ignored by git; see the FKL checks below)
+FKL_DEFAULT_DIR=$REPO/fkl
+if [ "$EXPERIMENT" = 1 ] && [ "$(git -C "$REPO/fkl" rev-parse --short=7 HEAD 2>/dev/null)" != "$FKL_PAPER_COMMIT" ]; then
+    FKL_DEFAULT_DIR=$REPO/build-fkl-$FKL_PAPER_COMMIT
+fi
+FKL_GPU_DIR=${FKL_GPU_DIR:-$FKL_DEFAULT_DIR}
+FKL_CPU_DIR=${FKL_CPU_DIR:-$FKL_DEFAULT_DIR}
 # Experiment 3 has no CPU benchmark
 [ "$EXPERIMENT" = 3 ] && SKIP_CPU=1
 if [ -z "${CXX_CPU:-}" ]; then
@@ -99,16 +101,25 @@ command -v rocminfo > /dev/null || die "rocminfo not found"
 [ "$EXPERIMENT" = 3 ] || allowed SKIP_COUNTERS || command -v rocprofv3 > /dev/null ||
     die "rocprofv3 not found (install amdrocm-profiler-base10.1)"
 allowed SKIP_CPU || command -v "$CXX_CPU" > /dev/null || die "C++ compiler $CXX_CPU not found (set CXX_CPU)"
+if [ "$FKL_DEFAULT_DIR" != "$REPO/fkl" ] && [ ! -f "$FKL_DEFAULT_DIR/CMakeLists.txt" ] &&
+    { [ "$FKL_GPU_DIR" = "$FKL_DEFAULT_DIR" ] || { ! allowed SKIP_CPU && [ "$FKL_CPU_DIR" = "$FKL_DEFAULT_DIR" ]; }; }; then
+    echo "FKL $FKL_PAPER_COMMIT for experiment $EXPERIMENT: a worktree of the fkl submodule in $FKL_DEFAULT_DIR"
+    { git -C "$REPO/fkl" worktree add --detach "$FKL_DEFAULT_DIR" "$FKL_PAPER_COMMIT" &&
+        git -C "$FKL_DEFAULT_DIR" submodule update --init --recursive; } > "$OUT/logs/fkl_worktree.log" 2>&1 ||
+        die "no FKL worktree at $FKL_PAPER_COMMIT in $FKL_DEFAULT_DIR (log: $OUT/logs/fkl_worktree.log): initialize the fkl \
+submodule (git -C $REPO submodule update --init --recursive fkl), or set FKL_GPU_DIR and FKL_CPU_DIR to a checkout at \
+$FKL_PAPER_COMMIT"
+fi
 FKL_GPU_COMMIT=$(git -C "$FKL_GPU_DIR" rev-parse --short=7 HEAD 2>/dev/null) && [ -f "$FKL_GPU_DIR/CMakeLists.txt" ] ||
     die "no FKL checkout in $FKL_GPU_DIR (git -C $REPO submodule update --init --recursive fkl)"
 FKL_DIRS=("$FKL_GPU_DIR")
 [ "$FKL_GPU_COMMIT" = "$FKL_PAPER_COMMIT" ] || allowed ALLOW_OTHER_FKL ||
-    die "FKL_GPU_DIR is at $FKL_GPU_COMMIT, not $FKL_PAPER_COMMIT (the FKL commit of experiment $EXPERIMENT)$FKL_HINT"
+    die "FKL_GPU_DIR is at $FKL_GPU_COMMIT, not $FKL_PAPER_COMMIT (the FKL commit of experiment $EXPERIMENT)"
 if ! allowed SKIP_CPU; then
     FKL_CPU_COMMIT=$(git -C "$FKL_CPU_DIR" rev-parse --short=7 HEAD 2>/dev/null) && [ -f "$FKL_CPU_DIR/CMakeLists.txt" ] ||
         die "no FKL checkout in $FKL_CPU_DIR (git -C $REPO submodule update --init --recursive fkl)"
     [ "$FKL_CPU_COMMIT" = "$FKL_PAPER_COMMIT" ] || allowed ALLOW_OTHER_FKL ||
-        die "FKL_CPU_DIR is at $FKL_CPU_COMMIT, not $FKL_PAPER_COMMIT$FKL_HINT"
+        die "FKL_CPU_DIR is at $FKL_CPU_COMMIT, not $FKL_PAPER_COMMIT"
     FKL_DIRS+=("$FKL_CPU_DIR")
 fi
 for dir in "${FKL_DIRS[@]}"; do
