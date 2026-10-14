@@ -1329,6 +1329,11 @@ int main(int argc, char** argv) {
         if (tracing) {
             writeGpuTime(outDir / "gpu_time.csv", false);
             writeGpuTime(outDir / "gpu_time_l2_flushed.csv", true);
+        } else {
+            // The GPU time only files of an earlier run in this directory, which this run does not rewrite (as in
+            // rocm_bench.hip)
+            std::filesystem::remove(outDir / "gpu_time.csv");
+            std::filesystem::remove(outDir / "gpu_time_l2_flushed.csv");
         }
         writeRegionStats((outDir / "regions.csv").string(), *ctx.regions, WARMUP_ITERS, TIMED_ITERS);
         writeRegionStats((outDir / "regions_resize.csv").string(), *resizeRegions, WARMUP_ITERS, TIMED_ITERS);
