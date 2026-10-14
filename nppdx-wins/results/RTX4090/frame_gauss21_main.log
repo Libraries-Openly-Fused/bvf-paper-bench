@@ -1,0 +1,51 @@
+nppdx_frame: tile 64x32 block recommended cannot run: GPU Error: invalid argument File: /home/oscar/bvf-bench/paper-bench-wins/nppdx-wins/src/wins_common.h Line:627
+
+nppdx_frame: tile 64x32 block recommended median 0.00 us, max abs error 0.00e+00 (not within the tolerance)
+nppdx_frame: tile 64x32 block 128 cannot run: GPU Error: invalid argument File: /home/oscar/bvf-bench/paper-bench-wins/nppdx-wins/src/wins_common.h Line:627
+
+nppdx_frame: tile 64x32 block 128 median 0.00 us, max abs error 0.00e+00 (not within the tolerance)
+nppdx_frame: tile 64x32 block 256 cannot run: GPU Error: invalid argument File: /home/oscar/bvf-bench/paper-bench-wins/nppdx-wins/src/wins_common.h Line:627
+
+nppdx_frame: tile 64x32 block 256 median 0.00 us, max abs error 0.00e+00 (not within the tolerance)
+nppdx_frame: tile 64x32 block 512 cannot run: GPU Error: invalid argument File: /home/oscar/bvf-bench/paper-bench-wins/nppdx-wins/src/wins_common.h Line:627
+
+nppdx_frame: tile 64x32 block 512 median 0.00 us, max abs error 0.00e+00 (not within the tolerance)
+nppdx_frame: tile 32x32 block recommended median 798.58 us, max abs error 9.54e-07
+nppdx_frame: tile 32x32 block 128 median 1022.98 us, max abs error 1.87e+00 (not within the tolerance)
+nppdx_frame: tile 32x32 block 256 median 737.12 us, max abs error 1.78e+00 (not within the tolerance)
+nppdx_frame: tile 32x32 block 512 median 799.12 us, max abs error 9.54e-07
+nppdx_frame: tile 32x16 block recommended median 1274.88 us, max abs error 9.54e-07
+nppdx_frame: tile 32x16 block 128 median 1161.14 us, max abs error 1.87e+00 (not within the tolerance)
+nppdx_frame: tile 32x16 block 256 median 1269.07 us, max abs error 9.25e-02 (not within the tolerance)
+nppdx_frame: tile 32x16 block 512 median 1278.98 us, max abs error 9.54e-07
+nppdx_frame: tile 16x16 block recommended median 1359.20 us, max abs error 9.54e-07
+nppdx_frame: tile 16x16 block 128 median 1238.02 us, max abs error 1.74e+00 (not within the tolerance)
+nppdx_frame: tile 16x16 block 256 median 1341.44 us, max abs error 9.54e-07
+nppdx_frame: tile 16x16 block 512 median 2418.53 us, max abs error 9.54e-07
+nppdx_frame: tile 16x8 block recommended median 1787.87 us, max abs error 9.54e-07
+nppdx_frame: tile 16x8 block 128 median 1699.84 us, max abs error 2.44e-01 (not within the tolerance)
+nppdx_frame: tile 16x8 block 256 median 2456.58 us, max abs error 9.54e-07
+nppdx_frame: tile 16x8 block 512 median 4561.84 us, max abs error 9.54e-07
+nppdx_frame: tile 32x32 block recommended chosen
+fkl_staged_separable_frame: DPP tile 16x8 median 627.71 us, max abs error 1.19e-06
+fkl_staged_separable_frame: DPP tile 32x8 median 624.64 us, max abs error 1.19e-06
+fkl_staged_separable_frame: DPP tile 32x16 median 655.68 us, max abs error 1.19e-06
+fkl_staged_separable_frame: DPP tile 32x8 chosen
+=== nppdx-wins W2: a filter before a 2:1 resize of the 4K frame (smoke test)
+=== N = 1
+fkl_staged_frame: DPP tile 16x8 median 4274.13 us, max abs error 4.65e-06
+fkl_staged_frame: DPP tile 32x8 median 4237.07 us, max abs error 4.65e-06
+fkl_staged_frame: DPP tile 32x16 median 4257.38 us, max abs error 4.65e-06
+fkl_staged_frame: DPP tile 32x8 chosen
+nppdx        median   814.5 us  mean   814.6 us  p10   813.9  p90   815.9  FKL staged mean speedup   0.19x  max err 9.54e-07 (nppdx_pixel_center_float)
+fkl_staged_separable median   625.2 us  mean   624.6 us  p10   622.5  p90   625.7  FKL staged mean speedup   0.15x  max err 1.19e-06 (fkl_cpu_float)
+fkl_staged   median  4236.3 us  mean  4237.2 us  p10  4235.8  p90  4238.1  max err 4.65e-06 (fkl_cpu_float)
+=== GPU time only (CUPTI kernel execution times, after all CPU + GPU timings)
+GPU only nppdx        N   1  median  821.17 us  p10  820.93  p90  821.49  FKL staged mean speedup   0.19x
+GPU only fkl_staged_separable N   1  median  625.22 us  p10  619.73  p90  625.64  FKL staged mean speedup   0.15x
+GPU only fkl_staged   N   1  median 4243.78 us  p10 4242.87  p90 4244.27
+=== Kernel counts (CUPTI activity tracing, after all timings)
+nppdx      N   1  kernels    1  memsets 0  memcpys 0
+fkl_staged_separable N   1  kernels    3  memsets 0  memcpys 0
+fkl_staged N   1  kernels    2  memsets 0  memcpys 0
+Results written to "/home/oscar/bvf-bench/results-nppdx-wins/frame_gauss21"
