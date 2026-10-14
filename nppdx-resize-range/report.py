@@ -115,6 +115,39 @@ def main():
 
     # ---------------------------------------------------------------------------------------------------------------
     w("")
+    w("## Which ratios have a correct configuration (NPPDx's rules, every coprime J:K up to "
+      f"{summary[0]['max_J_and_K_searched']})")
+    w("")
+    w("A ratio has one if some tile compiles, fits the shared memory with the example's block and has J dividing it.")
+    w("")
+    w("| SM | method | ratios | largest J | largest K | closest to 1 (upscale) | closest to 1 (downscale) |")
+    w("|---|---|---|---|---|---|---|")
+    level = "fits_smem_example_block_j_divides"
+    feasible = defaultdict(set)
+    # Next to tables.md: every ratio that has one, with its best tile (rules_by_ratio.csv is too big to keep)
+    with open(d / "rules" / "rules_by_ratio.csv", newline="") as f, \
+            open(out.parent / "feasible_ratios.csv", "w", newline="") as g:
+        writer = csv.writer(g)
+        writer.writerow(["sm", "method", "J", "K", "factor", "direction", "tiles", "best_tile", "smem_bytes",
+                         "output_tile", "block"])
+        for r in csv.DictReader(f):
+            if r[f"{level}_best_tile"]:
+                j, k = int(r["J"]), int(r["K"])
+                feasible[(r["sm"], r["method"])].add((j, k))
+                writer.writerow([r["sm"], r["method"], j, k, f"{factor(j, k):.4f}",
+                                 "upscale" if k > j else ("downscale" if j > k else "identity"),
+                                 r[f"{level}_tiles"], r[f"{level}_best_tile"], r[f"{level}_best_smem"],
+                                 r[f"{level}_best_output"], r[f"{level}_best_block"]])
+    for sm in ("890", "900"):
+        for method in METHODS:
+            s = feasible[(sm, method)]
+            up = min((jk for jk in s if jk[1] > jk[0]), key=lambda jk: Fraction(jk[1], jk[0]))
+            down = min((jk for jk in s if jk[0] > jk[1]), key=lambda jk: Fraction(jk[0], jk[1]))
+            w(f"| {sm} | {method} | {len(s)} | {max(j for j, _ in s)} | {max(k for _, k in s)} | {up[0]}:{up[1]} | "
+              f"{down[0]}:{down[1]} |")
+
+    # ---------------------------------------------------------------------------------------------------------------
+    w("")
     w("## The compiled points")
     w("")
     agreement = (d / "agreement.txt").read_text().strip().splitlines()

@@ -1,0 +1,3 @@
+points: 14755, compiled: 3451, rejected: 11304
+rules vs compiler, accepted or not: 14755 agree, 0 disagree
+rules vs probe, tiles / shared memory / block of the compiled points: 3451 match, 0 differ
