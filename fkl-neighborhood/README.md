@@ -30,8 +30,9 @@ Fixed-size crops of the [frame](../README.md#workload) of every benchmark of thi
 - Every output value evaluates the chain before the box (an NV12 read and a color conversion) K^2 times per pass, so K^4
   times for two passes.
 
-**With FKL's `MorphologyDPP`.** `executeBoxBlur` (FusedKernelLibrary PR #393) runs the box as a morphology: an `Add`
-reducer per pass, and a `Mul` by 1 / K^(2 passes) fused in front of the output. One kernel:
+**With FKL's `MorphologyDPP`.** `executeBoxBlur` (FusedKernelLibrary PR #393) runs the box as a morphology: every pass
+sums its window with an `Add` reducer and multiplies the sum by 1 / K^2 (the pass's finalizer), so every pass is a mean.
+One kernel:
 - **Batching:** one grid z plane per crop (PR #393).
 - **Input:** the DPP reads the crops through the BVF chain `ReadNV12 -> YUVtoRGB -> Crop`, fused into its reads.
 - **Tiling:** it stages a tile of TW x TH output values, plus the halo of its passes, in shared memory, so every crop
@@ -49,11 +50,14 @@ reducer per pass, and a `Mul` by 1 / K^(2 passes) fused in front of the output. 
 ### Part (a): the BVF operation against the DPP, FKL only
 
 `benchmark_fkl_neighborhood_k<K>_p<passes>` is built for every K in {3, 5, 7} and 1 or 2 passes. It runs N = 1 and 16.
+`benchmark_fkl_neighborhood_k<K>_p<passes>_resize` is the same with the box after Figure 1's resize: the regions of
+[`common/bench_geometry.h`](../common/bench_geometry.h) (20x10, 32x16 and 48x24 by turns), cropped and resized to 64x32,
+then the box, replicating the edge of the resized region.
 
-| Implementation | What runs |
-|---|---|
-| `fkl_bvf_ops` | one `executeOperations` call, one kernel: `ReadYUV -> YUVToRGB -> Crop -> BoxBVF<K> [-> BoxBVF<K>] -> Mul -> Sub -> Div -> TensorWrite` |
-| `fkl_dpp` | one `executeBoxBlur<passes>` call, one kernel: `MorphologyDPP<float3, TW, TH, K, K>` |
+| Implementation | What runs | Chain evaluations per output value |
+|---|---|---|
+| `fkl_bvf_ops` | one `executeOperations` call, one kernel: `ReadYUV -> YUVToRGB -> Crop [-> Resize] -> BoxBVF<K> [-> BoxBVF<K>] -> Mul -> Sub -> Div -> TensorWrite` | K^2 or K^4 NV12 reads and conversions; with the resize 4 K^2 or 4 K^4 (four per bilinear sample) |
+| `fkl_dpp` | one `executeBoxBlur<passes>` call, one kernel: `MorphologyDPP<float3, TW, TH, K, K>` | one per value of a tile and its halo |
 
 ### Part (b): the DPP against the libraries
 
@@ -95,7 +99,7 @@ is computed in double and rounded as the implementation rounds it (`boxReference
 
 | Reference | Crops | Box | Implementations |
 |---|---|---|---|
-| `fkl_cpu_float` | float | float | `fkl_dpp`, `fkl_bvf_ops`, `nppdx` |
+| `fkl_cpu_float` | float (with the resize for the `_resize` programs) | float | `fkl_dpp`, `fkl_bvf_ops`, `nppdx` |
 | `fkl_cpu_float_rounded_8bit` | float | rounded half up to 8 bits | `nppdx_npp` |
 | `fkl_cpu_8bit_rgb` | the RGB rounded to 8 bits after the conversion (the 8 bit frame of NPP's conversion) | float | `npp_32f`, `npp_32f_frame`, `opencv_cuda`, `opencv_cuda_rgba` |
 | `fkl_cpu_8bit_rgb_floor_box` | the same 8 bit RGB | rounded down, floor(sum / 25) | `npp` |
@@ -106,7 +110,7 @@ the others.
 `test_neighborhood_ops` checks `BoxBVF` and `MorphologyDPP`'s box blur against the host box for every K and number of
 passes:
 - `BoxBVF` on FKL's CPU backend and on the GPU;
-- `executeBoxBlur` on the GPU, and `MorphologyDPP<ParArch::CPU>` with its reducers and write;
+- `executeBoxBlur` on the GPU, and `MorphologyDPP<ParArch::CPU>` with its passes;
 - on a plane read directly and on a batch of 64x32 crops of a larger image, one at its corner;
 - within 1e-5, relative.
 

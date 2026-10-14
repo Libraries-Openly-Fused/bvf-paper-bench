@@ -23,7 +23,7 @@ One folder per library compared with FKL, each its own CMake project with its ow
 | [`fkl-vs-nppdx/`](fkl-vs-nppdx/README.md) | FKL BVF with NVIDIA NPPDx, as one kernel with hand written CUDA code and combined with NPP without hand written pixel processing code | `benchmark_nppdx`, `benchmark_nppdx_npp` |
 | [`fkl-vs-opencv-cpu/`](fkl-vs-opencv-cpu/README.md) | FKL's CPU backends with OpenCV on the CPU | `benchmark_opencv_cpu` |
 | [`fkl-ablation/`](fkl-ablation/README.md) | FKL with BVF against FKL without it (vertical and horizontal fusion only), FKL's host overhead, the type FKL builds | `benchmark_fkl_ablation`, `bvf_types` |
-| [`fkl-neighborhood/`](fkl-neighborhood/README.md) | The neighborhood experiment: 64x32 crops, a box blur and the normalization; FKL's BVF box operation against its MorphologyDPP, and the DPP against NPP, OpenCV CUDA, NPPDx and NPPDx+NPP | `benchmark_fkl_neighborhood_k<K>_p<passes>`, `benchmark_{npp,opencv_cuda,nppdx,nppdx_npp}_neighborhood`, `test_neighborhood_ops` |
+| [`fkl-neighborhood/`](fkl-neighborhood/README.md) | The neighborhood experiment: 64x32 crops, a box blur and the normalization; FKL's BVF box operation against its MorphologyDPP, and the DPP against NPP, OpenCV CUDA, NPPDx and NPPDx+NPP | `benchmark_fkl_neighborhood_k<K>_p<passes>[_resize]`, `benchmark_{npp,opencv_cuda,nppdx,nppdx_npp}_neighborhood`, `test_neighborhood_ops` |
 | [`rocm/`](rocm/README.md) | FKL's HIP backend with AMD RPP on an AMD GPU, and FKL's CPU backends with RPP's HOST backend, on ROCm | `rocm_bench`, `rpp_cpu_bench` |
 
 Next to them:
