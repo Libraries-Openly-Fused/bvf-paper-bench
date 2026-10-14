@@ -4,34 +4,37 @@ Part of the [BVF paper benchmarks](../README.md): the experiment on neighborhood
 
 ## Pipeline
 
-The [workload](../README.md#workload) of every benchmark of this repository, with a morphology stage after the
-resize and without the letterbox of Figure 1:
+Fixed-size crops of the [frame](../README.md#workload) of every benchmark of this repository, blurred and normalized:
 
-    ReadNV12 -> YUVtoRGB -> Crop -> Resize -> Morph (K x K) -> Mul -> Sub -> Div -> Write
+    ReadNV12 -> YUVtoRGB -> Crop (64x32) -> Box (K x K) -> Mul -> Sub -> Div -> Write
 
-- **Output:** N planes of 64x32 float3, without the black rows of Figure 1.
-- **Morphology:** an erosion (one pass of minimum) or an opening (a minimum, then a maximum).
-  - The mask is a K x K rectangle anchored at its center.
-  - Every pass replicates the border of the 64x32 plane it reads, including the second pass of the opening, which reads
-    the result of the first.
-  - The minimum and the maximum are per channel.
+- **Why this pipeline:** it is one that both FKL and NPPDx fuse into a single kernel.
+  - FKL's `MorphologyDPP` reads through a BVF chain that ends at the crop and writes through the pointwise tail.
+  - NPPDx has the box (`BoxBlur`) between its color conversion and its write.
+  - A resize between the crop and the box would break both: NPPDx's `Resize` writes no halo, so no area step can
+    follow it in one kernel, and a DPP's output must be a write, so it cannot feed a resize.
+- **Crops:** N crops of 64x32 per iteration, at uniform random even positions at least 8 pixels from the frame edges, new
+  every iteration and the same for every implementation, program and machine (`cropRegionSets`: `RegionSets` of
+  [`common/bench_geometry.h`](../common/bench_geometry.h) with a fixed size, from the same seed). No resize and no added
+  rows.
+- **Output:** N planes of 64x32 float3.
+- **Box:** the mean of the K x K window centered on the value, per channel, replicating the edge of the crop. With two
+  passes, the second one blurs the result of the first, again replicating the edge of the crop.
 - **Shared with `rocm/`:** these definitions are in [`common/bench_neighborhood.h`](../common/bench_neighborhood.h), with
-  the sizes of both parts and the host reference.
+  the sizes of both parts and the host references.
 
 ## FKL's two ways to write a neighborhood operation
 
-**As BVF operations.** [`common/bench_neighborhood_ops.h`](../common/bench_neighborhood_ops.h) has `ErodeBVF<K>` and
-`DilateBVF<K>`:
-- They are ReadBack operations, like `Crop` and `Resize`, so the whole pipeline is one `executeOperations` call.
-- Every output value evaluates the chain before the morphology K^2 times per pass, so K^4 times for the opening.
-- Every evaluation of the bilinear resize reads four values of the color conversion.
-- That is 4 K^2 (erosion) or 4 K^4 (opening) NV12 reads and conversions per output value.
+**As a BVF operation.** [`common/bench_neighborhood_ops.h`](../common/bench_neighborhood_ops.h) has `BoxBVF<K>`:
+- It is a ReadBack operation, like `Crop` and `Resize`, so the whole pipeline is one `executeOperations` call.
+- Every output value evaluates the chain before the box (an NV12 read and a color conversion) K^2 times per pass, so K^4
+  times for two passes.
 
-**With FKL's `MorphologyDPP`.** A Data Parallel Pattern runs every pass in one kernel:
-- **Batching:** one grid z plane per region (FusedKernelLibrary PR #393).
-- **Input:** the DPP reads the regions through the BVF chain `ReadNV12 -> YUVtoRGB -> Crop -> Resize`, fused into its
-  reads.
-- **Tiling:** it stages a tile of TW x TH output values, plus the halo of its passes, in shared memory, so every resized
+**With FKL's `MorphologyDPP`.** `executeBoxBlur` (FusedKernelLibrary PR #393) runs the box as a morphology: an `Add`
+reducer per pass, and a `Mul` by 1 / K^(2 passes) fused in front of the output. One kernel:
+- **Batching:** one grid z plane per crop (PR #393).
+- **Input:** the DPP reads the crops through the BVF chain `ReadNV12 -> YUVtoRGB -> Crop`, fused into its reads.
+- **Tiling:** it stages a tile of TW x TH output values, plus the halo of its passes, in shared memory, so every crop
   value of the tile and halo is computed once.
 - **Output:** it writes through `Mul -> Sub -> Div -> TensorWrite`, fused into its write. No intermediate is in memory.
 - **Tile choice per batch size:** the program compiles the DPP for every tile of `DPP_TILES` (16x8, 32x8, 32x16). It
@@ -43,82 +46,84 @@ resize and without the letterbox of Figure 1:
 
 ## Programs
 
-### Part (a): the BVF operations against the DPP, FKL only
+### Part (a): the BVF operation against the DPP, FKL only
 
-`benchmark_fkl_neighborhood_k<K>_p<passes>` is built for every K in {3, 5, 7} and every number of passes: 1 (erode) or
-2 (open). It runs N = 1 and 16.
+`benchmark_fkl_neighborhood_k<K>_p<passes>` is built for every K in {3, 5, 7} and 1 or 2 passes. It runs N = 1 and 16.
 
 | Implementation | What runs |
 |---|---|
-| `fkl_bvf_ops` | one `executeOperations` call, one kernel: `ReadYUV -> YUVToRGB -> Crop -> Resize -> ErodeBVF<K> [-> DilateBVF<K>] -> Mul -> Sub -> Div -> TensorWrite` |
-| `fkl_dpp` | one `executeErode` / `executeOpen` call, one kernel: `MorphologyDPP<float3, TW, TH, K, K>` |
+| `fkl_bvf_ops` | one `executeOperations` call, one kernel: `ReadYUV -> YUVToRGB -> Crop -> BoxBVF<K> [-> BoxBVF<K>] -> Mul -> Sub -> Div -> TensorWrite` |
+| `fkl_dpp` | one `executeBoxBlur<passes>` call, one kernel: `MorphologyDPP<float3, TW, TH, K, K>` |
 
 ### Part (b): the DPP against the libraries
 
-These programs use K = 5 and every batch size. There is one program per operation, `_erode` and `_open`.
+These programs use a 5x5 box, one pass, and every batch size.
 
-| Program | Implementation | What runs | Kernels (erode / open) |
+| Program | Implementation | What runs | Kernels |
 |---|---|---|---|
-| `benchmark_npp_neighborhood_*` | `npp` | `fkl-vs-npp`'s pipeline up to its batched 32f resize (NV12->RGB of the frame, per region `nppiConvert_8u32f_C3R`, one `nppiResizeBatch_32f_C3R_Advanced` into 64x32 float3 planes); then per region `nppiFilterMinBorder_32f_C3R` (erode), or `nppiFilterMinBorder` into a plane buffer then `nppiFilterMaxBorder_32f_C3R` (open), with `oSrcSize` the plane and `NPP_BORDER_REPLICATE`, into its output plane; then `nppiMulC`, `nppiSubC`, `nppiDivC` on the whole output | 2N + 5 / 3N + 5 |
-| | `npp_morph` | the same with `nppiErodeBorder_32f_C3R` (K x K mask of ones) / `nppiMorphOpenBorder_32f_C3R` (two kernels per call, with its scratch buffer) | 2N + 5 / 3N + 5 |
-| `benchmark_opencv_cuda_neighborhood_*` | `opencv_cuda` | OpenCV CUDA's morphology filters take no 3 channel image, so `fkl-vs-opencv-cuda`'s pipeline works on 4 channels: NPP NV12->RGB of the frame, `cv::cuda::cvtColor` RGB2RGBA of the frame, then per region `convertTo` 32FC4, `resize`, and the `createMorphologyFilter` (`MORPH_ERODE` / `MORPH_OPEN`, K x K ones) filter into its plane; then `multiply`, `subtract`, `divide` on the 4 channel output and one `cvtColor` RGBA2RGB into the float3 output | 4N + 6 / 6N + 6 |
-| | `opencv_cuda_rgba_per_region` | the same with `cvtColor` RGB2RGBA per region instead of on the frame | 5N + 5 / 7N + 5 |
-| `benchmark_nppdx_npp_neighborhood_*` | `nppdx_npp` | without hand written pixel processing code: `fkl-vs-nppdx`'s NPPDx kernel of NPPDx+NPP (NV12 ingest, ColorConvert, Resize, 8 bit RGB write; one launch for the N regions), then NPP, since NPPDx 0.1.2 has no morphology: per region `nppiErodeBorder_8u_C3R` (erode), or ErodeBorder into a plane buffer then `nppiDilateBorder_8u_C3R` (open); then `nppiConvert_8u32f_C3R`, `nppiMulC`, `nppiSubC`, `nppiDivC` on all planes. Every NPPDx tile and block is validated and its kernel timed alone, and the fastest correct one is used (`nppdx_npp_configs.csv`, `nppdx_npp_config_sweep.csv`). Built for one region size, like `fkl-vs-nppdx` | N + 5 / 2N + 5 |
-| every program | `fkl_dpp` | one kernel (see above) | 1 / 1 |
+| `benchmark_npp_neighborhood` | `npp` | NV12->RGB of the frame (8 bit); per crop `nppiFilterBoxBorder_8u_C3R` from the crop of the frame (`oSrcSize` the crop, `NPP_BORDER_REPLICATE`) into its packed 8 bit plane, which rounds down; one `nppiConvert_8u32f_C3R` of the N planes; `nppiMulC`, `nppiSubC`, `nppiDivC` on the whole output | N + 5 |
+| | `npp_32f` | NV12->RGB; per crop `nppiConvert_8u32f_C3R` of the crop, then `nppiFilterBoxBorder_32f_C3R` into its output plane; the three passes | 2N + 4 |
+| | `npp_32f_frame` | NV12->RGB; one `nppiConvert_8u32f_C3R` of the whole frame; per crop `nppiFilterBoxBorder_32f_C3R` from the crop of the float frame into its output plane; the three passes | N + 5 |
+| `benchmark_opencv_cuda_neighborhood` | `opencv_cuda` | NPP NV12->RGB of the frame (OpenCV CUDA has none); per crop `convertTo` 32FC3 of the crop, then `createSeparableLinearFilter` (`CV_32FC3`, 5 taps of 1/5 for the rows and the columns, `BORDER_REPLICATE`; a row and a column kernel) into its plane; `multiply`, `subtract`, `divide` on the float3 output | 3N + 4 |
+| | `opencv_cuda_rgba` | NPP NV12->RGB; `cvtColor` RGB2RGBA of the frame; per crop `convertTo` 32FC4, then `createLinearFilter` (`CV_32FC4`, 5x5 taps of 1/25, `BORDER_REPLICATE`; one kernel) into its plane of a 4 channel output; `multiply`, `subtract`, `divide` on it; `cvtColor` RGBA2RGB into the float3 output | 2N + 6 |
+| `benchmark_nppdx_neighborhood` | `nppdx` | one kernel ([`src/nppdx_box.h`](src/nppdx_box.h)): NPPDx's NV12 ingest of the crop (the crop is the image, so the halo replicates its edge), `FromLimitedLuma` / `FromLimitedChroma`, `ColorConvert` BT.601 and `BoxBlur<5, 5>`, then the normalization and the float3 write written by hand, as `fkl-vs-nppdx`'s NPPDx kernel (NPPDx has no float output); one launch for the N crops | 1 |
+| `benchmark_nppdx_npp_neighborhood` | `nppdx_npp` | without hand written pixel processing code: the same NPPDx operations with NPPDx's 8 bit RGB write (rounded half up) into packed planes, then `nppiConvert_8u32f_C3R`, `nppiMulC`, `nppiSubC`, `nppiDivC` on all planes | 5 |
+| every program | `fkl_dpp` | one kernel (see above) | 1 |
+
+**NPPDx configurations:** for both NPPDx programs, every tile of the crop that NPPDx supports (64x32, then halvings of
+the longer side down to 8x8, in 4x2 pixel cells) runs with NPPDx's recommended block and with `BlockDim` 64, 128, 256
+and 512. Each one is validated and its kernel timed alone for every batch size, and the fastest correct one is used
+(`<name>_configs.csv`, `<name>_config_sweep.csv`).
 
 ### Notes on the libraries
 
-- **The morphology functions take two kernels per call**, so the L2 flush cannot sit between them:
-  - OpenCV's `apply` copies the plane with `copyMakeBorder` (`BORDER_REFLECT_101`), then runs an NPP kernel, for every
-    pass.
-  - NPP's `nppiMorphOpenBorder` runs an erosion and a dilation kernel.
-  - With the L2 flushed, the flush runs before every library call, not between the kernels of one call.
-- **The border semantics agree.** For a centered rectangular mask, `BORDER_REFLECT_101` gives the same minimum and
-  maximum as replicating the border.
-- **8-bit NPP morphology:** NPP's 8 bit `nppiFilterMin/MaxBorder` take an extra path (three kernels) when the
-  destination is not 12-byte aligned. The NPPDx+NPP programs use `nppiErodeBorder` / `nppiDilateBorder`, which have no
-  such path.
+- **NPP has no batched box filter**, so it makes one call per crop. `nppiFilterBoxBorder` accepts only
+  `NPP_BORDER_REPLICATE`, and is one kernel per call at any offset, 8 bit and float. The non-border `nppiFilterBox`
+  reads the pixels around its ROI, so it is not used.
+- **OpenCV CUDA's `createBoxFilter` takes 8UC1, 8UC4 and 32FC1 only**, so the box is a linear filter: the separable one
+  takes 3 channels, the 2D one 1 or 4. OpenCV's filters build their border from the image they get (a view of the
+  crop), so `BORDER_REPLICATE` replicates the edge of the crop.
+- **Multi-kernel calls:** the separable filter runs a row and a column kernel in one call. With the L2 flushed, the flush
+  runs before every library call, not between the kernels of one call.
 
 ## Validation
 
-Every implementation is checked against the reference of its conventions:
-- **The base:** the Figure 1 references of [`common/bench_gpu.h`](../common/bench_gpu.h) without the letterbox,
-  normalized. For NPPDx+NPP, fkl-vs-nppdx's pixel-center 8 bit one.
-- **Then the morphology:** `hostMorph` of `common/bench_neighborhood.h`, applied on the host after the normalization.
-  This is exact, because the normalization is non-decreasing in every channel and so commutes with the minimum and the
-  maximum.
+Every reference blurs the RGB values and then normalizes them, as every pipeline does: a box does not commute exactly
+with the normalization, which rounds. The crops come from FKL's CPU backend (`ReadNV12 -> YUVtoRGB -> Crop`). The box
+is computed in double and rounded as the implementation rounds it (`boxReference` of
+[`common/bench_neighborhood.h`](../common/bench_neighborhood.h)).
 
-The tolerances are those of every GPU benchmark: 1e-3 for FKL, one level of 8 bit RGB for the 8 bit pipelines.
+| Reference | Crops | Box | Implementations |
+|---|---|---|---|
+| `fkl_cpu_float` | float | float | `fkl_dpp`, `fkl_bvf_ops`, `nppdx` |
+| `fkl_cpu_float_rounded_8bit` | float | rounded half up to 8 bits | `nppdx_npp` |
+| `fkl_cpu_8bit_rgb` | the RGB rounded to 8 bits after the conversion (the 8 bit frame of NPP's conversion) | float | `npp_32f`, `npp_32f_frame`, `opencv_cuda`, `opencv_cuda_rgba` |
+| `fkl_cpu_8bit_rgb_floor_box` | the same 8 bit RGB | rounded down, floor(sum / 25) | `npp` |
 
-`test_neighborhood_ops` checks `ErodeBVF` and `DilateBVF` against the host reference, on FKL's CPU backend and on the
-GPU, for every K and number of passes:
-- on a plane read directly: bit-identical;
-- on a batch of three regions of different sizes, cropped and resized: within 1e-5, relative.
+The tolerances are those of every GPU benchmark: 1e-3 against the float reference, and one level of 8 bit RGB against
+the others.
+
+`test_neighborhood_ops` checks `BoxBVF` and `MorphologyDPP`'s box blur against the host box for every K and number of
+passes:
+- `BoxBVF` on FKL's CPU backend and on the GPU;
+- `executeBoxBlur` on the GPU, and `MorphologyDPP<ParArch::CPU>` with its reducers and write;
+- on a plane read directly and on a batch of 64x32 crops of a larger image, one at its corner;
+- within 1e-5, relative.
 
 ## Build and run
 
-Needs FusedKernelLibrary with the batched `MorphologyDPP` (PR #393; the `fkl` submodule points to it). With `OpenCV_DIR`
-for the OpenCV programs (or `-DBENCH_OPENCV=OFF`):
+Needs FusedKernelLibrary with the batched `MorphologyDPP` and `executeBoxBlur` (PR #393; the `fkl` submodule points to
+it), and NPPDx (the `nppdx` submodule; CMake 3.30 or newer, or `-DBENCH_NPPDX=OFF`). With `OpenCV_DIR` for the OpenCV
+program (or `-DBENCH_OPENCV=OFF`):
 
     cmake -S fkl-neighborhood -B build-neighborhood -DCMAKE_BUILD_TYPE=Release -DOpenCV_DIR=<OpenCV>
     cmake --build build-neighborhood -j
     ./build-neighborhood/test_neighborhood_ops
-    ./build-neighborhood/benchmark_npp_neighborhood_open ../results/fkl-neighborhood/npp_neighborhood_open
-    ./build-neighborhood/benchmark_npp_neighborhood_open ../results/fkl-neighborhood/npp_neighborhood_open \
-        --gpu-only-l2-flushed
-
-The NPPDx+NPP programs are built for one region size. With `BENCH_NPPDX=ON`, this folder builds only them:
-
-    cmake -S fkl-neighborhood -B build-neighborhood-nppdx-32x16 -DCMAKE_BUILD_TYPE=Release -DBENCH_NPPDX=ON \
-        -DBENCH_REGIONS=32x16
-    cmake --build build-neighborhood-nppdx-32x16 -j
-    ./build-neighborhood-nppdx-32x16/benchmark_nppdx_npp_neighborhood_open \
-        ../results/fkl-neighborhood/nppdx_npp_neighborhood_open/32x16
+    ./build-neighborhood/benchmark_npp_neighborhood ../results/fkl-neighborhood/npp_neighborhood
+    ./build-neighborhood/benchmark_npp_neighborhood ../results/fkl-neighborhood/npp_neighborhood --gpu-only-l2-flushed
 
 `scripts/run_all.sh` (step `neighborhood`) builds and runs all of them, each program into
-`<results>/fkl-neighborhood/<program>`:
-- the NPPDx+NPP ones into `<program>/<size>`, for every size of `NPPDX_SIZES`;
-- the main run first, then the L2-flushed one.
+`<results>/fkl-neighborhood/<program>`: the main run first, then the L2-flushed one.
 
 The timings, modes, output files and validation rules are those of every GPU benchmark on
 [`common/bench_gpu.h`](../common/bench_gpu.h), described in the [main README](../README.md#the-gpu-benchmarks). The

@@ -3,7 +3,7 @@
 # NPP (main run and the GPU only run with the L2 flushed), FKL's ablation (the same, plus the host overhead, the
 # per-kernel GPU times and bvf_types, the type of the fused operation), FKL vs NPPDx for every region size (both
 # programs: main run, L2 flushed, and the runner-up NPPDx configuration re-timed against FKL), the neighborhood
-# experiment (fkl-neighborhood: every program, main run and L2 flushed, the NPPDx+NPP ones for every region size),
+# experiment (fkl-neighborhood: every program, main run and L2 flushed, on its fixed-size 64x32 crops),
 # FKL vs OpenCV on the CPU, with COMPILE_TIME=1 the compile-time units, and with PROFILE=1 the memory traffic with
 # Nsight Compute
 # (scripts/ncu_dram.sh and ncu_l2.sh, their summaries and the traffic model), which needs the driver to let every user
@@ -19,8 +19,7 @@
 # Environment variables:
 #   STEPS        the benchmarks to build and run, among opencv-cuda, npp, ablation, nppdx, neighborhood and opencv-cpu
 #                (default all)
-#   NPPDX_SIZES  the region sizes of FKL vs NPPDx and of the NPPDx+NPP neighborhood programs (default
-#                "20x10 32x16 48x24")
+#   NPPDX_SIZES  the region sizes of FKL vs NPPDx (default "20x10 32x16 48x24")
 #   COMPILE_TIME 1 to also run scripts/compile_time.sh after the runs (long: 10 rounds of every unit): FKL's ablation,
 #                the OpenCV and NPP units, and in the NPPDx builds the headers and FKL BVF (first size) and the NPPDx
 #                kernel at N = 100 (every size)
@@ -33,8 +32,7 @@
 #                the CPU benchmark), which win. Setting or unsetting BENCH_REGIONS in them is an error: this script sets
 #                it for every project (mixed, or the NPPDx sizes of NPPDX_SIZES)
 # Results: <results>/<benchmark folder>, FKL vs NPPDx in <results>/fkl-vs-nppdx/<size> (the runner-up configurations in
-# its runner-up/), the neighborhood experiment in <results>/fkl-neighborhood/<program> (the NPPDx+NPP ones in
-# <program>/<size>), logs in <results>/logs. The GPU benchmarks run one at a time; leave the GPU otherwise idle.
+# its runner-up/), the neighborhood experiment in <results>/fkl-neighborhood/<program>, logs in <results>/logs. The GPU benchmarks run one at a time; leave the GPU otherwise idle.
 set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -174,9 +172,10 @@ if has_step nppdx; then
     done
 fi
 if has_step neighborhood; then
-    # Part (a) and the NPP and OpenCV CUDA programs on the mixed regions, then the NPPDx+NPP programs, built for one
-    # region size at a time. Every program runs its main benchmark, which chooses the MorphologyDPP tile (and the NPPDx
-    # configuration) of every batch size, then the GPU only one with the L2 flushed, which reads them.
+    # Part (a), then the library programs of part (b), all on the fixed-size crops of common/bench_neighborhood.h (one
+    # build: BENCH_REGIONS does not change them). Every program runs its main benchmark, which chooses the
+    # MorphologyDPP tile (and the NPPDx configuration) of every batch size, then the GPU only one with the L2 flushed,
+    # which reads them.
     build=$BUILD_ROOT/build-neighborhood
     out=$RESULTS/fkl-neighborhood
     echo "  fkl-neighborhood ($build)"
@@ -188,25 +187,11 @@ if has_step neighborhood; then
             programs+=("benchmark_fkl_neighborhood_k${k}_p$passes")
         done
     done
-    for library in npp opencv_cuda; do
-        for op in erode open; do
-            programs+=("benchmark_${library}_neighborhood_$op")
-        done
-    done
+    programs+=(benchmark_npp_neighborhood benchmark_opencv_cuda_neighborhood benchmark_nppdx_neighborhood
+               benchmark_nppdx_npp_neighborhood)
     for program in "${programs[@]}"; do
         run "$LOGS/$program.log" "$build/$program" "$out/${program#benchmark_}"
         run "$LOGS/${program}_l2_flushed.log" "$build/$program" "$out/${program#benchmark_}" --gpu-only-l2-flushed
-    done
-    for size in $NPPDX_SIZES; do
-        build=$BUILD_ROOT/build-neighborhood-nppdx-$size
-        echo "  fkl-neighborhood, NPPDx+NPP, $size regions ($build)"
-        configure "$REPO/fkl-neighborhood" "$build" -DBENCH_REGIONS="$size" -DBENCH_NPPDX=ON
-        for op in erode open; do
-            program=benchmark_nppdx_npp_neighborhood_$op
-            run "$LOGS/${program}_$size.log" "$build/$program" "$out/${program#benchmark_}/$size"
-            run "$LOGS/${program}_${size}_l2_flushed.log" "$build/$program" "$out/${program#benchmark_}/$size" \
-                --gpu-only-l2-flushed
-        done
     done
 fi
 if [ "$COMPILE_TIME" = 1 ]; then

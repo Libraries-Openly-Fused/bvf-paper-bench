@@ -12,182 +12,142 @@
    See the License for the specific language governing permissions and
    limitations under the License. */
 
-// Experiment 3, part (b): FKL's MorphologyDPP against NPP on the pipeline of the neighborhood experiment
-// (common/bench_neighborhood.h), with a MORPH_K x MORPH_K mask and the operation NEIGHBORHOOD_OP (0: erode, 1: open;
-// one build each, fkl-neighborhood/CMakeLists.txt). The harness is common/bench_gpu.h.
+// Experiment 3, part (b): FKL's MorphologyDPP box blur against NPP on the pipeline of the neighborhood experiment
+// (common/bench_neighborhood.h): BOX_K x BOX_K box, one pass. The harness is common/bench_gpu.h. NPP has no batched
+// box filter, so it runs one call per crop; nppiFilterBoxBorder with oSrcSize the crop and oSrcOffset 0 replicates the
+// edge of the crop (NPP_BORDER_REPLICATE, the only border it accepts). Every call is one kernel at any offset.
 //
-//   npp        the NPP pipeline of Figure 1 (fkl-vs-npp) up to the resize: NV12->RGB of the whole frame, per region
-//              8u->32f, one batched resize into float3 64x32 planes; then per region the morphology with NPP's
-//              rectangular minimum and maximum filters (nppiFilterMinBorder_32f_C3R for the erosion;
-//              nppiFilterMinBorder into a plane buffer, then nppiFilterMaxBorder, for the opening), replicating the
-//              border of the plane, into its output plane; then MulC, SubC and DivC on the whole output:
-//              2N + 5 kernels (erode), 3N + 5 (open)
-//   npp_morph  the same with NPP's morphology functions (nppiErodeBorder_32f_C3R with a K x K mask of ones;
-//              nppiMorphOpenBorder_32f_C3R, which runs its two passes as two kernels with a scratch buffer)
-//   fkl_dpp    FKL's MorphologyDPP, one kernel (neighborhood_common.h)
+//   npp            NV12->RGB of the whole frame (8 bit); per crop nppiFilterBoxBorder_8u_C3R from the crop of the
+//                  8 bit frame into its packed 8 bit plane (floor(sum / 25)); one nppiConvert_8u32f_C3R of the N
+//                  planes; MulC, SubC, DivC on the whole output: N + 5 kernels
+//   npp_32f        NV12->RGB; per crop nppiConvert_8u32f_C3R of the crop into a float crop, then
+//                  nppiFilterBoxBorder_32f_C3R into its output plane; MulC, SubC, DivC: 2N + 4 kernels
+//   npp_32f_frame  NV12->RGB; one nppiConvert_8u32f_C3R of the whole frame; per crop nppiFilterBoxBorder_32f_C3R from
+//                  the crop of the float frame into its output plane; MulC, SubC, DivC: N + 5 kernels
+//   fkl_dpp        FKL's MorphologyDPP box blur, one kernel (neighborhood_common.h)
 
 #include "neighborhood_common.h"
 
-#ifndef NEIGHBORHOOD_OP
-#error "Define NEIGHBORHOOD_OP, 0 (erode) or 1 (open) (fkl-neighborhood/CMakeLists.txt does)"
-#endif
-
 namespace bench::neighborhood {
 
-constexpr MorphOp OP = NEIGHBORHOOD_OP == 0 ? MorphOp::Erode : MorphOp::Open;
-static_assert(NEIGHBORHOOD_OP == 0 || NEIGHBORHOOD_OP == 1, "0 (erode) or 1 (open)");
-constexpr int K = MORPH_K;
+constexpr int K = BOX_K;
+
+enum class NppVariant { Box8u, Convert32fPerCrop, Convert32fFrame };
 
 struct NPPState {
     Npp8u* rgb8{nullptr};
     int rgbStep{0};
-    Npp32f* cropped{nullptr};
-    Npp32f* resized{nullptr};
-    // The result of the first pass of the opening with the filters
-    Npp32f* firstPass{nullptr};
+    // The float frame (Convert32fFrame)
+    Npp32f* rgb32f{nullptr};
+    int rgb32fStep{0};
+    // The packed 8 bit planes (Box8u) or the float crop of every crop (Convert32fPerCrop)
+    Npp8u* planes8{nullptr};
+    Npp32f* crops32f{nullptr};
     Npp32f* tensor{nullptr};
-    // The K x K mask of ones of nppiErodeBorder / nppiMorphOpenBorder, and the scratch buffer of the latter
-    Npp8u* mask{nullptr};
-    Npp8u* scratch{nullptr};
-    // The batched resize's source descriptors and ROIs of one iteration, one after the other, in device memory and in
-    // the pinned host buffer they are uploaded from; the destination descriptors do not change
-    void* batchDevice{nullptr};
-    void* batchHost{nullptr};
-    NppiImageDescriptor* dstDescriptors{nullptr};
-    // The regions of every iteration, N per iteration (rects[t * N + i])
+    // The crops of every iteration, N per iteration (rects[t * N + i])
     std::vector<fk::Rect> rects;
     ~NPPState() {
         cudaFree(rgb8);
-        cudaFree(cropped);
-        cudaFree(resized);
-        cudaFree(firstPass);
+        cudaFree(rgb32f);
+        cudaFree(planes8);
+        cudaFree(crops32f);
         cudaFree(tensor);
-        cudaFree(mask);
-        cudaFree(scratch);
-        cudaFree(batchDevice);
-        cudaFreeHost(batchHost);
-        cudaFree(dstDescriptors);
     }
 };
 
-// MORPH_FUNCTIONS false: npp (filters), true: npp_morph (morphology functions)
-template <size_t N, bool MORPH_FUNCTIONS>
-Implementation makeNPP(Context& ctx) {
-    // One float3 crop of the largest region size per region; a region of another size uses its top-left corner
-    const int cropStep = MAX_REGION_W * 3 * sizeof(Npp32f);
-    const int planeStep = PLANE_W * 3 * sizeof(Npp32f);
-    const size_t cropFloats = static_cast<size_t>(MAX_REGION_W) * MAX_REGION_H * 3;
-    const NppiSize plane{PLANE_W, PLANE_H};
-    auto st = std::make_shared<NPPState>();
-    size_t rgbPitch = 0;
-    gpuErrchk(cudaMallocPitch(reinterpret_cast<void**>(&st->rgb8), &rgbPitch, FRAME_W * 3, FRAME_H));
-    st->rgbStep = static_cast<int>(rgbPitch);
-    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->cropped), N * cropFloats * sizeof(Npp32f)));
-    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->resized), N * PLANE_FLOATS * sizeof(Npp32f)));
-    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->firstPass), N * PLANE_FLOATS * sizeof(Npp32f)));
-    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->tensor), N * PLANE_FLOATS * sizeof(Npp32f)));
-    const std::vector<Npp8u> ones(static_cast<size_t>(K) * K, 1);
-    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->mask), ones.size()));
-    gpuErrchk(cudaMemcpy(st->mask, ones.data(), ones.size(), cudaMemcpyHostToDevice));
-    int scratchBytes = 0;
-    NPP_CHECK(nppiMorphGetBufferSize_32f_C3R(plane, &scratchBytes));
-    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->scratch), static_cast<size_t>(std::max(scratchBytes, 1))));
-    const size_t descriptorBytes = N * sizeof(NppiImageDescriptor);
-    const size_t batchBytes = descriptorBytes + N * sizeof(NppiResizeBatchROI_Advanced);
-    static_assert(sizeof(NppiImageDescriptor) % alignof(NppiResizeBatchROI_Advanced) == 0, "ROIs after descriptors");
-    gpuErrchk(cudaMalloc(&st->batchDevice, batchBytes));
-    gpuErrchk(cudaMallocHost(&st->batchHost, batchBytes));
-    std::vector<NppiImageDescriptor> dst(N);
-    for (size_t i = 0; i < N; ++i) {
-        dst[i] = NppiImageDescriptor{st->resized + i * PLANE_FLOATS, planeStep, plane};
+inline const char* nppVariantName(const NppVariant v) {
+    switch (v) {
+        case NppVariant::Box8u: return "npp";
+        case NppVariant::Convert32fPerCrop: return "npp_32f";
+        default: return "npp_32f_frame";
     }
-    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->dstDescriptors), descriptorBytes));
-    gpuErrchk(cudaMemcpy(st->dstDescriptors, dst.data(), descriptorBytes, cudaMemcpyHostToDevice));
+}
+
+template <size_t N, NppVariant V>
+Implementation makeNPP(Context& ctx) {
+    const int plane8Step = PLANE_W * 3;
+    const int planeStep = PLANE_W * 3 * sizeof(Npp32f);
+    const NppiSize crop{CROP_W, CROP_H};
+    const NppiSize mask{K, K};
+    const NppiPoint anchor{K / 2, K / 2};
+    const NppiPoint origin{0, 0};
+    auto st = std::make_shared<NPPState>();
+    size_t pitch = 0;
+    gpuErrchk(cudaMallocPitch(reinterpret_cast<void**>(&st->rgb8), &pitch, FRAME_W * 3, FRAME_H));
+    st->rgbStep = static_cast<int>(pitch);
+    if constexpr (V == NppVariant::Convert32fFrame) {
+        gpuErrchk(cudaMallocPitch(reinterpret_cast<void**>(&st->rgb32f), &pitch, FRAME_W * 3 * sizeof(Npp32f),
+                                  FRAME_H));
+        st->rgb32fStep = static_cast<int>(pitch);
+    }
+    if constexpr (V == NppVariant::Box8u) {
+        gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->planes8), N * PLANE_FLOATS));
+    }
+    if constexpr (V == NppVariant::Convert32fPerCrop) {
+        gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->crops32f), N * PLANE_FLOATS * sizeof(Npp32f)));
+    }
+    gpuErrchk(cudaMalloc(reinterpret_cast<void**>(&st->tensor), N * PLANE_FLOATS * sizeof(Npp32f)));
     for (size_t t = 0; t < ctx.regions->iterations(); ++t) {
         const auto rects = fklRects<N>(ctx, t);
         st->rects.insert(st->rects.end(), rects.begin(), rects.end());
     }
 
-    Implementation impl{MORPH_FUNCTIONS ? "npp_morph" : "npp", Reference::NppSampling8bit};
+    Implementation impl{nppVariantName(V), V == NppVariant::Box8u ? Reference::Fkl8bitFloorBox : Reference::Fkl8bit};
     impl.stages.emplace_back("1_nv12_to_rgb8_full_frame", [&ctx, st](size_t) {
         nv12ToRgb8(ctx, st->rgb8, st->rgbStep);
     });
-    impl.stages.emplace_back("2_per_crop_convert_8u32f", [&ctx, st, cropFloats, cropStep](size_t t) {
-        for (size_t i = 0; i < N; ++i) {
-            const fk::Rect& r = st->rects[t * N + i];
-            const Npp8u* cropSrc = st->rgb8 + static_cast<size_t>(r.y) * st->rgbStep + r.x * 3;
-            beforeKernel();
-            NPP_CHECK(nppiConvert_8u32f_C3R_Ctx(cropSrc, st->rgbStep, st->cropped + i * cropFloats, cropStep,
-                                                NppiSize{r.width, r.height}, ctx.npp));
-        }
-    });
-    impl.stages.emplace_back("3_resize_batch", [&ctx, st, cropFloats, cropStep, planeStep, plane, descriptorBytes,
-                                                batchBytes](size_t t) {
-        if constexpr (N == 1) {
-            // nppiResizeBatch rejects a batch of one image with NPP_BAD_ARGUMENT_ERROR
-            const fk::Rect& r = st->rects[t];
-            beforeKernel();
-            NPP_CHECK(nppiResize_32f_C3R_Ctx(st->cropped, cropStep, NppiSize{r.width, r.height},
-                                             NppiRect{0, 0, r.width, r.height}, st->resized, planeStep, plane,
-                                             NppiRect{0, 0, PLANE_W, PLANE_H}, NPPI_INTER_LINEAR, ctx.npp));
-        } else {
-            // The source descriptors and ROIs of this iteration's regions, uploaded with one copy
-            auto* src = static_cast<NppiImageDescriptor*>(st->batchHost);
-            auto* rois = reinterpret_cast<NppiResizeBatchROI_Advanced*>(static_cast<char*>(st->batchHost) +
-                                                                         descriptorBytes);
+    if constexpr (V == NppVariant::Box8u) {
+        impl.stages.emplace_back("2_per_crop_filter_box_border_8u", [&ctx, st, plane8Step, crop, mask, anchor,
+                                                                     origin](size_t t) {
             for (size_t i = 0; i < N; ++i) {
                 const fk::Rect& r = st->rects[t * N + i];
-                src[i] = NppiImageDescriptor{st->cropped + i * cropFloats, cropStep, NppiSize{r.width, r.height}};
-                rois[i] = NppiResizeBatchROI_Advanced{NppiRect{0, 0, r.width, r.height},
-                                                      NppiRect{0, 0, PLANE_W, PLANE_H}};
+                beforeKernel();
+                NPP_CHECK(nppiFilterBoxBorder_8u_C3R_Ctx(
+                    st->rgb8 + static_cast<size_t>(r.y) * st->rgbStep + r.x * 3, st->rgbStep, crop, origin,
+                    st->planes8 + i * PLANE_FLOATS, plane8Step, crop, mask, anchor, NPP_BORDER_REPLICATE, ctx.npp));
             }
-            gpuErrchk(cudaMemcpyAsync(st->batchDevice, st->batchHost, batchBytes, cudaMemcpyHostToDevice,
-                                      ctx.stream));
+        });
+        impl.stages.emplace_back("3_convert_8u32f_planes", [&ctx, st, plane8Step, planeStep](size_t) {
             beforeKernel();
-            NPP_CHECK(nppiResizeBatch_32f_C3R_Advanced_Ctx(
-                PLANE_W, PLANE_H, static_cast<NppiImageDescriptor*>(st->batchDevice), st->dstDescriptors,
-                reinterpret_cast<NppiResizeBatchROI_Advanced*>(static_cast<char*>(st->batchDevice) + descriptorBytes),
-                static_cast<unsigned int>(N), NPPI_INTER_LINEAR, ctx.npp));
-        }
-    });
-    // The morphology of every plane: oSrcSize is the plane and oSrcOffset 0, so NPP replicates the border of the plane
-    const NppiSize mask{K, K};
-    const NppiPoint anchor{K / 2, K / 2};
-    const NppiPoint origin{0, 0};
-    std::string morphStage = MORPH_FUNCTIONS ? (OP == MorphOp::Erode ? "4_per_region_erode_border"
-                                                                     : "4_per_region_morph_open_border")
-                                             : (OP == MorphOp::Erode ? "4_per_region_filter_min_border"
-                                                                     : "4_per_region_filter_min_then_max_border");
-    impl.stages.emplace_back(morphStage, [&ctx, st, planeStep, plane, mask, anchor, origin](size_t) {
-        for (size_t i = 0; i < N; ++i) {
-            const Npp32f* src = st->resized + i * PLANE_FLOATS;
-            Npp32f* out = st->tensor + i * PLANE_FLOATS;
-            if constexpr (MORPH_FUNCTIONS && OP == MorphOp::Erode) {
+            NPP_CHECK(nppiConvert_8u32f_C3R_Ctx(st->planes8, plane8Step, st->tensor, planeStep,
+                                                NppiSize{PLANE_W, static_cast<int>(N) * PLANE_H}, ctx.npp));
+        });
+    } else if constexpr (V == NppVariant::Convert32fPerCrop) {
+        impl.stages.emplace_back("2_per_crop_convert_8u32f_and_filter_box_border_32f",
+                                 [&ctx, st, planeStep, crop, mask, anchor, origin](size_t t) {
+            for (size_t i = 0; i < N; ++i) {
+                const fk::Rect& r = st->rects[t * N + i];
+                Npp32f* crop32f = st->crops32f + i * PLANE_FLOATS;
                 beforeKernel();
-                NPP_CHECK(nppiErodeBorder_32f_C3R_Ctx(src, planeStep, plane, origin, out, planeStep, plane, st->mask,
-                                                      mask, anchor, NPP_BORDER_REPLICATE, ctx.npp));
-            } else if constexpr (MORPH_FUNCTIONS) {
-                // Two kernels (erosion, dilation) in one call: the L2 flush runs before the call only
+                NPP_CHECK(nppiConvert_8u32f_C3R_Ctx(st->rgb8 + static_cast<size_t>(r.y) * st->rgbStep + r.x * 3,
+                                                    st->rgbStep, crop32f, planeStep, crop, ctx.npp));
                 beforeKernel();
-                NPP_CHECK(nppiMorphOpenBorder_32f_C3R_Ctx(src, planeStep, plane, origin, out, planeStep, plane,
-                                                          st->mask, mask, anchor, st->scratch, NPP_BORDER_REPLICATE,
-                                                          ctx.npp));
-            } else if constexpr (OP == MorphOp::Erode) {
-                beforeKernel();
-                NPP_CHECK(nppiFilterMinBorder_32f_C3R_Ctx(src, planeStep, plane, origin, out, planeStep, plane, mask,
+                NPP_CHECK(nppiFilterBoxBorder_32f_C3R_Ctx(crop32f, planeStep, crop, origin,
+                                                          st->tensor + i * PLANE_FLOATS, planeStep, crop, mask,
                                                           anchor, NPP_BORDER_REPLICATE, ctx.npp));
-            } else {
-                Npp32f* firstPass = st->firstPass + i * PLANE_FLOATS;
-                beforeKernel();
-                NPP_CHECK(nppiFilterMinBorder_32f_C3R_Ctx(src, planeStep, plane, origin, firstPass, planeStep, plane,
-                                                          mask, anchor, NPP_BORDER_REPLICATE, ctx.npp));
-                beforeKernel();
-                NPP_CHECK(nppiFilterMaxBorder_32f_C3R_Ctx(firstPass, planeStep, plane, origin, out, planeStep, plane,
-                                                          mask, anchor, NPP_BORDER_REPLICATE, ctx.npp));
             }
-        }
-    });
-    impl.stages.emplace_back("5_mulc_subc_divc", [&ctx, st, planeStep](size_t) {
+        });
+    } else {
+        impl.stages.emplace_back("2_convert_8u32f_full_frame", [&ctx, st](size_t) {
+            beforeKernel();
+            NPP_CHECK(nppiConvert_8u32f_C3R_Ctx(st->rgb8, st->rgbStep, st->rgb32f, st->rgb32fStep,
+                                                NppiSize{FRAME_W, FRAME_H}, ctx.npp));
+        });
+        impl.stages.emplace_back("3_per_crop_filter_box_border_32f", [&ctx, st, planeStep, crop, mask, anchor,
+                                                                      origin](size_t t) {
+            for (size_t i = 0; i < N; ++i) {
+                const fk::Rect& r = st->rects[t * N + i];
+                const Npp32f* src = reinterpret_cast<const Npp32f*>(reinterpret_cast<const Npp8u*>(st->rgb32f) +
+                                                                    static_cast<size_t>(r.y) * st->rgb32fStep) +
+                                    r.x * 3;
+                beforeKernel();
+                NPP_CHECK(nppiFilterBoxBorder_32f_C3R_Ctx(src, st->rgb32fStep, crop, origin,
+                                                          st->tensor + i * PLANE_FLOATS, planeStep, crop, mask,
+                                                          anchor, NPP_BORDER_REPLICATE, ctx.npp));
+            }
+        });
+    }
+    impl.stages.emplace_back("4_mulc_subc_divc", [&ctx, st, planeStep](size_t) {
         const NppiSize tensorSize{PLANE_W, static_cast<int>(N) * PLANE_H};
         beforeKernel();
         NPP_CHECK(nppiMulC_32f_C3IR_Ctx(MUL, st->tensor, planeStep, tensorSize, ctx.npp));
@@ -203,56 +163,51 @@ Implementation makeNPP(Context& ctx) {
 }
 
 struct NppVsFklDpp {
-    static constexpr const char* title = "FKL MorphologyDPP vs NPP, neighborhood experiment (fkl-neighborhood)";
+    static constexpr const char* title = "FKL MorphologyDPP box blur vs NPP, neighborhood experiment (fkl-neighborhood)";
     static constexpr const char* fklName = "fkl_dpp";
     static constexpr const char* fklLabel = "FKL DPP";
     static constexpr const char* fklShortLabel = "DPP";
+    static constexpr geometry::RegionSize regionSize = CROP_SIZE;
 
     template <size_t N>
     static std::vector<Implementation> implementations(Context& ctx) {
         std::vector<Implementation> impls;
-        impls.push_back(makeNPP<N, false>(ctx));
-        impls.push_back(makeNPP<N, true>(ctx));
+        impls.push_back(makeNPP<N, NppVariant::Box8u>(ctx));
+        impls.push_back(makeNPP<N, NppVariant::Convert32fPerCrop>(ctx));
+        impls.push_back(makeNPP<N, NppVariant::Convert32fFrame>(ctx));
         return impls;
     }
 
     template <size_t N>
     static Implementation fklImplementation(Context& ctx) {
-        return fklDpp<N, K, OP>(ctx);
+        return fklDpp<N, K, 1>(ctx);
     }
 
     template <size_t N>
     static std::vector<float> reference(const Context& ctx, Reference r, size_t t) {
-        return morphReference<N>(ctx, r, t, K, OP);
+        return boxReferenceOf<N>(ctx, r, t, K, 1);
     }
 
     static void setup(const std::filesystem::path& outDir, const std::string& mode) { setupTileChoice(outDir, mode); }
 
-    static void workload(std::ostream& os) { describeWorkload(os, K, OP, BATCHES); }
+    static void workload(std::ostream& os) { describeWorkload(os, K, 1, BATCHES); }
 
     static void describe(std::ostream& os, const std::filesystem::path&) {
         const NppLibraryVersion* npp = nppGetLibVersion();
-        const bool erode = OP == MorphOp::Erode;
         os << "NPP: " << npp->major << "." << npp->minor << "." << npp->build << "\n"
-           << "NPP pipelines: as fkl-vs-npp up to the resize (nppiNV12ToRGB_8u_ColorTwist32f_P2C3R of the whole frame "
-              "into an 8 bit RGB frame, per region nppiConvert_8u32f_C3R, one nppiResizeBatch_32f_C3R_Advanced, or "
-              "nppiResize_32f_C3R for N = 1, into float3 " << PLANE_W << "x" << PLANE_H << " planes, its descriptors "
-              "and ROIs uploaded with one cudaMemcpyAsync per execution inside the timed region), then per region the "
-              "morphology into its output plane (oSrcSize the plane, oSrcOffset 0, NPP_BORDER_REPLICATE: the border of "
-              "the plane is replicated), then nppiMulC, nppiSubC and nppiDivC_32f_C3IR on the whole float3 output.\n"
-           << "  npp: "
-           << (erode ? "nppiFilterMinBorder_32f_C3R (the rectangular minimum filter): 2N + 5 kernels"
-                     : "nppiFilterMinBorder_32f_C3R into a plane buffer, then nppiFilterMaxBorder_32f_C3R: 3N + 5 "
-                       "kernels")
-           << "\n"
-           << "  npp_morph: "
-           << (erode ? "nppiErodeBorder_32f_C3R with a K x K mask of ones: 2N + 5 kernels"
-                     : "nppiMorphOpenBorder_32f_C3R with a K x K mask of ones and its scratch buffer "
-                       "(nppiMorphGetBufferSize_32f_C3R), which launches an erosion and a dilation kernel: 3N + 5 "
-                       "kernels; with the L2 flushed, the flush runs before the call, not between its two kernels")
-           << "\n"
-           << "NPP samples its bilinear resize at dst * scale - 0.25 (measured, see fkl-vs-npp), so both are checked "
-              "against a reference with that sampling and the 8 bit RGB of NPP's conversion.\n";
+           << "NPP pipelines: nppiNV12ToRGB_8u_ColorTwist32f_P2C3R of the whole frame into an 8 bit RGB frame (as "
+              "fkl-vs-npp), the box per crop with nppiFilterBoxBorder (NPP has no batched box filter; oSrcSize the "
+              "crop and oSrcOffset 0, NPP_BORDER_REPLICATE: the edge of the crop is replicated; " << K << "x" << K
+           << " mask, anchor (" << K / 2 << ", " << K / 2 << ")), and nppiMulC, nppiSubC and nppiDivC_32f_C3IR on "
+              "the whole float3 output. One kernel per call.\n"
+           << "  npp: per crop nppiFilterBoxBorder_8u_C3R from the crop of the 8 bit frame into its packed 8 bit plane "
+              "(floor(sum / " << K * K << ")), then one nppiConvert_8u32f_C3R of the N planes: N + 5 kernels\n"
+           << "  npp_32f: per crop nppiConvert_8u32f_C3R of the crop into a float crop, then "
+              "nppiFilterBoxBorder_32f_C3R into its output plane: 2N + 4 kernels\n"
+           << "  npp_32f_frame: one nppiConvert_8u32f_C3R of the whole frame, then per crop "
+              "nppiFilterBoxBorder_32f_C3R from the crop of the float frame into its output plane: N + 5 kernels\n"
+           << "References: the 8 bit RGB of NPP's conversion (FKL's conversion rounded to nearest, see the diagnostic "
+              "below), with the box rounded down for npp and in float for npp_32f and npp_32f_frame.\n";
     }
 
     static std::string diagnostic(const Context& ctx) { return nppConversionDiagnostic(ctx); }

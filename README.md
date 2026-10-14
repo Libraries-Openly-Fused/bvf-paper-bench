@@ -9,8 +9,8 @@ pipeline of the paper,
 on one 3840x2160 NV12 frame with N in {1, 4, 16, 50, 100} regions of 20x10, 32x16 and 48x24 that change every
 iteration, each resized (bilinear) to 64x32, padded with 16 black rows on top and bottom to 64x64, normalized as
 (x * mul - sub) / div and written as float3 into an N plane tensor, with FKL and with other libraries.
-[`fkl-neighborhood/`](fkl-neighborhood/README.md) measures the same pipeline with a morphology stage after the resize
-and without the black rows (the neighborhood experiment).
+[`fkl-neighborhood/`](fkl-neighborhood/README.md) measures fixed-size 64x32 crops of the same frame, blurred with a box
+filter and normalized, without the resize and the black rows (the neighborhood experiment).
 
 ## Layout
 
@@ -23,7 +23,7 @@ One folder per library compared with FKL, each its own CMake project with its ow
 | [`fkl-vs-nppdx/`](fkl-vs-nppdx/README.md) | FKL BVF with NVIDIA NPPDx, as one kernel with hand written CUDA code and combined with NPP without hand written pixel processing code | `benchmark_nppdx`, `benchmark_nppdx_npp` |
 | [`fkl-vs-opencv-cpu/`](fkl-vs-opencv-cpu/README.md) | FKL's CPU backends with OpenCV on the CPU | `benchmark_opencv_cpu` |
 | [`fkl-ablation/`](fkl-ablation/README.md) | FKL with BVF against FKL without it (vertical and horizontal fusion only), FKL's host overhead, the type FKL builds | `benchmark_fkl_ablation`, `bvf_types` |
-| [`fkl-neighborhood/`](fkl-neighborhood/README.md) | The neighborhood experiment: Figure 1 with a morphology stage after the resize; FKL's BVF morphology operations against its MorphologyDPP, and the DPP against NPP, OpenCV CUDA and NPPDx+NPP | `benchmark_fkl_neighborhood_k<K>_p<passes>`, `benchmark_{npp,opencv_cuda,nppdx_npp}_neighborhood_{erode,open}`, `test_neighborhood_ops` |
+| [`fkl-neighborhood/`](fkl-neighborhood/README.md) | The neighborhood experiment: 64x32 crops, a box blur and the normalization; FKL's BVF box operation against its MorphologyDPP, and the DPP against NPP, OpenCV CUDA, NPPDx and NPPDx+NPP | `benchmark_fkl_neighborhood_k<K>_p<passes>`, `benchmark_{npp,opencv_cuda,nppdx,nppdx_npp}_neighborhood`, `test_neighborhood_ops` |
 | [`rocm/`](rocm/README.md) | FKL's HIP backend with AMD RPP on an AMD GPU, and FKL's CPU backends with RPP's HOST backend, on ROCm | `rocm_bench`, `rpp_cpu_bench` |
 
 Next to them:
@@ -32,7 +32,7 @@ Next to them:
   GPU benchmarks of OpenCV CUDA, NPP and FKL's ablation (`bench_gpu.h`, `bench_gpu.cmake`), the validation rules
   shared by every GPU benchmark (`bench_validation.h`), NPP's error check and NV12 conversion (`bench_npp.h`), the
   platform description (`bench_platform.h`), the common part of the compile-time units (`compile_time_unit.h`), and the
-  workload and BVF morphology operations of the neighborhood experiment (`bench_neighborhood.h`,
+  workload and BVF box operation of the neighborhood experiment (`bench_neighborhood.h`,
   `bench_neighborhood_ops.h`, shared with `rocm/`);
 - [`scripts/`](scripts): `run_all.sh` (every benchmark but `rocm/`), the memory traffic with Nsight Compute
   (`ncu_dram.sh`, `ncu_l2.sh`, `ncu_common.sh`, `ncu_summarize.py`, `ncu_traffic_model.py`), the compile time
@@ -184,7 +184,7 @@ Each benchmark has its own requirements, besides a C++20 compiler:
 | `fkl-vs-opencv-cuda` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.28, OpenCV 4.14 built with CUDA and the opencv_contrib modules `cudaarithm` and `cudawarping` |
 | `fkl-vs-npp`, `fkl-ablation` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.28; no OpenCV |
 | `fkl-vs-nppdx` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.30, a Linux x86_64 or Windows x64 machine (NPPDx's platforms); no OpenCV |
-| `fkl-neighborhood` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.28, FusedKernelLibrary with the batched `MorphologyDPP` (PR #393, the `fkl` submodule), OpenCV 4.14 built with CUDA and the opencv_contrib modules `cudaarithm`, `cudafilters`, `cudaimgproc` and `cudawarping` for its OpenCV programs, and for its NPPDx+NPP programs what `fkl-vs-nppdx` needs |
+| `fkl-neighborhood` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.28, FusedKernelLibrary with the batched `MorphologyDPP` and `executeBoxBlur` (PR #393, the `fkl` submodule), OpenCV 4.14 built with CUDA and the opencv_contrib modules `cudaarithm`, `cudafilters` and `cudaimgproc` for its OpenCV program, and for its NPPDx programs what `fkl-vs-nppdx` needs (or `-DBENCH_NPPDX=OFF`) |
 | `fkl-vs-opencv-cpu` | CMake 3.28 and OpenCV 4.14 with `core` and `imgproc`; no GPU or CUDA |
 | `rocm` | Linux, an AMD GPU (gfx1200 by default, another one with `-DCMAKE_HIP_ARCHITECTURES`), ROCm 10.1 with RPP 3.2.0 and rocprofiler-sdk, CMake 3.28, Ninja (see [its README](rocm/README.md)); no CUDA or OpenCV |
 
@@ -211,7 +211,7 @@ The README of every folder has its commands. `scripts/run_all.sh` builds and run
 its own `rocm/scripts/run_all.sh`): the main run and the GPU only run with the L2 flushed of every GPU benchmark, FKL's
 host overhead and per-kernel times, `bvf_types`, FKL vs NPPDx for every region size (`NPPDX_SIZES`) with the runner-up
 NPPDx configuration of every N re-timed against FKL (`nppdx_runner_up.py`, then `--configs`, into `runner-up/`), every
-program of the neighborhood experiment (the NPPDx+NPP ones for every size of `NPPDX_SIZES`), and the CPU benchmark; `COMPILE_TIME=1` adds the compile-time units and `PROFILE=1` the Nsight Compute scripts, their summaries
+program of the neighborhood experiment, and the CPU benchmark; `COMPILE_TIME=1` adds the compile-time units and `PROFILE=1` the Nsight Compute scripts, their summaries
 and the traffic model, when the driver lets every user read the GPU performance counters (`RmProfilingAdminOnly: 0`);
 otherwise it prints their commands, which then need sudo:
 
@@ -235,7 +235,7 @@ only, the CPUs NPPDx supports.
 Every job runs [`scripts/ci/run_benchmarks.cmake`](scripts/ci/run_benchmarks.cmake), which also runs on any machine
 (see its header). It builds OpenCV 4.14.0 with the modules the benchmarks use once per runner and configuration, in
 `~/bvf-paper-bench-deps` (so the first run on a runner takes much longer), builds the benchmarks (FKL vs NPPDx for
-every region size, `NPPDX_SIZES`, and so the NPPDx+NPP neighborhood programs) with one timed iteration and no warm-up (`ITERATIONS` and `WARMUP_ITERATIONS` of the
+every region size, `NPPDX_SIZES`, and the NPPDx neighborhood programs) with one timed iteration and no warm-up (`ITERATIONS` and `WARMUP_ITERATIONS` of the
 script), runs every mode except those for Nsight Compute (`--ncu-target` and the profiling scripts), and fails if a
 benchmark fails or if FKL's or NPPDx's outputs do not match their references (OpenCV's and NPP's are in
 `validation.csv` but not required: they come from the OpenCV build and the CUDA toolkit of each runner). The results
