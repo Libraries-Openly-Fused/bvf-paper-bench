@@ -10,8 +10,8 @@
 //                         XYWH ROIs (crop + box in one call, into N 64x32 U8 images), rppt_crop_mirror_normalize
 //                         8u->32f with the whole normalization (per channel multiplier Mul / Div and offset -Sub / Div)
 //                         into the output tensor
-//   rpp_u8box_normalize   the same with rppt_crop_mirror_normalize 8u->32f converting only, then rppt_normalize (Mul +
-//                         Sub + Div) on the whole tensor
+//   rpp_u8box_normalize   the same with rppt_crop_mirror_normalize 8u->32f converting only, then rppt_normalize
+//                         ((x * Mul - Sub) / Div per channel) on the whole tensor
 //   rpp_f32box_cmn        rppt_yuv_to_rgb, rppt_crop_mirror_normalize 8u->32f of the crops (aliased frame, XYWH ROIs)
 //                         with the whole normalization, rppt_box_filter F32 of the normalized crops into the output
 //   rpp_f32box_normalize  the same with rppt_crop_mirror_normalize converting only, then rppt_normalize
