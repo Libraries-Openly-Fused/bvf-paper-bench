@@ -15,8 +15,8 @@
 //   rpp_f32box_cmn        rppt_yuv_to_rgb, rppt_crop_mirror_normalize 8u->32f of the crops (aliased frame, XYWH ROIs)
 //                         with the whole normalization, rppt_box_filter F32 of the normalized crops into the output
 //   rpp_f32box_normalize  the same with rppt_crop_mirror_normalize converting only, then rppt_normalize
-//   fkl_dpp_<W>x<H>       one FKL kernel: MorphologyDPP's executeBoxBlur<passes> (an Add reducer per pass, the 1 / K^2
-//                         of every pass in the write) batched over the crops, reading the BVF chain ReadNV12 -> YUVtoRGB
+//   fkl_dpp_<W>x<H>       one FKL kernel: MorphologyDPP's executeBoxBlur<passes> (every pass a mean: an Add reducer and
+//                         a Mul 1 / K^2 finalizer) batched over the crops, reading the BVF chain ReadNV12 -> YUVtoRGB
 //                         -> Crop and writing through Mul -> Sub -> Div -> Write, one for every tile of DPP_TILES
 // Part (a), the micro-experiment (FKL only, K of PART_A_KS, 1 or 2 passes, N of PART_A_BATCHES), in two variants:
 // on the crops as above (operation box), and with the resize (operation resize_box): Figure 1's chain on Experiment 1's
@@ -1217,8 +1217,8 @@ void writePlatformNb(const std::filesystem::path& path, const std::string& diagn
     for (size_t i = 0; i < DPP_TILES.size(); ++i) {
         os << (i ? ", " : "") << DPP_TILES[i].width << "x" << DPP_TILES[i].height;
     }
-    os << " (MorphologyDPPDetails<float3, W, H, K, K>, executeBoxBlur<passes>: an Add reducer per pass, the 1 / K^2 of "
-       << "every pass in the write).\n"
+    os << " (MorphologyDPPDetails<float3, W, H, K, K>, executeBoxBlur<passes>: every pass a mean, an Add reducer and a "
+       << "Mul 1 / K^2 finalizer).\n"
        << "Timing (CPU + GPU): as rocm_bench.hip: " << WARMUP_ITERS << " warm-up then " << TIMED_ITERS
        << " timed iterations; iteration t runs every implementation of the group on the crops of iteration t, each "
        << "between two HIP events on one stream and followed by a synchronization. Chosen per group: the DPP tile with "

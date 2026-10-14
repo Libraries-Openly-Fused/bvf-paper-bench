@@ -89,8 +89,8 @@ harness). Two parts, each a set of groups (part, K, passes, N) whose implementat
   - `rpp_f32box_cmn`: `rppt_crop_mirror_normalize` 8u->32f of the crops with the whole normalization, then
     `rppt_box_filter` F32 into the output tensor: 3 kernels.
   - `rpp_f32box_normalize`: the same with the conversion only, then `rppt_normalize`: 4 kernels.
-  - `fkl_dpp_<W>x<H>`: one FKL kernel, MorphologyDPP's `executeBoxBlur<passes>` (an Add reducer per pass, the 1 / K^2
-    of every pass in the write) on `MorphologyDPPDetails<float3, W, H, K, K>`, batched over the crops, reading the BVF
+  - `fkl_dpp_<W>x<H>`: one FKL kernel, MorphologyDPP's `executeBoxBlur<passes>` (every pass a mean: an Add reducer
+    and a Mul 1 / K^2 finalizer) on `MorphologyDPPDetails<float3, W, H, K, K>`, batched over the crops, reading the BVF
     chain up to the crop and writing through Mul, Sub, Div, for every tile of `DPP_TILES`.
 - Part (a), the micro-experiment, FKL only: K = 3, 5, 7, one and two passes, N = 1 and 16: `fkl_bvf_naive` (the naive
   ReadBack operation `BoxBVF<K>` of `common/bench_neighborhood_ops.h` in the BVF chain, twice for two passes, one
