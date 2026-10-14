@@ -1,0 +1,37 @@
+key,candidate,launched,median_us,max_abs_err,within_tolerance,chosen
+nppdx_N1,tile 32x16 block recommended,yes,12.35,8.345e-07,yes,no
+nppdx_N1,tile 32x16 block 128,yes,10.94,8.345e-07,yes,no
+nppdx_N1,tile 32x16 block 256,yes,8.19,8.345e-07,yes,no
+nppdx_N1,tile 16x16 block recommended,yes,10.30,8.345e-07,yes,no
+nppdx_N1,tile 16x16 block 128,yes,7.98,8.345e-07,yes,no
+nppdx_N1,tile 16x16 block 256,yes,7.17,8.345e-07,yes,no
+nppdx_N1,tile 16x8 block recommended,yes,9.22,8.345e-07,yes,no
+nppdx_N1,tile 16x8 block 128,yes,6.94,8.345e-07,yes,no
+nppdx_N1,tile 16x8 block 256,yes,6.67,8.345e-07,yes,yes
+fkl_staged_N1,MorphologyDPP tile 16x8,yes,6.14,8.345e-07,yes,yes
+fkl_staged_N1,MorphologyDPP tile 32x8,yes,6.14,8.345e-07,yes,no
+fkl_staged_N1,MorphologyDPP tile 32x16,yes,6.66,8.345e-07,yes,no
+nppdx_N16,tile 32x16 block recommended,yes,13.39,9.537e-07,yes,no
+nppdx_N16,tile 32x16 block 128,yes,11.42,9.537e-07,yes,no
+nppdx_N16,tile 32x16 block 256,yes,10.02,9.537e-07,yes,no
+nppdx_N16,tile 16x16 block recommended,yes,11.26,9.537e-07,yes,no
+nppdx_N16,tile 16x16 block 128,yes,8.59,9.537e-07,yes,yes
+nppdx_N16,tile 16x16 block 256,yes,9.38,9.537e-07,yes,no
+nppdx_N16,tile 16x8 block recommended,yes,10.24,9.537e-07,yes,no
+nppdx_N16,tile 16x8 block 128,yes,9.22,9.537e-07,yes,no
+nppdx_N16,tile 16x8 block 256,yes,10.24,9.537e-07,yes,no
+fkl_staged_N16,MorphologyDPP tile 16x8,yes,6.98,1.431e-06,yes,no
+fkl_staged_N16,MorphologyDPP tile 32x8,yes,6.59,1.431e-06,yes,yes
+fkl_staged_N16,MorphologyDPP tile 32x16,yes,7.04,1.431e-06,yes,no
+nppdx_N100,tile 32x16 block recommended,yes,13.78,1.192e-06,yes,no
+nppdx_N100,tile 32x16 block 128,yes,11.68,1.192e-06,yes,no
+nppdx_N100,tile 32x16 block 256,yes,9.63,1.192e-06,yes,yes
+nppdx_N100,tile 16x16 block recommended,yes,14.32,1.192e-06,yes,no
+nppdx_N100,tile 16x16 block 128,yes,10.80,1.192e-06,yes,no
+nppdx_N100,tile 16x16 block 256,yes,10.96,1.192e-06,yes,no
+nppdx_N100,tile 16x8 block recommended,yes,12.96,1.192e-06,yes,no
+nppdx_N100,tile 16x8 block 128,yes,10.24,1.192e-06,yes,no
+nppdx_N100,tile 16x8 block 256,yes,13.86,1.192e-06,yes,no
+fkl_staged_N100,MorphologyDPP tile 16x8,yes,11.26,1.669e-06,yes,yes
+fkl_staged_N100,MorphologyDPP tile 32x8,yes,11.26,1.669e-06,yes,no
+fkl_staged_N100,MorphologyDPP tile 32x16,yes,12.56,1.669e-06,yes,no

@@ -1,0 +1,76 @@
+nppdx_N1: tile 32x16 block recommended median 12.35 us, max abs error 8.34e-07
+nppdx_N1: tile 32x16 block 128 median 10.94 us, max abs error 8.34e-07
+nppdx_N1: tile 32x16 block 256 median 8.19 us, max abs error 8.34e-07
+nppdx_N1: tile 16x16 block recommended median 10.30 us, max abs error 8.34e-07
+nppdx_N1: tile 16x16 block 128 median 7.98 us, max abs error 8.34e-07
+nppdx_N1: tile 16x16 block 256 median 7.17 us, max abs error 8.34e-07
+nppdx_N1: tile 16x8 block recommended median 9.22 us, max abs error 8.34e-07
+nppdx_N1: tile 16x8 block 128 median 6.94 us, max abs error 8.34e-07
+nppdx_N1: tile 16x8 block 256 median 6.67 us, max abs error 8.34e-07
+nppdx_N1: tile 16x8 block 256 chosen
+=== nppdx-wins W1: box 5x5 before a 1:2 resize, 32x16 regions (smoke test)
+=== N = 1
+fkl_staged_N1: MorphologyDPP tile 16x8 median 6.14 us, max abs error 8.34e-07
+fkl_staged_N1: MorphologyDPP tile 32x8 median 6.14 us, max abs error 8.34e-07
+fkl_staged_N1: MorphologyDPP tile 32x16 median 6.66 us, max abs error 8.34e-07
+fkl_staged_N1: MorphologyDPP tile 16x8 chosen
+nppdx        median     7.2 us  mean     7.2 us  p10     7.2  p90     7.3  FKL staged mean speedup   1.16x  max err 9.54e-07 (nppdx_pixel_center_float)
+fkl_inline   median     7.1 us  mean     7.2 us  p10     6.9  p90     7.9  FKL staged mean speedup   1.17x  max err 1.19e-06 (fkl_cpu_float)
+fkl_staged   median     6.1 us  mean     6.2 us  p10     6.1  p90     6.3  max err 1.19e-06 (fkl_cpu_float)
+=== N = 16
+nppdx_N16: tile 32x16 block recommended median 13.39 us, max abs error 9.54e-07
+nppdx_N16: tile 32x16 block 128 median 11.42 us, max abs error 9.54e-07
+nppdx_N16: tile 32x16 block 256 median 10.02 us, max abs error 9.54e-07
+nppdx_N16: tile 16x16 block recommended median 11.26 us, max abs error 9.54e-07
+nppdx_N16: tile 16x16 block 128 median 8.59 us, max abs error 9.54e-07
+nppdx_N16: tile 16x16 block 256 median 9.38 us, max abs error 9.54e-07
+nppdx_N16: tile 16x8 block recommended median 10.24 us, max abs error 9.54e-07
+nppdx_N16: tile 16x8 block 128 median 9.22 us, max abs error 9.54e-07
+nppdx_N16: tile 16x8 block 256 median 10.24 us, max abs error 9.54e-07
+nppdx_N16: tile 16x16 block 128 chosen
+fkl_staged_N16: MorphologyDPP tile 16x8 median 6.98 us, max abs error 1.43e-06
+fkl_staged_N16: MorphologyDPP tile 32x8 median 6.59 us, max abs error 1.43e-06
+fkl_staged_N16: MorphologyDPP tile 32x16 median 7.04 us, max abs error 1.43e-06
+fkl_staged_N16: MorphologyDPP tile 32x8 chosen
+nppdx        median     9.0 us  mean     8.8 us  p10     8.2  p90     9.2  FKL staged mean speedup   1.34x  max err 9.54e-07 (nppdx_pixel_center_float)
+fkl_inline   median     8.4 us  mean     8.6 us  p10     8.2  p90     9.0  FKL staged mean speedup   1.31x  max err 1.43e-06 (fkl_cpu_float)
+fkl_staged   median     6.6 us  mean     6.6 us  p10     6.1  p90     7.0  max err 1.43e-06 (fkl_cpu_float)
+=== N = 100
+nppdx_N100: tile 32x16 block recommended median 13.78 us, max abs error 1.19e-06
+nppdx_N100: tile 32x16 block 128 median 11.68 us, max abs error 1.19e-06
+nppdx_N100: tile 32x16 block 256 median 9.63 us, max abs error 1.19e-06
+nppdx_N100: tile 16x16 block recommended median 14.32 us, max abs error 1.19e-06
+nppdx_N100: tile 16x16 block 128 median 10.80 us, max abs error 1.19e-06
+nppdx_N100: tile 16x16 block 256 median 10.96 us, max abs error 1.19e-06
+nppdx_N100: tile 16x8 block recommended median 12.96 us, max abs error 1.19e-06
+nppdx_N100: tile 16x8 block 128 median 10.24 us, max abs error 1.19e-06
+nppdx_N100: tile 16x8 block 256 median 13.86 us, max abs error 1.19e-06
+nppdx_N100: tile 32x16 block 256 chosen
+fkl_staged_N100: MorphologyDPP tile 16x8 median 11.26 us, max abs error 1.67e-06
+fkl_staged_N100: MorphologyDPP tile 32x8 median 11.26 us, max abs error 1.67e-06
+fkl_staged_N100: MorphologyDPP tile 32x16 median 12.56 us, max abs error 1.67e-06
+fkl_staged_N100: MorphologyDPP tile 16x8 chosen
+nppdx        median    10.0 us  mean     9.9 us  p10     9.5  p90    10.2  FKL staged mean speedup   0.88x  max err 1.19e-06 (nppdx_pixel_center_float)
+fkl_inline   median    29.8 us  mean    30.1 us  p10    29.7  p90    30.7  FKL staged mean speedup   2.67x  max err 1.67e-06 (fkl_cpu_float)
+fkl_staged   median    11.3 us  mean    11.3 us  p10    11.1  p90    11.3  max err 1.67e-06 (fkl_cpu_float)
+=== GPU time only (CUPTI kernel execution times, after all CPU + GPU timings)
+GPU only nppdx        N   1  median    5.39 us  p10    5.31  p90    5.50  FKL staged mean speedup   1.45x
+GPU only fkl_inline   N   1  median    5.22 us  p10    5.18  p90    5.73  FKL staged mean speedup   1.43x
+GPU only fkl_staged   N   1  median    3.71 us  p10    3.67  p90    3.78
+GPU only nppdx        N  16  median    6.94 us  p10    6.88  p90    6.98  FKL staged mean speedup   1.73x
+GPU only fkl_inline   N  16  median    6.11 us  p10    6.01  p90    6.15  FKL staged mean speedup   1.52x
+GPU only fkl_staged   N  16  median    4.00 us  p10    4.00  p90    4.03
+GPU only nppdx        N 100  median    8.14 us  p10    8.06  p90    8.29  FKL staged mean speedup   1.13x
+GPU only fkl_inline   N 100  median   23.49 us  p10   23.21  p90   23.75  FKL staged mean speedup   3.26x
+GPU only fkl_staged   N 100  median    7.20 us  p10    7.13  p90    7.31
+=== Kernel counts (CUPTI activity tracing, after all timings)
+nppdx      N   1  kernels    1  memsets 0  memcpys 0
+fkl_inline N   1  kernels    1  memsets 0  memcpys 0
+fkl_staged N   1  kernels    2  memsets 0  memcpys 0
+nppdx      N  16  kernels    1  memsets 0  memcpys 0
+fkl_inline N  16  kernels    1  memsets 0  memcpys 0
+fkl_staged N  16  kernels    2  memsets 0  memcpys 0
+nppdx      N 100  kernels    1  memsets 0  memcpys 0
+fkl_inline N 100  kernels    1  memsets 0  memcpys 0
+fkl_staged N 100  kernels    2  memsets 0  memcpys 0
+Results written to "/home/oscar/bvf-bench/results-nppdx-wins/regions"

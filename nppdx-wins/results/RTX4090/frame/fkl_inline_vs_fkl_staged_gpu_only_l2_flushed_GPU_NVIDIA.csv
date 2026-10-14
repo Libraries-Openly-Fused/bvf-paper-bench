@@ -1,0 +1,2 @@
+Batch size, fkl_inline MeanTime, fkl_inline TimeVariance, fkl_inline MaxTime, fkl_inline MinTime, fkl_staged MeanTime, fkl_staged TimeVariance, fkl_staged MaxTime, fkl_staged MinTime, Mean Speedup, fkl_inline MedianTime, fkl_inline P10Time, fkl_inline P90Time, fkl_staged MedianTime, fkl_staged P10Time, fkl_staged P90Time
+1, 0.175432, 6.15722e-08, 0.176065, 0.175169, 0.274341, 8.55884e-08, 0.274882, 0.274019, 0.639467, 0.175393, 0.175228, 0.175548, 0.274258, 0.274047, 0.27468
