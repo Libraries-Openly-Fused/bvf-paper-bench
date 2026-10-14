@@ -1168,7 +1168,9 @@ std::string workloadNb() {
        << REGION_SEED << ", batch N uses the first N of every iteration; common/bench_neighborhood.h cropRegionSets), "
        << "box blur K x K (mean of the window centred on the value, per channel, replicating the edge of the crop in "
        << "every pass; part (b) K = " << BOX_K << ", one pass), Mul (1/255), Sub (0.485, 0.456, 0.406), Div (0.229, "
-       << "0.224, 0.225), output N planes of " << PLANE_W << "x" << PLANE_H << " float3, no resize, no border";
+       << "0.224, 0.225), output N planes of " << PLANE_W << "x" << PLANE_H << " float3, no border; no resize, except "
+       << "part (a)'s resize_box groups: Experiment 1's regions (N in {1, 16}) resized to " << PLANE_W << "x" << PLANE_H
+       << " (bilinear, aspect ratio ignored) before the box";
     return os.str();
 }
 
@@ -1229,8 +1231,10 @@ void writePlatformNb(const std::filesystem::path& path, const std::string& diagn
        << "Validation: as rocm_bench.hip, on the timed iterations " << validation::VALIDATION_STRIDE << " apart and the "
        << "last, into NaN-poisoned outputs. FKL against the float reference: FKL's CPU float chain ReadNV12 -> YUVtoRGB -> "
        << "Crop, then bench::neighborhood::boxReference (the box in double, no rounding, then the normalization in float; "
-       << "the box is linear and the normalization rounds, so the references blur before they normalize, as the "
-       << "pipelines do), tolerance " << TOLERANCE << ". RPP, whose frame is 8 bit RGB, against the same chain with the "
+       << "the box is linear and the normalization rounds, so the order matters: the references blur, then normalize, "
+       << "the order of the pipeline and of every implementation but rpp_f32box_cmn, which normalizes in "
+       << "crop_mirror_normalize before its F32 box and is held to its tolerance against these references and exactly to "
+       << "its own RPP-convention reference, in its own order), tolerance " << TOLERANCE << ". RPP, whose frame is 8 bit RGB, against the same chain with the "
        << "RGB saturated and rounded to nearest 8 bit (fkl_cpu_8bit_rgb, as in Experiment 1), and for the U8 box its "
        << "output rounded half up to 8 bit (fkl_cpu_8bit_rgb_rounded_box), tolerance " << TOLERANCE_8BIT
        << " (one level of 8 bit RGB); its error against the float reference, whose RGB is not saturated, is recorded "

@@ -102,8 +102,10 @@ In every group every implementation is validated and timed in the same interleav
 the fastest (median, CPU + GPU) within its tolerance and the chosen RPP variant the fastest within its tolerance and
 within `RPP_EQUIVALENCE` of its RPP-convention reference (`chosen` column); every one is recorded, and the speedups are
 per iteration over the chosen DPP tile. References (`bench::neighborhood::boxReference`: the box in double, then the
-normalization in float; a box does not commute with the normalization in float, so the references blur first, as the
-pipelines do): FKL against FKL's CPU float chain (tolerance 1e-3); RPP, whose frame is 8 bit RGB, against the same
+normalization in float; a box does not commute with the normalization in float, so the references blur first, the
+order of the pipeline and of every implementation but `rpp_f32box_cmn`, which normalizes in `rppt_crop_mirror_normalize`
+before its F32 box: it is held to its tolerance against these references, and exactly to its own RPP-convention
+reference, which follows its order): FKL against FKL's CPU float chain (tolerance 1e-3); RPP, whose frame is 8 bit RGB, against the same
 chain with the RGB saturated and rounded to 8 bits (`fkl_cpu_8bit_rgb`), and for the U8 box with its output rounded to
 8 bits (`fkl_cpu_8bit_rgb_rounded_box`), tolerance one 8 bit level; its error against the float reference, whose RGB is
 not saturated, is recorded too. Each RPP variant is also checked against its RPP-convention reference, RPP 3.2.0's HIP
