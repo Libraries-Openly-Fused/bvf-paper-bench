@@ -13,7 +13,8 @@ candidate is a neighborhood operation before a resize with a compile-time ratio:
 - **Libraries and hardware:** NPPDx v0.1.2 for SM 890; RTX 4090, CUDA 13.3, driver 610.43.02.
 - **Results:** `results/RTX4090/regions` and `results/RTX4090/frame`, the harness's files and the logs of the runs. The
   second smoke (W2 with heavier filters, commit 485266f, below) is in `results/RTX4090/frame_k9`, `frame_k5_p2` and
-  `frame_gauss21`.
+  `frame_gauss21`. The full-protocol W2 runs for citation (commit 57f08bc) are in `results/RTX4090-full` (section "Full
+  protocol").
 
 ## Workloads
 
@@ -193,6 +194,89 @@ were excluded.
     1.31x faster than NPPDx in GPU time (625 vs 821 us), 1.41x with the L2 flushed and 1.30x in latency.
   - So the Gaussian is an NPPDx win only against the non-separable form.
 
+## Full protocol: the W2 cases for citation (commit 57f08bc, FKL 3e900e6)
+
+**What was run:** the paper coordinator's request, 2026-10-15.
+- **The pipeline:** the 4K NV12 frame -> filter -> Resize 2:1 -> 1920x1080 float3, four cases (the 5x5 box in one and in
+  two passes, the 9x9 box, the 21-tap Gaussian).
+- **Implementations:** nppdx; fkl_inline; fkl_staged; and, for the Gaussian, fkl_staged_separable as a labelled extra.
+  - fkl_inline for the Gaussian is `GaussianBVF<21>` (common/bench_neighborhood_ops.h, commit bb0c245).
+- **Protocol:** the paper's, as Experiments 1 and 3.
+  - 100 warm-up and 1000 timed iterations in every mode (latency, GPU only, GPU only with the L2 flushed), the
+    implementations interleaved in every iteration, default clocks.
+  - Per-iteration mean speedups in both directions: nppdx over each FKL form, and each FKL form over nppdx.
+  - Medians and p10-p90, CUPTI kernel counts, validation on 21 iterations (the first, every 50th and the last timed one).
+- **Run and data:**
+  - Run: `~/bvf-bench/results-nppdx-wins-full/run.sh`, 2026-10-15 01:09-01:13. bvf-paper-bench 57f08bc and FKL 3e900e6
+    are recorded in `commit.txt` and every `platform.txt`.
+  - Data: `results/RTX4090-full/<case>`, with every iteration's time in `per_iteration_<mode>.csv`.
+  - Tables: `results/RTX4090-full/tables.md` and `key_numbers.csv`, from `full_report.py`.
+- **Configurations:** the fastest validated, re-swept with 1000 iterations wherever the smoke's choice was within 2% of
+  its runner-up (the smoke's noise).
+  - Pinned: only fkl_staged's DPP tile for the two-pass box (32x16, 6.1% ahead in the smoke), via
+    `WINS_PINNED_CHOICES`.
+  - Chosen: NPPDx 64x32 / block 512 (5x5, two passes), 64x32 / recommended (9x9), 32x32 / recommended (Gaussian); DPP
+    32x8 (5x5, Gaussian), 32x16 (two passes, 9x9).
+
+**Semantics (documented, not matched):**
+- **Resize sampling:** FKL's samples at (2x, 2y) (bilinear weights 1 and 0). NPPDx's samples at pixel centers (the
+  2x2 mean).
+- **Edges with two passes:** FKL replicates the edge of every pass (BoxBVF clamps to the image before it; MorphologyDPP
+  replicates the border of every pass). NPPDx's ingest replicates the frame edge into the halo, and each BoxBlur step
+  filters the whole tile with its halo: NPPDx filters the frame extended by the total halo, so its second pass reads
+  first-pass values beyond the frame instead of replicating the first pass's edge.
+- **Where they differ:** only near the frame border; with one pass the two are the same. Each implementation is
+  validated against its own semantics.
+
+**NPPDx's Gaussian tile on the RTX 4090:** the 64x32 tile cannot launch.
+- Its kernel needs 138240 bytes of shared memory: the 88x56 ingest and filtered tiles (halo 10 + 2) twice, the 32x36
+  intermediate and the 32x16 output, 12 bytes per pixel.
+- The RTX 4090's opt-in limit is 101376 bytes, so `cudaFuncSetAttribute` fails (invalid argument) and the sweep excluded
+  it. 32x32 is the largest Gaussian tile NPPDx can run there.
+
+### GPU only, medians (us) [p10-p90] and per-iteration mean speedups
+
+"nppdx over it" is the mean of t_it / t_nppdx; "it over nppdx" is the mean of t_nppdx / t_it.
+
+| case | nppdx | fkl_inline (nppdx over it / it over nppdx) | fkl_staged | fkl_staged_separable (extra) | fastest |
+|---|---|---|---|---|---|
+| box 5x5 | 235.23 [234.59-235.81] | **175.07** [174.88-175.30] (0.745 / 1.343) | 299.81 [298.98-300.96] (1.275 / 0.784) | | fkl_inline |
+| box 5x5, two passes | **328.32** [326.44-329.51] | 4589.40 [4562.10-4604.04] (14.020 / 0.071) | 508.69 [506.28-510.34] (1.550 / 0.645) | | **nppdx** |
+| box 9x9 | 615.78 [614.24-617.45] | **504.77** [504.36-505.22] (0.820 / 1.220) | 548.97 [548.26-549.70] (0.891 / 1.122) | | fkl_inline |
+| Gaussian 21 taps | 827.85 [827.24-828.59] | 3446.98 [3445.92-3449.77] (4.178 / 0.239) | 4272.68 [4271.79-4273.52] (5.183 / 0.193) | **629.41** [628.49-630.21] (0.761 / 1.315) | fkl_staged_separable |
+
+### Latency and L2 flushed, medians (us) and nppdx's mean speedup over the faster FKL form
+
+| case | mode | nppdx | fkl_inline | fkl_staged | fkl_staged_separable | nppdx over the faster FKL form |
+|---|---|---|---|---|---|---|
+| box 5x5 | latency | 233.84 | **175.74** | 298.91 | | 0.750 (inline) |
+| box 5x5 | L2 flushed | 233.35 | **175.94** | 275.17 | | 0.754 (inline) |
+| box 5x5, two passes | latency | **326.66** | 4563.97 | 504.61 | | 1.544 (staged) |
+| box 5x5, two passes | L2 flushed | **321.24** | 4483.52 | 476.17 | | 1.485 (staged) |
+| box 9x9 | latency | 615.42 | **503.81** | 549.50 | | 0.819 (inline) |
+| box 9x9 | L2 flushed | 612.90 | **502.40** | 522.50 | | 0.819 (inline) |
+| Gaussian 21 taps | latency | 823.23 | 3443.76 | 4275.17 | **629.76** | 4.193 (inline); 0.765 over separable |
+| Gaussian 21 taps | L2 flushed | 826.89 | 3440.10 | 4245.87 | **598.09** | 4.176 (inline); 0.724 over separable |
+
+**Kernels per execution:** nppdx 1, fkl_inline 1, fkl_staged 2, fkl_staged_separable 3.
+
+**Validation:** every implementation is within its tolerance (1e-3) in all 21 validated iterations; the largest max abs
+error is 4.6e-6 (fkl_staged, the Gaussian's LinearFilterDPP 21x21).
+
+**With the L2 flushed, fkl_staged is faster than without** (275 vs 300 us for the 5x5 box). The flush runs before every
+kernel, so the DPP's dirty lines of the intermediate are written back during the flush, not during the measured
+kernels.
+
+**Answer:**
+- **NPPDx wins the 5x5 box in two passes** in every mode: 1.55x over the faster FKL form (fkl_staged) in GPU time,
+  1.54x in latency and 1.49x with the L2 flushed. fkl_inline is 14x slower than NPPDx there (625 frame evaluations per
+  tap).
+- **FKL wins the other three cases:**
+  - The 5x5 box: fkl_inline, 1.34x over NPPDx in GPU time.
+  - The 9x9 box: fkl_inline, 1.22x.
+  - The Gaussian: of the two FKL forms asked for, fkl_inline is the faster, and NPPDx is 4.2x faster than it. FKL's
+    LinearFilterDPP used separably (the extra, three kernels) is 1.31x faster than NPPDx in GPU time.
+
 ## Reproduce
 
     cmake -S nppdx-wins -B build-wins -DBENCH_ITERATIONS=10 -DBENCH_WARMUP_ITERATIONS=3
@@ -202,6 +286,9 @@ were excluded.
     ./build-wins/benchmark_wins_frame <out>/frame
     ./build-wins/benchmark_wins_frame <out>/frame --gpu-only-l2-flushed
     # the second smoke: the same two runs for benchmark_wins_frame_k9, _k5_p2 and _gauss21
+    # the full protocol: build with -DBENCH_ITERATIONS=1000 -DBENCH_WARMUP_ITERATIONS=100, then
+    # results-nppdx-wins-full/run.sh (copied to results/RTX4090-full/run.sh) and
+    nppdx-wins/full_report.py <results directory> <tables.md>
 
 The main run of each program validates and times every NPPDx configuration and DPP tile, and writes its choices to
 `choices.csv`. The flushed run reads them.

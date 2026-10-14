@@ -1,0 +1,25 @@
+Benchmark: nppdx-wins W2: a filter before a 2:1 resize of the 4K frame (smoke test)
+GPU: NVIDIA GeForce RTX 4090 (sm_89, 128 SMs, 24106 MiB)
+NVIDIA driver: 610.43.02
+CUDA runtime: 13.3, CUDA driver API: 13.3
+nvcc: 13.3.73
+nvcc flags:  -O3 -DNDEBUG -std=c++20 --threads 0 -rdc=false -split-compile=0 -ftemplate-depth=1000 -lineinfo, CUDA_ARCHITECTURES native (89-real)
+Host compiler: GCC 15.2.0
+FKL: branch HEAD, commit 3e900e6
+NPPDx: v0.1.2, operations for SM 890
+Filter: box 9x9
+nppdx: one kernel over the frame (wins_common.h): NV12 ingest of the tile with the halo of the filter and the resize, FromLimitedLuma/Chroma, ColorConvert BT.601, the filter (BoxBlur steps or GaussianBlur), Resize<2, 1, bilinear>, the normalization and float3 write written by hand; the fastest validated of tiles 64x32, 32x32, 32x16, 16x16, 16x8 with the recommended block and 128, 256, 512 (choices.csv, choice_sweep.csv).
+fkl_inline: one kernel, ReadNV12 -> YUVtoRGB -> BoxBVF<K> per pass (GaussianBVF<21> with NPPDx's taps for the Gaussian) -> Resize -> Mul -> Sub -> Div -> TensorWrite (4 x (K^2)^passes NV12 reads and conversions per output value).
+fkl_staged: two kernels, the DPP of the filter (MorphologyDPP, executeBoxBlur; LinearFilterDPP 21x21 for the Gaussian) of the frame into a float3 frame in memory (99532800 bytes written, then read by the resize), then TransformDPP Resize -> Mul -> Sub -> Div -> TensorWrite; the fastest validated DPP tile of 16x8, 32x8, 32x16.
+CPU: AMD Ryzen 9 5950X 16-Core Processor
+OS: Ubuntu 26.04.1 LTS, kernel 7.0.0-38-generic
+GPU clocks: not locked (locking needs root); application clocks as reported by nvidia-smi: 3105 MHz, 10501 MHz
+
+bvf-paper-bench: commit 57f08bc
+Workload (nppdx-wins W2, smoke test): the 3840x2160 NV12 frame (seed 1), NV12->RGB BT.601 limited range, box 9x9 (per channel, replicating the frame edge; with two passes FKL replicates the edge of every pass and NPPDx filters the extended frame), resized 2:1 (bilinear) to 1920x1080, then Mul (1/255), Sub (0.485, 0.456, 0.406), Div (0.229, 0.224, 0.225), one float3 plane. Batch 1 is the frame (the harness's regions are not used).
+Semantics (documented, not matched): FKL's 2:1 bilinear samples at (2x, 2y), i.e. the boxed pixel; NPPDx's at pixel centers, the mean of the 2x2 boxed pixels. Each is checked against a reference of its own semantics.
+Regions: iteration t of every loop (the 100 warm-up iterations are t in [0, 100), the 1000 timed ones t in [100, 1100)) runs every pipeline on the regions of iteration t, generated before the loops and the same for every implementation, program and machine (statistics of the timed ones in regions.csv). Each pipeline converts them into its library's arguments before the loops; inside the timed region is what the library needs to receive the regions of the iteration: FKL's build() calls and the fusion of the chain, and the per-region arguments and calls of the baselines (see their pipelines).
+Timing: 100 warm-up then 1000 timed iterations. In every iteration nppdx, fkl_inline, then FKL staged run one after the other, each timed with CUDA events on one stream around the complete pipeline (all host enqueue work included) and followed by a synchronization. FKL staged's speedup over each baseline is computed per iteration (baseline time / staged time) and averaged (mean speedup, FKL's two-execution convention). Median, p10, p90 with linear interpolation.
+GPU time only: a second pass with the same interleaved iterations and regions and CUPTI kernel tracing on; the GPU time of one execution is the sum of the execution times of its kernels (no host work, no launch gaps, no memory copies), and FKL staged's speedups are again computed per execution and averaged.
+Validation: before the timing, every pipeline on the regions of the first, every 50th and the last timed iteration, against its reference (validation.csv, one row per iteration): 1e-3 for FKL staged against the float reference, one level of 8 bit RGB for the 8 bit pipelines against theirs.
+Kernel counts: CUPTI activity tracing of one pipeline (regions of the first timed iteration), in a separate pass after all timings

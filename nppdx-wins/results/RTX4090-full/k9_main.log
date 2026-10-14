@@ -1,0 +1,39 @@
+nppdx_frame: tile 64x32 block recommended median 613.38 us, max abs error 9.54e-07
+nppdx_frame: tile 64x32 block 128 median 342.02 us, max abs error 2.76e+00 (not within the tolerance)
+nppdx_frame: tile 64x32 block 256 median 458.75 us, max abs error 2.63e+00 (not within the tolerance)
+nppdx_frame: tile 64x32 block 512 median 615.42 us, max abs error 9.54e-07
+nppdx_frame: tile 32x32 block recommended median 772.10 us, max abs error 9.54e-07
+nppdx_frame: tile 32x32 block 128 median 514.13 us, max abs error 2.54e+00 (not within the tolerance)
+nppdx_frame: tile 32x32 block 256 median 764.75 us, max abs error 9.54e-07
+nppdx_frame: tile 32x32 block 512 median 762.85 us, max abs error 9.54e-07
+nppdx_frame: tile 32x16 block recommended median 838.66 us, max abs error 9.54e-07
+nppdx_frame: tile 32x16 block 128 median 730.11 us, max abs error 1.40e+00 (not within the tolerance)
+nppdx_frame: tile 32x16 block 256 median 775.07 us, max abs error 9.54e-07
+nppdx_frame: tile 32x16 block 512 median 897.02 us, max abs error 9.54e-07
+nppdx_frame: tile 16x16 block recommended median 1095.52 us, max abs error 9.54e-07
+nppdx_frame: tile 16x16 block 128 median 1061.89 us, max abs error 9.54e-07
+nppdx_frame: tile 16x16 block 256 median 1048.37 us, max abs error 9.54e-07
+nppdx_frame: tile 16x16 block 512 median 1317.89 us, max abs error 9.54e-07
+nppdx_frame: tile 16x8 block recommended median 1488.90 us, max abs error 9.54e-07
+nppdx_frame: tile 16x8 block 128 median 1389.57 us, max abs error 9.54e-07
+nppdx_frame: tile 16x8 block 256 median 1428.48 us, max abs error 9.54e-07
+nppdx_frame: tile 16x8 block 512 median 1922.38 us, max abs error 9.54e-07
+nppdx_frame: tile 64x32 block recommended chosen
+=== nppdx-wins W2: a filter before a 2:1 resize of the 4K frame (smoke test)
+=== N = 1
+fkl_staged_frame: DPP tile 16x8 median 566.18 us, max abs error 2.38e-06
+fkl_staged_frame: DPP tile 32x8 median 562.18 us, max abs error 2.38e-06
+fkl_staged_frame: DPP tile 32x16 median 555.10 us, max abs error 2.38e-06
+fkl_staged_frame: DPP tile 32x16 chosen
+nppdx        median   615.4 us  mean   615.6 us  p10   613.4  p90   617.5  FKL staged mean speedup   1.12x  max err 9.54e-07 (nppdx_pixel_center_float)
+fkl_inline   median   503.8 us  mean   504.0 us  p10   502.8  p90   504.8  FKL staged mean speedup   0.92x  max err 2.38e-06 (fkl_cpu_float)
+fkl_staged   median   549.5 us  mean   549.4 us  p10   548.1  p90   550.2  max err 2.38e-06 (fkl_cpu_float)
+=== GPU time only (CUPTI kernel execution times, after all CPU + GPU timings)
+GPU only nppdx        N   1  median  615.78 us  p10  614.24  p90  617.45  FKL staged mean speedup   1.12x
+GPU only fkl_inline   N   1  median  504.77 us  p10  504.36  p90  505.22  FKL staged mean speedup   0.92x
+GPU only fkl_staged   N   1  median  548.97 us  p10  548.26  p90  549.70
+=== Kernel counts (CUPTI activity tracing, after all timings)
+nppdx      N   1  kernels    1  memsets 0  memcpys 0
+fkl_inline N   1  kernels    1  memsets 0  memcpys 0
+fkl_staged N   1  kernels    2  memsets 0  memcpys 0
+Results written to "/home/oscar/bvf-bench/results-nppdx-wins-full/k9"

@@ -21,6 +21,8 @@ CASES = [("k5", "box 5x5, one pass"), ("k5_p2", "box 5x5, two passes"), ("k9", "
 MODES = [("latency", "latency (CPU + GPU)"), ("gpu_only", "GPU only"),
          ("gpu_only_l2_flushed", "GPU only, L2 flushed")]
 ORDER = ["nppdx", "fkl_inline", "fkl_staged", "fkl_staged_separable"]
+# The candidates of the DPP tiles (wins_common.h's DPP_TILES), for a pinned choice that has no sweep row
+DPP_TILES = ["16x8", "32x8", "32x16"]
 
 
 def read_csv(path):
@@ -50,7 +52,7 @@ def main():
     if len(sys.argv) != 3:
         print(__doc__)
         return 1
-    root = Path(sys.argv[1])
+    root = Path(sys.argv[1]).resolve()
     out = Path(sys.argv[2])
     lines = []
     w = lines.append
@@ -75,7 +77,13 @@ def main():
         for c in choices:
             cands = [s for s in sweep if s["key"] == c["key"] and s["chosen"] == "yes"]
             how = c.get("how", "swept")
-            w(f"- configuration {c['key']}: {cands[0]['candidate'] if cands else 'candidate ' + c['index']} ({how})")
+            if cands:
+                name = cands[0]["candidate"]
+            elif c["key"].startswith("fkl_staged"):
+                name = f"DPP tile {DPP_TILES[int(c['index'])]}"
+            else:
+                name = f"candidate {c['index']}"
+            w(f"- configuration {c['key']}: {name} ({how})")
         # Validation over the validated iterations
         validation = defaultdict(list)
         for r in read_csv(d / "validation.csv"):
