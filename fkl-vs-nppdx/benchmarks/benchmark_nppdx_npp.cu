@@ -54,7 +54,9 @@ struct NppdxNppPipeline {
                ":" + std::to_string(RESIZE_K) + " bilinear, 8 bit RGB write), then NPP with the function it offers for "
                "each step, as in the GPU benchmark's NPP pipeline: nppiCopyConstBorder_8u_C3R once per crop (NPP has "
                "no batched border), then nppiConvert_8u32f_C3R, nppiMulC_32f_C3IR, nppiSubC_32f_C3IR and "
-               "nppiDivC_32f_C3IR on the N planes as one image; N + 5 kernels. The resized RGB is rounded to 8 bits "
+               "nppiDivC_32f_C3IR on the N planes as one image; N + 5 kernels (the bordered planes start at a multiple of "
+               "768 bytes, so that nppiCopyConstBorder_8u_C3R, whose destination must be a multiple of 12 bytes for one "
+               "kernel, is one kernel per crop in every run). The resized RGB is rounded to 8 bits "
                "before the normalization. The times include the NPP calls; the configuration sweep times the NPPDx "
                "kernel alone.";
     }

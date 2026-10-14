@@ -40,7 +40,9 @@ the same FKL pipeline:
   in the GPU benchmark's NPP pipeline: `nppiCopyConstBorder_8u_C3R` adds the black rows, once per crop (NPP has no
   batched border), then `nppiConvert_8u32f_C3R`, `nppiMulC_32f_C3IR`, `nppiSubC_32f_C3IR` and `nppiDivC_32f_C3IR` run
   on the N planes as one image. N + 5 kernels, with the intermediates in memory, and the resized RGB is rounded to 8
-  bits before the normalization.
+  bits before the normalization. The bordered planes start at a multiple of 768 bytes: `nppiCopyConstBorder_8u_C3R`
+  launches one kernel only when its destination is a multiple of 12 bytes (two or three otherwise), so this keeps the
+  pipeline at N + 5 kernels in every mode and process, wherever the allocation lands.
 
 The two benchmarks share everything but the NPPDx pipeline ([`benchmarks/figure1_common.h`](benchmarks/figure1_common.h)
 and [`benchmarks/nppdx_common.h`](benchmarks/nppdx_common.h)), and have the same modes and output files, with their
