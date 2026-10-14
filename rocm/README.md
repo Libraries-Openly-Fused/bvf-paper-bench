@@ -171,9 +171,13 @@ thread pool, so that the idle gap before every timed run puts both pools to slee
   `amdrocm-profiler-base10.1` (rocprofiler-sdk, rocprofv3) and `amdrocm-amdsmi10.1`. Without root, unpack them with
   `apt-get download <package> && dpkg -x <package>_*.deb <prefix>` and set `ROCM_EXTRA=<prefix>/opt/rocm/core-10.1`.
 - FusedKernelLibrary at `63782f6` for Experiments 1 and 2 and the CPU benchmark, and at the commit recorded for the
-  repository's `fkl` submodule (with MorphologyDPP's `executeBoxBlur`) for Experiment 3: by default the repository's `fkl`
-  submodule with its `thread-pool` submodule (`git submodule update --init --recursive fkl`); `run_all.sh` takes other
-  checkouts with `FKL_GPU_DIR` / `FKL_CPU_DIR` and checks the commit of the experiment it runs.
+  repository's `fkl` submodule (with MorphologyDPP's `executeBoxBlur`) for Experiment 3. `run_all.sh` uses the
+  repository's `fkl` submodule with its `thread-pool` submodule (`git submodule update --init --recursive fkl`) unless
+  `FKL_GPU_DIR` / `FKL_CPU_DIR` name other checkouts, and stops if FKL is not at the commit of the experiment it runs.
+  The submodule is at Experiment 3's commit, so Experiments 1 and 2 need a checkout at `63782f6` in both, e.g.
+  `git clone https://github.com/Libraries-Openly-Fused/FusedKernelLibrary.git ../fkl-63782f6 && git -C ../fkl-63782f6
+  checkout 63782f6 && git -C ../fkl-63782f6 submodule update --init --recursive`, then
+  `FKL_GPU_DIR=../fkl-63782f6 FKL_CPU_DIR=../fkl-63782f6 rocm/scripts/run_all.sh <results dir>`.
 
 ## Build and run
 

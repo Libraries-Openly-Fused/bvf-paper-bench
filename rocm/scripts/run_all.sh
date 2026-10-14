@@ -56,6 +56,11 @@ else
 fi
 FKL_GPU_DIR=${FKL_GPU_DIR:-$REPO/fkl}
 FKL_CPU_DIR=${FKL_CPU_DIR:-$REPO/fkl}
+# The repository's fkl submodule is at Experiment 3's FKL: Experiments 1 and 2 take another checkout, at 63782f6
+FKL_HINT=""
+[ "$EXPERIMENT" = 1 ] && FKL_HINT="; Experiments 1 and 2 need an FKL checkout at $FKL_PAPER_COMMIT with its submodules \
+in FKL_GPU_DIR and FKL_CPU_DIR (the repository's fkl submodule is at Experiment 3's FKL, \
+$(git -C "$REPO" ls-tree HEAD fkl | awk '{print substr($3, 1, 7)}'))"
 # Experiment 3 has no CPU benchmark
 [ "$EXPERIMENT" = 3 ] && SKIP_CPU=1
 if [ -z "${CXX_CPU:-}" ]; then
@@ -98,12 +103,12 @@ FKL_GPU_COMMIT=$(git -C "$FKL_GPU_DIR" rev-parse --short=7 HEAD 2>/dev/null) && 
     die "no FKL checkout in $FKL_GPU_DIR (git -C $REPO submodule update --init --recursive fkl)"
 FKL_DIRS=("$FKL_GPU_DIR")
 [ "$FKL_GPU_COMMIT" = "$FKL_PAPER_COMMIT" ] || allowed ALLOW_OTHER_FKL ||
-    die "FKL_GPU_DIR is at $FKL_GPU_COMMIT, not $FKL_PAPER_COMMIT (the FKL commit of experiment $EXPERIMENT)"
+    die "FKL_GPU_DIR is at $FKL_GPU_COMMIT, not $FKL_PAPER_COMMIT (the FKL commit of experiment $EXPERIMENT)$FKL_HINT"
 if ! allowed SKIP_CPU; then
     FKL_CPU_COMMIT=$(git -C "$FKL_CPU_DIR" rev-parse --short=7 HEAD 2>/dev/null) && [ -f "$FKL_CPU_DIR/CMakeLists.txt" ] ||
         die "no FKL checkout in $FKL_CPU_DIR (git -C $REPO submodule update --init --recursive fkl)"
     [ "$FKL_CPU_COMMIT" = "$FKL_PAPER_COMMIT" ] || allowed ALLOW_OTHER_FKL ||
-        die "FKL_CPU_DIR is at $FKL_CPU_COMMIT, not $FKL_PAPER_COMMIT"
+        die "FKL_CPU_DIR is at $FKL_CPU_COMMIT, not $FKL_PAPER_COMMIT$FKL_HINT"
     FKL_DIRS+=("$FKL_CPU_DIR")
 fi
 for dir in "${FKL_DIRS[@]}"; do
