@@ -94,7 +94,9 @@ harness). Two parts, each a set of groups (part, K, passes, N) whose implementat
     chain up to the crop and writing through Mul, Sub, Div, for every tile of `DPP_TILES`.
 - Part (a), the micro-experiment, FKL only: K = 3, 5, 7, one and two passes, N = 1 and 16: `fkl_bvf_naive` (the naive
   ReadBack operation `BoxBVF<K>` of `common/bench_neighborhood_ops.h` in the BVF chain, twice for two passes, one
-  kernel) against the DPP tiles.
+  kernel) against the DPP tiles, in two variants: on the crops (operation `box`), and with the resize (operation
+  `resize_box`: Figure 1's chain on Experiment 1's regions without the border, ReadNV12 -> YUVtoRGB -> Crop -> Resize
+  64x32 -> Box -> Mul -> Sub -> Div -> Write, the DPP's input chain ending at the resize).
 
 In every group every implementation is validated and timed in the same interleaved iterations; the chosen DPP tile is
 the fastest (median, CPU + GPU) within its tolerance and the chosen RPP variant the fastest within its tolerance and
@@ -112,9 +114,11 @@ repository's `fkl` submodule (CMake builds `rocm_neighborhood` only with an FKL 
 `rocm_bench` alone).
 
 Output files (in `<results dir>/neighborhood` with `run_all.sh`): `latency.csv`, `validation.csv`, `gpu_time.csv`,
-`gpu_time_l2_flushed.csv`, `kernel_breakdown.csv`, `kernel_counts_per_operation.csv`, `regions.csv` and `platform.txt`,
+`gpu_time_l2_flushed.csv`, `kernel_breakdown.csv`, `kernel_counts_per_operation.csv`, `regions.csv`,
+`regions_resize.csv` and `platform.txt`,
 with the group in the first columns (`part,operation,K,passes,N,implementation,chosen`) or in the implementation name
-(`<part>_box_k<K>_p<passes>_n<N>/<implementation>`). `--validate` only validates every group.
+(`<part>_<operation>_k<K>_p<passes>_n<N>/<implementation>`); `regions_resize.csv` has the regions of the resize
+variant. `--validate` only validates every group.
 
     EXPERIMENT=3 rocm/scripts/run_all.sh ../results/rocm-neighborhood
 

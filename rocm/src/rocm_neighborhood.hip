@@ -18,11 +18,13 @@
 //   fkl_dpp_<W>x<H>       one FKL kernel: MorphologyDPP's executeBoxBlur<passes> (an Add reducer per pass, the 1 / K^2
 //                         of every pass in the write) batched over the crops, reading the BVF chain ReadNV12 -> YUVtoRGB
 //                         -> Crop and writing through Mul -> Sub -> Div -> Write, one for every tile of DPP_TILES
-// Part (a), the micro-experiment (FKL only, K of PART_A_KS, 1 or 2 passes, N of PART_A_BATCHES):
+// Part (a), the micro-experiment (FKL only, K of PART_A_KS, 1 or 2 passes, N of PART_A_BATCHES), in two variants:
+// on the crops as above (operation box), and with the resize (operation resize_box): Figure 1's chain on Experiment 1's
+// regions (common/bench_geometry.h), ReadNV12 -> YUVtoRGB -> Crop -> Resize 64x32 -> Box -> Mul -> Sub -> Div -> Write
 //   fkl_bvf_naive         one FKL kernel with the naive ReadBack operation BoxBVF<K> of common/bench_neighborhood_ops.h
-//                         (twice for two passes) in the BVF chain after the Crop
-//   fkl_dpp_<W>x<H>       as in part (b), with executeBoxBlur<passes>
-// In every group (part, K, passes, N) all of them are validated and timed in the same interleaved iterations; the RPP
+//                         (twice for two passes) in the BVF chain after the Crop (or the Resize)
+//   fkl_dpp_<W>x<H>       as in part (b), with executeBoxBlur<passes>, its input chain ending at the Crop (or the Resize)
+// In every group (part, operation, K, passes, N) all of them are validated and timed in the same interleaved iterations; the RPP
 // variant and the DPP tile of a group are the fastest (median of the CPU + GPU pass) of those that pass their checks,
 // and every one is recorded. The speedups are per iteration (baseline / chosen DPP tile), averaged.
 //
@@ -64,11 +66,44 @@ struct Group {
     int k{0};
     int passes{1};
     int batch{0};
+    bool resize{false}; // part (a) with the resize: Experiment 1's regions, resized to 64x32 before the box
+    std::string operation() const { return resize ? "resize_box" : "box"; }
     std::string label() const {
-        return std::string(1, part) + "_box_k" + std::to_string(k) + "_p" + std::to_string(passes) + "_n" +
-               std::to_string(batch);
+        return std::string(1, part) + "_" + operation() + "_k" + std::to_string(k) + "_p" + std::to_string(passes) +
+               "_n" + std::to_string(batch);
     }
 };
+
+// The regions of part (a) with the resize: Experiment 1's (common/bench_geometry.h, the default RegionSets), while
+// ctx.regions holds the crops of every other group
+std::unique_ptr<RegionSets> resizeRegions;
+
+template <bool R>
+const RegionSets& regionsOf(const Context& ctx) {
+    return R ? *resizeRegions : *ctx.regions;
+}
+
+// The first N regions of iteration t as FKL rectangles, and those of every iteration
+template <size_t N>
+std::array<fk::Rect, N> rectsOf(const RegionSets& sets, size_t t) {
+    std::array<fk::Rect, N> rects{};
+    for (size_t i = 0; i < N; ++i) {
+        const Region& r = sets.at(t, i);
+        rects[i] = fk::Rect(static_cast<uint>(r.x), static_cast<uint>(r.y), r.width, r.height);
+    }
+    return rects;
+}
+
+template <size_t N>
+std::shared_ptr<const std::vector<std::array<fk::Rect, N>>> rectSetsOf(const RegionSets& sets) {
+    auto all = std::make_shared<std::vector<std::array<fk::Rect, N>>>(sets.iterations());
+    for (size_t t = 0; t < all->size(); ++t) {
+        (*all)[t] = rectsOf<N>(sets, t);
+    }
+    return all;
+}
+
+using ResizeTo64x32 = fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>;
 
 // ------------------------------------------------------------------------------------------------
 // References (common/bench_neighborhood.h): the crops blurred, then normalized.
@@ -93,26 +128,36 @@ inline size_t at(size_t plane, int y, int x, int c) {
     return (plane * PLANE_PIXELS + static_cast<size_t>(y) * PLANE_W + x) * 3 + c;
 }
 
-// The crops of iteration t on FKL's CPU float chain ReadNV12 -> YUVtoRGB -> Crop (RGB values, not saturated)
-template <size_t N>
+// The crops of iteration t on FKL's CPU float chain ReadNV12 -> YUVtoRGB -> Crop (RGB values, not saturated), resized
+// to 64x32 (bilinear, aspect ratio ignored) for part (a) with the resize
+template <size_t N, bool R = false>
 std::vector<double> fklFloatCrops(const Context& ctx, size_t t) {
-    const auto crops = fklRegions<N>(ctx, t);
+    const auto crops = rectsOf<N>(regionsOf<R>(ctx), t);
     fk::Stream_<fk::ParArch::CPU> cpuStream;
     fk::Tensor<fk::float3> out(PLANE_W, PLANE_H, N, 1, fk::MemType::Host);
-    fk::executeOperations<fk::TransformDPP<fk::ParArch::CPU>>(cpuStream,
-        fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameHost),
-        YUVToRGB::build(),
-        fk::Crop<>::build(crops),
-        fk::TensorWrite<fk::float3>::build(out.ptr()));
+    if constexpr (R) {
+        fk::executeOperations<fk::TransformDPP<fk::ParArch::CPU>>(cpuStream,
+            fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameHost),
+            YUVToRGB::build(),
+            fk::Crop<>::build(crops),
+            ResizeTo64x32::build(fk::Size(PLANE_W, PLANE_H)),
+            fk::TensorWrite<fk::float3>::build(out.ptr()));
+    } else {
+        fk::executeOperations<fk::TransformDPP<fk::ParArch::CPU>>(cpuStream,
+            fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameHost),
+            YUVToRGB::build(),
+            fk::Crop<>::build(crops),
+            fk::TensorWrite<fk::float3>::build(out.ptr()));
+    }
     cpuStream.sync();
     const float* data = reinterpret_cast<const float*>(out.ptr().data);
     return std::vector<double>(data, data + N * PLANE_FLOATS);
 }
 
-template <size_t N>
+template <size_t N, bool R = false>
 std::vector<float> floatReference(const Context& ctx, size_t t, int k, int passes) {
-    return neighborhood::boxReference(fklFloatCrops<N>(ctx, t), N, k, passes, neighborhood::Rounding::None, MUL, SUB,
-                                      DIV);
+    return neighborhood::boxReference(fklFloatCrops<N, R>(ctx, t), N, k, passes, neighborhood::Rounding::None, MUL,
+                                      SUB, DIV);
 }
 
 // The reference of RPP's tolerance check (its frame is 8 bit RGB): FKL's conversion saturated and rounded to nearest
@@ -259,19 +304,29 @@ void planeIo(Implementation& impl, Context& ctx, const std::shared_ptr<fk::Tenso
     impl.fillNaN = [&ctx, out]() { poisonDevice(ctx.stream, out->ptr().data, N * PLANE_FLOATS); };
 }
 
-// MorphologyDPP's box blur with the BVF chain up to the Crop as its input and the pointwise tail and the write as its
-// output, batched over the crops (grid z), with a W x H tile and a K x K mask, P passes
-template <size_t N, int K, int P, int TW, int TH>
+// The BVF chain before the box: ReadNV12 -> YUVtoRGB -> Crop, and the resize for part (a) with the resize
+template <bool R, typename Rects>
+auto chainBeforeBox(const Context& ctx, const Rects& rects) {
+    const auto crop =
+        fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice).then(YUVToRGB::build()).then(fk::Crop<>::build(rects));
+    if constexpr (R) {
+        return crop.then(ResizeTo64x32::build(fk::Size(PLANE_W, PLANE_H)));
+    } else {
+        return crop;
+    }
+}
+
+// MorphologyDPP's box blur with the BVF chain up to the Crop (or the Resize) as its input and the pointwise tail and the
+// write as its output, batched over the crops (grid z), with a W x H tile and a K x K mask, P passes
+template <size_t N, int K, int P, bool R, int TW, int TH>
 Implementation makeFklDpp(Context& ctx) {
     auto out = planeTensor<N>();
-    const auto sets = fklRegionSets<N>(ctx);
+    const auto sets = rectSetsOf<N>(regionsOf<R>(ctx));
     Implementation impl{"fkl_dpp_" + std::to_string(TW) + "x" + std::to_string(TH), "fkl_cpu_float"};
     impl.run = [&ctx, out, sets](size_t t) {
         using Details = fk::MorphologyDPPDetails<fk::float3, TW, TH, K, K>;
         const Details details{PLANE_W, PLANE_H, K, K, K / 2, K / 2};
-        const auto input = fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice)
-                               .then(YUVToRGB::build())
-                               .then(fk::Crop<>::build((*sets)[t]));
+        const auto input = chainBeforeBox<R>(ctx, (*sets)[t]);
         const auto output = fk::Mul<fk::float3>::build(mulValue)
                                 .then(fk::Sub<fk::float3>::build(subValue))
                                 .then(fk::Div<fk::float3>::build(divValue))
@@ -286,16 +341,40 @@ Implementation makeFklDpp(Context& ctx) {
 }
 
 // The naive operation of common/bench_neighborhood_ops.h in the BVF chain: every output value reads K x K cropped
-// values (K^4 for two passes), each of them the color conversion of its NV12 values
-template <size_t N, int K, int P>
+// (or resized) values (K^4 for two passes), each of them the color conversion of its NV12 values (four of them for a
+// resized value)
+template <size_t N, int K, int P, bool R>
 Implementation makeFklNaive(Context& ctx) {
     static_assert(P == 1 || P == 2, "part (a) runs one or two passes");
     auto out = planeTensor<N>();
-    const auto sets = fklRegionSets<N>(ctx);
+    const auto sets = rectSetsOf<N>(regionsOf<R>(ctx));
     Implementation impl{"fkl_bvf_naive", "fkl_cpu_float"};
     impl.run = [&ctx, out, sets](size_t t) {
         beforeKernel();
-        if constexpr (P == 1) {
+        if constexpr (R && P == 1) {
+            fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
+                fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
+                YUVToRGB::build(),
+                fk::Crop<>::build((*sets)[t]),
+                ResizeTo64x32::build(fk::Size(PLANE_W, PLANE_H)),
+                fk::BoxBVF<K>::build(),
+                fk::Mul<fk::float3>::build(mulValue),
+                fk::Sub<fk::float3>::build(subValue),
+                fk::Div<fk::float3>::build(divValue),
+                fk::TensorWrite<fk::float3>::build(out->ptr()));
+        } else if constexpr (R) {
+            fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
+                fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
+                YUVToRGB::build(),
+                fk::Crop<>::build((*sets)[t]),
+                ResizeTo64x32::build(fk::Size(PLANE_W, PLANE_H)),
+                fk::BoxBVF<K>::build(),
+                fk::BoxBVF<K>::build(),
+                fk::Mul<fk::float3>::build(mulValue),
+                fk::Sub<fk::float3>::build(subValue),
+                fk::Div<fk::float3>::build(divValue),
+                fk::TensorWrite<fk::float3>::build(out->ptr()));
+        } else if constexpr (P == 1) {
             fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
                 fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
                 YUVToRGB::build(),
@@ -485,24 +564,24 @@ Implementation makeRppBox(Context& ctx, const RppVariant& variant) {
 // ------------------------------------------------------------------------------------------------
 // Groups
 // ------------------------------------------------------------------------------------------------
-template <size_t N, int K, int P, size_t... Is>
+template <size_t N, int K, int P, bool R, size_t... Is>
 void addDppTiles(Context& ctx, std::vector<Implementation>& impls, std::index_sequence<Is...>) {
-    (impls.push_back(makeFklDpp<N, K, P, DPP_TILES[Is].width, DPP_TILES[Is].height>(ctx)), ...);
+    (impls.push_back(makeFklDpp<N, K, P, R, DPP_TILES[Is].width, DPP_TILES[Is].height>(ctx)), ...);
 }
 
 // Part (b): the RPP variants, then the DPP tiles; part (a): the naive FKL pipeline, then the DPP tiles
-template <char PART, size_t N, int K, int P>
+template <char PART, size_t N, int K, int P, bool R>
 std::vector<Implementation> makeGroup(Context& ctx) {
-    static_assert(PART == 'a' || (K == BOX_K && P == 1), "part (b) is one pass of the BOX_K x BOX_K box");
+    static_assert(PART == 'a' || (K == BOX_K && P == 1 && !R), "part (b) is one pass of the BOX_K x BOX_K box");
     std::vector<Implementation> impls;
     if constexpr (PART == 'b') {
         for (const auto& v : RPP_VARIANTS_NB) {
             impls.push_back(makeRppBox<N>(ctx, v));
         }
     } else {
-        impls.push_back(makeFklNaive<N, K, P>(ctx));
+        impls.push_back(makeFklNaive<N, K, P, R>(ctx));
     }
-    addDppTiles<N, K, P>(ctx, impls, std::make_index_sequence<DPP_TILES.size()>{});
+    addDppTiles<N, K, P, R>(ctx, impls, std::make_index_sequence<DPP_TILES.size()>{});
     return impls;
 }
 
@@ -524,12 +603,12 @@ std::map<std::string, std::string> chosenDpp;
 
 std::string flatName(const Group& g, const std::string& impl) { return g.label() + "/" + impl; }
 
-template <char PART, size_t N, int K, int P>
+template <char PART, size_t N, int K, int P, bool R>
 void runGroup(Context& ctx, bool timing) {
-    const Group g{PART, K, P, static_cast<int>(N)};
+    const Group g{PART, K, P, static_cast<int>(N), R};
     std::cout << "=== " << g.label() << std::endl;
     progress("implementations");
-    const auto impls = makeGroup<PART, N, K, P>(ctx);
+    const auto impls = makeGroup<PART, N, K, P, R>(ctx);
     std::vector<GroupResult> rs(impls.size());
     for (size_t k = 0; k < impls.size(); ++k) {
         rs[k].group = g;
@@ -543,7 +622,7 @@ void runGroup(Context& ctx, bool timing) {
     for (size_t v = 0; v < validated.size(); ++v) {
         const size_t t = static_cast<size_t>(WARMUP_ITERS) + validated[v];
         progress("float reference of iteration " + std::to_string(t));
-        const auto refFloat = floatReference<N>(ctx, t, K, P);
+        const auto refFloat = floatReference<N, R>(ctx, t, K, P);
         const auto ref8bit = PART == 'b' ? eightBitReference<N>(ctx, t, K, P, false) : std::vector<float>{};
         const auto ref8bitRoundedBox = PART == 'b' ? eightBitReference<N>(ctx, t, K, P, true) : std::vector<float>{};
         for (size_t k = 0; k < impls.size(); ++k) {
@@ -662,14 +741,9 @@ void runGroup(Context& ctx, bool timing) {
     }
 }
 
-// Every group of the experiment, part (b) first: f.template operator()<part, N, K, passes>() for every group
-template <typename F>
-void forEachGroup(F&& f) {
-    // Part (b): every N, one pass of the BOX_K x BOX_K box
-    [&]<size_t... Is>(std::index_sequence<Is...>) {
-        (f.template operator()<'b', BATCHES[Is], BOX_K, 1>(), ...);
-    }(std::make_index_sequence<BATCHES.size()>{});
-    // Part (a): every K, every number of passes, every N
+// Part (a) with or without the resize: every K, every number of passes, every N
+template <bool R, typename F>
+void forEachPartAGroup(F&& f) {
     [&]<size_t... Ks>(std::index_sequence<Ks...>) {
         ([&]<size_t KI>() {
             constexpr int K = neighborhood::PART_A_KS[KI];
@@ -677,12 +751,24 @@ void forEachGroup(F&& f) {
                 ([&]<size_t PI>() {
                     constexpr int P = neighborhood::PART_A_PASSES[PI];
                     [&]<size_t... Ns>(std::index_sequence<Ns...>) {
-                        (f.template operator()<'a', neighborhood::PART_A_BATCHES[Ns], K, P>(), ...);
+                        (f.template operator()<'a', neighborhood::PART_A_BATCHES[Ns], K, P, R>(), ...);
                     }(std::make_index_sequence<neighborhood::PART_A_BATCHES.size()>{});
                 }.template operator()<Ps>(), ...);
             }(std::make_index_sequence<neighborhood::PART_A_PASSES.size()>{});
         }.template operator()<Ks>(), ...);
     }(std::make_index_sequence<neighborhood::PART_A_KS.size()>{});
+}
+
+// Every group of the experiment: f.template operator()<part, N, K, passes, resize>() for part (b), then part (a)
+// without the resize, then part (a) with the resize
+template <typename F>
+void forEachGroup(F&& f) {
+    // Part (b): every N, one pass of the BOX_K x BOX_K box
+    [&]<size_t... Is>(std::index_sequence<Is...>) {
+        (f.template operator()<'b', BATCHES[Is], BOX_K, 1, false>(), ...);
+    }(std::make_index_sequence<BATCHES.size()>{});
+    forEachPartAGroup<false>(f);
+    forEachPartAGroup<true>(f);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -706,11 +792,11 @@ Result& profileRow(const Group& g, const std::string& impl) {
     return *r;
 }
 
-template <char PART, size_t N, int K, int P>
+template <char PART, size_t N, int K, int P, bool R>
 void countGroup(Context& ctx) {
-    const Group g{PART, K, P, static_cast<int>(N)};
+    const Group g{PART, K, P, static_cast<int>(N), R};
     const size_t t = static_cast<size_t>(WARMUP_ITERS);
-    for (const auto& impl : makeGroup<PART, N, K, P>(ctx)) {
+    for (const auto& impl : makeGroup<PART, N, K, P, R>(ctx)) {
         impl.run(t); // warm-up: code object loading is not counted
         gpuErrchk(hipStreamSynchronize(ctx.stream));
         profileRow(g, impl.name).launches = countLaunches(ctx, impl, t);
@@ -726,10 +812,10 @@ void countGroup(Context& ctx) {
 }
 
 // rocm_bench.hip's gpuOnlyBatch for the implementations of one group, with the speedups over the chosen DPP tile
-template <char PART, size_t N, int K, int P>
+template <char PART, size_t N, int K, int P, bool R>
 void gpuOnlyGroup(Context& ctx, CacheFlusher* flusher) {
-    const Group g{PART, K, P, static_cast<int>(N)};
-    const auto impls = makeGroup<PART, N, K, P>(ctx);
+    const Group g{PART, K, P, static_cast<int>(N), R};
+    const auto impls = makeGroup<PART, N, K, P, R>(ctx);
     const auto chosen = chosenDpp.find(g.label());
     if (chosen == chosenDpp.end()) {
         throw std::runtime_error("No chosen DPP tile for " + g.label());
@@ -934,14 +1020,14 @@ void profilePass(Context& ctx, const std::filesystem::path& outDir, const std::f
                  const std::filesystem::path& choicesFile) {
     readChoices(choicesFile);
     std::cout << "=== Kernel counts (HIP runtime API tracing)" << std::endl;
-    forEachGroup([&]<char PART, size_t N, int K, int P>() { countGroup<PART, N, K, P>(ctx); });
+    forEachGroup([&]<char PART, size_t N, int K, int P, bool R>() { countGroup<PART, N, K, P, R>(ctx); });
     writeOperationCounts(outDir / "kernel_counts_per_operation.csv");
     const bool tracing = kernelTracingWorks(ctx);
     if (tracing) {
         std::cout << "=== GPU time only (kernel dispatch tracing)" << std::endl;
-        forEachGroup([&]<char PART, size_t N, int K, int P>() { gpuOnlyGroup<PART, N, K, P>(ctx, nullptr); });
+        forEachGroup([&]<char PART, size_t N, int K, int P, bool R>() { gpuOnlyGroup<PART, N, K, P, R>(ctx, nullptr); });
         CacheFlusher flusher = makeCacheFlusher(ctx);
-        forEachGroup([&]<char PART, size_t N, int K, int P>() { gpuOnlyGroup<PART, N, K, P>(ctx, &flusher); });
+        forEachGroup([&]<char PART, size_t N, int K, int P, bool R>() { gpuOnlyGroup<PART, N, K, P, R>(ctx, &flusher); });
         freeCacheFlusher(flusher);
     } else {
         std::cout << "=== GPU time only: NOT MEASURED (no kernel dispatch records from rocprofiler-sdk on this system)"
@@ -1002,7 +1088,7 @@ bool runProfilingChild(const std::filesystem::path& outDir) {
 // Output files
 // ------------------------------------------------------------------------------------------------
 void writeGroupColumns(std::ostream& os, const GroupResult& gr) {
-    os << gr.group.part << ",box," << gr.group.k << "," << gr.group.passes << "," << gr.r.batch << "," << gr.r.name
+    os << gr.group.part << "," << gr.group.operation() << "," << gr.group.k << "," << gr.group.passes << "," << gr.r.batch << "," << gr.r.name
        << "," << (gr.chosen ? "yes" : "no");
 }
 
@@ -1124,8 +1210,10 @@ void writePlatformNb(const std::filesystem::path& path, const std::string& diagn
        << "-> Write.\n"
        << "Groups: part (b) K = " << BOX_K << ", one pass, N = " << batchList(", ")
        << ": the RPP variants and the FKL MorphologyDPP tiles; part (a) K = 3, 5, 7, one and two passes, N = 1, 16: "
-       << "fkl_bvf_naive (BoxBVF<K> of common/bench_neighborhood_ops.h, twice for two passes) and the DPP tiles. DPP "
-       << "tiles: ";
+       << "fkl_bvf_naive (BoxBVF<K> of common/bench_neighborhood_ops.h, twice for two passes) and the DPP tiles, on the "
+       << "crops (operation box) and with the resize (operation resize_box: Figure 1's chain on Experiment 1's regions, "
+       << describe(false, "1, 16") << ": ReadNV12 -> YUVtoRGB -> Crop -> Resize " << PLANE_W << "x" << PLANE_H
+       << " -> Box K x K -> Mul -> Sub -> Div -> Write; regions_resize.csv). DPP tiles: ";
     for (size_t i = 0; i < DPP_TILES.size(); ++i) {
         os << (i ? ", " : "") << DPP_TILES[i].width << "x" << DPP_TILES[i].height;
     }
@@ -1194,6 +1282,7 @@ int main(int argc, char** argv) {
         initContext(ctx);
         // The experiment's crops instead of Experiment 1's regions (the same in the profiling child)
         ctx.regions = std::make_unique<RegionSets>(neighborhood::cropRegionSets(REGION_ITERATIONS));
+        resizeRegions = std::make_unique<RegionSets>(REGION_ITERATIONS);
         if (argc > 4 && std::string(argv[2]) == "--profile-pass") {
             nb::profilePass(ctx, outDir, argv[3], argv[4]);
             return 0;
@@ -1217,7 +1306,7 @@ int main(int argc, char** argv) {
             });
         };
         if (validateOnly) {
-            forEachGroup([&]<char PART, size_t N, int K, int P>() { runGroup<PART, N, K, P>(ctx, false); });
+            forEachGroup([&]<char PART, size_t N, int K, int P, bool R>() { runGroup<PART, N, K, P, R>(ctx, false); });
             writeValidation(outDir / "validation.csv");
             if (fklFailed()) {
                 std::cerr << "ERROR: an FKL output is not within its tolerance" << std::endl;
@@ -1226,7 +1315,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         measureEventFloor(ctx);
-        forEachGroup([&]<char PART, size_t N, int K, int P>() { runGroup<PART, N, K, P>(ctx, true); });
+        forEachGroup([&]<char PART, size_t N, int K, int P, bool R>() { runGroup<PART, N, K, P, R>(ctx, true); });
         bool tracing = false;
         std::string profilingError;
         try {
@@ -1242,6 +1331,7 @@ int main(int argc, char** argv) {
             writeGpuTime(outDir / "gpu_time_l2_flushed.csv", true);
         }
         writeRegionStats((outDir / "regions.csv").string(), *ctx.regions, WARMUP_ITERS, TIMED_ITERS);
+        writeRegionStats((outDir / "regions_resize.csv").string(), *resizeRegions, WARMUP_ITERS, TIMED_ITERS);
         {
             std::ofstream stages(outDir / "kernel_breakdown.csv");
             stages << "implementation,N,kernel,median_us,p10_us,p90_us\n";
