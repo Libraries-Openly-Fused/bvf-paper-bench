@@ -216,8 +216,9 @@ inline void nv12ToRgb8(const Context& ctx, Npp8u* dst, int dstStep) {
 // VF+HF), which resize at dst * scale like FKL; or that with NPP's resize sampling (NPP, nppConventionReference8bit).
 // Fkl8bitFloorBox (the 8 bit RGB and a box filter that rounds down, NPP's 8 bit one) and FklFloatRounded (the float
 // chain with the filtered RGB rounded half up to 8 bits, NPPDx's 8 bit write) are only for programs with their own
-// reference() (fkl-neighborhood/).
-enum class Reference { FklFloat, Fkl8bit, NppSampling8bit, Fkl8bitFloorBox, FklFloatRounded };
+// reference() (fkl-neighborhood/). NppdxPixelCenterFloat (float, NPPDx's resize sampling at pixel centers) is for
+// nppdx-wins/.
+enum class Reference { FklFloat, Fkl8bit, NppSampling8bit, Fkl8bitFloorBox, FklFloatRounded, NppdxPixelCenterFloat };
 
 inline const char* referenceName(Reference r) {
     switch (r) {
@@ -225,12 +226,15 @@ inline const char* referenceName(Reference r) {
         case Reference::Fkl8bit: return "fkl_cpu_8bit_rgb";
         case Reference::Fkl8bitFloorBox: return "fkl_cpu_8bit_rgb_floor_box";
         case Reference::FklFloatRounded: return "fkl_cpu_float_rounded_8bit";
+        case Reference::NppdxPixelCenterFloat: return "nppdx_pixel_center_float";
         default: return "npp_sampling_8bit";
     }
 }
 
-// 1e-3 against the float reference, one level of 8 bit RGB against the 8 bit ones
-inline float toleranceOf(Reference r) { return r == Reference::FklFloat ? TOLERANCE : TOLERANCE_8BIT; }
+// 1e-3 against the float references, one level of 8 bit RGB against the 8 bit ones
+inline float toleranceOf(Reference r) {
+    return r == Reference::FklFloat || r == Reference::NppdxPixelCenterFloat ? TOLERANCE : TOLERANCE_8BIT;
+}
 
 // Each implementation enqueues one complete pipeline on the regions of iteration t on ctx.stream with run(t), and
 // returns the N x OUT_H x OUT_W x 3 float output with download(). fillNaN() poisons the output before validation.
