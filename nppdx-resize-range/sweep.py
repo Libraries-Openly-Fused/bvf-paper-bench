@@ -144,6 +144,22 @@ def main():
     bindir.mkdir(exist_ok=True)
     nppdx = args.nppdx.resolve()
 
+    def capture(cmd, cwd=None):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, cwd=cwd).stdout.strip()
+        except OSError as e:
+            return str(e)
+
+    with open(out / "environment.txt", "w") as f:
+        f.write(f"bvf-paper-bench: {capture(['git', 'rev-parse', 'HEAD'], cwd=REPO)} "
+                f"({capture(['git', 'status', '--porcelain', '--', 'nppdx-resize-range'], cwd=REPO) or 'clean'})\n")
+        f.write(f"nppdx: {capture(['git', 'describe', '--always', '--tags'], cwd=nppdx)} "
+                f"{capture(['git', 'rev-parse', 'HEAD'], cwd=nppdx)}\n")
+        f.write(f"nvcc: {capture(['nvcc', '--version']).splitlines()[-1]}\n")
+        f.write(f"gpu: {capture(['nvidia-smi', '--query-gpu=name,driver_version', '--format=csv,noheader'])}\n")
+        f.write(f"max J and K of the rules: {args.max_jk}\n")
+        f.write(f"started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
     # 1. NPPDx's rules over every ratio and tile
     rules = bindir / "resize_rules"
     subprocess.run(["nvcc", "-std=c++20", "-O3", "-arch=sm_89", "--expt-relaxed-constexpr", f"-I{nppdx}/include",
