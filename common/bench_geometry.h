@@ -196,12 +196,13 @@ inline std::string regionSizeList() {
     return os.str();
 }
 
-// The workload, for the platform files of every benchmark
-inline std::string describe() {
+// The workload, for the platform files of every benchmark. Without letterbox (the neighborhood experiment), the
+// resized regions are the output, with no rows added; batches is the list of batch sizes (default BATCHES).
+inline std::string describe(const bool letterbox = true, const std::string& batches = batchList(", ")) {
     std::ostringstream os;
     os << FRAME_W << "x" << FRAME_H << " NV12 frame (uniform random limited-range values, Y in [" << LUMA_MIN << ", "
        << LUMA_MAX << "], U and V in [" << CHROMA_MIN << ", " << CHROMA_MAX << "], seed " << FRAME_SEED
-       << "), NV12->RGB BT.601 limited range, N in {" << batchList(", ") << "} regions per iteration, new every "
+       << "), NV12->RGB BT.601 limited range, N in {" << batches << "} regions per iteration, new every "
        << "iteration (warm-up and timed) and precomputed before the loop (seed " << REGION_SEED
        << ", batch N uses the first N of every iteration): ";
     if (MIXED_SIZES) {
@@ -212,9 +213,14 @@ inline std::string describe() {
     }
     os << ", at uniform random even positions at least " << REGION_MARGIN << " pixels from the frame edges (drawn for a "
        << MAX_REGION_W << "x" << MAX_REGION_H << " box, the same positions for every size), bilinear resize to " << RES_W
-       << "x" << RES_H << " (aspect ratio ignored), " << BORDER_TOP << " black rows added on top and " << BORDER_BOTTOM
-       << " at the bottom, output " << OUT_W << "x" << OUT_H << " per region (CMake option BENCH_REGIONS="
-       << (MIXED_SIZES ? std::string("mixed") : regionSizeList()) << ")";
+       << "x" << RES_H << " (aspect ratio ignored), ";
+    if (letterbox) {
+        os << BORDER_TOP << " black rows added on top and " << BORDER_BOTTOM << " at the bottom, output " << OUT_W << "x"
+           << OUT_H;
+    } else {
+        os << "no rows added, output " << RES_W << "x" << RES_H;
+    }
+    os << " per region (CMake option BENCH_REGIONS=" << (MIXED_SIZES ? std::string("mixed") : regionSizeList()) << ")";
     return os.str();
 }
 
