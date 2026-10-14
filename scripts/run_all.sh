@@ -184,7 +184,7 @@ if has_step neighborhood; then
     programs=()
     for k in 3 5 7; do
         for passes in 1 2; do
-            programs+=("benchmark_fkl_neighborhood_k${k}_p$passes")
+            programs+=("benchmark_fkl_neighborhood_k${k}_p$passes" "benchmark_fkl_neighborhood_k${k}_p${passes}_resize")
         done
     done
     programs+=(benchmark_npp_neighborhood benchmark_opencv_cuda_neighborhood benchmark_nppdx_neighborhood

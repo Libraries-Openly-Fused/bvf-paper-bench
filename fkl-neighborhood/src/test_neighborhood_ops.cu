@@ -13,7 +13,7 @@
    limitations under the License. */
 
 // Tests of BoxBVF (common/bench_neighborhood_ops.h) and of FKL's MorphologyDPP box blur (executeBoxBlur, and
-// MorphologyDPP<ParArch::CPU> with its reducers and write) against the host reference of common/bench_neighborhood.h
+// MorphologyDPP<ParArch::CPU> with its passes) against the host reference of common/bench_neighborhood.h
 // (hostBoxPlane, sums in double), for every box size and number of passes of the experiment:
 //   - one PLANE_W x PLANE_H plane read directly (PerThreadRead);
 //   - a batch of CROP_W x CROP_H crops of a larger image, one of them at its corner (the chain of the experiment,
@@ -130,12 +130,11 @@ constexpr Details<K> details() {
     return Details<K>{PLANE_W, PLANE_H, K, K, K / 2, K / 2};
 }
 
-// The box of the experiment with MorphologyDPP on the CPU: the reducers and the write of executeBoxBlur
+// The box of the experiment with MorphologyDPP on the CPU: the passes of executeBoxBlur
 template <int K, int PASSES, typename ReadIOp, typename WriteIOp>
 void runDppCpu(const ReadIOp& read, const WriteIOp& write) {
     fk::MorphologyDPP<fk::ParArch::CPU, Details<K>>::exec(
-        details<K>(), read, fk::morphology_detail::boxBlurWrite<fk::float3, PASSES>(details<K>(), write),
-        fk::morphology_detail::boxBlurReducers<fk::float3, PASSES>());
+        details<K>(), read, write, fk::morphology_detail::boxBlurReducers<fk::float3, PASSES>(details<K>()));
 }
 
 template <int K, int PASSES>

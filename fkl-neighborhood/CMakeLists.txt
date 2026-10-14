@@ -16,12 +16,19 @@ option(BENCH_NPPDX "Build the NPPDx programs" ON)
 # BoxBVF and MorphologyDPP's box blur against the host reference of common/bench_neighborhood.h
 add_bench_target(test_neighborhood_ops src/test_neighborhood_ops.cu)
 
-# Part (a): one program per box size and number of passes (PART_A_KS, PART_A_PASSES of common/bench_neighborhood.h)
+# Part (a): one program per box size and number of passes (PART_A_KS, PART_A_PASSES of common/bench_neighborhood.h),
+# on the crops, and the same with the box after Figure 1's resize (_resize, on Figure 1's regions)
 foreach(K 3 5 7)
     foreach(PASSES 1 2)
-        set(TARGET_NAME benchmark_fkl_neighborhood_k${K}_p${PASSES})
-        add_bench_target(${TARGET_NAME} src/benchmark_fkl_neighborhood.cu)
-        target_compile_definitions(${TARGET_NAME} PRIVATE NEIGHBORHOOD_K=${K} NEIGHBORHOOD_PASSES=${PASSES})
+        foreach(RESIZE 0 1)
+            set(TARGET_NAME benchmark_fkl_neighborhood_k${K}_p${PASSES})
+            if(RESIZE)
+                string(APPEND TARGET_NAME _resize)
+            endif()
+            add_bench_target(${TARGET_NAME} src/benchmark_fkl_neighborhood.cu)
+            target_compile_definitions(${TARGET_NAME} PRIVATE NEIGHBORHOOD_K=${K} NEIGHBORHOOD_PASSES=${PASSES}
+                                                              NEIGHBORHOOD_RESIZE=${RESIZE})
+        endforeach()
     endforeach()
 endforeach()
 

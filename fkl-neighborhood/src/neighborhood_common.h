@@ -45,23 +45,31 @@ namespace bench::neighborhood {
 
 // The first N crops of iteration t on FKL's CPU backend: ReadNV12 -> YUVtoRGB -> Crop, in float (FKL's conversion),
 // or with the RGB rounded to 8 bits right after the conversion as in cpuReference (common/bench_gpu.h), like NPP's 8
-// bit RGB frame. N planes of PLANE_W x PLANE_H interleaved RGB, one after the other.
-template <size_t N, bool EIGHT_BIT>
+// bit RGB frame; with RESIZE, the regions resized to PLANE_W x PLANE_H after the crop (Resize, FKL's bilinear). N
+// planes of PLANE_W x PLANE_H interleaved RGB, one after the other.
+template <size_t N, bool EIGHT_BIT, bool RESIZE = false>
 std::vector<double> cropRgb(const Context& ctx, const size_t t) {
     const auto crops = fklRects<N>(ctx, t);
     fk::Stream_<fk::ParArch::CPU> cpuStream;
     fk::Tensor<fk::float3> out(PLANE_W, PLANE_H, N, 1, fk::MemType::Host);
     const auto rgbRead = fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameHost).then(YUVToRGB::build());
     const auto write = fk::TensorWrite<fk::float3>::build(out.ptr());
+    const auto run = [&](const auto& read) {
+        if constexpr (RESIZE) {
+            fk::executeOperations<fk::TransformDPP<fk::ParArch::CPU>>(cpuStream, read, fk::Crop<>::build(crops),
+                fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(
+                    fk::Size(PLANE_W, PLANE_H)), write);
+        } else {
+            fk::executeOperations<fk::TransformDPP<fk::ParArch::CPU>>(cpuStream, read, fk::Crop<>::build(crops), write);
+        }
+    };
     if constexpr (EIGHT_BIT) {
-        fk::executeOperations<fk::TransformDPP<fk::ParArch::CPU>>(cpuStream,
-            rgbRead.then(fk::NormalizePixel<fk::float3, fk::ColorDepth::p8bit>::build())
+        run(rgbRead.then(fk::NormalizePixel<fk::float3, fk::ColorDepth::p8bit>::build())
                 .then(fk::Add<fk::float3>::build(fk::make_set<fk::float3>(QUANTIZATION_OFFSET)))
                 .then(fk::SaturateDenormalizePixel<fk::float3, fk::uchar3, fk::ColorDepth::p8bit>::build())
-                .then(fk::Cast<fk::uchar3, fk::float3>::build()),
-            fk::Crop<>::build(crops), write);
+                .then(fk::Cast<fk::uchar3, fk::float3>::build()));
     } else {
-        fk::executeOperations<fk::TransformDPP<fk::ParArch::CPU>>(cpuStream, rgbRead, fk::Crop<>::build(crops), write);
+        run(rgbRead);
     }
     cpuStream.sync();
     const float* data = reinterpret_cast<const float*>(out.ptr().data);
@@ -75,9 +83,16 @@ std::vector<double> cropRgb(const Context& ctx, const size_t t) {
 //   FklFloatRounded  FKL's float RGB, box rounded half up to 8 bits (NPPDx's 8 bit write: NPPDx+NPP)
 //   Fkl8bit          8 bit RGB, float box (NPP's 32f box, OpenCV's float filters)
 //   Fkl8bitFloorBox  8 bit RGB, box rounded down, floor(sum / k^2) (NPP's 8 bit box)
-template <size_t N>
+// With RESIZE (part (a)'s variant with the resize, FKL only), the float reference of the resized regions.
+template <size_t N, bool RESIZE = false>
 std::vector<float> boxReferenceOf(const Context& ctx, const Reference r, const size_t t, const int k,
                                   const int passes) {
+    if constexpr (RESIZE) {
+        if (r != Reference::FklFloat) {
+            throw std::runtime_error("The variant with the resize is FKL only: float reference");
+        }
+        return boxReference(cropRgb<N, false, true>(ctx, t), N, k, passes, Rounding::None, MUL, SUB, DIV);
+    }
     switch (r) {
         case Reference::FklFloat:
             return boxReference(cropRgb<N, false>(ctx, t), N, k, passes, Rounding::None, MUL, SUB, DIV);
@@ -115,6 +130,19 @@ auto cropRead(const Context& ctx, const std::array<fk::Rect, N>& regions) {
         .then(fk::Crop<>::build(regions));
 }
 
+// The chain up to the box: the crops, or (RESIZE, part (a)'s variant with the resize) the regions resized to
+// PLANE_W x PLANE_H after the crop, as in Figure 1
+template <size_t N, bool RESIZE>
+auto boxInput(const Context& ctx, const std::array<fk::Rect, N>& regions) {
+    if constexpr (RESIZE) {
+        return cropRead<N>(ctx, regions).then(
+            fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(
+                fk::Size(PLANE_W, PLANE_H)));
+    } else {
+        return cropRead<N>(ctx, regions);
+    }
+}
+
 inline auto normalizedWrite(const fk::Tensor<fk::float3>& out) {
     return fk::Mul<fk::float3>::build(mulValue)
         .then(fk::Sub<fk::float3>::build(subValue))
@@ -123,11 +151,11 @@ inline auto normalizedWrite(const fk::Tensor<fk::float3>& out) {
 }
 
 // FKL's MorphologyDPP box blur with a TW x TH tile: one executeBoxBlur call (FusedKernelLibrary PR #393), one kernel
-// for the whole pipeline. The DPP reads the crops through the BVF chain and writes through the VF tail, so nothing is
-// in memory between the NV12 frame and the output; its grid has one z plane per crop. Every pass sums its window (an
-// Add reducer), and the Mul by 1 / K^(2 PASSES) runs in its write, in front of the normalization. Its shared memory
-// stages the tile, plus the halo of every pass, of the K x K box.
-template <size_t N, int K, int PASSES, int TW, int TH>
+// for the whole pipeline. The DPP reads the crops (or the resized regions) through the BVF chain and writes through the
+// VF tail, so nothing is in memory between the NV12 frame and the output; its grid has one z plane per crop. Every pass
+// sums its window (an Add reducer) and multiplies the sum by 1 / K^2 (its finalizer), so every pass is a mean. Its
+// shared memory stages the tile, plus the halo of every pass, of the K x K box.
+template <size_t N, int K, int PASSES, int TW, int TH, bool RESIZE = false>
 Implementation makeFklDpp(Context& ctx) {
     auto out = planesTensor<N>();
     const auto regions = fklRegionSets<N>(ctx);
@@ -136,7 +164,7 @@ Implementation makeFklDpp(Context& ctx) {
         using Details = fk::MorphologyDPPDetails<fk::float3, TW, TH, K, K>;
         const Details details{PLANE_W, PLANE_H, K, K, K / 2, K / 2};
         beforeKernel();
-        if (!fk::executeBoxBlur<PASSES>(details, cropRead<N>(ctx, (*regions)[t]), normalizedWrite(*out),
+        if (!fk::executeBoxBlur<PASSES>(details, boxInput<N, RESIZE>(ctx, (*regions)[t]), normalizedWrite(*out),
                                         *ctx.fkStream)) {
             throw std::runtime_error("executeBoxBlur rejected its details");
         }
@@ -146,27 +174,23 @@ Implementation makeFklDpp(Context& ctx) {
 }
 
 // FKL with the box as a BVF operation (common/bench_neighborhood_ops.h): one executeOperations call, one kernel, in
-// which every output value evaluates the read chain (an NV12 read and a color conversion) K x K times per pass (K^4
-// times for two passes)
-template <size_t N, int K, int PASSES>
+// which every output value evaluates the read chain (an NV12 read and a color conversion; with RESIZE, the bilinear
+// resize, which reads four of them) K x K times per pass (K^4 times for two passes)
+template <size_t N, int K, int PASSES, bool RESIZE = false>
 Implementation makeFklNaive(Context& ctx) {
     static_assert(PASSES == 1 || PASSES == 2, "One or two passes");
     auto out = planesTensor<N>();
     const auto regions = fklRegionSets<N>(ctx);
     Implementation impl{"fkl_bvf_ops", Reference::FklFloat};
     impl.run = [&ctx, out, regions](size_t t) {
-        const auto read = fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice);
+        const auto input = boxInput<N, RESIZE>(ctx, (*regions)[t]);
+        const auto write = normalizedWrite(*out);
         beforeKernel();
         if constexpr (PASSES == 1) {
-            fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream, read, YUVToRGB::build(),
-                fk::Crop<>::build((*regions)[t]), fk::BoxBVF<K>::build(), fk::Mul<fk::float3>::build(mulValue),
-                fk::Sub<fk::float3>::build(subValue), fk::Div<fk::float3>::build(divValue),
-                fk::TensorWrite<fk::float3>::build(out->ptr()));
+            fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream, input.then(fk::BoxBVF<K>::build()), write);
         } else {
-            fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream, read, YUVToRGB::build(),
-                fk::Crop<>::build((*regions)[t]), fk::BoxBVF<K>::build(), fk::BoxBVF<K>::build(),
-                fk::Mul<fk::float3>::build(mulValue), fk::Sub<fk::float3>::build(subValue),
-                fk::Div<fk::float3>::build(divValue), fk::TensorWrite<fk::float3>::build(out->ptr()));
+            fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
+                input.then(fk::BoxBVF<K>::build()).then(fk::BoxBVF<K>::build()), write);
         }
     };
     setPlanesIO<N>(impl, out);
@@ -260,11 +284,11 @@ void withTile(const size_t index, F&& f) {
     }(std::make_index_sequence<DPP_TILES.size()>{});
 }
 
-template <size_t N, int K, int PASSES>
+template <size_t N, int K, int PASSES, bool RESIZE>
 TileSweepRow sweepTile(Context& ctx, const size_t index, const std::vector<float>& reference) {
     TileSweepRow row{N, DPP_TILES[index]};
     withTile(index, [&]<size_t I>() {
-        const Implementation impl = makeFklDpp<N, K, PASSES, DPP_TILES[I].width, DPP_TILES[I].height>(ctx);
+        const Implementation impl = makeFklDpp<N, K, PASSES, DPP_TILES[I].width, DPP_TILES[I].height, RESIZE>(ctx);
         impl.fillNaN();
         gpuErrchk(cudaDeviceSynchronize());
         impl.run(WARMUP_ITERS);
@@ -276,7 +300,7 @@ TileSweepRow sweepTile(Context& ctx, const size_t index, const std::vector<float
 }
 
 // The tile of batch N: chosen the first time (main run) or read (other modes)
-template <size_t N, int K, int PASSES>
+template <size_t N, int K, int PASSES, bool RESIZE>
 size_t chooseTile(Context& ctx) {
     if (tileChoice.chosen.count(N)) {
         return tileChoice.chosen.at(N);
@@ -285,11 +309,11 @@ size_t chooseTile(Context& ctx) {
         throw std::runtime_error("No MorphologyDPP tile for N = " + std::to_string(N) + " in " +
                                  (tileChoice.outDir / TILE_FILE).string());
     }
-    const auto reference = boxReferenceOf<N>(ctx, Reference::FklFloat, WARMUP_ITERS, K, PASSES);
+    const auto reference = boxReferenceOf<N, RESIZE>(ctx, Reference::FklFloat, WARMUP_ITERS, K, PASSES);
     const size_t first = tileChoice.rows.size();
     size_t best = DPP_TILES.size();
     for (size_t i = 0; i < DPP_TILES.size(); ++i) {
-        tileChoice.rows.push_back(sweepTile<N, K, PASSES>(ctx, i, reference));
+        tileChoice.rows.push_back(sweepTile<N, K, PASSES, RESIZE>(ctx, i, reference));
         const TileSweepRow& r = tileChoice.rows.back();
         std::cout << "N " << N << ": MorphologyDPP tile " << r.tile.width << "x" << r.tile.height << " median "
                   << std::fixed << std::setprecision(2) << r.timing.median << " us, max abs error " << std::scientific
@@ -309,11 +333,11 @@ size_t chooseTile(Context& ctx) {
 }
 
 // FKL's MorphologyDPP box blur with the tile of batch N
-template <size_t N, int K, int PASSES>
+template <size_t N, int K, int PASSES, bool RESIZE = false>
 Implementation fklDpp(Context& ctx) {
     Implementation impl;
-    withTile(chooseTile<N, K, PASSES>(ctx), [&]<size_t I>() {
-        impl = makeFklDpp<N, K, PASSES, DPP_TILES[I].width, DPP_TILES[I].height>(ctx);
+    withTile(chooseTile<N, K, PASSES, RESIZE>(ctx), [&]<size_t I>() {
+        impl = makeFklDpp<N, K, PASSES, DPP_TILES[I].width, DPP_TILES[I].height, RESIZE>(ctx);
     });
     return impl;
 }
@@ -338,38 +362,50 @@ inline std::string tileSummary() {
 // Platform file
 // ------------------------------------------------------------------------------------------------
 
-// The workload of a program with a k x k box in passes passes and the given batch sizes
+// The workload of a program with a k x k box in passes passes and the given batch sizes; with resize, part (a)'s
+// variant with the resize (Figure 1's regions, resized, then the box)
 template <size_t B>
-void describeWorkload(std::ostream& os, const int k, const int passes, const std::array<size_t, B>& batches) {
+void describeWorkload(std::ostream& os, const int k, const int passes, const std::array<size_t, B>& batches,
+                      const bool resize = false) {
     std::ostringstream list;
     for (size_t i = 0; i < B; ++i) {
         list << (i ? ", " : "") << batches[i];
     }
-    os << "bvf-paper-bench: commit " << BENCH_REPO_COMMIT << " (FKL: the commit above)\n"
-       << "Workload (Experiment 3, neighborhood operations): " << FRAME_W << "x" << FRAME_H << " NV12 frame (uniform "
-       << "random limited-range values, Y in [" << LUMA_MIN << ", " << LUMA_MAX << "], U and V in [" << CHROMA_MIN
-       << ", " << CHROMA_MAX << "], seed " << FRAME_SEED << "), NV12->RGB BT.601 limited range, N in {" << list.str()
-       << "} crops of " << CROP_W << "x" << CROP_H << " per iteration, new every iteration (warm-up and timed) and "
-       << "precomputed before the loop (seed " << REGION_SEED << ", batch N uses the first N of every iteration), at "
-       << "uniform random even positions at least " << REGION_MARGIN << " pixels from the frame edges "
-       << "(cropRegionSets, common/bench_neighborhood.h). No resize and no added rows: each crop is blurred with a "
-       << k << "x" << k << " box (the mean of the window centered on the value, per channel, replicating the edge of "
-       << "the crop" << (passes > 1 ? "; " + std::to_string(passes) + " passes, each replicating the edge of the crop "
-                                          "it reads" : std::string(", one pass"))
-       << "), then Mul (1/255), Sub (0.485, 0.456, 0.406), Div (0.229, 0.224, 0.225), float3 tensor of N planes "
-       << PLANE_W << "x" << PLANE_H << "\n"
-       << "FKL DPP: one executeBoxBlur<" << passes << "> call (FusedKernelLibrary PR #393), one kernel: FKL's "
-       << "MorphologyDPP<float3, TW, TH, " << k << ", " << k << "> with an Add reducer per pass over the N crops (one "
-       << "grid z plane each), reading them through the BVF chain ReadNV12 -> YUVtoRGB -> Crop fused into its reads, "
-       << "staging them per tile with the halo of its passes in shared memory, and writing through Mul (1/" << k * k
-       << (passes > 1 ? "^" + std::to_string(passes) : std::string()) << ") -> Mul -> Sub -> Div -> TensorWrite fused "
-       << "into its write: no intermediates in memory, float3 from the color conversion to the write.\n"
+    const std::string box = std::to_string(k) + "x" + std::to_string(k) + " box (the mean of the window centered on "
+        "the value, per channel, replicating the edge of the " + (resize ? "resized region" : "crop") +
+        (passes > 1 ? "; " + std::to_string(passes) + " passes, each one replicating the edge of the image it reads" :
+                      std::string("; one pass")) + ")";
+    os << "bvf-paper-bench: commit " << BENCH_REPO_COMMIT << " (FKL: the commit above)\n";
+    if (resize) {
+        os << "Workload (Experiment 3, neighborhood operations, part (a) with the resize): "
+           << geometry::describe(false, list.str()) << ". Unlike Figure 1 there is no AddBorder: each resized region "
+           << "is blurred with a " << box << ", then Mul (1/255), Sub (0.485, 0.456, 0.406), Div (0.229, 0.224, "
+           << "0.225), float3 tensor of N planes " << PLANE_W << "x" << PLANE_H << "\n";
+    } else {
+        os << "Workload (Experiment 3, neighborhood operations): " << FRAME_W << "x" << FRAME_H << " NV12 frame "
+           << "(uniform random limited-range values, Y in [" << LUMA_MIN << ", " << LUMA_MAX << "], U and V in ["
+           << CHROMA_MIN << ", " << CHROMA_MAX << "], seed " << FRAME_SEED << "), NV12->RGB BT.601 limited range, N "
+           << "in {" << list.str() << "} crops of " << CROP_W << "x" << CROP_H << " per iteration, new every iteration "
+           << "(warm-up and timed) and precomputed before the loop (seed " << REGION_SEED << ", batch N uses the "
+           << "first N of every iteration), at uniform random even positions at least " << REGION_MARGIN << " pixels "
+           << "from the frame edges (cropRegionSets, common/bench_neighborhood.h). No resize and no added rows: each "
+           << "crop is blurred with a " << box << ", then Mul (1/255), Sub (0.485, 0.456, 0.406), Div (0.229, 0.224, "
+           << "0.225), float3 tensor of N planes " << PLANE_W << "x" << PLANE_H << "\n";
+    }
+    os << "FKL DPP: one executeBoxBlur<" << passes << "> call (FusedKernelLibrary PR #393), one kernel: FKL's "
+       << "MorphologyDPP<float3, TW, TH, " << k << ", " << k << "> over the N " << (resize ? "regions" : "crops")
+       << " (one grid z plane each), every pass an Add reducer with a Mul by 1/" << k * k << " as its finalizer (a "
+       << "mean), reading them through the BVF chain ReadNV12 -> YUVtoRGB -> Crop" << (resize ? " -> Resize" : "")
+       << " fused into its reads, staging them per tile with the halo of its passes in shared memory, and writing "
+       << "through Mul -> Sub -> Div -> TensorWrite fused into its write: no intermediates in memory, float3 from the "
+       << "color conversion to the write.\n"
        << tileSummary()
-       << "References: the crops of FKL's CPU backend (ReadNV12 -> YUVtoRGB -> Crop), in float or with the RGB "
-       << "rounded to 8 bits after the conversion (the 8 bit RGB frame of the libraries that convert with NPP), the box "
-       << "in double, rounded as the implementation rounds it (none, half up for NPPDx's 8 bit write, down for NPP's 8 "
-       << "bit box), then the normalization in float (boxReference, common/bench_neighborhood.h): the box before the "
-       << "normalization, as every pipeline.\n";
+       << "References: the " << (resize ? "resized regions" : "crops") << " of FKL's CPU backend (ReadNV12 -> "
+       << "YUVtoRGB -> Crop" << (resize ? " -> Resize" : "") << "), in float or with the RGB rounded to 8 bits after "
+       << "the conversion (the 8 bit RGB frame of the libraries that convert with NPP), the box in double, rounded as "
+       << "the implementation rounds it (none, half up for NPPDx's 8 bit write, down for NPP's 8 bit box), then the "
+       << "normalization in float (boxReference, common/bench_neighborhood.h): the box before the normalization, as "
+       << "every pipeline.\n";
 }
 
 } // namespace bench::neighborhood
