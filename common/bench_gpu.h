@@ -39,6 +39,8 @@
 //   workload(os)                          the pipeline and its output, for the platform file
 //   batches                               the batch sizes to run, a subset of BATCHES in the same order
 //   setup(outDir, mode)                   called before any run, with the mode argument (empty for the main run)
+//   regionSize                            every region of this size (RegionSets' fixed-size constructor) instead of
+//                                         the sizes of BENCH_REGIONS
 
 #ifndef BVF_BENCH_GPU_H
 #define BVF_BENCH_GPU_H
@@ -139,7 +141,8 @@ struct Context {
     std::unique_ptr<RegionSets> regions;
 };
 
-inline void initContext(Context& ctx) {
+// regions: the regions of every iteration (regionSetsOf<P>), or nullptr for those of common/bench_geometry.h
+inline void initContext(Context& ctx, std::unique_ptr<RegionSets> regions = nullptr) {
     gpuErrchk(cudaStreamCreateWithFlags(&ctx.stream, cudaStreamNonBlocking));
     ctx.fkStream = std::make_unique<fk::Stream>(ctx.stream);
     ctx.npp = npp::streamContext(ctx.stream);
@@ -166,7 +169,7 @@ inline void initContext(Context& ctx) {
     ctx.uv = raw.data + static_cast<size_t>(FRAME_H) * ctx.pitch;
 
     // The regions of every iteration, generated before any loop; batch N uses the first N of every iteration
-    ctx.regions = std::make_unique<RegionSets>(REGION_ITERATIONS);
+    ctx.regions = regions ? std::move(regions) : std::make_unique<RegionSets>(REGION_ITERATIONS);
 }
 
 // L2 flush before every kernel, for the GPU only benchmark with a flushed L2: simulates a GPU that runs other kernels
@@ -211,15 +214,17 @@ inline void nv12ToRgb8(const Context& ctx, Npp8u* dst, int dstStep) {
 // The reference an implementation is checked against, with its tolerance: the Figure 1 chain on FKL's CPU backend in
 // float (FKL BVF); the same with the RGB rounded to 8 bits, for the pipelines with an 8 bit RGB frame (OpenCV, FKL
 // VF+HF), which resize at dst * scale like FKL; or that with NPP's resize sampling (NPP, nppConventionReference8bit).
-// NppdxPixelCenters8bit (NPPDx's resize sampling at pixel centers and its 8 bit resized RGB) is only for programs with
-// their own reference() (fkl-neighborhood/).
-enum class Reference { FklFloat, Fkl8bit, NppSampling8bit, NppdxPixelCenters8bit };
+// Fkl8bitFloorBox (the 8 bit RGB and a box filter that rounds down, NPP's 8 bit one) and FklFloatRounded (the float
+// chain with the filtered RGB rounded half up to 8 bits, NPPDx's 8 bit write) are only for programs with their own
+// reference() (fkl-neighborhood/).
+enum class Reference { FklFloat, Fkl8bit, NppSampling8bit, Fkl8bitFloorBox, FklFloatRounded };
 
 inline const char* referenceName(Reference r) {
     switch (r) {
         case Reference::FklFloat: return "fkl_cpu_float";
         case Reference::Fkl8bit: return "fkl_cpu_8bit_rgb";
-        case Reference::NppdxPixelCenters8bit: return "nppdx_pixel_centers_8bit";
+        case Reference::Fkl8bitFloorBox: return "fkl_cpu_8bit_rgb_floor_box";
+        case Reference::FklFloatRounded: return "fkl_cpu_float_rounded_8bit";
         default: return "npp_sampling_8bit";
     }
 }
@@ -417,8 +422,9 @@ std::vector<float> referenceOutput(const Context& ctx, Reference r, size_t t) {
     switch (r) {
         case Reference::FklFloat: return cpuReference<N, false>(ctx, t);
         case Reference::Fkl8bit: return cpuReference<N, true>(ctx, t);
-        case Reference::NppdxPixelCenters8bit:
-            throw std::runtime_error("The NPPDx reference is only computed by programs with their own reference()");
+        case Reference::Fkl8bitFloorBox:
+        case Reference::FklFloatRounded:
+            throw std::runtime_error("This reference is only computed by programs with their own reference()");
         default: return nppConventionReference8bit<N>(ctx, t);
     }
 }
@@ -458,6 +464,16 @@ constexpr const char* fklShortLabelOf() {
         return P::fklShortLabel;
     } else {
         return "BVF";
+    }
+}
+
+// The regions of iterations 0 to iterations - 1: of size P::regionSize, or those of common/bench_geometry.h
+template <typename P>
+std::unique_ptr<RegionSets> regionSetsOf(size_t iterations) {
+    if constexpr (requires { P::regionSize; }) {
+        return std::make_unique<RegionSets>(iterations, P::regionSize);
+    } else {
+        return std::make_unique<RegionSets>(iterations);
     }
 }
 
@@ -1220,13 +1236,17 @@ int gpuBenchMain(int argc, char** argv) {
         }
         if (argc == 2 && std::string(argv[1]) == "--workload") {
             // The workload this binary was built for, so that scripts can check that binaries and results match
-            std::cout << describe() << std::endl;
+            if constexpr (requires { P::workload(std::cout); }) {
+                P::workload(std::cout);
+            } else {
+                std::cout << describe() << std::endl;
+            }
             return 0;
         }
         if (argc == 3 && std::string(argv[1]) == "--regions") {
             // The regions of one iteration as CSV, for the traffic model of the Nsight Compute profiles
             const size_t t = std::stoul(argv[2]);
-            std::cout << regionsCsv(RegionSets(t + 1), t);
+            std::cout << regionsCsv(*regionSetsOf<P>(t + 1), t);
             return 0;
         }
         std::filesystem::path outDir = argc > 1 ? argv[1] : "results";
@@ -1236,7 +1256,7 @@ int gpuBenchMain(int argc, char** argv) {
         }
 
         Context ctx;
-        initContext(ctx);
+        initContext(ctx, regionSetsOf<P>(REGION_ITERATIONS));
         const auto baselines = baselineNames<P>(ctx);
 
         if (argc > 2 && std::string(argv[2]) == "--gpu-only-l2-flushed") {
