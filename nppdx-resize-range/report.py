@@ -42,6 +42,9 @@ def launch_text(row):
         text = f"ran, interior max diff {interior}"
         if over not in ("", "0"):
             text += f" ({over} values > 1)"
+        example = row.get("launch_example_max_diff_interior", "")
+        if example not in ("", interior):
+            text += f"; example reference: {example}"
         r32 = row["launch32_result"]
         if r32 == "ran" and row["launch32_max_diff_interior"] != interior:
             text += f"; 32 threads: {row['launch32_max_diff_interior']}"
@@ -206,6 +209,19 @@ def main():
                     bad += 1
         w(f"| {div} | {res} | {len(rows)} | {ok if res == 'ran' else ''} | {bad if res == 'ran' else ''} | "
           f"{none if res == 'ran' else ''} |")
+    w("")
+    w("The interior max diff is against the probe's exact reference (integer phases). NPPDx's example reference "
+      "computes the phase in float; against it:")
+    w("")
+    ex = Counter()
+    for s in sweep:
+        if s["sm"] == "890" and s["launch_result"] == "ran" and s["launch_interior_pixels"] not in ("", "0"):
+            exact_ok = int(s["launch_max_diff_interior"]) <= 1
+            example_ok = int(s["launch_example_max_diff_interior"]) <= 1
+            ex[(exact_ok, example_ok)] += 1
+    for (exact_ok, example_ok), n in sorted(ex.items(), reverse=True):
+        w(f"- exact reference {'within' if exact_ok else 'beyond'} 1 level, example reference "
+          f"{'within' if example_ok else 'beyond'}: {n} points")
     w("")
     w("With 32 threads per block instead of the example's one thread per cell:")
     w("")

@@ -13,8 +13,7 @@ The pipeline of sweep.py (ingest -> BoxBlur<5, 5> -> Resize<J, K, Method> -> exg
 One line per ratio: method, J, K, factor (K / J: above 1 an upscale, below 1 a downscale), best_tile, smem_bytes,
 launched (yes / no) and correct (yes / no / untested).
 - Correct: the launch ran and the interior of its output is within 1 level of the CPU reference, as in README.md.
-- No: it ran and differs. This is NPPDx's nearest defect at the center phase (README.md), which does not depend on the
-  tile.
+- No: it ran and differs from the exact reference: NPPDx's nearest defect at the center phase (README.md).
 The comment lines (#) at the top give the search. The raw launch output is in <work directory>/results.jsonl.
 """
 
