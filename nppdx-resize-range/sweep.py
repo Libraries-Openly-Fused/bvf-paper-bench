@@ -15,7 +15,8 @@ Steps, all into the output directory:
 4. Compiles every point with probe/resize_probe.cu (nvcc, -arch=sm_89 for SM 890 and sm_90 for SM 900), in parallel.
    A point NPPDx rejects fails to compile: its static_assert texts are recorded. A point that compiles is run: it
    prints its tiles, shared memory and block. On the RTX 4090 every SM 890 point is also launched once with
-   fused_resize.cu's block (--launch) and once with 32 threads (--launch 32), and compared with the CPU reference.
+   fused_resize.cu's block (--launch) and once with 32 threads (--launch 32), and compared with the probe's exact
+   reference (and NPPDx's example reference, whose float phase is off by one pixel at some ratios).
 5. Writes sweep.csv (one line per point) and agreement.txt (the rules against the compiler and the program).
 
 No timing: this is capability data, one launch per point.
@@ -235,8 +236,9 @@ def main():
                "probe_matches_rules", "device_max_shared_memory_per_block_optin",
                "launch_result", "launch_error", "launch_block", "launch_grid", "launch_image", "launch_output",
                "launch_max_diff", "launch_values_over_1", "launch_interior_pixels", "launch_max_diff_interior",
-               "launch_interior_values_over_1", "launch32_result", "launch32_error", "launch32_max_diff",
-               "launch32_max_diff_interior", "launch32_interior_values_over_1"]
+               "launch_interior_values_over_1", "launch_example_max_diff", "launch_example_max_diff_interior",
+               "launch32_result", "launch32_error", "launch32_max_diff", "launch32_max_diff_interior",
+               "launch32_interior_values_over_1"]
     disagreements, mismatches, rows = [], [], []
     for key in keys:
         r, p = results[key], predicted[key]
@@ -270,7 +272,8 @@ def main():
             row[f"{tag}_max_diff"] = r.get(f"{tag}_max_diff", "")
             row[f"{tag}_max_diff_interior"] = r.get(f"{tag}_max_diff_interior", "")
             row[f"{tag}_interior_values_over_1"] = r.get(f"{tag}_interior_values_over_1", "")
-        for c in ("block", "grid", "image", "output", "values_over_1", "interior_pixels"):
+        for c in ("block", "grid", "image", "output", "values_over_1", "interior_pixels", "example_max_diff",
+                  "example_max_diff_interior"):
             row[f"launch_{c}"] = r.get(f"launch_{c}", "")
         rows.append(row)
     with open(out / "sweep.csv", "w", newline="") as f:

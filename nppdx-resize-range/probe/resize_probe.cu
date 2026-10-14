@@ -19,7 +19,7 @@
 // Compiled once per point by sweep.py with -DPROBE_J, -DPROBE_K, -DPROBE_METHOD (nearest, bilinear, bicubic or
 // lanczos3), -DPROBE_TX, -DPROBE_TY and -DPROBE_SM. If NPPDx rejects the point, the compiler prints NPPDx's
 // static_assert. If it accepts it, the program prints the tiles, the shared memory and the block of the point and,
-// with --launch, runs the kernel once on a random RGB24 image and compares it with a CPU reference.
+// with --launch, runs the kernel once on a random RGB24 image and compares it with CPU references.
 
 #include <nppdx.hpp>
 
@@ -166,6 +166,91 @@ std::vector<float> hostBox(const std::vector<uint8_t>& in, int w, int h) {
     return out;
 }
 
+// NPPDx's example reference (cpu_reference::resize) computes the phase of an output pixel in float,
+// theta = frac((o + 0.5f) * (J / K) - 0.5f). Where theta is exactly 0, the float can come out just under 1, which moves
+// the reference's taps by one pixel (at 7:3, 13:11 or 3:19, for every method). The exact reference is the same resample
+// with the phase and the center index from integers, as in NPPDx's kernel (compute_phase_index and
+// compute_center_input_index of detail/backend/resize_operations.hpp), and the taps and weights of the example
+// reference in double. Nearest has ties where theta is exactly 1/2 (J even): there both source pixels are accepted.
+constexpr int exactSpan() {
+    const unsigned int muNum = METHOD == nppdx::interpolation_method::bicubic    ? 2u
+                               : METHOD == nppdx::interpolation_method::lanczos3 ? 3u
+                                                                                 : 1u;
+    const unsigned int muDen = METHOD == nppdx::interpolation_method::nearest ? 2u : 1u;
+    const unsigned int radiusNum = J > K ? muNum * J : muNum;
+    const unsigned int radiusDen = J > K ? muDen * K : muDen;
+    const unsigned int raw = (2 * radiusNum + radiusDen - 1) / radiusDen;
+    return METHOD == nppdx::interpolation_method::nearest ? 1 : int(raw + raw % 2);
+}
+
+double exactKernel(double x) {
+    constexpr double pi = 3.14159265358979323846;
+    const double a = std::abs(x);
+    switch (METHOD) {
+    case nppdx::interpolation_method::nearest: return a <= 0.5 ? 1.0 : 0.0;
+    case nppdx::interpolation_method::bilinear: return a < 1.0 ? 1.0 - a : 0.0;
+    case nppdx::interpolation_method::bicubic:
+        if (a < 1.0) return (1.5 * a - 2.5) * a * a + 1.0;
+        if (a < 2.0) return ((-0.5 * a + 2.5) * a - 4.0) * a + 2.0;
+        return 0.0;
+    case nppdx::interpolation_method::lanczos3:
+        if (x == 0.0) return 1.0;
+        if (a >= 3.0) return 0.0;
+        return (std::sin(pi * x) / (pi * x)) * (std::sin(pi * x / 3.0) / (pi * x / 3.0));
+    default: return 0.0;
+    }
+}
+
+struct AxisTaps {
+    int start = 0;
+    std::vector<double> weights;
+    bool tie = false; // nearest: the source pixels start - 1 and start are at the same distance
+};
+
+AxisTaps exactTaps(long long o) {
+    constexpr int span = exactSpan();
+    const long long twoK = 2LL * K;
+    const long long num = (2 * o + 1) * static_cast<long long>(J) - static_cast<long long>(K);
+    const long long center = num >= 0 ? num / twoK : (num - twoK + 1) / twoK;
+    const long long phase = num - center * twoK; // theta = phase / 2K, in [0, 1)
+    const int delta = span % 2 == 0 ? 2 : (2 * phase < twoK ? 1 : 3);
+    AxisTaps taps;
+    taps.start = int(center) - (span - delta) / 2;
+    const double theta = double(phase) / double(twoK);
+    const double l = double(span - delta) / 2.0;
+    for (int j = 0; j < span; ++j) taps.weights.push_back(exactKernel(theta + l - double(j)));
+    taps.tie = METHOD == nppdx::interpolation_method::nearest && 2 * phase == twoK;
+    return taps;
+}
+
+// The smallest difference between an output value and the exact reference (any tie of nearest)
+int exactDiff(const std::vector<float>& blurred, int w, int h, const AxisTaps& tx, const AxisTaps& ty, unsigned int c,
+              int value) {
+    auto at = [&](int x, int y) {
+        x = std::clamp(x, 0, w - 1);
+        y = std::clamp(y, 0, h - 1);
+        return double(blurred[(static_cast<size_t>(y) * w + x) * CHANNELS + c]);
+    };
+    auto diff = [&](double v) { return std::abs(value - int(std::floor(std::clamp(v, 0.0, 255.0) + 0.5))); };
+    if (METHOD == nppdx::interpolation_method::nearest) {
+        int best = diff(at(tx.start, ty.start));
+        if (tx.tie) best = std::min(best, diff(at(tx.start - 1, ty.start)));
+        if (ty.tie) best = std::min(best, diff(at(tx.start, ty.start - 1)));
+        if (tx.tie && ty.tie) best = std::min(best, diff(at(tx.start - 1, ty.start - 1)));
+        return best;
+    }
+    double sum = 0.0, weights = 0.0;
+    for (size_t jy = 0; jy < ty.weights.size(); ++jy) {
+        for (size_t jx = 0; jx < tx.weights.size(); ++jx) {
+            const double wgt = ty.weights[jy] * tx.weights[jx];
+            if (wgt == 0.0) continue;
+            sum += wgt * at(tx.start + int(jx), ty.start + int(jy));
+            weights += wgt;
+        }
+    }
+    return diff(weights > 1e-6 ? sum / weights : sum);
+}
+
 #define PROBE_CUDA(call)                                                                                               \
     do {                                                                                                               \
         const cudaError_t err_ = (call);                                                                               \
@@ -175,11 +260,11 @@ std::vector<float> hostBox(const std::vector<uint8_t>& in, int w, int h) {
         }                                                                                                              \
     } while (0)
 
-// Runs the kernel once on a random RGB24 image of 3 x 3 input tiles (more if the output would have fewer than 2 x 2
-// output tiles) and compares it with the CPU reference: the 5x5 box above, then NPPDx's example resize
-// (cpu_reference::resize<J, K, Method>, which replicates the edge of the blurred image), rounded to 8 bits.
-// The kernel blurs the replicated input outside the image instead, so the comparison is also given for the interior:
-// the output pixels whose resize footprint and box window are inside the image.
+// Runs the kernel once on a random RGB24 image of at least 3 x 3 input tiles and compares it with the CPU references:
+// the 5x5 box above, then the exact resample above (max_diff...) and NPPDx's example resize (example_max_diff...),
+// both replicating the edge of the blurred image, rounded to 8 bits. The kernel blurs the replicated input outside the
+// image instead, so the comparison is also given for the interior: the output pixels whose resize footprint and box
+// window are inside the image.
 int launch(unsigned int blockThreads) {
     int device = 0;
     PROBE_CUDA(cudaGetDevice(&device));
@@ -241,7 +326,11 @@ int launch(unsigned int blockThreads) {
     const auto reference =
         nppdx::example::cpu_reference::resize<J, K, METHOD, CHANNELS>(blurred, int(w), int(h));
 
-    int maxDiff = 0, maxDiffInterior = 0;
+    std::vector<AxisTaps> tapsX, tapsY;
+    for (unsigned int x = 0; x < ow; ++x) tapsX.push_back(exactTaps(x));
+    for (unsigned int y = 0; y < oh; ++y) tapsY.push_back(exactTaps(y));
+
+    int maxDiff = 0, maxDiffInterior = 0, exampleMaxDiff = 0, exampleMaxDiffInterior = 0;
     size_t over1 = 0, over1Interior = 0, interior = 0;
     for (unsigned int y = 0; y < oh; ++y) {
         const double cy = (y + 0.5) * double(J) / double(K) - 0.5;
@@ -252,21 +341,25 @@ int launch(unsigned int blockThreads) {
             interior += inside ? 1 : 0;
             for (unsigned int c = 0; c < CHANNELS; ++c) {
                 const size_t i = (static_cast<size_t>(y) * ow + x) * CHANNELS + c;
+                const int diff = exactDiff(blurred, int(w), int(h), tapsX[x], tapsY[y], c, int(hostOut[i]));
                 const float ref = std::clamp(reference[i], 0.0f, 255.0f);
-                const int diff = std::abs(int(hostOut[i]) - int(std::floor(ref + 0.5f)));
+                const int exampleDiff = std::abs(int(hostOut[i]) - int(std::floor(ref + 0.5f)));
                 maxDiff = std::max(maxDiff, diff);
+                exampleMaxDiff = std::max(exampleMaxDiff, exampleDiff);
                 over1 += diff > 1 ? 1 : 0;
                 if (inside) {
                     maxDiffInterior = std::max(maxDiffInterior, diff);
+                    exampleMaxDiffInterior = std::max(exampleMaxDiffInterior, exampleDiff);
                     over1Interior += diff > 1 ? 1 : 0;
                 }
             }
         }
     }
     std::printf("launch result=ran,image=%ux%u,output=%ux%u,grid=%ux%u,block=%u,smem_bytes=%u,max_diff=%d,"
-                "values_over_1=%zu,interior_pixels=%zu,max_diff_interior=%d,interior_values_over_1=%zu\n",
+                "values_over_1=%zu,interior_pixels=%zu,max_diff_interior=%d,interior_values_over_1=%zu,"
+                "example_max_diff=%d,example_max_diff_interior=%d\n",
                 w, h, ow, oh, grid.x, grid.y, blockThreads, SMEM, maxDiff, over1, interior, maxDiffInterior,
-                over1Interior);
+                over1Interior, exampleMaxDiff, exampleMaxDiffInterior);
     cudaFree(dIn);
     cudaFree(dOut);
     return 0;
