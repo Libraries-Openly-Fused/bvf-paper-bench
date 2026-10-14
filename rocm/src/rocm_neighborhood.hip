@@ -487,7 +487,7 @@ void runGroup(Context& ctx, bool timing) {
     }
     for (size_t k = 0; k < impls.size(); ++k) {
         GroupResult& gr = rs[k];
-        gr.chosen = gr.chosen || k == rpp || gr.r.name == "fkl_bvf_naive";
+        gr.chosen = gr.chosen || k == rpp;
         if (k != dpp) {
             double sum = 0.;
             for (int i = 0; i < TIMED_ITERS; ++i) {
@@ -997,7 +997,8 @@ void writePlatformNb(const std::filesystem::path& path, const std::string& diagn
        << RPP_LEAD_BYTES << " bytes into their allocations (descriptor offsetInBytes; RPP's HIP morphology refuses an "
        << "offset below 12 * (kernelSize / 2) bytes), the morphology ROIs are the whole planes in XYWH, uploaded once. "
        << "Every RPP pipeline starts with the hipMemcpyAsync of the ROIs of its iteration, as in rocm_bench.hip; no "
-       << "memset (no border). One RPP handle per pipeline with batch size N.\n"
+       << "memset of the output (no border), the only memset is the one inside rppt_resize_mirror_normalize "
+       << "(rpp_fused_normalize). One RPP handle per pipeline with batch size N.\n"
        << "Kernel counts, GPU time only and GPU time only with L2 + MALL flushed: as rocm_bench.hip, in a profiling child "
        << "process, every implementation of every group"
        << (kernelTracing ? "" : onWsl() ? " (GPU time only NOT MEASURED on WSL2)" : " (GPU time only NOT MEASURED)") << ".\n";
