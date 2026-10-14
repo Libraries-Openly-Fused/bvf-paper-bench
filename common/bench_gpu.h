@@ -364,7 +364,7 @@ constexpr float NPP_SAMPLE_OFFSET = -0.25f;
 
 template <size_t N, bool LETTERBOX = true>
 std::vector<float> nppConventionReference8bit(const Context& ctx, size_t t) {
-    const int outW = OUT_W, outH = LETTERBOX ? OUT_H : RES_H;
+    const int outW = LETTERBOX ? OUT_W : RES_W, outH = LETTERBOX ? OUT_H : RES_H;
     const int borderTop = LETTERBOX ? BORDER_TOP : 0;
     std::vector<float> out(N * static_cast<size_t>(outW) * outH * 3);
     for (size_t i = 0; i < N; ++i) {
