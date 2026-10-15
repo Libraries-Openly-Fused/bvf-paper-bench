@@ -83,6 +83,12 @@ STATIC_ASSERT = re.compile(r'error: static assertion failed with "(.*?)"')
 ERROR = re.compile(r"error: (.*)")
 
 
+def process_failure(proc):
+    """The exit status and the last line of stderr of a probe run that failed"""
+    lines = proc.stderr.strip().splitlines() if proc.stderr else []
+    return f"exit {proc.returncode}" + (f": {lines[-1][:200]}" if lines else "")
+
+
 def run_point(point, nppdx, bindir, launch):
     sm, method, j, k, tx, ty = point
     name = f"sm{sm}_{method}_{j}_{k}_{tx}x{ty}"
@@ -111,28 +117,38 @@ def run_point(point, nppdx, bindir, launch):
         return result
     result["compiled"] = "yes"
     # A run that times out is recorded (probe_run, <tag>_result = timeout) and the sweep goes on: the point then has no
-    # probe values (a mismatch with the rules) or no launch comparison
+    # probe values (a mismatch with the rules) or no launch comparison. The probe exits with 0 after every error it
+    # reports, so a run that exits otherwise before its record crashed or was killed: probe_run, or <tag>_result =
+    # process_failed and <tag>_error, keep its exit status and the end of its stderr. Every exit status is in
+    # results.jsonl (probe_exit, <tag>_exit).
     try:
         try:
-            info = subprocess.run([str(binary)], capture_output=True, text=True, timeout=120).stdout
+            proc = subprocess.run([str(binary)], capture_output=True, text=True, timeout=120)
         except subprocess.TimeoutExpired:
             result["probe_run"] = "timeout"
             return result
-        for line in info.splitlines():
+        result["probe_exit"] = proc.returncode
+        for line in proc.stdout.splitlines():
             if line.startswith("point "):
                 result.update({"probe_" + key: v for key, v in parse_kv(line, "point").items()})
+        if proc.returncode != 0 and "probe_smem_bytes" not in result:
+            result["probe_run"] = f"process_failed ({process_failure(proc)})"
         if launch and sm == 890:
             for tag, args in (("launch", ["--launch"]), ("launch32", ["--launch", "32"])):
                 try:
-                    out = subprocess.run([str(binary)] + args, capture_output=True, text=True, timeout=600).stdout
+                    proc = subprocess.run([str(binary)] + args, capture_output=True, text=True, timeout=600)
                 except subprocess.TimeoutExpired:
                     result[f"{tag}_result"] = "timeout"
                     continue
-                for line in out.splitlines():
+                result[f"{tag}_exit"] = proc.returncode
+                for line in proc.stdout.splitlines():
                     if line.startswith("device "):
                         result.update({"device_" + key: v for key, v in parse_kv(line, "device").items()})
                     if line.startswith("launch "):
                         result.update({f"{tag}_{key}": v for key, v in parse_kv(line, "launch").items()})
+                if proc.returncode != 0 and f"{tag}_result" not in result:
+                    result[f"{tag}_result"] = "process_failed"
+                    result[f"{tag}_error"] = process_failure(proc)
     finally:
         binary.unlink(missing_ok=True)
     return result

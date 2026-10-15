@@ -96,12 +96,15 @@ def main():
 
     largest_j = max((r["J"] for r in rows), default=0)
     largest_k = max((r["K"] for r in rows), default=0)
+    # The search covers every J, K <= --max-jk, so the list is complete only within that range (up to the factors of
+    # 32 the README discusses)
+    complete = min(32, args.max_jk)
     with open(args.output, "w", newline="") as f:
         f.write(f"# NPPDx v0.1.2 Resize<J, K, Method> after BoxBlur<5, 5> in one kernel (fused_resize.cu's pipeline), "
                 f"RTX 4090 (SM 890, 101376 bytes of shared memory)\n")
         f.write(f"# Every coprime J:K with J, K <= {args.max_jk} that has a correct configuration (a tile that "
                 f"compiles, fits with the example's block and that J divides), by NPPDx's rules; the largest J is "
-                f"{largest_j} and the largest K {largest_k}, so the list is complete for J, K <= 32\n")
+                f"{largest_j} and the largest K {largest_k}, so the list is complete for J, K <= {complete}\n")
         f.write("# best_tile: the tile with the least shared memory; launched / correct: that tile compiled and "
                 "launched once, correct = the interior within 1 level of the CPU reference (no = NPPDx's nearest "
                 "defect at the center phase, README.md)\n")
