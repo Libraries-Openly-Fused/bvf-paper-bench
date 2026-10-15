@@ -11,9 +11,11 @@ The pipeline of sweep.py (ingest -> BoxBlur<5, 5> -> Resize<J, K, Method> -> exg
 2. Compiles every ratio at that tile with probe/resize_probe.cu and launches it once (sweep.py's run_point).
 
 One line per ratio: method, J, K, factor (K / J: above 1 an upscale, below 1 a downscale), best_tile, smem_bytes,
-launched (yes / no) and correct (yes / no / untested).
+launched (yes: the kernel ran / no) and correct (yes / no / untested).
 - Correct: the launch ran and the interior of its output is within 1 level of the CPU reference, as in README.md.
 - No: it ran and differs from the exact reference: NPPDx's nearest defect at the center phase (README.md).
+- Untested: it did not run (an attribute, launch or execution error, or a timeout) or its output has no interior. It is
+  printed as a PROBLEM and the program exits with 1.
 The comment lines (#) at the top give the search. The raw launch output is in <work directory>/results.jsonl.
 """
 
@@ -77,19 +79,23 @@ def main():
         smem = r[f"{LEVEL}_best_smem"]
         if res.get("compiled") != "yes" or res.get("probe_smem_bytes") != smem:
             problems.append(f"{p}: compiled={res.get('compiled')}, smem {res.get('probe_smem_bytes')} vs rules {smem}")
-        launched = res.get("launch_result", "") != ""
-        if res.get("launch_result") == "ran" and int(res["launch_interior_pixels"]) > 0:
+        # Compared only when the kernel ran and its output has an interior; any other outcome (no launch, an
+        # attribute, launch or execution error, a timeout) is untested and a problem, not a nearest defect
+        launched = res.get("launch_result") == "ran"
+        if launched and int(res.get("launch_interior_pixels", "0")) > 0:
             correct = "yes" if int(res["launch_max_diff_interior"]) <= 1 else "no"
         else:
-            correct = "no" if launched else "untested"
+            correct = "untested"
+            problems.append(f"{p}: not compared, launch_result={res.get('launch_result') or 'none'} "
+                            f"{res.get('launch_error', '')}".rstrip())
         j, k = p[2], p[3]
         rows.append({"method": r["method"], "J": j, "K": k, "factor": f"{k / j:.6g}", "best_tile": f"{p[4]}x{p[5]}",
                      "smem_bytes": smem, "launched": "yes" if launched else "no", "correct": correct,
                      "interior_max_diff": res.get("launch_max_diff_interior", "")})
     rows.sort(key=lambda r: (METHODS.index(r["method"]), r["K"] / r["J"], r["J"]))
 
-    largest_j = max(r["J"] for r in rows)
-    largest_k = max(r["K"] for r in rows)
+    largest_j = max((r["J"] for r in rows), default=0)
+    largest_k = max((r["K"] for r in rows), default=0)
     with open(args.output, "w", newline="") as f:
         f.write(f"# NPPDx v0.1.2 Resize<J, K, Method> after BoxBlur<5, 5> in one kernel (fused_resize.cu's pipeline), "
                 f"RTX 4090 (SM 890, 101376 bytes of shared memory)\n")
@@ -107,10 +113,12 @@ def main():
     for method in METHODS:
         sub = [r for r in rows if r["method"] == method]
         ok = [r for r in sub if r["correct"] == "yes"]
-        bad = [f"{r['J']}:{r['K']} ({r['interior_max_diff']})" for r in sub if r["correct"] != "yes"]
+        bad = [f"{r['J']}:{r['K']} ({r['interior_max_diff']})" for r in sub if r["correct"] == "no"]
+        untested = sum(1 for r in sub if r["correct"] == "untested")
         factors = [r["K"] / r["J"] for r in ok]
-        print(f"{method:8s} {len(sub):3d} by the rules, {len(ok):3d} correct, x{min(factors):.4g} to "
-              f"x{max(factors):.4g}; not correct: {', '.join(bad) or 'none'}")
+        span = f"x{min(factors):.4g} to x{max(factors):.4g}" if factors else "none"
+        print(f"{method:8s} {len(sub):3d} by the rules, {len(ok):3d} correct, {span}; "
+              f"not correct: {', '.join(bad) or 'none'}" + (f"; untested: {untested}" if untested else ""))
     for problem in problems:
         print("PROBLEM", problem)
     return 1 if problems else 0

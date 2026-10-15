@@ -17,7 +17,9 @@ Steps, all into the output directory:
    prints its tiles, shared memory and block. On the RTX 4090 every SM 890 point is also launched once with
    fused_resize.cu's block (--launch) and once with 32 threads (--launch 32), and compared with the probe's exact
    reference (and NPPDx's example reference, whose float phase is off by one pixel at some ratios).
-5. Writes sweep.csv (one line per point) and agreement.txt (the rules against the compiler and the program).
+5. Writes sweep.csv (one line per point) and agreement.txt (the rules against the compiler and the program). A point
+   whose compilation timed out or failed without a static_assert confirms nothing: it is listed as inconclusive and
+   the sweep exits with 1, as for a disagreement. A run or launch that times out is recorded and the sweep goes on.
 
 No timing: this is capability data, one launch per point.
 """
@@ -108,14 +110,24 @@ def run_point(point, nppdx, bindir, launch):
             result["other_errors"] = " | ".join(dict.fromkeys(errors))[:500]
         return result
     result["compiled"] = "yes"
+    # A run that times out is recorded (probe_run, <tag>_result = timeout) and the sweep goes on: the point then has no
+    # probe values (a mismatch with the rules) or no launch comparison
     try:
-        info = subprocess.run([str(binary)], capture_output=True, text=True, timeout=120).stdout
+        try:
+            info = subprocess.run([str(binary)], capture_output=True, text=True, timeout=120).stdout
+        except subprocess.TimeoutExpired:
+            result["probe_run"] = "timeout"
+            return result
         for line in info.splitlines():
             if line.startswith("point "):
                 result.update({"probe_" + key: v for key, v in parse_kv(line, "point").items()})
         if launch and sm == 890:
             for tag, args in (("launch", ["--launch"]), ("launch32", ["--launch", "32"])):
-                out = subprocess.run([str(binary)] + args, capture_output=True, text=True, timeout=600).stdout
+                try:
+                    out = subprocess.run([str(binary)] + args, capture_output=True, text=True, timeout=600).stdout
+                except subprocess.TimeoutExpired:
+                    result[f"{tag}_result"] = "timeout"
+                    continue
                 for line in out.splitlines():
                     if line.startswith("device "):
                         result.update({"device_" + key: v for key, v in parse_kv(line, "device").items()})
@@ -124,6 +136,16 @@ def run_point(point, nppdx, bindir, launch):
     finally:
         binary.unlink(missing_ok=True)
     return result
+
+
+def agreement(result, predicted):
+    """The rules against the compiler at one point: yes or no when the point compiled, or when it failed with
+    NPPDx's static_asserts; inconclusive when the compiler timed out or failed without a static_assert (a killed
+    compiler, a system error), which confirms nothing"""
+    compiled = result.get("compiled")
+    if compiled == "yes" or (compiled == "no" and result.get("static_asserts")):
+        return "yes" if (compiled == "yes") == (predicted["predicted_compiles"] == "yes") else "no"
+    return "inconclusive"
 
 
 def read_csv(path):
@@ -239,7 +261,7 @@ def main():
                "launch_interior_values_over_1", "launch_example_max_diff", "launch_example_max_diff_interior",
                "launch32_result", "launch32_error", "launch32_max_diff", "launch32_max_diff_interior",
                "launch32_interior_values_over_1"]
-    disagreements, mismatches, rows = [], [], []
+    disagreements, inconclusive, mismatches, rows = [], [], [], []
     for key in keys:
         r, p = results[key], predicted[key]
         sm, method, j, k, tx, ty = key
@@ -251,9 +273,11 @@ def main():
             row[c] = r.get(c, "")
         row["predicted_compiles"] = p["predicted_compiles"]
         row["predicted_failing_checks"] = p["failing_checks"]
-        row["agrees"] = "yes" if (r.get("compiled") == "yes") == (p["predicted_compiles"] == "yes") else "no"
+        row["agrees"] = agreement(r, p)
         if row["agrees"] == "no":
             disagreements.append(row)
+        elif row["agrees"] == "inconclusive":
+            inconclusive.append(row)
         for c in ("box_halo", "resize_halo", "input_storage", "blurred_storage", "intermediate_storage",
                   "output_storage", "smem_bytes", "shared_memory_limit", "fits_smem", "block", "example_block_fits",
                   "j_divides_tile"):
@@ -282,20 +306,27 @@ def main():
         w.writerows(rows)
     with open(out / "agreement.txt", "w") as f:
         compiled = sum(1 for r in rows if r["compiled"] == "yes")
-        f.write(f"points: {len(rows)}, compiled: {compiled}, rejected: {len(rows) - compiled}\n")
-        f.write(f"rules vs compiler, accepted or not: {len(rows) - len(disagreements)} agree, "
-                f"{len(disagreements)} disagree\n")
+        # Rejected: by NPPDx's static_asserts; the other failures and the timeouts are inconclusive
+        rejected = len(rows) - compiled - len(inconclusive)
+        f.write(f"points: {len(rows)}, compiled: {compiled}, rejected: {rejected}"
+                + (f", inconclusive: {len(inconclusive)}" if inconclusive else "") + "\n")
+        f.write(f"rules vs compiler, accepted or not: {len(rows) - len(disagreements) - len(inconclusive)} agree, "
+                f"{len(disagreements)} disagree"
+                + (f", {len(inconclusive)} inconclusive (not compared)" if inconclusive else "") + "\n")
         f.write(f"rules vs probe, tiles / shared memory / block of the compiled points: "
                 f"{compiled - len(mismatches)} match, {len(mismatches)} differ\n")
         for row in disagreements:
             f.write(f"DISAGREE {row['sm']} {row['method']} {row['J']}:{row['K']} {row['tile']} compiled="
                     f"{row['compiled']} predicted={row['predicted_compiles']} ({row['predicted_failing_checks']}) "
                     f"{row['static_asserts']} {row['other_errors']}\n")
+        for row in inconclusive:
+            f.write(f"INCONCLUSIVE {row['sm']} {row['method']} {row['J']}:{row['K']} {row['tile']} compiled="
+                    f"{row['compiled']} after {row['compile_seconds']} s {row['other_errors']}\n")
         for row, r in mismatches:
             f.write(f"MISMATCH {row['sm']} {row['method']} {row['J']}:{row['K']} {row['tile']} "
                     f"{ {k: v for k, v in r.items() if k.startswith('probe_')} }\n")
     print((out / "agreement.txt").read_text())
-    return 0 if not disagreements and not mismatches else 1
+    return 0 if not disagreements and not inconclusive and not mismatches else 1
 
 
 if __name__ == "__main__":
