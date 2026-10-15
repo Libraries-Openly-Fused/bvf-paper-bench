@@ -78,7 +78,9 @@ done
 GENERATOR=${GENERATOR:-"Unix Makefiles"}
 
 has_step() { [[ " $STEPS " == *" $1 "* ]]; }
-if { has_step opencv-cuda || has_step opencv-cpu || has_step neighborhood; } && [ -z "${OpenCV_DIR:-}" ]; then
+# The OpenCV benchmarks always need OpenCV. The neighborhood experiment needs it only for its OpenCV program
+# (BENCH_OPENCV, which CMAKE_ARGS can turn off): its CMake project enforces that, and gets OpenCV_DIR when it is set.
+if { has_step opencv-cuda || has_step opencv-cpu; } && [ -z "${OpenCV_DIR:-}" ]; then
     echo "Set OpenCV_DIR to the OpenCV build or install folder (the OpenCV benchmarks need it)" >&2
     exit 1
 fi
@@ -183,7 +185,7 @@ if has_step neighborhood; then
     build=$BUILD_ROOT/build-neighborhood
     out=$RESULTS/fkl-neighborhood
     echo "  fkl-neighborhood ($build)"
-    configure "$REPO/fkl-neighborhood" "$build" -DBENCH_REGIONS=mixed -DOpenCV_DIR="$OpenCV_DIR"
+    configure "$REPO/fkl-neighborhood" "$build" -DBENCH_REGIONS=mixed ${OpenCV_DIR:+"-DOpenCV_DIR=$OpenCV_DIR"}
     run "$LOGS/test_neighborhood_ops.log" "$build/test_neighborhood_ops"
     programs=()
     for k in 3 5 7; do

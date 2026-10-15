@@ -1,0 +1,6 @@
+bvf-paper-bench: c88ebf7a73e3a2a968f1e843c1e8ac505eb5290d (clean)
+nppdx: v0.1.2 e7efdc125800e496330c2a066ac88a8508b9d20f
+nvcc: Build cuda_13.3.r13.3/compiler.38244171_0
+gpu: NVIDIA GeForce RTX 4090, 610.43.02
+max J and K of the rules: 512
+started: 2026-10-14 22:56:33
