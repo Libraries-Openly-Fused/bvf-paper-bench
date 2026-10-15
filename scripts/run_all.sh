@@ -2,8 +2,10 @@
 # Builds and runs every benchmark of this repository, each into its own results folder: FKL vs OpenCV CUDA and FKL vs
 # NPP (main run and the GPU only run with the L2 flushed), FKL's ablation (the same, plus the host overhead, the
 # per-kernel GPU times and bvf_types, the type of the fused operation), FKL vs NPPDx for every region size (both
-# programs: main run, L2 flushed, and the runner-up NPPDx configuration re-timed against FKL), FKL vs OpenCV on the CPU,
-# with COMPILE_TIME=1 the compile-time units, and with PROFILE=1 the memory traffic with Nsight Compute
+# programs: main run, L2 flushed, and the runner-up NPPDx configuration re-timed against FKL), the neighborhood
+# experiment (fkl-neighborhood: every program, main run and L2 flushed, on its fixed-size 64x32 crops),
+# FKL vs OpenCV on the CPU, with COMPILE_TIME=1 the compile-time units, and with PROFILE=1 the memory traffic with
+# Nsight Compute
 # (scripts/ncu_dram.sh and ncu_l2.sh, their summaries and the traffic model), which needs the driver to let every user
 # read the GPU performance counters (RmProfilingAdminOnly=0); otherwise, since those scripts then need root, their
 # commands are printed at the end. Never uses sudo itself.
@@ -15,7 +17,8 @@
 # iteration).
 #
 # Environment variables:
-#   STEPS        the benchmarks to build and run, among opencv-cuda, npp, ablation, nppdx and opencv-cpu (default all)
+#   STEPS        the benchmarks to build and run, among opencv-cuda, npp, ablation, nppdx, neighborhood and opencv-cpu
+#                (default all)
 #   NPPDX_SIZES  the region sizes of FKL vs NPPDx (default "20x10 32x16 48x24")
 #   COMPILE_TIME 1 to also run scripts/compile_time.sh after the runs (long: 10 rounds of every unit): FKL's ablation,
 #                the OpenCV and NPP units, and in the NPPDx builds the headers and FKL BVF (first size) and the NPPDx
@@ -29,12 +32,12 @@
 #                the CPU benchmark), which win. Setting or unsetting BENCH_REGIONS in them is an error: this script sets
 #                it for every project (mixed, or the NPPDx sizes of NPPDX_SIZES)
 # Results: <results>/<benchmark folder>, FKL vs NPPDx in <results>/fkl-vs-nppdx/<size> (the runner-up configurations in
-# its runner-up/), logs in <results>/logs. The GPU benchmarks run one at a time; leave the GPU otherwise idle.
+# its runner-up/), the neighborhood experiment in <results>/fkl-neighborhood/<program>, logs in <results>/logs. The GPU benchmarks run one at a time; leave the GPU otherwise idle.
 set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 RESULTS=$(realpath -m "${1:-$(dirname "$REPO")/results}")
-STEPS=${STEPS:-"opencv-cuda npp ablation nppdx opencv-cpu"}
+STEPS=${STEPS:-"opencv-cuda npp ablation nppdx neighborhood opencv-cpu"}
 NPPDX_SIZES=${NPPDX_SIZES:-"20x10 32x16 48x24"}
 COMPILE_TIME=${COMPILE_TIME:-0}
 if grep -q "RmProfilingAdminOnly: 0" /proc/driver/nvidia/params 2>/dev/null; then
@@ -75,7 +78,7 @@ done
 GENERATOR=${GENERATOR:-"Unix Makefiles"}
 
 has_step() { [[ " $STEPS " == *" $1 "* ]]; }
-if { has_step opencv-cuda || has_step opencv-cpu; } && [ -z "${OpenCV_DIR:-}" ]; then
+if { has_step opencv-cuda || has_step opencv-cpu || has_step neighborhood; } && [ -z "${OpenCV_DIR:-}" ]; then
     echo "Set OpenCV_DIR to the OpenCV build or install folder (the OpenCV benchmarks need it)" >&2
     exit 1
 fi
@@ -95,7 +98,7 @@ done
 
 # The source folder of every step
 declare -A FOLDER=([opencv-cuda]=fkl-vs-opencv-cuda [npp]=fkl-vs-npp [ablation]=fkl-ablation [nppdx]=fkl-vs-nppdx
-                   [opencv-cpu]=fkl-vs-opencv-cpu)
+                   [neighborhood]=fkl-neighborhood [opencv-cpu]=fkl-vs-opencv-cpu)
 
 # Configures and builds a project. BENCH_REGIONS is a cached CMake option, so every configure sets it (mixed, or the
 # NPPDx size): a build folder reused from an earlier configure with another value must not keep it. The project's
@@ -108,6 +111,10 @@ configure() { # <source> <build folder> <options...>
           "${EXTRA[@]}" "$@" > "$build/run_all_configure.log" 2>&1 || { cat "$build/run_all_configure.log" >&2; exit 1; }
     cmake --build "$build" -j "$(nproc)" > "$build/run_all_build.log" 2>&1 ||
         { tail -50 "$build/run_all_build.log" >&2; exit 1; }
+}
+
+cache_option_on() { # <build folder> <option>: whether a boolean option is on in the build's CMake cache
+    grep -Eiq "^$2:BOOL=(on|yes|true|y|[1-9][0-9]*)$" "$1/CMakeCache.txt"
 }
 
 run() { # <log> <command...>: runs a benchmark, keeping its output
@@ -166,6 +173,36 @@ if has_step nppdx; then
             run "$LOGS/${program}_${size}_runner_up.log" "$build/$program" "$out/runner-up" --configs \
                 "$out/${program}_runner_up_config.csv"
         done
+    done
+fi
+if has_step neighborhood; then
+    # Part (a), then the library programs of part (b), all on the fixed-size crops of common/bench_neighborhood.h (one
+    # build: BENCH_REGIONS does not change them). Every program runs its main benchmark, which chooses the
+    # MorphologyDPP tile (and the NPPDx configuration) of every batch size, then the GPU only one with the L2 flushed,
+    # which reads them.
+    build=$BUILD_ROOT/build-neighborhood
+    out=$RESULTS/fkl-neighborhood
+    echo "  fkl-neighborhood ($build)"
+    configure "$REPO/fkl-neighborhood" "$build" -DBENCH_REGIONS=mixed -DOpenCV_DIR="$OpenCV_DIR"
+    run "$LOGS/test_neighborhood_ops.log" "$build/test_neighborhood_ops"
+    programs=()
+    for k in 3 5 7; do
+        for passes in 1 2; do
+            programs+=("benchmark_fkl_neighborhood_k${k}_p$passes" "benchmark_fkl_neighborhood_k${k}_p${passes}_resize")
+        done
+    done
+    programs+=(benchmark_npp_neighborhood)
+    # The OpenCV and NPPDx programs only when the build has them (CMAKE_ARGS can set BENCH_OPENCV or BENCH_NPPDX OFF):
+    # a clean build has no such executable, and a reused build folder can hold a stale one
+    if cache_option_on "$build" BENCH_OPENCV; then
+        programs+=(benchmark_opencv_cuda_neighborhood)
+    fi
+    if cache_option_on "$build" BENCH_NPPDX; then
+        programs+=(benchmark_nppdx_neighborhood)
+    fi
+    for program in "${programs[@]}"; do
+        run "$LOGS/$program.log" "$build/$program" "$out/${program#benchmark_}"
+        run "$LOGS/${program}_l2_flushed.log" "$build/$program" "$out/${program#benchmark_}" --gpu-only-l2-flushed
     done
 fi
 if [ "$COMPILE_TIME" = 1 ]; then

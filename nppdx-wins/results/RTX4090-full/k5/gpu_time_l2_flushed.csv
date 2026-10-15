@@ -1,0 +1,4 @@
+implementation,N,gpu_median_us,gpu_p10_us,gpu_p90_us,gpu_mean_us,iterations,kernels_launched,fkl_staged_mean_gpu_speedup
+nppdx,1,233.35,232.71,234.05,233.44,1000,1,0.846
+fkl_inline,1,175.94,175.71,176.16,175.95,1000,1,0.638
+fkl_staged,1,275.17,274.76,275.65,275.88,1000,2,

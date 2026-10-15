@@ -1,0 +1,2 @@
+Batch size, nppdx MeanTime, nppdx TimeVariance, nppdx MaxTime, nppdx MinTime, fkl_staged MeanTime, fkl_staged TimeVariance, fkl_staged MaxTime, fkl_staged MinTime, Mean Speedup, nppdx MedianTime, nppdx P10Time, nppdx P90Time, fkl_staged MedianTime, fkl_staged P10Time, fkl_staged P90Time
+1, 0.309419, 8.1019e-07, 0.311009, 0.308578, 0.465004, 8.12779e-07, 0.46637, 0.463651, 0.665412, 0.309122, 0.308578, 0.310347, 0.465154, 0.464025, 0.465824

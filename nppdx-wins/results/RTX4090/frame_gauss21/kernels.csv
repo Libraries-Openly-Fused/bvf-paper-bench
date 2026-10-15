@@ -1,0 +1,4 @@
+implementation,N,kernels,memsets,memcpys
+nppdx,1,1,0,0
+fkl_staged_separable,1,3,0,0
+fkl_staged,1,2,0,0

@@ -1,0 +1,6 @@
+Flushing 144 MiB (2x L2) before every kernel
+GPU only, L2 flushed nppdx        N   1  median  826.89 us  p10  826.35  p90  827.91  FKL staged mean speedup   0.19x
+GPU only, L2 flushed fkl_inline   N   1  median 3440.10 us  p10 3438.53  p90 3442.98  FKL staged mean speedup   0.81x
+GPU only, L2 flushed fkl_staged_separable N   1  median  598.08 us  p10  597.41  p90  598.95  FKL staged mean speedup   0.14x
+GPU only, L2 flushed fkl_staged   N   1  median 4245.87 us  p10 4244.84  p90 4247.28
+Results written to "/home/oscar/bvf-bench/results-nppdx-wins-full/gauss21"

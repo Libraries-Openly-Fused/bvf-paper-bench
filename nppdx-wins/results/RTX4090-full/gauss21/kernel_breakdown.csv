@@ -1,0 +1,12 @@
+implementation,N,kernel,median_us,p10_us,p90_us
+nppdx,1,1_nppdx_gaussian_resize_normalize,805.98,805.89,806.91
+nppdx,1,total,805.98,805.89,806.91
+fkl_inline,1,1_gaussian_resize_normalize,3664.62,3581.77,3687.42
+fkl_inline,1,total,3664.62,3581.77,3687.42
+fkl_staged_separable,1,1_linear_filter_dpp_rows,231.42,230.40,235.52
+fkl_staged_separable,1,2_linear_filter_dpp_columns,257.02,256.00,258.05
+fkl_staged_separable,1,3_resize_normalize,147.38,146.43,147.46
+fkl_staged_separable,1,total,634.99,633.76,640.00
+fkl_staged,1,1_linear_filter_dpp_of_the_frame,4133.02,4132.67,4133.89
+fkl_staged,1,2_resize_normalize,142.34,142.02,143.36
+fkl_staged,1,total,4276.00,4274.94,4277.22

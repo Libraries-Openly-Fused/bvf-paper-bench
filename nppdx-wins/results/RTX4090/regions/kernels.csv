@@ -1,0 +1,10 @@
+implementation,N,kernels,memsets,memcpys
+nppdx,1,1,0,0
+fkl_inline,1,1,0,0
+fkl_staged,1,2,0,0
+nppdx,16,1,0,0
+fkl_inline,16,1,0,0
+fkl_staged,16,2,0,0
+nppdx,100,1,0,0
+fkl_inline,100,1,0,0
+fkl_staged,100,2,0,0

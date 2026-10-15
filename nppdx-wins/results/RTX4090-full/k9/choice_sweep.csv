@@ -1,0 +1,24 @@
+key,candidate,launched,median_us,max_abs_err,within_tolerance,chosen
+nppdx_frame,tile 64x32 block recommended,yes,613.38,9.537e-07,yes,yes
+nppdx_frame,tile 64x32 block 128,yes,342.02,2.759e+00,no,no
+nppdx_frame,tile 64x32 block 256,yes,458.75,2.635e+00,no,no
+nppdx_frame,tile 64x32 block 512,yes,615.42,9.537e-07,yes,no
+nppdx_frame,tile 32x32 block recommended,yes,772.10,9.537e-07,yes,no
+nppdx_frame,tile 32x32 block 128,yes,514.13,2.537e+00,no,no
+nppdx_frame,tile 32x32 block 256,yes,764.75,9.537e-07,yes,no
+nppdx_frame,tile 32x32 block 512,yes,762.85,9.537e-07,yes,no
+nppdx_frame,tile 32x16 block recommended,yes,838.66,9.537e-07,yes,no
+nppdx_frame,tile 32x16 block 128,yes,730.11,1.399e+00,no,no
+nppdx_frame,tile 32x16 block 256,yes,775.07,9.537e-07,yes,no
+nppdx_frame,tile 32x16 block 512,yes,897.02,9.537e-07,yes,no
+nppdx_frame,tile 16x16 block recommended,yes,1095.52,9.537e-07,yes,no
+nppdx_frame,tile 16x16 block 128,yes,1061.89,9.537e-07,yes,no
+nppdx_frame,tile 16x16 block 256,yes,1048.37,9.537e-07,yes,no
+nppdx_frame,tile 16x16 block 512,yes,1317.89,9.537e-07,yes,no
+nppdx_frame,tile 16x8 block recommended,yes,1488.90,9.537e-07,yes,no
+nppdx_frame,tile 16x8 block 128,yes,1389.57,9.537e-07,yes,no
+nppdx_frame,tile 16x8 block 256,yes,1428.48,9.537e-07,yes,no
+nppdx_frame,tile 16x8 block 512,yes,1922.38,9.537e-07,yes,no
+fkl_staged_frame,DPP tile 16x8,yes,566.18,2.384e-06,yes,no
+fkl_staged_frame,DPP tile 32x8,yes,562.18,2.384e-06,yes,no
+fkl_staged_frame,DPP tile 32x16,yes,555.10,2.384e-06,yes,yes
