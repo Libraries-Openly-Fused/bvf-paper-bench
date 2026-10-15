@@ -724,28 +724,24 @@
 +  174  };
 --- exp3_nppdx (96cc71d; float-write path, the one the program instantiates): fkl-neighborhood/src/benchmark_nppdx_neighborhood.cu 46-46 (NPPDX_CONFIGS): 1 lines
 +   46  inline constexpr auto NPPDX_CONFIGS = nppdxConfigs<NPPDX_SM, FLOAT_WRITE>();
---- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/benchmark_wins_frame.cu 60-64 (CONFIGS, the tile and block list): 5 lines
+--- wins_nppdx_box1 (76a9136; 5x5, 9x9: one pass): nppdx-wins/src/benchmark_wins_frame.cu 60-64 (CONFIGS, the tile and block list): 5 lines
 +   60  constexpr std::array<NppdxConfig, 20> CONFIGS{{{64, 32, 0}, {64, 32, 128}, {64, 32, 256}, {64, 32, 512},
 +   61                                                 {32, 32, 0}, {32, 32, 128}, {32, 32, 256}, {32, 32, 512},
 +   62                                                 {32, 16, 0}, {32, 16, 128}, {32, 16, 256}, {32, 16, 512},
 +   63                                                 {16, 16, 0}, {16, 16, 128}, {16, 16, 256}, {16, 16, 512},
 +   64                                                 {16, 8, 0}, {16, 8, 128}, {16, 8, 256}, {16, 8, 512}}};
---- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/wins_common.h 475-477 (WINS_NPPDX_LAYOUT macro (tile, halos, SM, block)): 3 lines
+--- wins_nppdx_box1 (76a9136; 5x5, 9x9: one pass): nppdx-wins/src/wins_common.h 475-477 (WINS_NPPDX_LAYOUT macro (tile, halos, SM, block)): 3 lines
 +  475  #define WINS_NPPDX_LAYOUT(TX, TY, MH, CH, BX)                                                                         \
 +  476      nppdx::TileSize<TX, TY>() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, MH)() +                                             \
 +  477          NPPDX_MAKE_HALO(nppdx::CumulativeHalo, CH)() + nppdx::SM<NPPDX_SM>() + NppdxBlock<BX>()
---- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/wins_common.h 481-482 (BoxSpec head): 2 lines
+--- wins_nppdx_box1 (76a9136; 5x5, 9x9: one pass): nppdx-wins/src/wins_common.h 481-482 (BoxSpec head): 2 lines
 +  481  template <int K_, int PASSES_>
 +  482  struct BoxSpec {
---- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/wins_common.h 484-490 (BoxSpec K, PASSES, halos, Operator, FUNCTION (the GAUSSIAN flag of the harness skipped)): 7 lines
-+  484      static constexpr int K = K_;
-+  485      static constexpr int PASSES = PASSES_;
-+  486      static constexpr int STEP_HALO = K_ / 2;
-+  487      static constexpr int HALO = STEP_HALO * PASSES_;
+--- wins_nppdx_box1 (76a9136; 5x5, 9x9: one pass): nppdx-wins/src/wins_common.h 488-490 (BoxSpec Operator, FUNCTION, closing brace (K, PASSES, halos and the GAUSSIAN flag, shared by every version, skipped)): 3 lines
 +  488      using Operator = nppdx::BoxBlur<K_, K_>;
 +  489      static constexpr nppdx::function FUNCTION = nppdx::function::box_blur;
 +  490  };
---- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/wins_common.h 515-574 (FilterResizeOps (operation types, tiles, smem, block, device run)): 57 lines
+--- wins_nppdx_box1 (76a9136; 5x5, 9x9: one pass): nppdx-wins/src/wins_common.h 515-523 (FilterResizeOps head, ResizePre, halos): 9 lines
 +  515  template <unsigned TX_, unsigned TY_, unsigned BlockX, unsigned J, unsigned K, typename Spec>
 +  516  struct FilterResizeOps {
 +  517      static constexpr unsigned TX = TX_;
@@ -755,9 +751,7 @@
 +  521                                 nppdx::TileSize<TX, TY>() + nppdx::SM<NPPDX_SM>() + NppdxBlock<BlockX>());
 +  522      static constexpr nppdx::Halo4 resizeHalo = ResizePre::local_halo;
 +  523      static constexpr nppdx::Halo4 total = nppdx::Halo4::make_uniform(Spec::HALO) + resizeHalo;
-   524      // The halo left in the input of the second pass (with one pass, Blur2 is Blur and is not run)
-+  525      static constexpr nppdx::Halo4 second =
-+  526          Spec::PASSES == 2 ? nppdx::Halo4::make_uniform(Spec::HALO - Spec::STEP_HALO) + resizeHalo : total;
+--- wins_nppdx_box1 (76a9136; 5x5, 9x9: one pass): nppdx-wins/src/wins_common.h 527-541 (FilterResizeOps Ingest to Blur (second and Blur2 of the two-pass program skipped)): 15 lines
 +  527      using Ingest = decltype(nppdx::InputOutput<nppdx::input_output_direction::ingest>() +
 +  528                              nppdx::InputFormat<nppdx::packing_format::nv12>() +
 +  529                              WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
@@ -773,8 +767,7 @@
 +  539                               WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
 +  540      using Blur = decltype(nppdx::Function<Spec::FUNCTION>() + typename Spec::Operator() +
 +  541                            WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
-+  542      using Blur2 = decltype(nppdx::Function<Spec::FUNCTION>() + typename Spec::Operator() +
-+  543                             WINS_NPPDX_LAYOUT(TX, TY, total, second, BlockX));
+--- wins_nppdx_box1 (76a9136; 5x5, 9x9: one pass): nppdx-wins/src/wins_common.h 544-564 (FilterResizeOps Resize, tiles, smem, block, device run to the blur): 20 lines
 +  544      using Resize = decltype(ResizePre() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, total)() +
 +  545                              NPPDX_MAKE_HALO(nppdx::CumulativeHalo, resizeHalo)());
 +  546      using InTile = nppdx::input_storage_of_t<Ingest>;
@@ -796,24 +789,20 @@
 +  562          FromLimitedUV().execute(in, w, h);
 +  563          Convert().execute(in, w, h);
 +  564          Blur().execute(in, std::get<1>(tiles), w, h);
-+  565          if constexpr (Spec::PASSES == 2) {
-   566              // The second pass writes into the input tile, which is no longer needed
-+  567              Blur2().execute(std::get<1>(tiles), in, w, h);
-+  568              Resize().execute(in, std::get<2>(tiles), std::get<3>(tiles), w, h);
-+  569          } else {
+--- wins_nppdx_box1 (76a9136; 5x5, 9x9: one pass): nppdx-wins/src/wins_common.h 570-570 (FilterResizeOps run: the one-pass resize (the two-pass branch and the if/else skipped)): 1 lines
 +  570              Resize().execute(std::get<1>(tiles), std::get<2>(tiles), std::get<3>(tiles), w, h);
-+  571          }
+--- wins_nppdx_box1 (76a9136; 5x5, 9x9: one pass): nppdx-wins/src/wins_common.h 572-574 (FilterResizeOps run: syncthreads, closing braces): 3 lines
 +  572          __syncthreads();
 +  573      }
 +  574  };
---- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/wins_common.h 581-586 (sliceTiles): 6 lines
+--- wins_nppdx_box1 (76a9136; 5x5, 9x9: one pass): nppdx-wins/src/wins_common.h 581-586 (sliceTiles): 6 lines
 +  581  template <typename Ops>
 +  582  __device__ auto sliceTiles() {
 +  583      extern __shared__ unsigned char smem[];
 +  584      return nppdx::shared_memory::slice_into_tile_storage<typename Ops::InTile, typename Ops::BlurTile,
 +  585                                                           typename Ops::TmpTile, typename Ops::OutTile>(smem);
 +  586  }
---- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/wins_common.h 589-607 (writeTile (hand-written normalization and float write)): 19 lines
+--- wins_nppdx_box1 (76a9136; 5x5, 9x9: one pass): nppdx-wins/src/wins_common.h 589-607 (writeTile (hand-written normalization and float write)): 19 lines
 +  589  template <typename Ops, typename Tile>
 +  590  __device__ void writeTile(const Tile& tile, const Normalization& n, float* plane, const int x0, const int y0,
 +  591                            const int w, const int h) {
@@ -833,7 +822,7 @@
 +  605          }
 +  606      }
 +  607  }
---- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/wins_common.h 640-648 (nppdxFrameKernel): 9 lines
+--- wins_nppdx_box1 (76a9136; 5x5, 9x9: one pass): nppdx-wins/src/wins_common.h 640-648 (nppdxFrameKernel): 9 lines
 +  640  template <typename Ops>
 +  641  __global__ void nppdxFrameKernel(const uint8_t* y, const uint8_t* uv, const int pitch, const Normalization n,
 +  642                                   float* out) {
@@ -843,48 +832,40 @@
 +  646      writeTile<Ops>(std::get<3>(tiles), n, out, static_cast<int>(blockIdx.x * Ops::OX),
 +  647                     static_cast<int>(blockIdx.y * Ops::OY), W2_OUT_W, W2_OUT_H);
 +  648  }
---- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/wins_common.h 650-655 (allowSharedMemory (init)): 6 lines
+--- wins_nppdx_box1 (76a9136; 5x5, 9x9: one pass): nppdx-wins/src/wins_common.h 650-655 (allowSharedMemory (init)): 6 lines
 +  650  template <auto Kernel, size_t SMEM>
 +  651  void allowSharedMemory() {
 +  652      if constexpr (SMEM > 48 * 1024) {
 +  653          gpuErrchk(cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
 +  654      }
 +  655  }
---- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/benchmark_wins_frame.cu 73-74 (Ops, kernel): 2 lines
+--- wins_nppdx_box1 (76a9136; 5x5, 9x9: one pass): nppdx-wins/src/benchmark_wins_frame.cu 73-74 (Ops, kernel): 2 lines
 +   73      using Ops = FilterResizeOps<C.tileX, C.tileY, C.block, 2, 1, Spec>;
 +   74      constexpr auto kernel = nppdxFrameKernel<Ops>;
---- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/benchmark_wins_frame.cu 81-81 (grid): 1 lines
+--- wins_nppdx_box1 (76a9136; 5x5, 9x9: one pass): nppdx-wins/src/benchmark_wins_frame.cu 81-81 (grid): 1 lines
 +   81          const dim3 grid{(FRAME_W + Ops::TX - 1) / Ops::TX, (FRAME_H + Ops::TY - 1) / Ops::TY, 1};
---- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/benchmark_wins_frame.cu 83-85 (launch and its error check): 3 lines
+--- wins_nppdx_box1 (76a9136; 5x5, 9x9: one pass): nppdx-wins/src/benchmark_wins_frame.cu 83-85 (launch and its error check): 3 lines
 +   83          kernel<<<grid, dim3(Ops::block), Ops::smem, ctx.stream>>>(ctx.y, ctx.uv, ctx.pitch, n,
 +   84                                                                    reinterpret_cast<float*>(out->ptr().data));
 +   85          gpuErrchk(cudaGetLastError());
---- wins_nppdx_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 60-64 (CONFIGS, the tile and block list): 5 lines
+--- wins_nppdx_box2 (76a9136; 5x5 twice): nppdx-wins/src/benchmark_wins_frame.cu 60-64 (CONFIGS, the tile and block list): 5 lines
 +   60  constexpr std::array<NppdxConfig, 20> CONFIGS{{{64, 32, 0}, {64, 32, 128}, {64, 32, 256}, {64, 32, 512},
 +   61                                                 {32, 32, 0}, {32, 32, 128}, {32, 32, 256}, {32, 32, 512},
 +   62                                                 {32, 16, 0}, {32, 16, 128}, {32, 16, 256}, {32, 16, 512},
 +   63                                                 {16, 16, 0}, {16, 16, 128}, {16, 16, 256}, {16, 16, 512},
 +   64                                                 {16, 8, 0}, {16, 8, 128}, {16, 8, 256}, {16, 8, 512}}};
---- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 475-477 (WINS_NPPDX_LAYOUT macro): 3 lines
+--- wins_nppdx_box2 (76a9136; 5x5 twice): nppdx-wins/src/wins_common.h 475-477 (WINS_NPPDX_LAYOUT macro (tile, halos, SM, block)): 3 lines
 +  475  #define WINS_NPPDX_LAYOUT(TX, TY, MH, CH, BX)                                                                         \
 +  476      nppdx::TileSize<TX, TY>() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, MH)() +                                             \
 +  477          NPPDX_MAKE_HALO(nppdx::CumulativeHalo, CH)() + nppdx::SM<NPPDX_SM>() + NppdxBlock<BX>()
---- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 491-492 (GaussianSpec head): 2 lines
-+  491  template <int RT, nppdx::gaussian_tail_width TAIL>
-+  492  struct GaussianSpec {
---- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 497-497 (GaussianSpec BAND_TAPS): 1 lines
-+  497      static constexpr int BAND_TAPS = RT <= 9 ? 3 : RT <= 20 ? 5 : 7 + 2 * ((RT - 21) / 10);
---- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 499-499 (GaussianSpec K): 1 lines
-+  499      static constexpr int K = TAIL == nppdx::gaussian_tail_width::wide ? 2 * BAND_TAPS - 1 : BAND_TAPS;
---- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 501-505 (GaussianSpec PASSES, halos, Operator, FUNCTION (GAUSSIAN flag, BAND_MIN, ROW and taps() of FKL and the references skipped)): 5 lines
-+  501      static constexpr int PASSES = 1;
-+  502      static constexpr int STEP_HALO = K / 2;
-+  503      static constexpr int HALO = STEP_HALO;
-+  504      using Operator = nppdx::GaussianBlur<RT, TAIL>;
-+  505      static constexpr nppdx::function FUNCTION = nppdx::function::gaussian_blur;
---- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 511-511 (GaussianSpec closing brace): 1 lines
-+  511  };
---- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 515-574 (FilterResizeOps): 57 lines
+--- wins_nppdx_box2 (76a9136; 5x5 twice): nppdx-wins/src/wins_common.h 481-482 (BoxSpec head): 2 lines
++  481  template <int K_, int PASSES_>
++  482  struct BoxSpec {
+--- wins_nppdx_box2 (76a9136; 5x5 twice): nppdx-wins/src/wins_common.h 488-490 (BoxSpec Operator, FUNCTION, closing brace (K, PASSES, halos and the GAUSSIAN flag, shared by every version, skipped)): 3 lines
++  488      using Operator = nppdx::BoxBlur<K_, K_>;
++  489      static constexpr nppdx::function FUNCTION = nppdx::function::box_blur;
++  490  };
+--- wins_nppdx_box2 (76a9136; 5x5 twice): nppdx-wins/src/wins_common.h 515-564 (FilterResizeOps head to the first blur, with second and Blur2): 48 lines
 +  515  template <unsigned TX_, unsigned TY_, unsigned BlockX, unsigned J, unsigned K, typename Spec>
 +  516  struct FilterResizeOps {
 +  517      static constexpr unsigned TX = TX_;
@@ -935,24 +916,21 @@
 +  562          FromLimitedUV().execute(in, w, h);
 +  563          Convert().execute(in, w, h);
 +  564          Blur().execute(in, std::get<1>(tiles), w, h);
-+  565          if constexpr (Spec::PASSES == 2) {
-   566              // The second pass writes into the input tile, which is no longer needed
+--- wins_nppdx_box2 (76a9136; 5x5 twice): nppdx-wins/src/wins_common.h 567-568 (FilterResizeOps run: second pass and resize (the one-pass branch and the if/else skipped)): 2 lines
 +  567              Blur2().execute(std::get<1>(tiles), in, w, h);
 +  568              Resize().execute(in, std::get<2>(tiles), std::get<3>(tiles), w, h);
-+  569          } else {
-+  570              Resize().execute(std::get<1>(tiles), std::get<2>(tiles), std::get<3>(tiles), w, h);
-+  571          }
+--- wins_nppdx_box2 (76a9136; 5x5 twice): nppdx-wins/src/wins_common.h 572-574 (FilterResizeOps run: syncthreads, closing braces): 3 lines
 +  572          __syncthreads();
 +  573      }
 +  574  };
---- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 581-586 (sliceTiles): 6 lines
+--- wins_nppdx_box2 (76a9136; 5x5 twice): nppdx-wins/src/wins_common.h 581-586 (sliceTiles): 6 lines
 +  581  template <typename Ops>
 +  582  __device__ auto sliceTiles() {
 +  583      extern __shared__ unsigned char smem[];
 +  584      return nppdx::shared_memory::slice_into_tile_storage<typename Ops::InTile, typename Ops::BlurTile,
 +  585                                                           typename Ops::TmpTile, typename Ops::OutTile>(smem);
 +  586  }
---- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 589-607 (writeTile): 19 lines
+--- wins_nppdx_box2 (76a9136; 5x5 twice): nppdx-wins/src/wins_common.h 589-607 (writeTile (hand-written normalization and float write)): 19 lines
 +  589  template <typename Ops, typename Tile>
 +  590  __device__ void writeTile(const Tile& tile, const Normalization& n, float* plane, const int x0, const int y0,
 +  591                            const int w, const int h) {
@@ -972,7 +950,7 @@
 +  605          }
 +  606      }
 +  607  }
---- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 640-648 (nppdxFrameKernel): 9 lines
+--- wins_nppdx_box2 (76a9136; 5x5 twice): nppdx-wins/src/wins_common.h 640-648 (nppdxFrameKernel): 9 lines
 +  640  template <typename Ops>
 +  641  __global__ void nppdxFrameKernel(const uint8_t* y, const uint8_t* uv, const int pitch, const Normalization n,
 +  642                                   float* out) {
@@ -982,19 +960,144 @@
 +  646      writeTile<Ops>(std::get<3>(tiles), n, out, static_cast<int>(blockIdx.x * Ops::OX),
 +  647                     static_cast<int>(blockIdx.y * Ops::OY), W2_OUT_W, W2_OUT_H);
 +  648  }
---- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 650-655 (allowSharedMemory): 6 lines
+--- wins_nppdx_box2 (76a9136; 5x5 twice): nppdx-wins/src/wins_common.h 650-655 (allowSharedMemory (init)): 6 lines
 +  650  template <auto Kernel, size_t SMEM>
 +  651  void allowSharedMemory() {
 +  652      if constexpr (SMEM > 48 * 1024) {
 +  653          gpuErrchk(cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
 +  654      }
 +  655  }
---- wins_nppdx_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 73-74 (Ops, kernel): 2 lines
+--- wins_nppdx_box2 (76a9136; 5x5 twice): nppdx-wins/src/benchmark_wins_frame.cu 73-74 (Ops, kernel): 2 lines
 +   73      using Ops = FilterResizeOps<C.tileX, C.tileY, C.block, 2, 1, Spec>;
 +   74      constexpr auto kernel = nppdxFrameKernel<Ops>;
---- wins_nppdx_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 81-81 (grid): 1 lines
+--- wins_nppdx_box2 (76a9136; 5x5 twice): nppdx-wins/src/benchmark_wins_frame.cu 81-81 (grid): 1 lines
 +   81          const dim3 grid{(FRAME_W + Ops::TX - 1) / Ops::TX, (FRAME_H + Ops::TY - 1) / Ops::TY, 1};
---- wins_nppdx_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 83-85 (launch and its error check): 3 lines
+--- wins_nppdx_box2 (76a9136; 5x5 twice): nppdx-wins/src/benchmark_wins_frame.cu 83-85 (launch and its error check): 3 lines
++   83          kernel<<<grid, dim3(Ops::block), Ops::smem, ctx.stream>>>(ctx.y, ctx.uv, ctx.pitch, n,
++   84                                                                    reinterpret_cast<float*>(out->ptr().data));
++   85          gpuErrchk(cudaGetLastError());
+--- wins_nppdx_gauss (76a9136; one pass): nppdx-wins/src/benchmark_wins_frame.cu 60-64 (CONFIGS, the tile and block list): 5 lines
++   60  constexpr std::array<NppdxConfig, 20> CONFIGS{{{64, 32, 0}, {64, 32, 128}, {64, 32, 256}, {64, 32, 512},
++   61                                                 {32, 32, 0}, {32, 32, 128}, {32, 32, 256}, {32, 32, 512},
++   62                                                 {32, 16, 0}, {32, 16, 128}, {32, 16, 256}, {32, 16, 512},
++   63                                                 {16, 16, 0}, {16, 16, 128}, {16, 16, 256}, {16, 16, 512},
++   64                                                 {16, 8, 0}, {16, 8, 128}, {16, 8, 256}, {16, 8, 512}}};
+--- wins_nppdx_gauss (76a9136; one pass): nppdx-wins/src/wins_common.h 475-477 (WINS_NPPDX_LAYOUT macro (tile, halos, SM, block)): 3 lines
++  475  #define WINS_NPPDX_LAYOUT(TX, TY, MH, CH, BX)                                                                         \
++  476      nppdx::TileSize<TX, TY>() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, MH)() +                                             \
++  477          NPPDX_MAKE_HALO(nppdx::CumulativeHalo, CH)() + nppdx::SM<NPPDX_SM>() + NppdxBlock<BX>()
+--- wins_nppdx_gauss (76a9136; one pass): nppdx-wins/src/wins_common.h 491-492 (GaussianSpec head): 2 lines
++  491  template <int RT, nppdx::gaussian_tail_width TAIL>
++  492  struct GaussianSpec {
+--- wins_nppdx_gauss (76a9136; one pass): nppdx-wins/src/wins_common.h 504-505 (GaussianSpec Operator, FUNCTION): 2 lines
++  504      using Operator = nppdx::GaussianBlur<RT, TAIL>;
++  505      static constexpr nppdx::function FUNCTION = nppdx::function::gaussian_blur;
+--- wins_nppdx_gauss (76a9136; one pass): nppdx-wins/src/wins_common.h 511-511 (GaussianSpec closing brace (K, PASSES, halos, the GAUSSIAN flag, BAND_MIN, ROW and taps(), shared by every version or used by FKL and the references, skipped)): 1 lines
++  511  };
+--- wins_nppdx_gauss (76a9136; one pass): nppdx-wins/src/wins_common.h 515-523 (FilterResizeOps head, ResizePre, halos): 9 lines
++  515  template <unsigned TX_, unsigned TY_, unsigned BlockX, unsigned J, unsigned K, typename Spec>
++  516  struct FilterResizeOps {
++  517      static constexpr unsigned TX = TX_;
++  518      static constexpr unsigned TY = TY_;
++  519      using ResizePre = decltype(nppdx::Function<nppdx::function::resize>() +
++  520                                 nppdx::Resize<J, K, nppdx::interpolation_method::bilinear>() +
++  521                                 nppdx::TileSize<TX, TY>() + nppdx::SM<NPPDX_SM>() + NppdxBlock<BlockX>());
++  522      static constexpr nppdx::Halo4 resizeHalo = ResizePre::local_halo;
++  523      static constexpr nppdx::Halo4 total = nppdx::Halo4::make_uniform(Spec::HALO) + resizeHalo;
+--- wins_nppdx_gauss (76a9136; one pass): nppdx-wins/src/wins_common.h 527-541 (FilterResizeOps Ingest to Blur (second and Blur2 of the two-pass program skipped)): 15 lines
++  527      using Ingest = decltype(nppdx::InputOutput<nppdx::input_output_direction::ingest>() +
++  528                              nppdx::InputFormat<nppdx::packing_format::nv12>() +
++  529                              WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
++  530      using FromLimitedY = decltype(nppdx::Function<nppdx::function::affine_channel_map>() +
++  531                                    nppdx::FromLimitedLuma<nppdx::bit_depth::bpp_8u>() +
++  532                                    WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
++  533      using FromLimitedUV = decltype(nppdx::Function<nppdx::function::affine_channel_map>() +
++  534                                     nppdx::FromLimitedChroma<nppdx::bit_depth::bpp_8u>() +
++  535                                     WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
++  536      using Convert = decltype(nppdx::Function<nppdx::function::color_convert>() +
++  537                               nppdx::ColorConvert<nppdx::color_space::yuv_bt601, nppdx::color_space::rgb,
++  538                                                   nppdx::bit_depth::bpp_8u, nppdx::bit_depth::bpp_8u>() +
++  539                               WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
++  540      using Blur = decltype(nppdx::Function<Spec::FUNCTION>() + typename Spec::Operator() +
++  541                            WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
+--- wins_nppdx_gauss (76a9136; one pass): nppdx-wins/src/wins_common.h 544-564 (FilterResizeOps Resize, tiles, smem, block, device run to the blur): 20 lines
++  544      using Resize = decltype(ResizePre() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, total)() +
++  545                              NPPDX_MAKE_HALO(nppdx::CumulativeHalo, resizeHalo)());
++  546      using InTile = nppdx::input_storage_of_t<Ingest>;
++  547      using BlurTile = nppdx::output_storage_of_t<Blur>;
++  548      using TmpTile = nppdx::temp_storage_of_t<Resize>;
++  549      using OutTile = nppdx::output_storage_of_t<Resize>;
++  550      static constexpr unsigned OX = OutTile::ChannelSliceType::width;
++  551      static constexpr unsigned OY = OutTile::ChannelSliceType::height;
++  552      static constexpr size_t smem = nppdx::shared_memory::compute_total_tile_storage<InTile, BlurTile, TmpTile, OutTile>();
++  553      static constexpr unsigned block = std::max({Ingest::block_dim.x, FromLimitedY::block_dim.x,
++  554                                                  FromLimitedUV::block_dim.x, Convert::block_dim.x, Blur::block_dim.x,
++  555                                                  Blur2::block_dim.x, Resize::block_dim.x});
+   556  
++  557      template <typename Image, typename Tiles>
++  558      __device__ static void run(const Image& image, Tiles& tiles, const int w, const int h) {
++  559          auto& in = std::get<0>(tiles);
++  560          Ingest().execute(image, in, w, h);
++  561          FromLimitedY().execute(in, w, h);
++  562          FromLimitedUV().execute(in, w, h);
++  563          Convert().execute(in, w, h);
++  564          Blur().execute(in, std::get<1>(tiles), w, h);
+--- wins_nppdx_gauss (76a9136; one pass): nppdx-wins/src/wins_common.h 570-570 (FilterResizeOps run: the one-pass resize (the two-pass branch and the if/else skipped)): 1 lines
++  570              Resize().execute(std::get<1>(tiles), std::get<2>(tiles), std::get<3>(tiles), w, h);
+--- wins_nppdx_gauss (76a9136; one pass): nppdx-wins/src/wins_common.h 572-574 (FilterResizeOps run: syncthreads, closing braces): 3 lines
++  572          __syncthreads();
++  573      }
++  574  };
+--- wins_nppdx_gauss (76a9136; one pass): nppdx-wins/src/wins_common.h 581-586 (sliceTiles): 6 lines
++  581  template <typename Ops>
++  582  __device__ auto sliceTiles() {
++  583      extern __shared__ unsigned char smem[];
++  584      return nppdx::shared_memory::slice_into_tile_storage<typename Ops::InTile, typename Ops::BlurTile,
++  585                                                           typename Ops::TmpTile, typename Ops::OutTile>(smem);
++  586  }
+--- wins_nppdx_gauss (76a9136; one pass): nppdx-wins/src/wins_common.h 589-607 (writeTile (hand-written normalization and float write)): 19 lines
++  589  template <typename Ops, typename Tile>
++  590  __device__ void writeTile(const Tile& tile, const Normalization& n, float* plane, const int x0, const int y0,
++  591                            const int w, const int h) {
++  592      const int threads = blockDim.x * blockDim.y * blockDim.z;
++  593      const int tid = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
++  594      for (int i = tid; i < static_cast<int>(Ops::OX * Ops::OY); i += threads) {
++  595          const int tx = i % Ops::OX;
++  596          const int ty = i / Ops::OX;
++  597          const int x = x0 + tx;
++  598          const int y = y0 + ty;
++  599          if (x < w && y < h) {
++  600              float* pixel = plane + (static_cast<size_t>(y) * w + x) * 3;
++  601  #pragma unroll
++  602              for (int c = 0; c < 3; ++c) {
++  603                  pixel[c] = ((tile.channel(c)(ty, tx) * n.mul[c]) - n.sub[c]) / n.div[c];
++  604              }
++  605          }
++  606      }
++  607  }
+--- wins_nppdx_gauss (76a9136; one pass): nppdx-wins/src/wins_common.h 640-648 (nppdxFrameKernel): 9 lines
++  640  template <typename Ops>
++  641  __global__ void nppdxFrameKernel(const uint8_t* y, const uint8_t* uv, const int pitch, const Normalization n,
++  642                                   float* out) {
++  643      auto tiles = sliceTiles<Ops>();
++  644      const nppdx::ImageLayout<const uint8_t, 2> image{{{y, uv}}, {{pitch, pitch}}};
++  645      Ops::run(image, tiles, FRAME_W, FRAME_H);
++  646      writeTile<Ops>(std::get<3>(tiles), n, out, static_cast<int>(blockIdx.x * Ops::OX),
++  647                     static_cast<int>(blockIdx.y * Ops::OY), W2_OUT_W, W2_OUT_H);
++  648  }
+--- wins_nppdx_gauss (76a9136; one pass): nppdx-wins/src/wins_common.h 650-655 (allowSharedMemory (init)): 6 lines
++  650  template <auto Kernel, size_t SMEM>
++  651  void allowSharedMemory() {
++  652      if constexpr (SMEM > 48 * 1024) {
++  653          gpuErrchk(cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
++  654      }
++  655  }
+--- wins_nppdx_gauss (76a9136; one pass): nppdx-wins/src/benchmark_wins_frame.cu 73-74 (Ops, kernel): 2 lines
++   73      using Ops = FilterResizeOps<C.tileX, C.tileY, C.block, 2, 1, Spec>;
++   74      constexpr auto kernel = nppdxFrameKernel<Ops>;
+--- wins_nppdx_gauss (76a9136; one pass): nppdx-wins/src/benchmark_wins_frame.cu 81-81 (grid): 1 lines
++   81          const dim3 grid{(FRAME_W + Ops::TX - 1) / Ops::TX, (FRAME_H + Ops::TY - 1) / Ops::TY, 1};
+--- wins_nppdx_gauss (76a9136; one pass): nppdx-wins/src/benchmark_wins_frame.cu 83-85 (launch and its error check): 3 lines
 +   83          kernel<<<grid, dim3(Ops::block), Ops::smem, ctx.stream>>>(ctx.y, ctx.uv, ctx.pitch, n,
 +   84                                                                    reinterpret_cast<float*>(out->ptr().data));
 +   85          gpuErrchk(cudaGetLastError());
@@ -1025,14 +1128,13 @@
 +  665          .then(fk::Sub<fk::float3>::build(subValue))
 +  666          .then(fk::Div<fk::float3>::build(divValue))
 +  667          .then(fk::TensorWrite<fk::float3>::build(out.ptr()));
---- wins_fkl_plain_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 98-104 (taps array, the parameter of GaussianBVF): 7 lines
+--- wins_fkl_plain_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 98-98 (taps array, the parameter of GaussianBVF): 1 lines
 +   98      fk::Array<float, S::K> taps{};
-+   99      if constexpr (S::GAUSSIAN) {
+--- wins_fkl_plain_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 100-103 (filled from the Spec's taps (the if constexpr dispatch of the shared function skipped)): 4 lines
 +  100          const auto values = S::taps();
 +  101          for (int i = 0; i < S::K; ++i) {
 +  102              taps[i] = static_cast<float>(values[i]);
 +  103          }
-+  104      }
 --- wins_fkl_plain_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 110-114 (executeOperations with GaussianBVF<21>): 5 lines
 +  110              fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
 +  111                                                        fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
@@ -1456,12 +1558,16 @@ exp3_nppdx (96cc71d; float-write path, the one the program instantiates)    83  
        1  fkl-neighborhood/src/nppdx_box.h:152-152  kernel closing brace
       18  fkl-neighborhood/src/nppdx_box.h:155-174  NppdxBox (init/run)
        1  fkl-neighborhood/src/benchmark_nppdx_neighborhood.cu:46-46  NPPDX_CONFIGS
-wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9)      120  ok
+wins_nppdx_box1 (76a9136; 5x5, 9x9: one pass)      107  ok
        5  nppdx-wins/src/benchmark_wins_frame.cu:60-64  CONFIGS, the tile and block list
        3  nppdx-wins/src/wins_common.h:475-477  WINS_NPPDX_LAYOUT macro (tile, halos, SM, block)
        2  nppdx-wins/src/wins_common.h:481-482  BoxSpec head
-       7  nppdx-wins/src/wins_common.h:484-490  BoxSpec K, PASSES, halos, Operator, FUNCTION (the GAUSSIAN flag of the harness skipped)
-      57  nppdx-wins/src/wins_common.h:515-574  FilterResizeOps (operation types, tiles, smem, block, device run)
+       3  nppdx-wins/src/wins_common.h:488-490  BoxSpec Operator, FUNCTION, closing brace (K, PASSES, halos and the GAUSSIAN flag, shared by every version, skipped)
+       9  nppdx-wins/src/wins_common.h:515-523  FilterResizeOps head, ResizePre, halos
+      15  nppdx-wins/src/wins_common.h:527-541  FilterResizeOps Ingest to Blur (second and Blur2 of the two-pass program skipped)
+      20  nppdx-wins/src/wins_common.h:544-564  FilterResizeOps Resize, tiles, smem, block, device run to the blur
+       1  nppdx-wins/src/wins_common.h:570-570  FilterResizeOps run: the one-pass resize (the two-pass branch and the if/else skipped)
+       3  nppdx-wins/src/wins_common.h:572-574  FilterResizeOps run: syncthreads, closing braces
        6  nppdx-wins/src/wins_common.h:581-586  sliceTiles
       19  nppdx-wins/src/wins_common.h:589-607  writeTile (hand-written normalization and float write)
        9  nppdx-wins/src/wins_common.h:640-648  nppdxFrameKernel
@@ -1469,19 +1575,36 @@ wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9)      120  ok
        2  nppdx-wins/src/benchmark_wins_frame.cu:73-74  Ops, kernel
        1  nppdx-wins/src/benchmark_wins_frame.cu:81-81  grid
        3  nppdx-wins/src/benchmark_wins_frame.cu:83-85  launch and its error check
-wins_nppdx_gauss (76a9136)                         121  ok
+wins_nppdx_box2 (76a9136; 5x5 twice)               112  ok
        5  nppdx-wins/src/benchmark_wins_frame.cu:60-64  CONFIGS, the tile and block list
-       3  nppdx-wins/src/wins_common.h:475-477  WINS_NPPDX_LAYOUT macro
-       2  nppdx-wins/src/wins_common.h:491-492  GaussianSpec head
-       1  nppdx-wins/src/wins_common.h:497-497  GaussianSpec BAND_TAPS
-       1  nppdx-wins/src/wins_common.h:499-499  GaussianSpec K
-       5  nppdx-wins/src/wins_common.h:501-505  GaussianSpec PASSES, halos, Operator, FUNCTION (GAUSSIAN flag, BAND_MIN, ROW and taps() of FKL and the references skipped)
-       1  nppdx-wins/src/wins_common.h:511-511  GaussianSpec closing brace
-      57  nppdx-wins/src/wins_common.h:515-574  FilterResizeOps
+       3  nppdx-wins/src/wins_common.h:475-477  WINS_NPPDX_LAYOUT macro (tile, halos, SM, block)
+       2  nppdx-wins/src/wins_common.h:481-482  BoxSpec head
+       3  nppdx-wins/src/wins_common.h:488-490  BoxSpec Operator, FUNCTION, closing brace (K, PASSES, halos and the GAUSSIAN flag, shared by every version, skipped)
+      48  nppdx-wins/src/wins_common.h:515-564  FilterResizeOps head to the first blur, with second and Blur2
+       2  nppdx-wins/src/wins_common.h:567-568  FilterResizeOps run: second pass and resize (the one-pass branch and the if/else skipped)
+       3  nppdx-wins/src/wins_common.h:572-574  FilterResizeOps run: syncthreads, closing braces
        6  nppdx-wins/src/wins_common.h:581-586  sliceTiles
-      19  nppdx-wins/src/wins_common.h:589-607  writeTile
+      19  nppdx-wins/src/wins_common.h:589-607  writeTile (hand-written normalization and float write)
        9  nppdx-wins/src/wins_common.h:640-648  nppdxFrameKernel
-       6  nppdx-wins/src/wins_common.h:650-655  allowSharedMemory
+       6  nppdx-wins/src/wins_common.h:650-655  allowSharedMemory (init)
+       2  nppdx-wins/src/benchmark_wins_frame.cu:73-74  Ops, kernel
+       1  nppdx-wins/src/benchmark_wins_frame.cu:81-81  grid
+       3  nppdx-wins/src/benchmark_wins_frame.cu:83-85  launch and its error check
+wins_nppdx_gauss (76a9136; one pass)               107  ok
+       5  nppdx-wins/src/benchmark_wins_frame.cu:60-64  CONFIGS, the tile and block list
+       3  nppdx-wins/src/wins_common.h:475-477  WINS_NPPDX_LAYOUT macro (tile, halos, SM, block)
+       2  nppdx-wins/src/wins_common.h:491-492  GaussianSpec head
+       2  nppdx-wins/src/wins_common.h:504-505  GaussianSpec Operator, FUNCTION
+       1  nppdx-wins/src/wins_common.h:511-511  GaussianSpec closing brace (K, PASSES, halos, the GAUSSIAN flag, BAND_MIN, ROW and taps(), shared by every version or used by FKL and the references, skipped)
+       9  nppdx-wins/src/wins_common.h:515-523  FilterResizeOps head, ResizePre, halos
+      15  nppdx-wins/src/wins_common.h:527-541  FilterResizeOps Ingest to Blur (second and Blur2 of the two-pass program skipped)
+      20  nppdx-wins/src/wins_common.h:544-564  FilterResizeOps Resize, tiles, smem, block, device run to the blur
+       1  nppdx-wins/src/wins_common.h:570-570  FilterResizeOps run: the one-pass resize (the two-pass branch and the if/else skipped)
+       3  nppdx-wins/src/wins_common.h:572-574  FilterResizeOps run: syncthreads, closing braces
+       6  nppdx-wins/src/wins_common.h:581-586  sliceTiles
+      19  nppdx-wins/src/wins_common.h:589-607  writeTile (hand-written normalization and float write)
+       9  nppdx-wins/src/wins_common.h:640-648  nppdxFrameKernel
+       6  nppdx-wins/src/wins_common.h:650-655  allowSharedMemory (init)
        2  nppdx-wins/src/benchmark_wins_frame.cu:73-74  Ops, kernel
        1  nppdx-wins/src/benchmark_wins_frame.cu:81-81  grid
        3  nppdx-wins/src/benchmark_wins_frame.cu:83-85  launch and its error check
@@ -1493,8 +1616,9 @@ wins_fkl_plain_box2 (76a9136; 5x5 twice)            11  ok
        6  nppdx-wins/src/benchmark_wins_frame.cu:122-127  executeOperations with two BoxBVF<K>
        1  nppdx-wins/src/wins_common.h:661-661  Bilinear alias
        4  nppdx-wins/src/wins_common.h:664-667  write chain
-wins_fkl_plain_gauss (76a9136)                      17  ok
-       7  nppdx-wins/src/benchmark_wins_frame.cu:98-104  taps array, the parameter of GaussianBVF
+wins_fkl_plain_gauss (76a9136)                      15  ok
+       1  nppdx-wins/src/benchmark_wins_frame.cu:98-98  taps array, the parameter of GaussianBVF
+       4  nppdx-wins/src/benchmark_wins_frame.cu:100-103  filled from the Spec's taps (the if constexpr dispatch of the shared function skipped)
        5  nppdx-wins/src/benchmark_wins_frame.cu:110-114  executeOperations with GaussianBVF<21>
        1  nppdx-wins/src/wins_common.h:661-661  Bilinear alias
        4  nppdx-wins/src/wins_common.h:664-667  write chain
@@ -1541,4 +1665,4 @@ bench_op_BoxBVF (96cc71d, counted apart)            61  ok
 bench_op_GaussianBVF (76a9136, counted apart)       70  ok
       70  common/bench_neighborhood_ops.h:126-212  GaussianBVFParams, GaussianBVF, incomplete GaussianBVF
 
-18 of 18 totals as expected
+19 of 19 totals as expected

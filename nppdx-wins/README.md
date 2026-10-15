@@ -283,14 +283,15 @@ kernels.
 from the repository.
 - **Request:** the paper coordinator, 2026-10-15, for Oscar's request to put the lines of code in the comparison tables.
 - **Files:** the counter `loc/count_loc.py` and the line ranges `loc/manifest.json` are the coordinator's. The coordinator
-  wrote the ranges and four independent reviewers checked them. `loc/totals.txt` and `loc/show.txt` are the counter's
-  output.
+  wrote the ranges and four independent reviewers checked them. After the review of c51a930, the coordinator made the
+  count per program on both sides. `loc/totals.txt` and `loc/show.txt` are the counter's output.
 
-**The rule** (the paper's Methodology): count the lines that are neither blank nor comments of the code that builds and
-launches a pipeline.
+**The rule** (the paper's Methodology): count, per program, the lines that are neither blank nor comments of the code
+that builds and launches a pipeline.
 - **NPPDx:**
   - The kernel and the device helpers it calls.
-  - The structs with the types of its operations and tiles.
+  - The structs with the types of its operations and tiles. Of the `Spec` structs, only the struct head, `Operator`,
+    `FUNCTION` and the closing brace.
   - Its launch configuration: init with `cudaFuncSetAttribute`, grid, block, shared memory, the launch and its error
     check.
   - Its list of tile and block configurations.
@@ -301,10 +302,15 @@ launches a pipeline.
   - The error check of the call.
 - **Not counted, on either side:**
   - The harness, references, validation, the sweeps that choose a configuration, and output buffers.
-  - The parameters, constants and aliases every version shares: Normalization, crop origins, `RESIZE_J/K`, `HALO`,
-    `YUVToRGB`, the `Spec` alias, the `GAUSSIAN` flag and `GaussianSpec::taps()`.
+  - The parameters, constants and aliases every version shares or that derive from the workload: Normalization, crop
+    origins, `RESIZE_J/K`, `HALO`, `YUVToRGB`, the `Spec` alias, the `K`, `PASSES`, halo and `GAUSSIAN` members of the
+    `Spec` structs, and `GaussianSpec::taps()` (used by FKL and the references).
   - Namespace and include lines.
-  - Code that no program of the experiment instantiates: the 8-bit write branch of Experiment 3's `nppdx_box.h`.
+  - The branches the program does not instantiate, with their if/else dispatch lines:
+    - the 8-bit write branch of Experiment 3's `nppdx_box.h`;
+    - in part (c), the two-pass branch of `FilterResizeOps` for the one-pass programs and its one-pass branch for the
+      two-pass program;
+    - the box/Gaussian and one/two-pass dispatch of the shared FKL functions.
 - **Counted apart:** `BoxBVF` and `GaussianBVF`, the operations written for the benchmark.
 - **Calibration:** the rule reproduces the published 10 / 109 / 131 at 3845b60 exactly (results-v3-addendum README,
   section 4).
@@ -320,10 +326,10 @@ launches a pipeline.
 
 | Experiment 3 (c), 76a9136 (nppdx-wins; sources as 57f08bc) | NPPDx | FKL plain (BVF op inline) | FKL staged | FKL staged separable |
 |---|---|---|---|---|
-| box 5x5 | 120 | 10 | 21 | |
-| box 5x5, two passes | 120 | 11 | 21 | |
-| box 9x9 | 120 | 10 | 21 | |
-| Gaussian, 21 taps | 121 | 17 | 35 (21x21) | 50 |
+| box 5x5 | 107 | 10 | 21 | |
+| box 5x5, two passes | 112 | 11 | 21 | |
+| box 9x9 | 107 | 10 | 21 | |
+| Gaussian, 21 taps | 107 | 15 | 35 (21x21) | 50 |
 
 **Operations counted apart:** `BoxBVF` 61 (the same at 96cc71d and 76a9136) and `GaussianBVF` 70 (76a9136). FKL plain
 uses them.

@@ -32,12 +32,16 @@ exp3_nppdx (96cc71d; float-write path, the one the program instantiates)    83  
        1  fkl-neighborhood/src/nppdx_box.h:152-152  kernel closing brace
       18  fkl-neighborhood/src/nppdx_box.h:155-174  NppdxBox (init/run)
        1  fkl-neighborhood/src/benchmark_nppdx_neighborhood.cu:46-46  NPPDX_CONFIGS
-wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9)      120  ok
+wins_nppdx_box1 (76a9136; 5x5, 9x9: one pass)      107  ok
        5  nppdx-wins/src/benchmark_wins_frame.cu:60-64  CONFIGS, the tile and block list
        3  nppdx-wins/src/wins_common.h:475-477  WINS_NPPDX_LAYOUT macro (tile, halos, SM, block)
        2  nppdx-wins/src/wins_common.h:481-482  BoxSpec head
-       7  nppdx-wins/src/wins_common.h:484-490  BoxSpec K, PASSES, halos, Operator, FUNCTION (the GAUSSIAN flag of the harness skipped)
-      57  nppdx-wins/src/wins_common.h:515-574  FilterResizeOps (operation types, tiles, smem, block, device run)
+       3  nppdx-wins/src/wins_common.h:488-490  BoxSpec Operator, FUNCTION, closing brace (K, PASSES, halos and the GAUSSIAN flag, shared by every version, skipped)
+       9  nppdx-wins/src/wins_common.h:515-523  FilterResizeOps head, ResizePre, halos
+      15  nppdx-wins/src/wins_common.h:527-541  FilterResizeOps Ingest to Blur (second and Blur2 of the two-pass program skipped)
+      20  nppdx-wins/src/wins_common.h:544-564  FilterResizeOps Resize, tiles, smem, block, device run to the blur
+       1  nppdx-wins/src/wins_common.h:570-570  FilterResizeOps run: the one-pass resize (the two-pass branch and the if/else skipped)
+       3  nppdx-wins/src/wins_common.h:572-574  FilterResizeOps run: syncthreads, closing braces
        6  nppdx-wins/src/wins_common.h:581-586  sliceTiles
       19  nppdx-wins/src/wins_common.h:589-607  writeTile (hand-written normalization and float write)
        9  nppdx-wins/src/wins_common.h:640-648  nppdxFrameKernel
@@ -45,19 +49,36 @@ wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9)      120  ok
        2  nppdx-wins/src/benchmark_wins_frame.cu:73-74  Ops, kernel
        1  nppdx-wins/src/benchmark_wins_frame.cu:81-81  grid
        3  nppdx-wins/src/benchmark_wins_frame.cu:83-85  launch and its error check
-wins_nppdx_gauss (76a9136)                         121  ok
+wins_nppdx_box2 (76a9136; 5x5 twice)               112  ok
        5  nppdx-wins/src/benchmark_wins_frame.cu:60-64  CONFIGS, the tile and block list
-       3  nppdx-wins/src/wins_common.h:475-477  WINS_NPPDX_LAYOUT macro
-       2  nppdx-wins/src/wins_common.h:491-492  GaussianSpec head
-       1  nppdx-wins/src/wins_common.h:497-497  GaussianSpec BAND_TAPS
-       1  nppdx-wins/src/wins_common.h:499-499  GaussianSpec K
-       5  nppdx-wins/src/wins_common.h:501-505  GaussianSpec PASSES, halos, Operator, FUNCTION (GAUSSIAN flag, BAND_MIN, ROW and taps() of FKL and the references skipped)
-       1  nppdx-wins/src/wins_common.h:511-511  GaussianSpec closing brace
-      57  nppdx-wins/src/wins_common.h:515-574  FilterResizeOps
+       3  nppdx-wins/src/wins_common.h:475-477  WINS_NPPDX_LAYOUT macro (tile, halos, SM, block)
+       2  nppdx-wins/src/wins_common.h:481-482  BoxSpec head
+       3  nppdx-wins/src/wins_common.h:488-490  BoxSpec Operator, FUNCTION, closing brace (K, PASSES, halos and the GAUSSIAN flag, shared by every version, skipped)
+      48  nppdx-wins/src/wins_common.h:515-564  FilterResizeOps head to the first blur, with second and Blur2
+       2  nppdx-wins/src/wins_common.h:567-568  FilterResizeOps run: second pass and resize (the one-pass branch and the if/else skipped)
+       3  nppdx-wins/src/wins_common.h:572-574  FilterResizeOps run: syncthreads, closing braces
        6  nppdx-wins/src/wins_common.h:581-586  sliceTiles
-      19  nppdx-wins/src/wins_common.h:589-607  writeTile
+      19  nppdx-wins/src/wins_common.h:589-607  writeTile (hand-written normalization and float write)
        9  nppdx-wins/src/wins_common.h:640-648  nppdxFrameKernel
-       6  nppdx-wins/src/wins_common.h:650-655  allowSharedMemory
+       6  nppdx-wins/src/wins_common.h:650-655  allowSharedMemory (init)
+       2  nppdx-wins/src/benchmark_wins_frame.cu:73-74  Ops, kernel
+       1  nppdx-wins/src/benchmark_wins_frame.cu:81-81  grid
+       3  nppdx-wins/src/benchmark_wins_frame.cu:83-85  launch and its error check
+wins_nppdx_gauss (76a9136; one pass)               107  ok
+       5  nppdx-wins/src/benchmark_wins_frame.cu:60-64  CONFIGS, the tile and block list
+       3  nppdx-wins/src/wins_common.h:475-477  WINS_NPPDX_LAYOUT macro (tile, halos, SM, block)
+       2  nppdx-wins/src/wins_common.h:491-492  GaussianSpec head
+       2  nppdx-wins/src/wins_common.h:504-505  GaussianSpec Operator, FUNCTION
+       1  nppdx-wins/src/wins_common.h:511-511  GaussianSpec closing brace (K, PASSES, halos, the GAUSSIAN flag, BAND_MIN, ROW and taps(), shared by every version or used by FKL and the references, skipped)
+       9  nppdx-wins/src/wins_common.h:515-523  FilterResizeOps head, ResizePre, halos
+      15  nppdx-wins/src/wins_common.h:527-541  FilterResizeOps Ingest to Blur (second and Blur2 of the two-pass program skipped)
+      20  nppdx-wins/src/wins_common.h:544-564  FilterResizeOps Resize, tiles, smem, block, device run to the blur
+       1  nppdx-wins/src/wins_common.h:570-570  FilterResizeOps run: the one-pass resize (the two-pass branch and the if/else skipped)
+       3  nppdx-wins/src/wins_common.h:572-574  FilterResizeOps run: syncthreads, closing braces
+       6  nppdx-wins/src/wins_common.h:581-586  sliceTiles
+      19  nppdx-wins/src/wins_common.h:589-607  writeTile (hand-written normalization and float write)
+       9  nppdx-wins/src/wins_common.h:640-648  nppdxFrameKernel
+       6  nppdx-wins/src/wins_common.h:650-655  allowSharedMemory (init)
        2  nppdx-wins/src/benchmark_wins_frame.cu:73-74  Ops, kernel
        1  nppdx-wins/src/benchmark_wins_frame.cu:81-81  grid
        3  nppdx-wins/src/benchmark_wins_frame.cu:83-85  launch and its error check
@@ -69,8 +90,9 @@ wins_fkl_plain_box2 (76a9136; 5x5 twice)            11  ok
        6  nppdx-wins/src/benchmark_wins_frame.cu:122-127  executeOperations with two BoxBVF<K>
        1  nppdx-wins/src/wins_common.h:661-661  Bilinear alias
        4  nppdx-wins/src/wins_common.h:664-667  write chain
-wins_fkl_plain_gauss (76a9136)                      17  ok
-       7  nppdx-wins/src/benchmark_wins_frame.cu:98-104  taps array, the parameter of GaussianBVF
+wins_fkl_plain_gauss (76a9136)                      15  ok
+       1  nppdx-wins/src/benchmark_wins_frame.cu:98-98  taps array, the parameter of GaussianBVF
+       4  nppdx-wins/src/benchmark_wins_frame.cu:100-103  filled from the Spec's taps (the if constexpr dispatch of the shared function skipped)
        5  nppdx-wins/src/benchmark_wins_frame.cu:110-114  executeOperations with GaussianBVF<21>
        1  nppdx-wins/src/wins_common.h:661-661  Bilinear alias
        4  nppdx-wins/src/wins_common.h:664-667  write chain
@@ -117,4 +139,4 @@ bench_op_BoxBVF (96cc71d, counted apart)            61  ok
 bench_op_GaussianBVF (76a9136, counted apart)       70  ok
       70  common/bench_neighborhood_ops.h:126-212  GaussianBVFParams, GaussianBVF, incomplete GaussianBVF
 
-18 of 18 totals as expected
+19 of 19 totals as expected
