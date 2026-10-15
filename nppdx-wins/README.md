@@ -311,7 +311,7 @@ that builds and launches a pipeline.
     - in part (c), the two-pass branch of `FilterResizeOps` for the one-pass programs and its one-pass branch for the
       two-pass program;
     - the box/Gaussian and one/two-pass dispatch of the shared FKL functions.
-- **Counted apart:** `BoxBVF` and `GaussianBVF`, the operations written for the benchmark.
+  - `BoxBVF` and `GaussianBVF`, the operations written for the benchmark (Oscar, 2026-10-15).
 - **Calibration:** the rule reproduces the published 10 / 109 / 131 at 3845b60 exactly (results-v3-addendum README,
   section 4).
 - **What every range is:** the manifest's `what` field gives it for every range.
@@ -330,9 +330,6 @@ that builds and launches a pipeline.
 | box 5x5, two passes | 112 | 11 | 21 | |
 | box 9x9 | 107 | 10 | 21 | |
 | Gaussian, 21 taps | 107 | 15 | 35 (21x21) | 50 |
-
-**Operations counted apart:** `BoxBVF` 61 (the same at 96cc71d and 76a9136) and `GaussianBVF` 70 (76a9136). FKL plain
-uses them.
 
 **Run:** from any checkout that has fetched main, nppdx-npp-border-align, exp3-neighborhood and nppdx-wins.
 - The counter reads every file with `git show <commit>:<path>`, so the checked-out branch does not matter.
