@@ -14,8 +14,12 @@ operation in one kernel, and the same facts for FKL's `Resize`.
   - The example reference computes the phase of an output pixel in float: theta = frac((o + 0.5f) * (J / K) - 0.5f).
     At an exact center phase (theta = 0, only when J and K are both odd) this can come out just under 1, which moves
     all its taps by one pixel.
-  - Seen at 7:3, 13:11 and 3:19 for every method. There the GPU equals an exact rational evaluation and the example
-    reference is off by 22 to 35 levels.
+  - Seen at 7:3, 13:11 and 3:19 for every method: there the GPU's output differs from the example reference by 21 to 35
+    levels (`correct_ratios.py`'s launches).
+    - For bilinear, bicubic and lanczos3 at all three, and for nearest at 7:3, the GPU equals the exact reference
+      (within 1 level), so the error is the example reference's.
+    - Nearest at 13:11 and 3:19 is also off against the exact reference, by 29 and 35 levels. That is NPPDx's own
+      nearest defect at the center phase (see "Nearest picks the next source pixel" below), not the reference's.
   - The probe takes the phase and the center index from integers, as NPPDx's kernel does, and computes the weights in
     double. At a nearest tie (theta = 1/2) both source pixels are accepted.
   - The error against the example reference is also recorded (`launch_example_max_diff...`).
@@ -69,7 +73,8 @@ Each maximum is at the tile with the least shared memory. The shared memory show
 (bicubic) and 192 (lanczos3) of all coprime J:K up to 512 have a tile that compiles, fits with the example's block and
 that J divides (`results/RTX4090/feasible_ratios.csv`).
 - J <= 18, 17, 15 and 14; K <= 31, 31, 30 and 29.
-- The ratios closest to 1 are 14:15 and 15:14 (13:14 and 14:13 for lanczos3).
+- The ratios closest to 1 (upscale and downscale) are 14:15 and 15:14 for nearest and bilinear, 14:15 and 14:13 for
+  bicubic, and 13:14 and 14:13 for lanczos3 (`results/RTX4090/tables.md`).
 - **Launched once each at its best tile** (`correct_ratios.py`, `results/RTX4090/correct_ratios.csv`):
 
   | method | rules | correct | factors (K/J) of the correct ones | not correct |
