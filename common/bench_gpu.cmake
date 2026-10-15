@@ -24,6 +24,14 @@ find_package(CUDAToolkit REQUIRED)
 
 execute_process(COMMAND git -C ${FKL_DIR} rev-parse --short HEAD OUTPUT_VARIABLE FKL_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE)
 execute_process(COMMAND git -C ${FKL_DIR} rev-parse --abbrev-ref HEAD OUTPUT_VARIABLE FKL_BRANCH OUTPUT_STRIP_TRAILING_WHITESPACE)
+# The commit of this repository, and whether its checkout has changes (recorded by the programs that print it)
+execute_process(COMMAND git -C ${BENCH_COMMON_DIR}/.. rev-parse --short HEAD OUTPUT_VARIABLE BENCH_REPO_COMMIT
+                OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+execute_process(COMMAND git -C ${BENCH_COMMON_DIR}/.. status --porcelain --untracked-files=no
+                OUTPUT_VARIABLE BENCH_REPO_CHANGES OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(BENCH_REPO_CHANGES)
+    string(APPEND BENCH_REPO_COMMIT " (with uncommitted changes)")
+endif()
 
 # Same nvcc options FKL uses for its own CUDA targets (cmake/libs/cuda/target_generation.cmake)
 set(BENCH_CUDA_OPTIONS --threads 0 -rdc=false -split-compile=0 -ftemplate-depth=1000 -lineinfo)
@@ -45,7 +53,7 @@ function(add_bench_target TARGET_NAME SOURCE)
     target_include_directories(${TARGET_NAME} PRIVATE ${FKL_DIR}/include ${BENCH_COMMON_DIR})
     target_compile_options(${TARGET_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${BENCH_CUDA_OPTIONS}>)
     target_compile_definitions(${TARGET_NAME} PRIVATE
-        BENCH_FKL_COMMIT="${FKL_COMMIT}" BENCH_FKL_BRANCH="${FKL_BRANCH}"
+        BENCH_FKL_COMMIT="${FKL_COMMIT}" BENCH_FKL_BRANCH="${FKL_BRANCH}" BENCH_REPO_COMMIT="${BENCH_REPO_COMMIT}"
         BENCH_ITERATIONS=${BENCH_ITERATIONS} BENCH_WARMUP_ITERATIONS=${BENCH_WARMUP_ITERATIONS}
         ${BENCH_GEOMETRY_DEFINITIONS}
         BENCH_NVCC_VERSION="${CMAKE_CUDA_COMPILER_VERSION}" BENCH_NVCC_FLAGS="${BENCH_NVCC_FLAGS}")

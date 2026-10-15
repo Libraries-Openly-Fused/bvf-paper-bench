@@ -1,0 +1,154 @@
+{
+  "rule": "Lines that are neither blank nor comments of the code that builds and launches each pipeline. NPPDx: the __global__ kernel and the device helpers it calls, the structs that define the types of its operations and tiles (without the Spec members shared by every version), its launch configuration (init with cudaFuncSetAttribute, grid, block, shared memory, the launch and its error check) and its list of tile and block configurations. FKL: the call that builds and launches the pipeline (executeOperations, executeBoxBlur, executeLinearFilter) with the operation chains it is given, the details and tile list of a DPP, the intermediates of a staged form with their views and coefficient images, and the error check of the call. Not counted on either side: the harness (Implementation/stage wrappers, beforeKernel hooks, timing, CSV, modes), the host references, validation, the sweeps that choose a configuration, the output buffers, the parameter structures, constants and aliases shared by every version or derived from the workload (Normalization, crop origins, RESIZE_J/K, HALO, YUVToRGB, the Spec alias and the K, PASSES, halo and GAUSSIAN members of the Spec structs, the taps() accessor used by FKL and the references), the namespace and include lines, and, counting per program, the branches that the program of a row does not instantiate together with their if/else dispatch lines (the 8-bit write branch of Experiment 3's kernel; the two-pass branch of the part (c) kernel for the one-pass programs and the one-pass branch for the two-pass program; the box/Gaussian and one/two-pass dispatch of the shared FKL functions). BoxBVF and GaussianBVF, operations written for the benchmark, are not counted (Oscar, 2026-10-15). Calibration: FKL 10, NPPDx 109, NPPDx+NPP 131 at 3845b60 (results-v3-addendum/README.md section 4).",
+  "items": [
+    {"name": "exp1_fkl_bvf (3845b60)", "expected": 10, "ranges": [
+      {"commit": "3845b60", "path": "fkl-vs-nppdx/benchmarks/figure1_common.h", "lines": [173, 182], "what": "executeOperations call"}
+    ]},
+    {"name": "exp1_nppdx (3845b60)", "expected": 109, "ranges": [
+      {"commit": "3845b60", "path": "fkl-vs-nppdx/benchmarks/nppdx_figure1.h", "lines": [28, 109], "what": "kernel, NppdxFigure1 (init/run), nppdxFigure1Configs"},
+      {"commit": "3845b60", "path": "fkl-vs-nppdx/benchmarks/nppdx_common.h", "lines": [83, 131], "what": "NppdxOps"}
+    ]},
+    {"name": "exp1_nppdx_npp (3845b60, calibration)", "expected": 131, "ranges": [
+      {"commit": "3845b60", "path": "fkl-vs-nppdx/benchmarks/nppdx_npp_figure1.h", "lines": [32, 144], "what": "nppdxRgbKernel, NppdxRgb, nppdxRgbConfigs, NppTail"},
+      {"commit": "3845b60", "path": "fkl-vs-nppdx/benchmarks/nppdx_common.h", "lines": [83, 131], "what": "NppdxOps"}
+    ]},
+    {"name": "exp1_nppdx_npp (b7f6e88)", "expected": 140, "ranges": [
+      {"commit": "b7f6e88", "path": "fkl-vs-nppdx/benchmarks/nppdx_npp_figure1.h", "lines": [34, 163], "what": "nppdxRgbKernel, NppdxRgb, nppdxRgbConfigs, NppTail (aligned)"},
+      {"commit": "b7f6e88", "path": "fkl-vs-nppdx/benchmarks/nppdx_common.h", "lines": [83, 131], "what": "NppdxOps"},
+      {"commit": "b7f6e88", "path": "fkl-vs-nppdx/benchmarks/benchmark_nppdx_npp.cu", "lines": [70, 70], "what": "the 8-bit intermediate between the NPPDx kernel and NPP (declaration)"},
+      {"commit": "b7f6e88", "path": "fkl-vs-nppdx/benchmarks/benchmark_nppdx_npp.cu", "lines": [74, 74], "what": "its allocation"}
+    ]},
+    {"name": "exp3_fkl_dpp (96cc71d)", "expected": 14, "ranges": [
+      {"commit": "96cc71d", "path": "common/bench_neighborhood.h", "lines": [70, 70], "what": "DPP_TILES, the tile list"},
+      {"commit": "96cc71d", "path": "fkl-neighborhood/src/neighborhood_common.h", "lines": [128, 130], "what": "read chain ReadYUV.then(YUVToRGB).then(Crop)"},
+      {"commit": "96cc71d", "path": "fkl-neighborhood/src/neighborhood_common.h", "lines": [147, 150], "what": "write chain Mul.then(Sub).then(Div).then(TensorWrite)"},
+      {"commit": "96cc71d", "path": "fkl-neighborhood/src/neighborhood_common.h", "lines": [164, 165], "what": "MorphologyDPP details (tile, K, anchor)"},
+      {"commit": "96cc71d", "path": "fkl-neighborhood/src/neighborhood_common.h", "lines": [167, 170], "what": "executeBoxBlur call with its error check"}
+    ]},
+    {"name": "exp3_nppdx_as_written (96cc71d, info)", "expected": 94, "ranges": [
+      {"commit": "96cc71d", "path": "fkl-neighborhood/src/nppdx_box.h", "lines": [66, 108], "what": "BoxOps (operation types, tiles, smem, block, grid)"},
+      {"commit": "96cc71d", "path": "fkl-neighborhood/src/nppdx_box.h", "lines": [110, 152], "what": "nppdxBoxKernel"},
+      {"commit": "96cc71d", "path": "fkl-neighborhood/src/nppdx_box.h", "lines": [155, 174], "what": "NppdxBox (init/run)"},
+      {"commit": "96cc71d", "path": "fkl-neighborhood/src/benchmark_nppdx_neighborhood.cu", "lines": [46, 46], "what": "NPPDX_CONFIGS"}
+    ]},
+    {"name": "exp3_nppdx (96cc71d; float-write path, the one the program instantiates)", "expected": 83, "ranges": [
+      {"commit": "96cc71d", "path": "fkl-neighborhood/src/nppdx_box.h", "lines": [66, 92], "what": "BoxOps up to Blur"},
+      {"commit": "96cc71d", "path": "fkl-neighborhood/src/nppdx_box.h", "lines": [98, 105], "what": "BoxOps Tile, smem, blockFloatWrite (Exgest and blockExgest skipped)"},
+      {"commit": "96cc71d", "path": "fkl-neighborhood/src/nppdx_box.h", "lines": [107, 108], "what": "BoxOps gridOf, closing brace"},
+      {"commit": "96cc71d", "path": "fkl-neighborhood/src/nppdx_box.h", "lines": [110, 130], "what": "kernel up to the blur"},
+      {"commit": "96cc71d", "path": "fkl-neighborhood/src/nppdx_box.h", "lines": [132, 146], "what": "kernel: hand-written normalization and float write (the if/else of the 8-bit branch skipped)"},
+      {"commit": "96cc71d", "path": "fkl-neighborhood/src/nppdx_box.h", "lines": [152, 152], "what": "kernel closing brace"},
+      {"commit": "96cc71d", "path": "fkl-neighborhood/src/nppdx_box.h", "lines": [155, 174], "what": "NppdxBox (init/run)"},
+      {"commit": "96cc71d", "path": "fkl-neighborhood/src/benchmark_nppdx_neighborhood.cu", "lines": [46, 46], "what": "NPPDX_CONFIGS"}
+    ]},
+    {"name": "wins_nppdx_box1 (76a9136; 5x5, 9x9: one pass)", "expected": 107, "ranges": [
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [60, 64], "what": "CONFIGS, the tile and block list"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [475, 477], "what": "WINS_NPPDX_LAYOUT macro (tile, halos, SM, block)"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [481, 482], "what": "BoxSpec head"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [488, 490], "what": "BoxSpec Operator, FUNCTION, closing brace (K, PASSES, halos and the GAUSSIAN flag, shared by every version, skipped)"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [515, 523], "what": "FilterResizeOps head, ResizePre, halos"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [527, 541], "what": "FilterResizeOps Ingest to Blur (second and Blur2 of the two-pass program skipped)"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [544, 564], "what": "FilterResizeOps Resize, tiles, smem, block, device run to the blur"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [570, 570], "what": "FilterResizeOps run: the one-pass resize (the two-pass branch and the if/else skipped)"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [572, 574], "what": "FilterResizeOps run: syncthreads, closing braces"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [581, 586], "what": "sliceTiles"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [589, 607], "what": "writeTile (hand-written normalization and float write)"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [640, 648], "what": "nppdxFrameKernel"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [650, 655], "what": "allowSharedMemory (init)"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [73, 74], "what": "Ops, kernel"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [81, 81], "what": "grid"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [83, 85], "what": "launch and its error check"}
+    ]},
+    {"name": "wins_nppdx_box2 (76a9136; 5x5 twice)", "expected": 112, "ranges": [
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [60, 64], "what": "CONFIGS, the tile and block list"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [475, 477], "what": "WINS_NPPDX_LAYOUT macro (tile, halos, SM, block)"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [481, 482], "what": "BoxSpec head"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [488, 490], "what": "BoxSpec Operator, FUNCTION, closing brace (K, PASSES, halos and the GAUSSIAN flag, shared by every version, skipped)"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [515, 564], "what": "FilterResizeOps head to the first blur, with second and Blur2"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [567, 568], "what": "FilterResizeOps run: second pass and resize (the one-pass branch and the if/else skipped)"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [572, 574], "what": "FilterResizeOps run: syncthreads, closing braces"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [581, 586], "what": "sliceTiles"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [589, 607], "what": "writeTile (hand-written normalization and float write)"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [640, 648], "what": "nppdxFrameKernel"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [650, 655], "what": "allowSharedMemory (init)"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [73, 74], "what": "Ops, kernel"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [81, 81], "what": "grid"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [83, 85], "what": "launch and its error check"}
+    ]},
+    {"name": "wins_nppdx_gauss (76a9136; one pass)", "expected": 107, "ranges": [
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [60, 64], "what": "CONFIGS, the tile and block list"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [475, 477], "what": "WINS_NPPDX_LAYOUT macro (tile, halos, SM, block)"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [491, 492], "what": "GaussianSpec head"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [504, 505], "what": "GaussianSpec Operator, FUNCTION"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [511, 511], "what": "GaussianSpec closing brace (K, PASSES, halos, the GAUSSIAN flag, BAND_MIN, ROW and taps(), shared by every version or used by FKL and the references, skipped)"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [515, 523], "what": "FilterResizeOps head, ResizePre, halos"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [527, 541], "what": "FilterResizeOps Ingest to Blur (second and Blur2 of the two-pass program skipped)"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [544, 564], "what": "FilterResizeOps Resize, tiles, smem, block, device run to the blur"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [570, 570], "what": "FilterResizeOps run: the one-pass resize (the two-pass branch and the if/else skipped)"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [572, 574], "what": "FilterResizeOps run: syncthreads, closing braces"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [581, 586], "what": "sliceTiles"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [589, 607], "what": "writeTile (hand-written normalization and float write)"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [640, 648], "what": "nppdxFrameKernel"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [650, 655], "what": "allowSharedMemory (init)"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [73, 74], "what": "Ops, kernel"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [81, 81], "what": "grid"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [83, 85], "what": "launch and its error check"}
+    ]},
+    {"name": "wins_fkl_plain_box1 (76a9136; 5x5, 9x9)", "expected": 10, "ranges": [
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [116, 120], "what": "executeOperations ReadYUV, YUVToRGB, BoxBVF<K>, Resize, write chain"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [661, 661], "what": "Bilinear alias"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [664, 667], "what": "write chain"}
+    ]},
+    {"name": "wins_fkl_plain_box2 (76a9136; 5x5 twice)", "expected": 11, "ranges": [
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [122, 127], "what": "executeOperations with two BoxBVF<K>"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [661, 661], "what": "Bilinear alias"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [664, 667], "what": "write chain"}
+    ]},
+    {"name": "wins_fkl_plain_gauss (76a9136)", "expected": 15, "ranges": [
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [98, 98], "what": "taps array, the parameter of GaussianBVF"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [100, 103], "what": "filled from the Spec's taps (the if constexpr dispatch of the shared function skipped)"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [110, 114], "what": "executeOperations with GaussianBVF<21>"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [661, 661], "what": "Bilinear alias"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [664, 667], "what": "write chain"}
+    ]},
+    {"name": "wins_fkl_staged_box (76a9136; 5x5, 5x5 twice, 9x9)", "expected": 21, "ranges": [
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [678, 678], "what": "DPP_TILES, the tile list"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [158, 158], "what": "intermediate float3 frame"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [160, 161], "what": "its 2D view"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [180, 181], "what": "MorphologyDPP details"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [183, 187], "what": "executeBoxBlur call with its error check"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [192, 195], "what": "executeOperations PerThreadRead, Resize, write chain"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [661, 661], "what": "Bilinear alias"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [664, 667], "what": "write chain"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [671, 671], "what": "read chain ReadYUV.then(YUVToRGB)"}
+    ]},
+    {"name": "wins_fkl_staged_gauss_2d (76a9136)", "expected": 35, "ranges": [
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [678, 678], "what": "DPP_TILES, the tile list"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [140, 149], "what": "21x21 coefficient image from the taps"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [158, 158], "what": "intermediate float3 frame"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [160, 161], "what": "its 2D view"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [164, 164], "what": "the coefficient image of this form"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [166, 167], "what": "LinearFilterDPP details"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [169, 176], "what": "executeLinearFilter call with its error check"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [192, 195], "what": "executeOperations PerThreadRead, Resize, write chain"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [661, 661], "what": "Bilinear alias"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [664, 667], "what": "write chain"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [671, 671], "what": "read chain"}
+    ]},
+    {"name": "wins_fkl_staged_separable_gauss (76a9136)", "expected": 50, "ranges": [
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [678, 678], "what": "DPP_TILES, the tile list"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [224, 225], "what": "two intermediate float3 frames"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [227, 231], "what": "their 2D views"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [233, 242], "what": "21x1 and 1x21 coefficient images from the taps, uploaded"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [243, 244], "what": "Mul3, Add3 aliases"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [247, 248], "what": "rows DPP details"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [250, 256], "what": "rows executeLinearFilter call with its error check"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [260, 261], "what": "columns DPP details"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [263, 271], "what": "columns executeLinearFilter call with its error check"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/benchmark_wins_frame.cu", "lines": [275, 278], "what": "executeOperations PerThreadRead, Resize, write chain"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [661, 661], "what": "Bilinear alias"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [664, 667], "what": "write chain"},
+      {"commit": "76a9136", "path": "nppdx-wins/src/wins_common.h", "lines": [671, 671], "what": "read chain"}
+    ]}
+  ]
+}

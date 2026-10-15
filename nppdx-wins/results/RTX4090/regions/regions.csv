@@ -1,0 +1,6 @@
+N,iterations,first_iteration,regions_20x10,regions_32x16,regions_48x24,mean_region_area_px,mean_iteration_area_px,min_iteration_area_px,max_iteration_area_px
+1,10,3,0,10,0,512,512,512,512
+4,10,3,0,40,0,512,2048,2048,2048
+16,10,3,0,160,0,512,8192,8192,8192
+50,10,3,0,500,0,512,25600,25600,25600
+100,10,3,0,1000,0,512,51200,51200,51200

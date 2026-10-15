@@ -1,0 +1,8 @@
+implementation,N,kernel,median_us,p10_us,p90_us
+nppdx,1,1_nppdx_box_resize_normalize,230.37,229.38,230.66
+nppdx,1,total,230.37,229.38,230.66
+fkl_inline,1,1_box_resize_normalize,182.18,174.08,183.30
+fkl_inline,1,total,182.18,174.08,183.30
+fkl_staged,1,1_morphology_dpp_box_of_the_frame,159.74,158.72,160.51
+fkl_staged,1,2_resize_normalize,142.34,141.31,143.36
+fkl_staged,1,total,302.08,301.06,303.10

@@ -2363,6 +2363,8 @@ void rocprofTargetDispatch(Context& ctx, const std::string& name, size_t batch, 
 
 } // namespace bench
 
+// rocm_neighborhood.hip (Experiment 3) includes this file for its harness and has its own main
+#ifndef BENCH_NO_MAIN
 int main(int argc, char** argv) {
     using namespace bench;
     try {
@@ -2561,3 +2563,4 @@ int main(int argc, char** argv) {
     }
     return 0;
 }
+#endif // BENCH_NO_MAIN

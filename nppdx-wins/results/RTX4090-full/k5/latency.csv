@@ -1,0 +1,4 @@
+implementation,N,median_us,p10_us,p90_us,iterations,max_abs_err,kernels_launched,mean_us,fkl_staged_mean_speedup
+nppdx,1,233.84,233.40,234.53,1000,1.431e-06,1,234.08,0.783
+fkl_inline,1,175.74,175.10,176.13,1000,1.669e-06,1,175.62,0.588
+fkl_staged,1,298.91,297.76,300.03,1000,1.669e-06,2,298.99,
