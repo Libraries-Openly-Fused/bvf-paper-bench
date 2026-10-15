@@ -28,6 +28,8 @@
 #include "benchmarks/nppdx_common.h"
 #include "bench_npp.h"
 
+#include <cstdint>
+
 namespace figure1 {
 
 // The NPPDx kernel: NPPDx operations only. Each thread block processes one tile of one crop: NPPDx takes the position
@@ -103,10 +105,25 @@ constexpr auto nppdxRgbConfigs() {
 // (CopyConstBorder; NPP has no batched border), then 8 bit -> float and the normalization on the N planes at once, as
 // one image of OUT_W x N * OUT_H. before() runs before every NPP call (the GPU only benchmark with the L2 flushed
 // flushes there).
+//
+// The bordered planes start at a multiple of BORDERED_ALIGNMENT bytes. nppiCopyConstBorder_8u_C3R launches one kernel
+// when its destination is a multiple of 12 bytes (4 RGB8 pixels), and two or three otherwise (measured with NPP 13.1;
+// the source does not matter). Every plane is a multiple of 12 bytes, so every plane is aligned like the first, and
+// the pipeline is N + 5 kernels in every mode and process, wherever the allocation lands. Without the alignment the
+// residue was that of the address cudaMalloc returned: the same in every process of the main mode (residue 8: 2N + 5
+// kernels), and different per process with the L2 flushed, whose flush buffer moves the later allocations.
 class NppTail {
 public:
-    explicit NppTail(size_t n) : m_n(n) { gpuErrchk(cudaMalloc(&m_bordered, n * OUT_W * OUT_H * 3)); }
-    ~NppTail() { cudaFree(m_bordered); }
+    // 768: a multiple of 12 and of 256 (cudaMalloc's alignment), so the planes keep cudaMalloc's alignment too
+    static constexpr size_t BORDERED_ALIGNMENT = 768;
+    static_assert((OUT_W * OUT_H * 3) % 12 == 0, "Every bordered plane must start at a multiple of 12 bytes");
+
+    explicit NppTail(size_t n) : m_n(n) {
+        gpuErrchk(cudaMalloc(&m_allocation, n * OUT_W * OUT_H * 3 + BORDERED_ALIGNMENT));
+        const size_t address = reinterpret_cast<std::uintptr_t>(m_allocation);
+        m_bordered = m_allocation + (BORDERED_ALIGNMENT - address % BORDERED_ALIGNMENT) % BORDERED_ALIGNMENT;
+    }
+    ~NppTail() { cudaFree(m_allocation); }
     NppTail(const NppTail&) = delete;
     NppTail& operator=(const NppTail&) = delete;
 
@@ -139,6 +156,8 @@ public:
 
 private:
     size_t m_n{0};
+    // The allocation, and the first bordered plane in it (aligned to BORDERED_ALIGNMENT)
+    uint8_t* m_allocation{nullptr};
     uint8_t* m_bordered{nullptr};
 };
 
