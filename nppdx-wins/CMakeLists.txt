@@ -26,6 +26,12 @@ list(APPEND CMAKE_PREFIX_PATH "${NPPDX_DIR}")
 find_package(nppdx CONFIG REQUIRED)
 execute_process(COMMAND git -C ${NPPDX_DIR} describe --always --tags
                 OUTPUT_VARIABLE NPPDX_GIT_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(WIN32)
+    # As fkl-neighborhood and fkl-vs-nppdx: the real value of __cplusplus (MSVC reports 199711L without
+    # /Zc:__cplusplus, and NPPDx checks for C++17) and no min/max macros
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:__cplusplus>)
+    add_compile_definitions(NOMINMAX)
+endif()
 
 function(add_wins_target TARGET_NAME SOURCE)
     add_bench_target(${TARGET_NAME} ${SOURCE})
