@@ -68,6 +68,64 @@ areas of the regions of the timed iterations per N, as in every results folder);
 include the upload of the ROIs (9 per execution: that one and the 8 of `rppt_yuv_to_rgb`); `validation.csv` has an
 `iteration` column after N, and two more columns, the errors against the RPP-convention reference and against the paper's 8 bit reference, and `gpu_time*.csv` five more, the GPU time and dispatches of the HIP runtime's blit kernels (memsets, copies) of each execution, which the GPU time only sums leave out. `--validate` validates every RPP variant.
 
+## Experiment 3: neighborhood operations (`rocm/src/rocm_neighborhood.hip`)
+
+A box blur of fixed-size crops, without the resize and the border of Figure 1: ReadNV12 -> YUVtoRGB -> Crop 64x32 ->
+Box K x K -> Mul -> Sub -> Div -> Write, into N planes of 64x32 float3. The box is the mean of the K x K window centred
+on the value, per channel, replicating the edge of the crop in every pass; the crops (64x32 at random even positions,
+new every iteration) and the parameters are those of `common/bench_neighborhood.h`, shared with the CUDA side. Same
+frame, batch sizes, timing protocol and validation rules as `rocm_bench` (it includes `rocm_bench.hip` for its
+harness). Two parts, each a set of groups (part, K, passes, N) whose implementations compute the same output:
+
+- Part (b), the library comparison: K = `BOX_K` (5), one pass, every N. Every RPP variant starts with the upload of
+  the crops of its iteration and `rppt_yuv_to_rgb` (full frame) into a buffer that starts 256 bytes into its
+  allocation (`offsetInBytes`; RPP's HIP box filter needs at least 12 x (K / 2) bytes before the first pixel of its
+  source, `RPP_ERROR_LOW_OFFSET`).
+  - `rpp_u8box_cmn`: `rppt_box_filter` U8 on the frame with the crops as per-image XYWH ROIs (crop + box in one call:
+    it replicates the ROI edge and writes each crop at (0, 0) of its own image), then `rppt_crop_mirror_normalize`
+    8u->32f of the boxed crops with the whole normalization (multiplier Mul / Div, offset -Sub / Div, per channel) into
+    the output tensor: 3 kernels.
+  - `rpp_u8box_normalize`: the same with `rppt_crop_mirror_normalize` converting only, then `rppt_normalize`: 4 kernels.
+  - `rpp_f32box_cmn`: `rppt_crop_mirror_normalize` 8u->32f of the crops with the whole normalization, then
+    `rppt_box_filter` F32 into the output tensor: 3 kernels.
+  - `rpp_f32box_normalize`: the same with the conversion only, then `rppt_normalize`: 4 kernels.
+  - `fkl_dpp_<W>x<H>`: one FKL kernel, MorphologyDPP's `executeBoxBlur<passes>` (every pass a mean: an Add reducer
+    and a Mul 1 / K^2 finalizer) on `MorphologyDPPDetails<float3, W, H, K, K>`, batched over the crops, reading the BVF
+    chain up to the crop and writing through Mul, Sub, Div, for every tile of `DPP_TILES`.
+- Part (a), the micro-experiment, FKL only: K = 3, 5, 7, one and two passes, N = 1 and 16: `fkl_bvf_naive` (the naive
+  ReadBack operation `BoxBVF<K>` of `common/bench_neighborhood_ops.h` in the BVF chain, twice for two passes, one
+  kernel) against the DPP tiles, in two variants: on the crops (operation `box`), and with the resize (operation
+  `resize_box`: Figure 1's chain on Experiment 1's regions without the border, ReadNV12 -> YUVtoRGB -> Crop -> Resize
+  64x32 -> Box -> Mul -> Sub -> Div -> Write, the DPP's input chain ending at the resize).
+
+In every group every implementation is validated and timed in the same interleaved iterations; the chosen DPP tile is
+the fastest (median, CPU + GPU) within its tolerance and the chosen RPP variant the fastest within its tolerance and
+within `RPP_EQUIVALENCE` of its RPP-convention reference (`chosen` column); every one is recorded, and the speedups are
+per iteration over the chosen DPP tile. References (`bench::neighborhood::boxReference`: the box in double, then the
+normalization in float; a box does not commute with the normalization in float, so the references blur first, the
+order of the pipeline and of every implementation but `rpp_f32box_cmn`, which normalizes in `rppt_crop_mirror_normalize`
+before its F32 box: it is held to its tolerance against these references, and exactly to its own RPP-convention
+reference, which follows its order): FKL against FKL's CPU float chain (tolerance 1e-3); RPP, whose frame is 8 bit RGB, against the same
+chain with the RGB saturated and rounded to 8 bits (`fkl_cpu_8bit_rgb`), and for the U8 box with its output rounded to
+8 bits (`fkl_cpu_8bit_rgb_rounded_box`), tolerance one 8 bit level; its error against the float reference, whose RGB is
+not saturated, is recorded too. Each RPP variant is also checked against its RPP-convention reference, RPP 3.2.0's HIP
+arithmetic on RPP's 8 bit frame operation by operation (U8 box `rint(float(sum) * scale)`, F32 box the window summed in
+float row after row times the scale, `crop_mirror_normalize` `fmaf(x, multiplier, offset)`, `rppt_normalize`
+`fmaf(x - mean, 1 / stdDev, 0)`). It needs FKL with MorphologyDPP's `executeBoxBlur`: the commit recorded for the
+repository's `fkl` submodule (CMake builds `rocm_neighborhood` only with an FKL that has it, so FKL `63782f6` builds
+`rocm_bench` alone).
+
+Output files (in `<results dir>/neighborhood` with `run_all.sh`): `latency.csv`, `validation.csv`, `gpu_time.csv`,
+`gpu_time_l2_flushed.csv`, `kernel_breakdown.csv`, `kernel_counts_per_operation.csv`, `regions.csv`,
+`regions_resize.csv` and `platform.txt`,
+with the group in the first columns (`part,operation,K,passes,N,implementation,chosen`) or in the implementation name
+(`<part>_<operation>_k<K>_p<passes>_n<N>/<implementation>`); `regions_resize.csv` has the regions of the resize
+variant. `--validate` only validates every group.
+
+    EXPERIMENT=3 rocm/scripts/run_all.sh ../results/rocm-neighborhood
+
+or, after the build below, `./build-rocm/rocm_neighborhood ../results/rocm-neighborhood`.
+
 ## CPU benchmark (`rocm/cpu/`)
 
 RPP's HOST backend against FKL's CPU backends, with the same number of threads on both sides: RPP with 1 thread
@@ -112,9 +170,13 @@ thread pool, so that the idle gap before every timed run puts both pools to slee
 - The ROCm 10.1 packages `amdrocm-rpp10.1` and `amdrocm-rpp-dev10.1` (RPP 3.2.0: the library and its headers),
   `amdrocm-profiler-base10.1` (rocprofiler-sdk, rocprofv3) and `amdrocm-amdsmi10.1`. Without root, unpack them with
   `apt-get download <package> && dpkg -x <package>_*.deb <prefix>` and set `ROCM_EXTRA=<prefix>/opt/rocm/core-10.1`.
-- FusedKernelLibrary at `63782f6`, the commit of every benchmark of this repository: by default the repository's `fkl`
-  submodule with its `thread-pool` submodule (`git submodule update --init --recursive fkl`), for both the GPU and the
-  CPU benchmark; `run_all.sh` takes other checkouts with `FKL_GPU_DIR` / `FKL_CPU_DIR` and checks the commit.
+- FusedKernelLibrary at `63782f6` for Experiments 1 and 2 and the CPU benchmark, and at the commit recorded for the
+  repository's `fkl` submodule (with MorphologyDPP's `executeBoxBlur`) for Experiment 3. `run_all.sh` uses the
+  repository's `fkl` submodule with its `thread-pool` submodule (`git submodule update --init --recursive fkl`) unless
+  `FKL_GPU_DIR` / `FKL_CPU_DIR` name other checkouts, and stops if FKL is not at the commit of the experiment it runs.
+  The submodule is at Experiment 3's commit, so for Experiments 1 and 2 the default is a detached worktree of the
+  submodule at `63782f6` with its submodules, which `run_all.sh` makes the first time in `build-fkl-63782f6` (ignored
+  by git) and reuses.
 
 ## Build and run
 

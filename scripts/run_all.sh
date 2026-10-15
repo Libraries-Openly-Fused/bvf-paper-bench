@@ -113,6 +113,10 @@ configure() { # <source> <build folder> <options...>
         { tail -50 "$build/run_all_build.log" >&2; exit 1; }
 }
 
+cache_option_on() { # <build folder> <option>: whether a boolean option is on in the build's CMake cache
+    grep -Eiq "^$2:BOOL=(on|yes|true|y|[1-9][0-9]*)$" "$1/CMakeCache.txt"
+}
+
 run() { # <log> <command...>: runs a benchmark, keeping its output
     local log=$1
     shift
@@ -187,7 +191,15 @@ if has_step neighborhood; then
             programs+=("benchmark_fkl_neighborhood_k${k}_p$passes" "benchmark_fkl_neighborhood_k${k}_p${passes}_resize")
         done
     done
-    programs+=(benchmark_npp_neighborhood benchmark_opencv_cuda_neighborhood benchmark_nppdx_neighborhood)
+    programs+=(benchmark_npp_neighborhood)
+    # The OpenCV and NPPDx programs only when the build has them (CMAKE_ARGS can set BENCH_OPENCV or BENCH_NPPDX OFF):
+    # a clean build has no such executable, and a reused build folder can hold a stale one
+    if cache_option_on "$build" BENCH_OPENCV; then
+        programs+=(benchmark_opencv_cuda_neighborhood)
+    fi
+    if cache_option_on "$build" BENCH_NPPDX; then
+        programs+=(benchmark_nppdx_neighborhood)
+    fi
     for program in "${programs[@]}"; do
         run "$LOGS/$program.log" "$build/$program" "$out/${program#benchmark_}"
         run "$LOGS/${program}_l2_flushed.log" "$build/$program" "$out/${program#benchmark_}" --gpu-only-l2-flushed
