@@ -1,0 +1,1544 @@
+--- exp1_fkl_bvf (3845b60): fkl-vs-nppdx/benchmarks/figure1_common.h 173-182 (executeOperations call): 10 lines
++  173      fk::executeOperations<fk::TransformDPP<>>(*w.fkStream,
++  174          fk::ReadYUV<fk::PixelFormat::NV12>::build(*w.frameDevice),
++  175          YUVToRGB::build(),
++  176          fk::Crop<>::build(crops),
++  177          fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>::build(fk::Size(RES_W, RES_H)),
++  178          fk::AddBorder<>::build(BORDER_TOP, BORDER_BOTTOM, 0, 0, fk::float3{0.f, 0.f, 0.f}),
++  179          fk::Mul<fk::float3>::build(fk::float3{norm.mul[0], norm.mul[1], norm.mul[2]}),
++  180          fk::Sub<fk::float3>::build(fk::float3{norm.sub[0], norm.sub[1], norm.sub[2]}),
++  181          fk::Div<fk::float3>::build(fk::float3{norm.div[0], norm.div[1], norm.div[2]}),
++  182          fk::TensorWrite<fk::float3>::build(out.ptr()));
+--- exp1_nppdx (3845b60): fkl-vs-nppdx/benchmarks/nppdx_figure1.h 28-109 (kernel, NppdxFigure1 (init/run), nppdxFigure1Configs): 65 lines
+    28  
++   29  template <typename Ingest, typename FromLimitedY, typename FromLimitedUV, typename Convert, typename Resize,
++   30            typename InputTile, typename OutputTile, typename TempTile, size_t N>
++   31  __global__ void nppdxFigure1Kernel(const uint8_t* y, const uint8_t* uv, const int pitch,
++   32                                     const CropOrigins<N> crops, const Normalization n, float* out) {
++   33      extern __shared__ unsigned char smem[];
++   34      auto tiles = nppdx::shared_memory::slice_into_tile_storage<InputTile, OutputTile, TempTile>(smem);
++   35      auto inputTile = std::get<0>(tiles);
++   36      auto resizedTile = std::get<1>(tiles);
++   37      auto tempTile = std::get<2>(tiles);
+    38  
+    39      // ReadNV12 + Crop: the crop is ingested as a CROP_W x CROP_H NV12 image inside the frame; NPPDx takes the position
+    40      // of this block's tile in the crop from blockIdx.x and blockIdx.y, and blockIdx.z is the crop
++   41      const int2 o = crops.origin[blockIdx.z];
++   42      const nppdx::ImageLayout<const uint8_t, 2> crop{{{y + static_cast<size_t>(o.y) * pitch + o.x,
++   43                                                        uv + static_cast<size_t>(o.y / 2) * pitch + o.x}},
++   44                                                      {{pitch, pitch}}};
++   45      Ingest().execute(crop, inputTile, CROP_W, CROP_H);
+    46      // YUVtoRGB, BT.601 limited range, in place on the shared memory tile
++   47      FromLimitedY().execute(inputTile, CROP_W, CROP_H);
++   48      FromLimitedUV().execute(inputTile, CROP_W, CROP_H);
++   49      Convert().execute(inputTile, CROP_W, CROP_H);
+    50      // Resize, J input pixels to K output pixels in both dimensions
++   51      Resize().execute(inputTile, tempTile, resizedTile, CROP_W, CROP_H);
++   52      __syncthreads();
+    53  
+    54      // AddBorder + Mul + Sub + Div + Write float3 (no NPPDx operations for these). Each block writes its
+    55      // resized tile, plus the top border rows if it is in the first tile row and the bottom ones if in the last
++   56      constexpr int OTW = OutputTile::ChannelSliceType::width;
++   57      constexpr int OTH = OutputTile::ChannelSliceType::height;
++   58      const int ox = blockIdx.x * OTW;
++   59      const int oy = blockIdx.y * OTH;
++   60      const int rowBegin = blockIdx.y == 0 ? 0 : BORDER_TOP + oy;
++   61      const int rowEnd = blockIdx.y == gridDim.y - 1 ? OUT_H : BORDER_TOP + oy + OTH;
++   62      float* plane = out + static_cast<size_t>(blockIdx.z) * OUT_W * OUT_H * 3;
++   63      const int numThreads = blockDim.x * blockDim.y * blockDim.z;
++   64      const int tid = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
++   65      for (int idx = tid; idx < (rowEnd - rowBegin) * OTW; idx += numThreads) {
++   66          const int tx = idx % OTW;
++   67          const int outY = rowBegin + idx / OTW;
++   68          const bool inside = outY >= BORDER_TOP && outY < BORDER_TOP + RES_H;
++   69          float* pixel = plane + (static_cast<size_t>(outY) * OUT_W + ox + tx) * 3;
++   70  #pragma unroll
++   71          for (int c = 0; c < 3; ++c) {
++   72              const float value = inside ? resizedTile.channel(c)(outY - BORDER_TOP - oy, tx) : 0.f;
++   73              pixel[c] = ((value * n.mul[c]) - n.sub[c]) / n.div[c];
++   74          }
++   75      }
++   76  }
+    77  
+    78  // The kernel in one configuration: TileX x TileY input tiles, block size BlockX (0: NPPDx's recommended one)
++   79  template <int Arch, size_t N, unsigned BlockX, unsigned TileX, unsigned TileY>
++   80  struct NppdxFigure1 : NppdxOps<Arch, BlockX, TileX, TileY> {
++   81      using Ops = NppdxOps<Arch, BlockX, TileX, TileY>;
++   82      using typename Ops::Ingest, typename Ops::FromLimitedY, typename Ops::FromLimitedUV, typename Ops::Convert,
++   83          typename Ops::Resize, typename Ops::InputTile, typename Ops::OutputTile, typename Ops::TempTile;
++   84      static constexpr size_t smem = Ops::smem;
++   85      static constexpr dim3 block{Ops::blockBeforeWrite, 1, 1};
++   86      static constexpr dim3 grid = Ops::gridOf(N);
+    87  
++   88      static constexpr auto kernel = nppdxFigure1Kernel<Ingest, FromLimitedY, FromLimitedUV, Convert, Resize, InputTile,
++   89                                                        OutputTile, TempTile, N>;
+    90  
++   91      static void init() {
++   92          if constexpr (smem > 48 * 1024) {
++   93              gpuErrchk(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
++   94          }
++   95      }
+    96  
++   97      static void run(cudaStream_t stream, const uint8_t* y, const uint8_t* uv, int pitch, const CropOrigins<N>& crops,
++   98                      const Normalization& n, float* out) {
++   99          kernel<<<grid, block, smem, stream>>>(y, uv, pitch, crops, n, out);
++  100          gpuErrchk(cudaGetLastError());
++  101      }
++  102  };
+   103  
+   104  // The configurations of this kernel (it has no 8 bit RGB write)
++  105  template <int Arch>
++  106  constexpr auto nppdxFigure1Configs() {
++  107      return nppdxConfigs<Arch, false>();
++  108  }
+   109  
+--- exp1_nppdx (3845b60): fkl-vs-nppdx/benchmarks/nppdx_common.h 83-131 (NppdxOps): 44 lines
++   83  template <int Arch, unsigned BlockX, unsigned TileX, unsigned TileY>
++   84  struct NppdxOps {
++   85      static constexpr unsigned J = RESIZE_J, K = RESIZE_K;
++   86      static_assert(tileSplitsCrop(TileX, TileY), "Tiles must split the crop in 4x2 pixel cells and J pixel groups");
++   87      using ResizePre = decltype(nppdx::Function<nppdx::function::resize>() +
++   88                                 nppdx::Resize<J, K, nppdx::interpolation_method::bilinear>() +
++   89                                 nppdx::TileSize<TileX, TileY>() + nppdx::SM<Arch>() + NppdxBlock<BlockX>());
++   90      static constexpr auto halo = ResizePre::local_halo;
++   91      using Ingest = decltype(nppdx::InputOutput<nppdx::input_output_direction::ingest>() +
++   92                              nppdx::InputFormat<nppdx::packing_format::nv12>() + nppdx::TileSize<TileX, TileY>() +
++   93                              NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() + NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() +
++   94                              nppdx::SM<Arch>() + NppdxBlock<BlockX>());
+    95      // NPPDx's color conversion is full range; limited range input is first expanded with NPPDx's own range operations
++   96      using FromLimitedY = decltype(nppdx::Function<nppdx::function::affine_channel_map>() +
++   97                                    nppdx::FromLimitedLuma<nppdx::bit_depth::bpp_8u>() + nppdx::TileSize<TileX, TileY>() +
++   98                                    NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++   99                                    NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() + nppdx::SM<Arch>() +
++  100                                    NppdxBlock<BlockX>());
++  101      using FromLimitedUV = decltype(nppdx::Function<nppdx::function::affine_channel_map>() +
++  102                                     nppdx::FromLimitedChroma<nppdx::bit_depth::bpp_8u>() +
++  103                                     nppdx::TileSize<TileX, TileY>() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++  104                                     NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() + nppdx::SM<Arch>() +
++  105                                     NppdxBlock<BlockX>());
++  106      using Convert = decltype(nppdx::Function<nppdx::function::color_convert>() +
++  107                               nppdx::ColorConvert<nppdx::color_space::yuv_bt601, nppdx::color_space::rgb,
++  108                                                   nppdx::bit_depth::bpp_8u, nppdx::bit_depth::bpp_8u>() +
++  109                               nppdx::TileSize<TileX, TileY>() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++  110                               NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() + nppdx::SM<Arch>() + NppdxBlock<BlockX>());
++  111      using Resize = decltype(ResizePre() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++  112                              NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)());
++  113      using InputTile = nppdx::input_storage_of_t<Ingest>;
++  114      using OutputTile = nppdx::output_storage_of_t<Resize>;
++  115      using TempTile = nppdx::temp_storage_of_t<Resize>;
++  116      static constexpr unsigned outTileX = OutputTile::ChannelSliceType::width;
++  117      static constexpr unsigned outTileY = OutputTile::ChannelSliceType::height;
++  118      static_assert(outTileX * J == TileX * K && outTileY * J == TileY * K, "Unexpected output tile size");
++  119      static_assert(nppdx::is_supported_v<Ingest, Arch> && nppdx::is_supported_v<FromLimitedY, Arch> &&
++  120                    nppdx::is_supported_v<FromLimitedUV, Arch> && nppdx::is_supported_v<Convert, Arch> &&
++  121                    nppdx::is_supported_v<Resize, Arch>);
++  122      static constexpr size_t smem = nppdx::shared_memory::compute_total_tile_storage<InputTile, OutputTile, TempTile>();
+   123      // The largest recommended block of the operations before the write: a kernel runs all of them with one block size
+   124      // (with BlockDim<X> they are all X). Ingest alone would not be enough: its recommended block has one thread per 4x2
+   125      // cell of the tile, but it loads the tile plus the resize halo, which has more cells.
++  126      static constexpr unsigned blockBeforeWrite =
++  127          std::max({Ingest::block_dim.x, FromLimitedY::block_dim.x, FromLimitedUV::block_dim.x, Convert::block_dim.x,
++  128                    Resize::block_dim.x});
+   129      // One block per output tile of every crop
++  130      static constexpr dim3 gridOf(size_t n) { return dim3{RES_W / outTileX, RES_H / outTileY, static_cast<unsigned>(n)}; }
++  131  };
+--- exp1_nppdx_npp (3845b60, calibration): fkl-vs-nppdx/benchmarks/nppdx_npp_figure1.h 32-144 (nppdxRgbKernel, NppdxRgb, nppdxRgbConfigs, NppTail): 87 lines
+    32  
+    33  // The NPPDx kernel: NPPDx operations only. Each thread block processes one tile of one crop: NPPDx takes the position
+    34  // of the tile from blockIdx.x and blockIdx.y, and blockIdx.z selects the crop, which is given to NPPDx as an image of
+    35  // CROP_W x CROP_H inside the frame. The resized crops are written one after the other as 8 bit RGB.
++   36  template <typename Ingest, typename FromLimitedY, typename FromLimitedUV, typename Convert, typename Resize,
++   37            typename Exgest, typename InputTile, typename OutputTile, typename TempTile, size_t N>
++   38  __global__ void nppdxRgbKernel(const uint8_t* y, const uint8_t* uv, const int pitch, const CropOrigins<N> crops,
++   39                                 uint8_t* resized) {
++   40      extern __shared__ unsigned char smem[];
++   41      auto tiles = nppdx::shared_memory::slice_into_tile_storage<InputTile, OutputTile, TempTile>(smem);
++   42      auto inputTile = std::get<0>(tiles);
++   43      auto resizedTile = std::get<1>(tiles);
++   44      auto tempTile = std::get<2>(tiles);
+    45  
++   46      const int2 o = crops.origin[blockIdx.z];
++   47      const nppdx::ImageLayout<const uint8_t, 2> crop{{{y + static_cast<size_t>(o.y) * pitch + o.x,
++   48                                                        uv + static_cast<size_t>(o.y / 2) * pitch + o.x}},
++   49                                                      {{pitch, pitch}}};
++   50      uint8_t* resizedCrop = resized + static_cast<size_t>(blockIdx.z) * RES_W * RES_H * 3;
+    51  
++   52      Ingest().execute(crop, inputTile, CROP_W, CROP_H);
++   53      FromLimitedY().execute(inputTile, CROP_W, CROP_H);
++   54      FromLimitedUV().execute(inputTile, CROP_W, CROP_H);
++   55      Convert().execute(inputTile, CROP_W, CROP_H);
++   56      Resize().execute(inputTile, tempTile, resizedTile, CROP_W, CROP_H);
++   57      Exgest().execute(resizedTile, resizedCrop, RES_W, RES_H);
++   58  }
+    59  
+    60  // The NPPDx kernel in one configuration: TileX x TileY input tiles, block size BlockX (0: NPPDx's recommended one)
++   61  template <int Arch, size_t N, unsigned BlockX, unsigned TileX, unsigned TileY>
++   62  struct NppdxRgb : NppdxOps<Arch, BlockX, TileX, TileY> {
++   63      using Ops = NppdxOps<Arch, BlockX, TileX, TileY>;
++   64      using typename Ops::Ingest, typename Ops::FromLimitedY, typename Ops::FromLimitedUV, typename Ops::Convert,
++   65          typename Ops::Resize, typename Ops::InputTile, typename Ops::OutputTile, typename Ops::TempTile;
+    66      // 8 bit RGB write of the resized tile, as in NPPDx's resize example
++   67      using Exgest = decltype(nppdx::InputOutput<nppdx::input_output_direction::exgest>() +
++   68                              nppdx::OutputFormat<nppdx::packing_format::rgb24>() +
++   69                              nppdx::TileSize<Ops::outTileX, Ops::outTileY>() +
++   70                              NPPDX_MAKE_HALO(nppdx::MemoryHalo, nppdx::Halo4::make_empty())() +
++   71                              NPPDX_MAKE_HALO(nppdx::CumulativeHalo, nppdx::Halo4::make_empty())() + nppdx::SM<Arch>() +
++   72                              NppdxBlock<BlockX>());
++   73      static_assert(nppdx::is_supported_v<Exgest, Arch>);
++   74      static constexpr size_t smem = Ops::smem;
+    75      // The write of the larger output tile is part of the kernel, so its block counts too, as in NPPDx's resize example
++   76      static constexpr dim3 block{std::max(Ops::blockBeforeWrite, Exgest::block_dim.x), 1, 1};
++   77      static constexpr dim3 grid = Ops::gridOf(N);
+    78  
++   79      static constexpr auto kernel = nppdxRgbKernel<Ingest, FromLimitedY, FromLimitedUV, Convert, Resize, Exgest,
++   80                                                    InputTile, OutputTile, TempTile, N>;
+    81  
++   82      static void init() {
++   83          if constexpr (smem > 48 * 1024) {
++   84              gpuErrchk(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
++   85          }
++   86      }
+    87  
+    88      // Writes the N resized crops, RES_W x RES_H 8 bit RGB each, one after the other in resized
++   89      static void run(cudaStream_t stream, const uint8_t* y, const uint8_t* uv, int pitch, const CropOrigins<N>& crops,
++   90                      uint8_t* resized) {
++   91          kernel<<<grid, block, smem, stream>>>(y, uv, pitch, crops, resized);
++   92          gpuErrchk(cudaGetLastError());
++   93      }
++   94  };
+    95  
+    96  // The configurations of this kernel (with its 8 bit RGB write)
++   97  template <int Arch>
++   98  constexpr auto nppdxRgbConfigs() {
++   99      return nppdxConfigs<Arch, true>();
++  100  }
+   101  
+   102  // The NPP part of the pipeline, after the NPPDx kernel, and its 8 bit RGB output planes: per crop the black rows
+   103  // (CopyConstBorder; NPP has no batched border), then 8 bit -> float and the normalization on the N planes at once, as
+   104  // one image of OUT_W x N * OUT_H. before() runs before every NPP call (the GPU only benchmark with the L2 flushed
+   105  // flushes there).
++  106  class NppTail {
++  107  public:
++  108      explicit NppTail(size_t n) : m_n(n) { gpuErrchk(cudaMalloc(&m_bordered, n * OUT_W * OUT_H * 3)); }
++  109      ~NppTail() { cudaFree(m_bordered); }
++  110      NppTail(const NppTail&) = delete;
++  111      NppTail& operator=(const NppTail&) = delete;
+   112  
+   113      // Fills the bordered planes with values the border never writes, before a validation
++  114      void poison(cudaStream_t stream) const {
++  115          gpuErrchk(cudaMemsetAsync(m_bordered, 0xAB, m_n * OUT_W * OUT_H * 3, stream));
++  116      }
+   117  
++  118      template <typename Before>
++  119      void run(const uint8_t* resized, float* out, const Normalization& n, const NppStreamContext& ctx,
++  120               Before&& before) const {
++  121          static const Npp8u black[3] = {0, 0, 0};
++  122          for (size_t i = 0; i < m_n; ++i) {
++  123              before();
++  124              NPP_CHECK(nppiCopyConstBorder_8u_C3R_Ctx(resized + i * RES_W * RES_H * 3, RES_W * 3, NppiSize{RES_W, RES_H},
++  125                                                       m_bordered + i * OUT_W * OUT_H * 3, OUT_W * 3,
++  126                                                       NppiSize{OUT_W, OUT_H}, BORDER_TOP, 0, black, ctx));
++  127          }
++  128          const NppiSize planes{OUT_W, static_cast<int>(m_n) * OUT_H};
++  129          const int step = OUT_W * 3 * static_cast<int>(sizeof(float));
++  130          before();
++  131          NPP_CHECK(nppiConvert_8u32f_C3R_Ctx(m_bordered, OUT_W * 3, out, step, planes, ctx));
++  132          before();
++  133          NPP_CHECK(nppiMulC_32f_C3IR_Ctx(n.mul, out, step, planes, ctx));
++  134          before();
++  135          NPP_CHECK(nppiSubC_32f_C3IR_Ctx(n.sub, out, step, planes, ctx));
++  136          before();
++  137          NPP_CHECK(nppiDivC_32f_C3IR_Ctx(n.div, out, step, planes, ctx));
++  138      }
+   139  
++  140  private:
++  141      size_t m_n{0};
++  142      uint8_t* m_bordered{nullptr};
++  143  };
+   144  
+--- exp1_nppdx_npp (3845b60, calibration): fkl-vs-nppdx/benchmarks/nppdx_common.h 83-131 (NppdxOps): 44 lines
++   83  template <int Arch, unsigned BlockX, unsigned TileX, unsigned TileY>
++   84  struct NppdxOps {
++   85      static constexpr unsigned J = RESIZE_J, K = RESIZE_K;
++   86      static_assert(tileSplitsCrop(TileX, TileY), "Tiles must split the crop in 4x2 pixel cells and J pixel groups");
++   87      using ResizePre = decltype(nppdx::Function<nppdx::function::resize>() +
++   88                                 nppdx::Resize<J, K, nppdx::interpolation_method::bilinear>() +
++   89                                 nppdx::TileSize<TileX, TileY>() + nppdx::SM<Arch>() + NppdxBlock<BlockX>());
++   90      static constexpr auto halo = ResizePre::local_halo;
++   91      using Ingest = decltype(nppdx::InputOutput<nppdx::input_output_direction::ingest>() +
++   92                              nppdx::InputFormat<nppdx::packing_format::nv12>() + nppdx::TileSize<TileX, TileY>() +
++   93                              NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() + NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() +
++   94                              nppdx::SM<Arch>() + NppdxBlock<BlockX>());
+    95      // NPPDx's color conversion is full range; limited range input is first expanded with NPPDx's own range operations
++   96      using FromLimitedY = decltype(nppdx::Function<nppdx::function::affine_channel_map>() +
++   97                                    nppdx::FromLimitedLuma<nppdx::bit_depth::bpp_8u>() + nppdx::TileSize<TileX, TileY>() +
++   98                                    NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++   99                                    NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() + nppdx::SM<Arch>() +
++  100                                    NppdxBlock<BlockX>());
++  101      using FromLimitedUV = decltype(nppdx::Function<nppdx::function::affine_channel_map>() +
++  102                                     nppdx::FromLimitedChroma<nppdx::bit_depth::bpp_8u>() +
++  103                                     nppdx::TileSize<TileX, TileY>() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++  104                                     NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() + nppdx::SM<Arch>() +
++  105                                     NppdxBlock<BlockX>());
++  106      using Convert = decltype(nppdx::Function<nppdx::function::color_convert>() +
++  107                               nppdx::ColorConvert<nppdx::color_space::yuv_bt601, nppdx::color_space::rgb,
++  108                                                   nppdx::bit_depth::bpp_8u, nppdx::bit_depth::bpp_8u>() +
++  109                               nppdx::TileSize<TileX, TileY>() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++  110                               NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() + nppdx::SM<Arch>() + NppdxBlock<BlockX>());
++  111      using Resize = decltype(ResizePre() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++  112                              NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)());
++  113      using InputTile = nppdx::input_storage_of_t<Ingest>;
++  114      using OutputTile = nppdx::output_storage_of_t<Resize>;
++  115      using TempTile = nppdx::temp_storage_of_t<Resize>;
++  116      static constexpr unsigned outTileX = OutputTile::ChannelSliceType::width;
++  117      static constexpr unsigned outTileY = OutputTile::ChannelSliceType::height;
++  118      static_assert(outTileX * J == TileX * K && outTileY * J == TileY * K, "Unexpected output tile size");
++  119      static_assert(nppdx::is_supported_v<Ingest, Arch> && nppdx::is_supported_v<FromLimitedY, Arch> &&
++  120                    nppdx::is_supported_v<FromLimitedUV, Arch> && nppdx::is_supported_v<Convert, Arch> &&
++  121                    nppdx::is_supported_v<Resize, Arch>);
++  122      static constexpr size_t smem = nppdx::shared_memory::compute_total_tile_storage<InputTile, OutputTile, TempTile>();
+   123      // The largest recommended block of the operations before the write: a kernel runs all of them with one block size
+   124      // (with BlockDim<X> they are all X). Ingest alone would not be enough: its recommended block has one thread per 4x2
+   125      // cell of the tile, but it loads the tile plus the resize halo, which has more cells.
++  126      static constexpr unsigned blockBeforeWrite =
++  127          std::max({Ingest::block_dim.x, FromLimitedY::block_dim.x, FromLimitedUV::block_dim.x, Convert::block_dim.x,
++  128                    Resize::block_dim.x});
+   129      // One block per output tile of every crop
++  130      static constexpr dim3 gridOf(size_t n) { return dim3{RES_W / outTileX, RES_H / outTileY, static_cast<unsigned>(n)}; }
++  131  };
+--- exp1_nppdx_npp (b7f6e88): fkl-vs-nppdx/benchmarks/nppdx_npp_figure1.h 34-163 (nppdxRgbKernel, NppdxRgb, nppdxRgbConfigs, NppTail (aligned)): 94 lines
+    34  
+    35  // The NPPDx kernel: NPPDx operations only. Each thread block processes one tile of one crop: NPPDx takes the position
+    36  // of the tile from blockIdx.x and blockIdx.y, and blockIdx.z selects the crop, which is given to NPPDx as an image of
+    37  // CROP_W x CROP_H inside the frame. The resized crops are written one after the other as 8 bit RGB.
++   38  template <typename Ingest, typename FromLimitedY, typename FromLimitedUV, typename Convert, typename Resize,
++   39            typename Exgest, typename InputTile, typename OutputTile, typename TempTile, size_t N>
++   40  __global__ void nppdxRgbKernel(const uint8_t* y, const uint8_t* uv, const int pitch, const CropOrigins<N> crops,
++   41                                 uint8_t* resized) {
++   42      extern __shared__ unsigned char smem[];
++   43      auto tiles = nppdx::shared_memory::slice_into_tile_storage<InputTile, OutputTile, TempTile>(smem);
++   44      auto inputTile = std::get<0>(tiles);
++   45      auto resizedTile = std::get<1>(tiles);
++   46      auto tempTile = std::get<2>(tiles);
+    47  
++   48      const int2 o = crops.origin[blockIdx.z];
++   49      const nppdx::ImageLayout<const uint8_t, 2> crop{{{y + static_cast<size_t>(o.y) * pitch + o.x,
++   50                                                        uv + static_cast<size_t>(o.y / 2) * pitch + o.x}},
++   51                                                      {{pitch, pitch}}};
++   52      uint8_t* resizedCrop = resized + static_cast<size_t>(blockIdx.z) * RES_W * RES_H * 3;
+    53  
++   54      Ingest().execute(crop, inputTile, CROP_W, CROP_H);
++   55      FromLimitedY().execute(inputTile, CROP_W, CROP_H);
++   56      FromLimitedUV().execute(inputTile, CROP_W, CROP_H);
++   57      Convert().execute(inputTile, CROP_W, CROP_H);
++   58      Resize().execute(inputTile, tempTile, resizedTile, CROP_W, CROP_H);
++   59      Exgest().execute(resizedTile, resizedCrop, RES_W, RES_H);
++   60  }
+    61  
+    62  // The NPPDx kernel in one configuration: TileX x TileY input tiles, block size BlockX (0: NPPDx's recommended one)
++   63  template <int Arch, size_t N, unsigned BlockX, unsigned TileX, unsigned TileY>
++   64  struct NppdxRgb : NppdxOps<Arch, BlockX, TileX, TileY> {
++   65      using Ops = NppdxOps<Arch, BlockX, TileX, TileY>;
++   66      using typename Ops::Ingest, typename Ops::FromLimitedY, typename Ops::FromLimitedUV, typename Ops::Convert,
++   67          typename Ops::Resize, typename Ops::InputTile, typename Ops::OutputTile, typename Ops::TempTile;
+    68      // 8 bit RGB write of the resized tile, as in NPPDx's resize example
++   69      using Exgest = decltype(nppdx::InputOutput<nppdx::input_output_direction::exgest>() +
++   70                              nppdx::OutputFormat<nppdx::packing_format::rgb24>() +
++   71                              nppdx::TileSize<Ops::outTileX, Ops::outTileY>() +
++   72                              NPPDX_MAKE_HALO(nppdx::MemoryHalo, nppdx::Halo4::make_empty())() +
++   73                              NPPDX_MAKE_HALO(nppdx::CumulativeHalo, nppdx::Halo4::make_empty())() + nppdx::SM<Arch>() +
++   74                              NppdxBlock<BlockX>());
++   75      static_assert(nppdx::is_supported_v<Exgest, Arch>);
++   76      static constexpr size_t smem = Ops::smem;
+    77      // The write of the larger output tile is part of the kernel, so its block counts too, as in NPPDx's resize example
++   78      static constexpr dim3 block{std::max(Ops::blockBeforeWrite, Exgest::block_dim.x), 1, 1};
++   79      static constexpr dim3 grid = Ops::gridOf(N);
+    80  
++   81      static constexpr auto kernel = nppdxRgbKernel<Ingest, FromLimitedY, FromLimitedUV, Convert, Resize, Exgest,
++   82                                                    InputTile, OutputTile, TempTile, N>;
+    83  
++   84      static void init() {
++   85          if constexpr (smem > 48 * 1024) {
++   86              gpuErrchk(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
++   87          }
++   88      }
+    89  
+    90      // Writes the N resized crops, RES_W x RES_H 8 bit RGB each, one after the other in resized
++   91      static void run(cudaStream_t stream, const uint8_t* y, const uint8_t* uv, int pitch, const CropOrigins<N>& crops,
++   92                      uint8_t* resized) {
++   93          kernel<<<grid, block, smem, stream>>>(y, uv, pitch, crops, resized);
++   94          gpuErrchk(cudaGetLastError());
++   95      }
++   96  };
+    97  
+    98  // The configurations of this kernel (with its 8 bit RGB write)
++   99  template <int Arch>
++  100  constexpr auto nppdxRgbConfigs() {
++  101      return nppdxConfigs<Arch, true>();
++  102  }
+   103  
+   104  // The NPP part of the pipeline, after the NPPDx kernel, and its 8 bit RGB output planes: per crop the black rows
+   105  // (CopyConstBorder; NPP has no batched border), then 8 bit -> float and the normalization on the N planes at once, as
+   106  // one image of OUT_W x N * OUT_H. before() runs before every NPP call (the GPU only benchmark with the L2 flushed
+   107  // flushes there).
+   108  //
+   109  // The bordered planes start at a multiple of BORDERED_ALIGNMENT bytes. nppiCopyConstBorder_8u_C3R launches one kernel
+   110  // when its destination is a multiple of 12 bytes (4 RGB8 pixels), and two or three otherwise (measured with NPP 13.1;
+   111  // the source does not matter). Every plane is a multiple of 12 bytes, so every plane is aligned like the first, and
+   112  // the pipeline is N + 5 kernels in every mode and process, wherever the allocation lands. Without the alignment the
+   113  // residue was that of the address cudaMalloc returned: the same in every process of the main mode (residue 8: 2N + 5
+   114  // kernels), and different per process with the L2 flushed, whose flush buffer moves the later allocations.
++  115  class NppTail {
++  116  public:
+   117      // 768: a multiple of 12 and of 256 (cudaMalloc's alignment), so the planes keep cudaMalloc's alignment too
++  118      static constexpr size_t BORDERED_ALIGNMENT = 768;
++  119      static_assert((OUT_W * OUT_H * 3) % 12 == 0, "Every bordered plane must start at a multiple of 12 bytes");
+   120  
++  121      explicit NppTail(size_t n) : m_n(n) {
++  122          gpuErrchk(cudaMalloc(&m_allocation, n * OUT_W * OUT_H * 3 + BORDERED_ALIGNMENT));
++  123          const size_t address = reinterpret_cast<std::uintptr_t>(m_allocation);
++  124          m_bordered = m_allocation + (BORDERED_ALIGNMENT - address % BORDERED_ALIGNMENT) % BORDERED_ALIGNMENT;
++  125      }
++  126      ~NppTail() { cudaFree(m_allocation); }
++  127      NppTail(const NppTail&) = delete;
++  128      NppTail& operator=(const NppTail&) = delete;
+   129  
+   130      // Fills the bordered planes with values the border never writes, before a validation
++  131      void poison(cudaStream_t stream) const {
++  132          gpuErrchk(cudaMemsetAsync(m_bordered, 0xAB, m_n * OUT_W * OUT_H * 3, stream));
++  133      }
+   134  
++  135      template <typename Before>
++  136      void run(const uint8_t* resized, float* out, const Normalization& n, const NppStreamContext& ctx,
++  137               Before&& before) const {
++  138          static const Npp8u black[3] = {0, 0, 0};
++  139          for (size_t i = 0; i < m_n; ++i) {
++  140              before();
++  141              NPP_CHECK(nppiCopyConstBorder_8u_C3R_Ctx(resized + i * RES_W * RES_H * 3, RES_W * 3, NppiSize{RES_W, RES_H},
++  142                                                       m_bordered + i * OUT_W * OUT_H * 3, OUT_W * 3,
++  143                                                       NppiSize{OUT_W, OUT_H}, BORDER_TOP, 0, black, ctx));
++  144          }
++  145          const NppiSize planes{OUT_W, static_cast<int>(m_n) * OUT_H};
++  146          const int step = OUT_W * 3 * static_cast<int>(sizeof(float));
++  147          before();
++  148          NPP_CHECK(nppiConvert_8u32f_C3R_Ctx(m_bordered, OUT_W * 3, out, step, planes, ctx));
++  149          before();
++  150          NPP_CHECK(nppiMulC_32f_C3IR_Ctx(n.mul, out, step, planes, ctx));
++  151          before();
++  152          NPP_CHECK(nppiSubC_32f_C3IR_Ctx(n.sub, out, step, planes, ctx));
++  153          before();
++  154          NPP_CHECK(nppiDivC_32f_C3IR_Ctx(n.div, out, step, planes, ctx));
++  155      }
+   156  
++  157  private:
++  158      size_t m_n{0};
+   159      // The allocation, and the first bordered plane in it (aligned to BORDERED_ALIGNMENT)
++  160      uint8_t* m_allocation{nullptr};
++  161      uint8_t* m_bordered{nullptr};
++  162  };
+   163  
+--- exp1_nppdx_npp (b7f6e88): fkl-vs-nppdx/benchmarks/nppdx_common.h 83-131 (NppdxOps): 44 lines
++   83  template <int Arch, unsigned BlockX, unsigned TileX, unsigned TileY>
++   84  struct NppdxOps {
++   85      static constexpr unsigned J = RESIZE_J, K = RESIZE_K;
++   86      static_assert(tileSplitsCrop(TileX, TileY), "Tiles must split the crop in 4x2 pixel cells and J pixel groups");
++   87      using ResizePre = decltype(nppdx::Function<nppdx::function::resize>() +
++   88                                 nppdx::Resize<J, K, nppdx::interpolation_method::bilinear>() +
++   89                                 nppdx::TileSize<TileX, TileY>() + nppdx::SM<Arch>() + NppdxBlock<BlockX>());
++   90      static constexpr auto halo = ResizePre::local_halo;
++   91      using Ingest = decltype(nppdx::InputOutput<nppdx::input_output_direction::ingest>() +
++   92                              nppdx::InputFormat<nppdx::packing_format::nv12>() + nppdx::TileSize<TileX, TileY>() +
++   93                              NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() + NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() +
++   94                              nppdx::SM<Arch>() + NppdxBlock<BlockX>());
+    95      // NPPDx's color conversion is full range; limited range input is first expanded with NPPDx's own range operations
++   96      using FromLimitedY = decltype(nppdx::Function<nppdx::function::affine_channel_map>() +
++   97                                    nppdx::FromLimitedLuma<nppdx::bit_depth::bpp_8u>() + nppdx::TileSize<TileX, TileY>() +
++   98                                    NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++   99                                    NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() + nppdx::SM<Arch>() +
++  100                                    NppdxBlock<BlockX>());
++  101      using FromLimitedUV = decltype(nppdx::Function<nppdx::function::affine_channel_map>() +
++  102                                     nppdx::FromLimitedChroma<nppdx::bit_depth::bpp_8u>() +
++  103                                     nppdx::TileSize<TileX, TileY>() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++  104                                     NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() + nppdx::SM<Arch>() +
++  105                                     NppdxBlock<BlockX>());
++  106      using Convert = decltype(nppdx::Function<nppdx::function::color_convert>() +
++  107                               nppdx::ColorConvert<nppdx::color_space::yuv_bt601, nppdx::color_space::rgb,
++  108                                                   nppdx::bit_depth::bpp_8u, nppdx::bit_depth::bpp_8u>() +
++  109                               nppdx::TileSize<TileX, TileY>() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++  110                               NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() + nppdx::SM<Arch>() + NppdxBlock<BlockX>());
++  111      using Resize = decltype(ResizePre() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++  112                              NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)());
++  113      using InputTile = nppdx::input_storage_of_t<Ingest>;
++  114      using OutputTile = nppdx::output_storage_of_t<Resize>;
++  115      using TempTile = nppdx::temp_storage_of_t<Resize>;
++  116      static constexpr unsigned outTileX = OutputTile::ChannelSliceType::width;
++  117      static constexpr unsigned outTileY = OutputTile::ChannelSliceType::height;
++  118      static_assert(outTileX * J == TileX * K && outTileY * J == TileY * K, "Unexpected output tile size");
++  119      static_assert(nppdx::is_supported_v<Ingest, Arch> && nppdx::is_supported_v<FromLimitedY, Arch> &&
++  120                    nppdx::is_supported_v<FromLimitedUV, Arch> && nppdx::is_supported_v<Convert, Arch> &&
++  121                    nppdx::is_supported_v<Resize, Arch>);
++  122      static constexpr size_t smem = nppdx::shared_memory::compute_total_tile_storage<InputTile, OutputTile, TempTile>();
+   123      // The largest recommended block of the operations before the write: a kernel runs all of them with one block size
+   124      // (with BlockDim<X> they are all X). Ingest alone would not be enough: its recommended block has one thread per 4x2
+   125      // cell of the tile, but it loads the tile plus the resize halo, which has more cells.
++  126      static constexpr unsigned blockBeforeWrite =
++  127          std::max({Ingest::block_dim.x, FromLimitedY::block_dim.x, FromLimitedUV::block_dim.x, Convert::block_dim.x,
++  128                    Resize::block_dim.x});
+   129      // One block per output tile of every crop
++  130      static constexpr dim3 gridOf(size_t n) { return dim3{RES_W / outTileX, RES_H / outTileY, static_cast<unsigned>(n)}; }
++  131  };
+--- exp1_nppdx_npp (b7f6e88): fkl-vs-nppdx/benchmarks/benchmark_nppdx_npp.cu 70-70 (the 8-bit intermediate between the NPPDx kernel and NPP (declaration)): 1 lines
++   70          uint8_t* resized{nullptr};
+--- exp1_nppdx_npp (b7f6e88): fkl-vs-nppdx/benchmarks/benchmark_nppdx_npp.cu 74-74 (its allocation): 1 lines
++   74              gpuErrchk(cudaMalloc(&resized, N * RES_W * RES_H * 3));
+--- exp3_fkl_dpp (96cc71d): common/bench_neighborhood.h 70-70 (DPP_TILES, the tile list): 1 lines
++   70  constexpr std::array<Tile, 3> DPP_TILES{{{16, 8}, {32, 8}, {32, 16}}};
+--- exp3_fkl_dpp (96cc71d): fkl-neighborhood/src/neighborhood_common.h 128-130 (read chain ReadYUV.then(YUVToRGB).then(Crop)): 3 lines
++  128      return fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice)
++  129          .then(YUVToRGB::build())
++  130          .then(fk::Crop<>::build(regions));
+--- exp3_fkl_dpp (96cc71d): fkl-neighborhood/src/neighborhood_common.h 147-150 (write chain Mul.then(Sub).then(Div).then(TensorWrite)): 4 lines
++  147      return fk::Mul<fk::float3>::build(mulValue)
++  148          .then(fk::Sub<fk::float3>::build(subValue))
++  149          .then(fk::Div<fk::float3>::build(divValue))
++  150          .then(fk::TensorWrite<fk::float3>::build(out.ptr()));
+--- exp3_fkl_dpp (96cc71d): fkl-neighborhood/src/neighborhood_common.h 164-165 (MorphologyDPP details (tile, K, anchor)): 2 lines
++  164          using Details = fk::MorphologyDPPDetails<fk::float3, TW, TH, K, K>;
++  165          const Details details{PLANE_W, PLANE_H, K, K, K / 2, K / 2};
+--- exp3_fkl_dpp (96cc71d): fkl-neighborhood/src/neighborhood_common.h 167-170 (executeBoxBlur call with its error check): 4 lines
++  167          if (!fk::executeBoxBlur<PASSES>(details, boxInput<N, RESIZE>(ctx, (*regions)[t]), normalizedWrite(*out),
++  168                                          *ctx.fkStream)) {
++  169              throw std::runtime_error("executeBoxBlur rejected its details");
++  170          }
+--- exp3_nppdx_as_written (96cc71d, info): fkl-neighborhood/src/nppdx_box.h 66-108 (BoxOps (operation types, tiles, smem, block, grid)): 39 lines
++   66  template <int Arch, unsigned BlockX, unsigned TileX, unsigned TileY>
++   67  struct BoxOps {
++   68      static constexpr nppdx::Halo4 halo = nppdx::Halo4::make_uniform(HALO);
++   69      using Ingest = decltype(nppdx::InputOutput<nppdx::input_output_direction::ingest>() +
++   70                              nppdx::InputFormat<nppdx::packing_format::nv12>() + nppdx::TileSize<TileX, TileY>() +
++   71                              NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() + NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() +
++   72                              nppdx::SM<Arch>() + NppdxBlock<BlockX>());
+    73      // NPPDx's color conversion is full range; limited range input is first expanded with NPPDx's own range operations
++   74      using FromLimitedY = decltype(nppdx::Function<nppdx::function::affine_channel_map>() +
++   75                                    nppdx::FromLimitedLuma<nppdx::bit_depth::bpp_8u>() + nppdx::TileSize<TileX, TileY>() +
++   76                                    NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++   77                                    NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() + nppdx::SM<Arch>() +
++   78                                    NppdxBlock<BlockX>());
++   79      using FromLimitedUV = decltype(nppdx::Function<nppdx::function::affine_channel_map>() +
++   80                                     nppdx::FromLimitedChroma<nppdx::bit_depth::bpp_8u>() +
++   81                                     nppdx::TileSize<TileX, TileY>() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++   82                                     NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() + nppdx::SM<Arch>() +
++   83                                     NppdxBlock<BlockX>());
++   84      using Convert = decltype(nppdx::Function<nppdx::function::color_convert>() +
++   85                               nppdx::ColorConvert<nppdx::color_space::yuv_bt601, nppdx::color_space::rgb,
++   86                                                   nppdx::bit_depth::bpp_8u, nppdx::bit_depth::bpp_8u>() +
++   87                               nppdx::TileSize<TileX, TileY>() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++   88                               NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() + nppdx::SM<Arch>() + NppdxBlock<BlockX>());
+    89      // The box consumes the halo: its output is the TileX x TileY tile, at (HALO, HALO) in its memory tile
++   90      using Blur = decltype(nppdx::Function<nppdx::function::box_blur>() + nppdx::BoxBlur<BOX_K, BOX_K>() +
++   91                            nppdx::TileSize<TileX, TileY>() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++   92                            NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() + nppdx::SM<Arch>() + NppdxBlock<BlockX>());
++   93      using Exgest = decltype(nppdx::InputOutput<nppdx::input_output_direction::exgest>() +
++   94                              nppdx::OutputFormat<nppdx::packing_format::rgb24>() + nppdx::TileSize<TileX, TileY>() +
++   95                              NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++   96                              NPPDX_MAKE_HALO(nppdx::CumulativeHalo, nppdx::Halo4::make_empty())() + nppdx::SM<Arch>() +
++   97                              NppdxBlock<BlockX>());
++   98      using Tile = nppdx::input_storage_of_t<Ingest>;
++   99      static_assert(std::is_same_v<Tile, nppdx::output_storage_of_t<Blur>>, "The box writes a tile like its input's");
+   100      // The input tile and the blurred tile
++  101      static constexpr size_t smem = nppdx::shared_memory::compute_total_tile_storage<Tile, Tile>();
+   102      // A kernel runs every operation with one block size: the largest recommended one (with BlockDim<X> all are X)
++  103      static constexpr unsigned blockFloatWrite = std::max({Ingest::block_dim.x, FromLimitedY::block_dim.x,
++  104                                                            FromLimitedUV::block_dim.x, Convert::block_dim.x,
++  105                                                            Blur::block_dim.x});
++  106      static constexpr unsigned blockExgest = std::max(blockFloatWrite, Exgest::block_dim.x);
++  107      static constexpr dim3 gridOf(size_t n) { return dim3{CROP_W / TileX, CROP_H / TileY, static_cast<unsigned>(n)}; }
++  108  };
+--- exp3_nppdx_as_written (96cc71d, info): fkl-neighborhood/src/nppdx_box.h 110-152 (nppdxBoxKernel): 36 lines
++  110  template <typename Ops, size_t N, bool FLOAT_WRITE, unsigned TileX, unsigned TileY>
++  111  __global__ void nppdxBoxKernel(const uint8_t* y, const uint8_t* uv, const int pitch, const CropOrigins<N> crops,
++  112                                 const Normalization n, float* outF, uint8_t* out8) {
++  113      extern __shared__ unsigned char smem[];
++  114      auto tiles = nppdx::shared_memory::slice_into_tile_storage<typename Ops::Tile, typename Ops::Tile>(smem);
++  115      auto inputTile = std::get<0>(tiles);
++  116      auto blurredTile = std::get<1>(tiles);
+   117  
+   118      // ReadNV12 + Crop: the crop is ingested as a CROP_W x CROP_H NV12 image inside the frame, so the halo replicates
+   119      // its edge; NPPDx takes the position of this block's tile in the crop from blockIdx.x and blockIdx.y
++  120      const int2 o = crops.origin[blockIdx.z];
++  121      const nppdx::ImageLayout<const uint8_t, 2> crop{{{y + static_cast<size_t>(o.y) * pitch + o.x,
++  122                                                        uv + static_cast<size_t>(o.y / 2) * pitch + o.x}},
++  123                                                      {{pitch, pitch}}};
++  124      typename Ops::Ingest().execute(crop, inputTile, CROP_W, CROP_H);
+   125      // YUVtoRGB, BT.601 limited range, in place on the shared memory tile
++  126      typename Ops::FromLimitedY().execute(inputTile, CROP_W, CROP_H);
++  127      typename Ops::FromLimitedUV().execute(inputTile, CROP_W, CROP_H);
++  128      typename Ops::Convert().execute(inputTile, CROP_W, CROP_H);
+   129      // Box, from the tile with its halo into the blurred tile
++  130      typename Ops::Blur().execute(inputTile, blurredTile, CROP_W, CROP_H);
++  131      if constexpr (FLOAT_WRITE) {
++  132          __syncthreads();
+   133          // Mul + Sub + Div + Write float3 (no NPPDx operations for these): each block writes its tile
++  134          float* plane = outF + static_cast<size_t>(blockIdx.z) * PLANE_FLOATS;
++  135          const int numThreads = blockDim.x * blockDim.y * blockDim.z;
++  136          const int tid = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
++  137          for (int idx = tid; idx < static_cast<int>(TileX * TileY); idx += numThreads) {
++  138              const int tx = idx % TileX;
++  139              const int ty = idx / TileX;
++  140              float* pixel =
++  141                  plane + (static_cast<size_t>(blockIdx.y * TileY + ty) * CROP_W + blockIdx.x * TileX + tx) * 3;
++  142  #pragma unroll
++  143              for (int c = 0; c < 3; ++c) {
++  144                  pixel[c] = ((blurredTile.channel(c)(ty + HALO, tx + HALO) * n.mul[c]) - n.sub[c]) / n.div[c];
++  145              }
++  146          }
++  147      } else {
+   148          // NPPDx's 8 bit RGB write of the tile, into the crop's packed plane
++  149          typename Ops::Exgest().execute(blurredTile, out8 + static_cast<size_t>(blockIdx.z) * PLANE_BYTES, CROP_W,
++  150                                         CROP_H);
++  151      }
++  152  }
+--- exp3_nppdx_as_written (96cc71d, info): fkl-neighborhood/src/nppdx_box.h 155-174 (NppdxBox (init/run)): 18 lines
++  155  template <int Arch, size_t N, bool FLOAT_WRITE, unsigned BlockX, unsigned TileX, unsigned TileY>
++  156  struct NppdxBox {
++  157      using Ops = BoxOps<Arch, BlockX, TileX, TileY>;
++  158      static constexpr size_t smem = Ops::smem;
++  159      static constexpr dim3 block{FLOAT_WRITE ? Ops::blockFloatWrite : Ops::blockExgest, 1, 1};
++  160      static constexpr dim3 grid = Ops::gridOf(N);
++  161      static constexpr auto kernel = nppdxBoxKernel<Ops, N, FLOAT_WRITE, TileX, TileY>;
+   162  
++  163      static void init() {
++  164          if constexpr (smem > 48 * 1024) {
++  165              gpuErrchk(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
++  166          }
++  167      }
+   168  
++  169      static void run(cudaStream_t stream, const uint8_t* y, const uint8_t* uv, int pitch, const CropOrigins<N>& crops,
++  170                      const Normalization& n, float* outF, uint8_t* out8) {
++  171          kernel<<<grid, block, smem, stream>>>(y, uv, pitch, crops, n, outF, out8);
++  172          gpuErrchk(cudaGetLastError());
++  173      }
++  174  };
+--- exp3_nppdx_as_written (96cc71d, info): fkl-neighborhood/src/benchmark_nppdx_neighborhood.cu 46-46 (NPPDX_CONFIGS): 1 lines
++   46  inline constexpr auto NPPDX_CONFIGS = nppdxConfigs<NPPDX_SM, FLOAT_WRITE>();
+--- exp3_nppdx (96cc71d; float-write path, the one the program instantiates): fkl-neighborhood/src/nppdx_box.h 66-92 (BoxOps up to Blur): 25 lines
++   66  template <int Arch, unsigned BlockX, unsigned TileX, unsigned TileY>
++   67  struct BoxOps {
++   68      static constexpr nppdx::Halo4 halo = nppdx::Halo4::make_uniform(HALO);
++   69      using Ingest = decltype(nppdx::InputOutput<nppdx::input_output_direction::ingest>() +
++   70                              nppdx::InputFormat<nppdx::packing_format::nv12>() + nppdx::TileSize<TileX, TileY>() +
++   71                              NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() + NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() +
++   72                              nppdx::SM<Arch>() + NppdxBlock<BlockX>());
+    73      // NPPDx's color conversion is full range; limited range input is first expanded with NPPDx's own range operations
++   74      using FromLimitedY = decltype(nppdx::Function<nppdx::function::affine_channel_map>() +
++   75                                    nppdx::FromLimitedLuma<nppdx::bit_depth::bpp_8u>() + nppdx::TileSize<TileX, TileY>() +
++   76                                    NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++   77                                    NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() + nppdx::SM<Arch>() +
++   78                                    NppdxBlock<BlockX>());
++   79      using FromLimitedUV = decltype(nppdx::Function<nppdx::function::affine_channel_map>() +
++   80                                     nppdx::FromLimitedChroma<nppdx::bit_depth::bpp_8u>() +
++   81                                     nppdx::TileSize<TileX, TileY>() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++   82                                     NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() + nppdx::SM<Arch>() +
++   83                                     NppdxBlock<BlockX>());
++   84      using Convert = decltype(nppdx::Function<nppdx::function::color_convert>() +
++   85                               nppdx::ColorConvert<nppdx::color_space::yuv_bt601, nppdx::color_space::rgb,
++   86                                                   nppdx::bit_depth::bpp_8u, nppdx::bit_depth::bpp_8u>() +
++   87                               nppdx::TileSize<TileX, TileY>() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++   88                               NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() + nppdx::SM<Arch>() + NppdxBlock<BlockX>());
+    89      // The box consumes the halo: its output is the TileX x TileY tile, at (HALO, HALO) in its memory tile
++   90      using Blur = decltype(nppdx::Function<nppdx::function::box_blur>() + nppdx::BoxBlur<BOX_K, BOX_K>() +
++   91                            nppdx::TileSize<TileX, TileY>() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, halo)() +
++   92                            NPPDX_MAKE_HALO(nppdx::CumulativeHalo, halo)() + nppdx::SM<Arch>() + NppdxBlock<BlockX>());
+--- exp3_nppdx (96cc71d; float-write path, the one the program instantiates): fkl-neighborhood/src/nppdx_box.h 98-105 (BoxOps Tile, smem, blockFloatWrite (Exgest and blockExgest skipped)): 6 lines
++   98      using Tile = nppdx::input_storage_of_t<Ingest>;
++   99      static_assert(std::is_same_v<Tile, nppdx::output_storage_of_t<Blur>>, "The box writes a tile like its input's");
+   100      // The input tile and the blurred tile
++  101      static constexpr size_t smem = nppdx::shared_memory::compute_total_tile_storage<Tile, Tile>();
+   102      // A kernel runs every operation with one block size: the largest recommended one (with BlockDim<X> all are X)
++  103      static constexpr unsigned blockFloatWrite = std::max({Ingest::block_dim.x, FromLimitedY::block_dim.x,
++  104                                                            FromLimitedUV::block_dim.x, Convert::block_dim.x,
++  105                                                            Blur::block_dim.x});
+--- exp3_nppdx (96cc71d; float-write path, the one the program instantiates): fkl-neighborhood/src/nppdx_box.h 107-108 (BoxOps gridOf, closing brace): 2 lines
++  107      static constexpr dim3 gridOf(size_t n) { return dim3{CROP_W / TileX, CROP_H / TileY, static_cast<unsigned>(n)}; }
++  108  };
+--- exp3_nppdx (96cc71d; float-write path, the one the program instantiates): fkl-neighborhood/src/nppdx_box.h 110-130 (kernel up to the blur): 16 lines
++  110  template <typename Ops, size_t N, bool FLOAT_WRITE, unsigned TileX, unsigned TileY>
++  111  __global__ void nppdxBoxKernel(const uint8_t* y, const uint8_t* uv, const int pitch, const CropOrigins<N> crops,
++  112                                 const Normalization n, float* outF, uint8_t* out8) {
++  113      extern __shared__ unsigned char smem[];
++  114      auto tiles = nppdx::shared_memory::slice_into_tile_storage<typename Ops::Tile, typename Ops::Tile>(smem);
++  115      auto inputTile = std::get<0>(tiles);
++  116      auto blurredTile = std::get<1>(tiles);
+   117  
+   118      // ReadNV12 + Crop: the crop is ingested as a CROP_W x CROP_H NV12 image inside the frame, so the halo replicates
+   119      // its edge; NPPDx takes the position of this block's tile in the crop from blockIdx.x and blockIdx.y
++  120      const int2 o = crops.origin[blockIdx.z];
++  121      const nppdx::ImageLayout<const uint8_t, 2> crop{{{y + static_cast<size_t>(o.y) * pitch + o.x,
++  122                                                        uv + static_cast<size_t>(o.y / 2) * pitch + o.x}},
++  123                                                      {{pitch, pitch}}};
++  124      typename Ops::Ingest().execute(crop, inputTile, CROP_W, CROP_H);
+   125      // YUVtoRGB, BT.601 limited range, in place on the shared memory tile
++  126      typename Ops::FromLimitedY().execute(inputTile, CROP_W, CROP_H);
++  127      typename Ops::FromLimitedUV().execute(inputTile, CROP_W, CROP_H);
++  128      typename Ops::Convert().execute(inputTile, CROP_W, CROP_H);
+   129      // Box, from the tile with its halo into the blurred tile
++  130      typename Ops::Blur().execute(inputTile, blurredTile, CROP_W, CROP_H);
+--- exp3_nppdx (96cc71d; float-write path, the one the program instantiates): fkl-neighborhood/src/nppdx_box.h 132-146 (kernel: hand-written normalization and float write (the if/else of the 8-bit branch skipped)): 14 lines
++  132          __syncthreads();
+   133          // Mul + Sub + Div + Write float3 (no NPPDx operations for these): each block writes its tile
++  134          float* plane = outF + static_cast<size_t>(blockIdx.z) * PLANE_FLOATS;
++  135          const int numThreads = blockDim.x * blockDim.y * blockDim.z;
++  136          const int tid = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
++  137          for (int idx = tid; idx < static_cast<int>(TileX * TileY); idx += numThreads) {
++  138              const int tx = idx % TileX;
++  139              const int ty = idx / TileX;
++  140              float* pixel =
++  141                  plane + (static_cast<size_t>(blockIdx.y * TileY + ty) * CROP_W + blockIdx.x * TileX + tx) * 3;
++  142  #pragma unroll
++  143              for (int c = 0; c < 3; ++c) {
++  144                  pixel[c] = ((blurredTile.channel(c)(ty + HALO, tx + HALO) * n.mul[c]) - n.sub[c]) / n.div[c];
++  145              }
++  146          }
+--- exp3_nppdx (96cc71d; float-write path, the one the program instantiates): fkl-neighborhood/src/nppdx_box.h 152-152 (kernel closing brace): 1 lines
++  152  }
+--- exp3_nppdx (96cc71d; float-write path, the one the program instantiates): fkl-neighborhood/src/nppdx_box.h 155-174 (NppdxBox (init/run)): 18 lines
++  155  template <int Arch, size_t N, bool FLOAT_WRITE, unsigned BlockX, unsigned TileX, unsigned TileY>
++  156  struct NppdxBox {
++  157      using Ops = BoxOps<Arch, BlockX, TileX, TileY>;
++  158      static constexpr size_t smem = Ops::smem;
++  159      static constexpr dim3 block{FLOAT_WRITE ? Ops::blockFloatWrite : Ops::blockExgest, 1, 1};
++  160      static constexpr dim3 grid = Ops::gridOf(N);
++  161      static constexpr auto kernel = nppdxBoxKernel<Ops, N, FLOAT_WRITE, TileX, TileY>;
+   162  
++  163      static void init() {
++  164          if constexpr (smem > 48 * 1024) {
++  165              gpuErrchk(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
++  166          }
++  167      }
+   168  
++  169      static void run(cudaStream_t stream, const uint8_t* y, const uint8_t* uv, int pitch, const CropOrigins<N>& crops,
++  170                      const Normalization& n, float* outF, uint8_t* out8) {
++  171          kernel<<<grid, block, smem, stream>>>(y, uv, pitch, crops, n, outF, out8);
++  172          gpuErrchk(cudaGetLastError());
++  173      }
++  174  };
+--- exp3_nppdx (96cc71d; float-write path, the one the program instantiates): fkl-neighborhood/src/benchmark_nppdx_neighborhood.cu 46-46 (NPPDX_CONFIGS): 1 lines
++   46  inline constexpr auto NPPDX_CONFIGS = nppdxConfigs<NPPDX_SM, FLOAT_WRITE>();
+--- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/benchmark_wins_frame.cu 60-64 (CONFIGS, the tile and block list): 5 lines
++   60  constexpr std::array<NppdxConfig, 20> CONFIGS{{{64, 32, 0}, {64, 32, 128}, {64, 32, 256}, {64, 32, 512},
++   61                                                 {32, 32, 0}, {32, 32, 128}, {32, 32, 256}, {32, 32, 512},
++   62                                                 {32, 16, 0}, {32, 16, 128}, {32, 16, 256}, {32, 16, 512},
++   63                                                 {16, 16, 0}, {16, 16, 128}, {16, 16, 256}, {16, 16, 512},
++   64                                                 {16, 8, 0}, {16, 8, 128}, {16, 8, 256}, {16, 8, 512}}};
+--- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/wins_common.h 475-477 (WINS_NPPDX_LAYOUT macro (tile, halos, SM, block)): 3 lines
++  475  #define WINS_NPPDX_LAYOUT(TX, TY, MH, CH, BX)                                                                         \
++  476      nppdx::TileSize<TX, TY>() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, MH)() +                                             \
++  477          NPPDX_MAKE_HALO(nppdx::CumulativeHalo, CH)() + nppdx::SM<NPPDX_SM>() + NppdxBlock<BX>()
+--- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/wins_common.h 481-482 (BoxSpec head): 2 lines
++  481  template <int K_, int PASSES_>
++  482  struct BoxSpec {
+--- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/wins_common.h 484-490 (BoxSpec K, PASSES, halos, Operator, FUNCTION (the GAUSSIAN flag of the harness skipped)): 7 lines
++  484      static constexpr int K = K_;
++  485      static constexpr int PASSES = PASSES_;
++  486      static constexpr int STEP_HALO = K_ / 2;
++  487      static constexpr int HALO = STEP_HALO * PASSES_;
++  488      using Operator = nppdx::BoxBlur<K_, K_>;
++  489      static constexpr nppdx::function FUNCTION = nppdx::function::box_blur;
++  490  };
+--- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/wins_common.h 515-574 (FilterResizeOps (operation types, tiles, smem, block, device run)): 57 lines
++  515  template <unsigned TX_, unsigned TY_, unsigned BlockX, unsigned J, unsigned K, typename Spec>
++  516  struct FilterResizeOps {
++  517      static constexpr unsigned TX = TX_;
++  518      static constexpr unsigned TY = TY_;
++  519      using ResizePre = decltype(nppdx::Function<nppdx::function::resize>() +
++  520                                 nppdx::Resize<J, K, nppdx::interpolation_method::bilinear>() +
++  521                                 nppdx::TileSize<TX, TY>() + nppdx::SM<NPPDX_SM>() + NppdxBlock<BlockX>());
++  522      static constexpr nppdx::Halo4 resizeHalo = ResizePre::local_halo;
++  523      static constexpr nppdx::Halo4 total = nppdx::Halo4::make_uniform(Spec::HALO) + resizeHalo;
+   524      // The halo left in the input of the second pass (with one pass, Blur2 is Blur and is not run)
++  525      static constexpr nppdx::Halo4 second =
++  526          Spec::PASSES == 2 ? nppdx::Halo4::make_uniform(Spec::HALO - Spec::STEP_HALO) + resizeHalo : total;
++  527      using Ingest = decltype(nppdx::InputOutput<nppdx::input_output_direction::ingest>() +
++  528                              nppdx::InputFormat<nppdx::packing_format::nv12>() +
++  529                              WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
++  530      using FromLimitedY = decltype(nppdx::Function<nppdx::function::affine_channel_map>() +
++  531                                    nppdx::FromLimitedLuma<nppdx::bit_depth::bpp_8u>() +
++  532                                    WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
++  533      using FromLimitedUV = decltype(nppdx::Function<nppdx::function::affine_channel_map>() +
++  534                                     nppdx::FromLimitedChroma<nppdx::bit_depth::bpp_8u>() +
++  535                                     WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
++  536      using Convert = decltype(nppdx::Function<nppdx::function::color_convert>() +
++  537                               nppdx::ColorConvert<nppdx::color_space::yuv_bt601, nppdx::color_space::rgb,
++  538                                                   nppdx::bit_depth::bpp_8u, nppdx::bit_depth::bpp_8u>() +
++  539                               WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
++  540      using Blur = decltype(nppdx::Function<Spec::FUNCTION>() + typename Spec::Operator() +
++  541                            WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
++  542      using Blur2 = decltype(nppdx::Function<Spec::FUNCTION>() + typename Spec::Operator() +
++  543                             WINS_NPPDX_LAYOUT(TX, TY, total, second, BlockX));
++  544      using Resize = decltype(ResizePre() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, total)() +
++  545                              NPPDX_MAKE_HALO(nppdx::CumulativeHalo, resizeHalo)());
++  546      using InTile = nppdx::input_storage_of_t<Ingest>;
++  547      using BlurTile = nppdx::output_storage_of_t<Blur>;
++  548      using TmpTile = nppdx::temp_storage_of_t<Resize>;
++  549      using OutTile = nppdx::output_storage_of_t<Resize>;
++  550      static constexpr unsigned OX = OutTile::ChannelSliceType::width;
++  551      static constexpr unsigned OY = OutTile::ChannelSliceType::height;
++  552      static constexpr size_t smem = nppdx::shared_memory::compute_total_tile_storage<InTile, BlurTile, TmpTile, OutTile>();
++  553      static constexpr unsigned block = std::max({Ingest::block_dim.x, FromLimitedY::block_dim.x,
++  554                                                  FromLimitedUV::block_dim.x, Convert::block_dim.x, Blur::block_dim.x,
++  555                                                  Blur2::block_dim.x, Resize::block_dim.x});
+   556  
++  557      template <typename Image, typename Tiles>
++  558      __device__ static void run(const Image& image, Tiles& tiles, const int w, const int h) {
++  559          auto& in = std::get<0>(tiles);
++  560          Ingest().execute(image, in, w, h);
++  561          FromLimitedY().execute(in, w, h);
++  562          FromLimitedUV().execute(in, w, h);
++  563          Convert().execute(in, w, h);
++  564          Blur().execute(in, std::get<1>(tiles), w, h);
++  565          if constexpr (Spec::PASSES == 2) {
+   566              // The second pass writes into the input tile, which is no longer needed
++  567              Blur2().execute(std::get<1>(tiles), in, w, h);
++  568              Resize().execute(in, std::get<2>(tiles), std::get<3>(tiles), w, h);
++  569          } else {
++  570              Resize().execute(std::get<1>(tiles), std::get<2>(tiles), std::get<3>(tiles), w, h);
++  571          }
++  572          __syncthreads();
++  573      }
++  574  };
+--- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/wins_common.h 581-586 (sliceTiles): 6 lines
++  581  template <typename Ops>
++  582  __device__ auto sliceTiles() {
++  583      extern __shared__ unsigned char smem[];
++  584      return nppdx::shared_memory::slice_into_tile_storage<typename Ops::InTile, typename Ops::BlurTile,
++  585                                                           typename Ops::TmpTile, typename Ops::OutTile>(smem);
++  586  }
+--- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/wins_common.h 589-607 (writeTile (hand-written normalization and float write)): 19 lines
++  589  template <typename Ops, typename Tile>
++  590  __device__ void writeTile(const Tile& tile, const Normalization& n, float* plane, const int x0, const int y0,
++  591                            const int w, const int h) {
++  592      const int threads = blockDim.x * blockDim.y * blockDim.z;
++  593      const int tid = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
++  594      for (int i = tid; i < static_cast<int>(Ops::OX * Ops::OY); i += threads) {
++  595          const int tx = i % Ops::OX;
++  596          const int ty = i / Ops::OX;
++  597          const int x = x0 + tx;
++  598          const int y = y0 + ty;
++  599          if (x < w && y < h) {
++  600              float* pixel = plane + (static_cast<size_t>(y) * w + x) * 3;
++  601  #pragma unroll
++  602              for (int c = 0; c < 3; ++c) {
++  603                  pixel[c] = ((tile.channel(c)(ty, tx) * n.mul[c]) - n.sub[c]) / n.div[c];
++  604              }
++  605          }
++  606      }
++  607  }
+--- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/wins_common.h 640-648 (nppdxFrameKernel): 9 lines
++  640  template <typename Ops>
++  641  __global__ void nppdxFrameKernel(const uint8_t* y, const uint8_t* uv, const int pitch, const Normalization n,
++  642                                   float* out) {
++  643      auto tiles = sliceTiles<Ops>();
++  644      const nppdx::ImageLayout<const uint8_t, 2> image{{{y, uv}}, {{pitch, pitch}}};
++  645      Ops::run(image, tiles, FRAME_W, FRAME_H);
++  646      writeTile<Ops>(std::get<3>(tiles), n, out, static_cast<int>(blockIdx.x * Ops::OX),
++  647                     static_cast<int>(blockIdx.y * Ops::OY), W2_OUT_W, W2_OUT_H);
++  648  }
+--- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/wins_common.h 650-655 (allowSharedMemory (init)): 6 lines
++  650  template <auto Kernel, size_t SMEM>
++  651  void allowSharedMemory() {
++  652      if constexpr (SMEM > 48 * 1024) {
++  653          gpuErrchk(cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
++  654      }
++  655  }
+--- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/benchmark_wins_frame.cu 73-74 (Ops, kernel): 2 lines
++   73      using Ops = FilterResizeOps<C.tileX, C.tileY, C.block, 2, 1, Spec>;
++   74      constexpr auto kernel = nppdxFrameKernel<Ops>;
+--- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/benchmark_wins_frame.cu 81-81 (grid): 1 lines
++   81          const dim3 grid{(FRAME_W + Ops::TX - 1) / Ops::TX, (FRAME_H + Ops::TY - 1) / Ops::TY, 1};
+--- wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/benchmark_wins_frame.cu 83-85 (launch and its error check): 3 lines
++   83          kernel<<<grid, dim3(Ops::block), Ops::smem, ctx.stream>>>(ctx.y, ctx.uv, ctx.pitch, n,
++   84                                                                    reinterpret_cast<float*>(out->ptr().data));
++   85          gpuErrchk(cudaGetLastError());
+--- wins_nppdx_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 60-64 (CONFIGS, the tile and block list): 5 lines
++   60  constexpr std::array<NppdxConfig, 20> CONFIGS{{{64, 32, 0}, {64, 32, 128}, {64, 32, 256}, {64, 32, 512},
++   61                                                 {32, 32, 0}, {32, 32, 128}, {32, 32, 256}, {32, 32, 512},
++   62                                                 {32, 16, 0}, {32, 16, 128}, {32, 16, 256}, {32, 16, 512},
++   63                                                 {16, 16, 0}, {16, 16, 128}, {16, 16, 256}, {16, 16, 512},
++   64                                                 {16, 8, 0}, {16, 8, 128}, {16, 8, 256}, {16, 8, 512}}};
+--- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 475-477 (WINS_NPPDX_LAYOUT macro): 3 lines
++  475  #define WINS_NPPDX_LAYOUT(TX, TY, MH, CH, BX)                                                                         \
++  476      nppdx::TileSize<TX, TY>() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, MH)() +                                             \
++  477          NPPDX_MAKE_HALO(nppdx::CumulativeHalo, CH)() + nppdx::SM<NPPDX_SM>() + NppdxBlock<BX>()
+--- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 491-492 (GaussianSpec head): 2 lines
++  491  template <int RT, nppdx::gaussian_tail_width TAIL>
++  492  struct GaussianSpec {
+--- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 497-497 (GaussianSpec BAND_TAPS): 1 lines
++  497      static constexpr int BAND_TAPS = RT <= 9 ? 3 : RT <= 20 ? 5 : 7 + 2 * ((RT - 21) / 10);
+--- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 499-499 (GaussianSpec K): 1 lines
++  499      static constexpr int K = TAIL == nppdx::gaussian_tail_width::wide ? 2 * BAND_TAPS - 1 : BAND_TAPS;
+--- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 501-505 (GaussianSpec PASSES, halos, Operator, FUNCTION (GAUSSIAN flag, BAND_MIN, ROW and taps() of FKL and the references skipped)): 5 lines
++  501      static constexpr int PASSES = 1;
++  502      static constexpr int STEP_HALO = K / 2;
++  503      static constexpr int HALO = STEP_HALO;
++  504      using Operator = nppdx::GaussianBlur<RT, TAIL>;
++  505      static constexpr nppdx::function FUNCTION = nppdx::function::gaussian_blur;
+--- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 511-511 (GaussianSpec closing brace): 1 lines
++  511  };
+--- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 515-574 (FilterResizeOps): 57 lines
++  515  template <unsigned TX_, unsigned TY_, unsigned BlockX, unsigned J, unsigned K, typename Spec>
++  516  struct FilterResizeOps {
++  517      static constexpr unsigned TX = TX_;
++  518      static constexpr unsigned TY = TY_;
++  519      using ResizePre = decltype(nppdx::Function<nppdx::function::resize>() +
++  520                                 nppdx::Resize<J, K, nppdx::interpolation_method::bilinear>() +
++  521                                 nppdx::TileSize<TX, TY>() + nppdx::SM<NPPDX_SM>() + NppdxBlock<BlockX>());
++  522      static constexpr nppdx::Halo4 resizeHalo = ResizePre::local_halo;
++  523      static constexpr nppdx::Halo4 total = nppdx::Halo4::make_uniform(Spec::HALO) + resizeHalo;
+   524      // The halo left in the input of the second pass (with one pass, Blur2 is Blur and is not run)
++  525      static constexpr nppdx::Halo4 second =
++  526          Spec::PASSES == 2 ? nppdx::Halo4::make_uniform(Spec::HALO - Spec::STEP_HALO) + resizeHalo : total;
++  527      using Ingest = decltype(nppdx::InputOutput<nppdx::input_output_direction::ingest>() +
++  528                              nppdx::InputFormat<nppdx::packing_format::nv12>() +
++  529                              WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
++  530      using FromLimitedY = decltype(nppdx::Function<nppdx::function::affine_channel_map>() +
++  531                                    nppdx::FromLimitedLuma<nppdx::bit_depth::bpp_8u>() +
++  532                                    WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
++  533      using FromLimitedUV = decltype(nppdx::Function<nppdx::function::affine_channel_map>() +
++  534                                     nppdx::FromLimitedChroma<nppdx::bit_depth::bpp_8u>() +
++  535                                     WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
++  536      using Convert = decltype(nppdx::Function<nppdx::function::color_convert>() +
++  537                               nppdx::ColorConvert<nppdx::color_space::yuv_bt601, nppdx::color_space::rgb,
++  538                                                   nppdx::bit_depth::bpp_8u, nppdx::bit_depth::bpp_8u>() +
++  539                               WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
++  540      using Blur = decltype(nppdx::Function<Spec::FUNCTION>() + typename Spec::Operator() +
++  541                            WINS_NPPDX_LAYOUT(TX, TY, total, total, BlockX));
++  542      using Blur2 = decltype(nppdx::Function<Spec::FUNCTION>() + typename Spec::Operator() +
++  543                             WINS_NPPDX_LAYOUT(TX, TY, total, second, BlockX));
++  544      using Resize = decltype(ResizePre() + NPPDX_MAKE_HALO(nppdx::MemoryHalo, total)() +
++  545                              NPPDX_MAKE_HALO(nppdx::CumulativeHalo, resizeHalo)());
++  546      using InTile = nppdx::input_storage_of_t<Ingest>;
++  547      using BlurTile = nppdx::output_storage_of_t<Blur>;
++  548      using TmpTile = nppdx::temp_storage_of_t<Resize>;
++  549      using OutTile = nppdx::output_storage_of_t<Resize>;
++  550      static constexpr unsigned OX = OutTile::ChannelSliceType::width;
++  551      static constexpr unsigned OY = OutTile::ChannelSliceType::height;
++  552      static constexpr size_t smem = nppdx::shared_memory::compute_total_tile_storage<InTile, BlurTile, TmpTile, OutTile>();
++  553      static constexpr unsigned block = std::max({Ingest::block_dim.x, FromLimitedY::block_dim.x,
++  554                                                  FromLimitedUV::block_dim.x, Convert::block_dim.x, Blur::block_dim.x,
++  555                                                  Blur2::block_dim.x, Resize::block_dim.x});
+   556  
++  557      template <typename Image, typename Tiles>
++  558      __device__ static void run(const Image& image, Tiles& tiles, const int w, const int h) {
++  559          auto& in = std::get<0>(tiles);
++  560          Ingest().execute(image, in, w, h);
++  561          FromLimitedY().execute(in, w, h);
++  562          FromLimitedUV().execute(in, w, h);
++  563          Convert().execute(in, w, h);
++  564          Blur().execute(in, std::get<1>(tiles), w, h);
++  565          if constexpr (Spec::PASSES == 2) {
+   566              // The second pass writes into the input tile, which is no longer needed
++  567              Blur2().execute(std::get<1>(tiles), in, w, h);
++  568              Resize().execute(in, std::get<2>(tiles), std::get<3>(tiles), w, h);
++  569          } else {
++  570              Resize().execute(std::get<1>(tiles), std::get<2>(tiles), std::get<3>(tiles), w, h);
++  571          }
++  572          __syncthreads();
++  573      }
++  574  };
+--- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 581-586 (sliceTiles): 6 lines
++  581  template <typename Ops>
++  582  __device__ auto sliceTiles() {
++  583      extern __shared__ unsigned char smem[];
++  584      return nppdx::shared_memory::slice_into_tile_storage<typename Ops::InTile, typename Ops::BlurTile,
++  585                                                           typename Ops::TmpTile, typename Ops::OutTile>(smem);
++  586  }
+--- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 589-607 (writeTile): 19 lines
++  589  template <typename Ops, typename Tile>
++  590  __device__ void writeTile(const Tile& tile, const Normalization& n, float* plane, const int x0, const int y0,
++  591                            const int w, const int h) {
++  592      const int threads = blockDim.x * blockDim.y * blockDim.z;
++  593      const int tid = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
++  594      for (int i = tid; i < static_cast<int>(Ops::OX * Ops::OY); i += threads) {
++  595          const int tx = i % Ops::OX;
++  596          const int ty = i / Ops::OX;
++  597          const int x = x0 + tx;
++  598          const int y = y0 + ty;
++  599          if (x < w && y < h) {
++  600              float* pixel = plane + (static_cast<size_t>(y) * w + x) * 3;
++  601  #pragma unroll
++  602              for (int c = 0; c < 3; ++c) {
++  603                  pixel[c] = ((tile.channel(c)(ty, tx) * n.mul[c]) - n.sub[c]) / n.div[c];
++  604              }
++  605          }
++  606      }
++  607  }
+--- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 640-648 (nppdxFrameKernel): 9 lines
++  640  template <typename Ops>
++  641  __global__ void nppdxFrameKernel(const uint8_t* y, const uint8_t* uv, const int pitch, const Normalization n,
++  642                                   float* out) {
++  643      auto tiles = sliceTiles<Ops>();
++  644      const nppdx::ImageLayout<const uint8_t, 2> image{{{y, uv}}, {{pitch, pitch}}};
++  645      Ops::run(image, tiles, FRAME_W, FRAME_H);
++  646      writeTile<Ops>(std::get<3>(tiles), n, out, static_cast<int>(blockIdx.x * Ops::OX),
++  647                     static_cast<int>(blockIdx.y * Ops::OY), W2_OUT_W, W2_OUT_H);
++  648  }
+--- wins_nppdx_gauss (76a9136): nppdx-wins/src/wins_common.h 650-655 (allowSharedMemory): 6 lines
++  650  template <auto Kernel, size_t SMEM>
++  651  void allowSharedMemory() {
++  652      if constexpr (SMEM > 48 * 1024) {
++  653          gpuErrchk(cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
++  654      }
++  655  }
+--- wins_nppdx_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 73-74 (Ops, kernel): 2 lines
++   73      using Ops = FilterResizeOps<C.tileX, C.tileY, C.block, 2, 1, Spec>;
++   74      constexpr auto kernel = nppdxFrameKernel<Ops>;
+--- wins_nppdx_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 81-81 (grid): 1 lines
++   81          const dim3 grid{(FRAME_W + Ops::TX - 1) / Ops::TX, (FRAME_H + Ops::TY - 1) / Ops::TY, 1};
+--- wins_nppdx_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 83-85 (launch and its error check): 3 lines
++   83          kernel<<<grid, dim3(Ops::block), Ops::smem, ctx.stream>>>(ctx.y, ctx.uv, ctx.pitch, n,
++   84                                                                    reinterpret_cast<float*>(out->ptr().data));
++   85          gpuErrchk(cudaGetLastError());
+--- wins_fkl_plain_box1 (76a9136; 5x5, 9x9): nppdx-wins/src/benchmark_wins_frame.cu 116-120 (executeOperations ReadYUV, YUVToRGB, BoxBVF<K>, Resize, write chain): 5 lines
++  116              fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
++  117                                                        fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
++  118                                                        YUVToRGB::build(), fk::BoxBVF<S::K>::build(),
++  119                                                        Bilinear::build(fk::Size(W2_OUT_W, W2_OUT_H)),
++  120                                                        normalizedWrite(*out));
+--- wins_fkl_plain_box1 (76a9136; 5x5, 9x9): nppdx-wins/src/wins_common.h 661-661 (Bilinear alias): 1 lines
++  661  using Bilinear = fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>;
+--- wins_fkl_plain_box1 (76a9136; 5x5, 9x9): nppdx-wins/src/wins_common.h 664-667 (write chain): 4 lines
++  664      return fk::Mul<fk::float3>::build(mulValue)
++  665          .then(fk::Sub<fk::float3>::build(subValue))
++  666          .then(fk::Div<fk::float3>::build(divValue))
++  667          .then(fk::TensorWrite<fk::float3>::build(out.ptr()));
+--- wins_fkl_plain_box2 (76a9136; 5x5 twice): nppdx-wins/src/benchmark_wins_frame.cu 122-127 (executeOperations with two BoxBVF<K>): 6 lines
++  122              fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
++  123                                                        fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
++  124                                                        YUVToRGB::build(), fk::BoxBVF<S::K>::build(),
++  125                                                        fk::BoxBVF<S::K>::build(),
++  126                                                        Bilinear::build(fk::Size(W2_OUT_W, W2_OUT_H)),
++  127                                                        normalizedWrite(*out));
+--- wins_fkl_plain_box2 (76a9136; 5x5 twice): nppdx-wins/src/wins_common.h 661-661 (Bilinear alias): 1 lines
++  661  using Bilinear = fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>;
+--- wins_fkl_plain_box2 (76a9136; 5x5 twice): nppdx-wins/src/wins_common.h 664-667 (write chain): 4 lines
++  664      return fk::Mul<fk::float3>::build(mulValue)
++  665          .then(fk::Sub<fk::float3>::build(subValue))
++  666          .then(fk::Div<fk::float3>::build(divValue))
++  667          .then(fk::TensorWrite<fk::float3>::build(out.ptr()));
+--- wins_fkl_plain_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 98-104 (taps array, the parameter of GaussianBVF): 7 lines
++   98      fk::Array<float, S::K> taps{};
++   99      if constexpr (S::GAUSSIAN) {
++  100          const auto values = S::taps();
++  101          for (int i = 0; i < S::K; ++i) {
++  102              taps[i] = static_cast<float>(values[i]);
++  103          }
++  104      }
+--- wins_fkl_plain_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 110-114 (executeOperations with GaussianBVF<21>): 5 lines
++  110              fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
++  111                                                        fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice),
++  112                                                        YUVToRGB::build(), fk::GaussianBVF<S::K>::build(taps),
++  113                                                        Bilinear::build(fk::Size(W2_OUT_W, W2_OUT_H)),
++  114                                                        normalizedWrite(*out));
+--- wins_fkl_plain_gauss (76a9136): nppdx-wins/src/wins_common.h 661-661 (Bilinear alias): 1 lines
++  661  using Bilinear = fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>;
+--- wins_fkl_plain_gauss (76a9136): nppdx-wins/src/wins_common.h 664-667 (write chain): 4 lines
++  664      return fk::Mul<fk::float3>::build(mulValue)
++  665          .then(fk::Sub<fk::float3>::build(subValue))
++  666          .then(fk::Div<fk::float3>::build(divValue))
++  667          .then(fk::TensorWrite<fk::float3>::build(out.ptr()));
+--- wins_fkl_staged_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/wins_common.h 678-678 (DPP_TILES, the tile list): 1 lines
++  678  constexpr std::array<DppTile, 3> DPP_TILES{{{16, 8}, {32, 8}, {32, 16}}};
+--- wins_fkl_staged_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/benchmark_wins_frame.cu 158-158 (intermediate float3 frame): 1 lines
++  158      auto inter = std::make_shared<fk::Tensor<fk::float3>>(FRAME_W, FRAME_H, 1, 1, fk::MemType::Device);
+--- wins_fkl_staged_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/benchmark_wins_frame.cu 160-161 (its 2D view): 2 lines
++  160      const fk::RawPtr<fk::ND::_2D, fk::float3> frame{inter->ptr().data,
++  161                                                       {FRAME_W, FRAME_H, FRAME_W * sizeof(fk::float3)}};
+--- wins_fkl_staged_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/benchmark_wins_frame.cu 180-181 (MorphologyDPP details): 2 lines
++  180              using Details = fk::MorphologyDPPDetails<fk::float3, TW, TH, Spec::K, Spec::K>;
++  181              const Details details{FRAME_W, FRAME_H, Spec::K, Spec::K, Spec::STEP_HALO, Spec::STEP_HALO};
+--- wins_fkl_staged_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/benchmark_wins_frame.cu 183-187 (executeBoxBlur call with its error check): 5 lines
++  183              if (!fk::executeBoxBlur<Spec::PASSES>(details, rgbRead(ctx),
++  184                                                    fk::PerThreadWrite<fk::ND::_2D, fk::float3>::build(frame),
++  185                                                    *ctx.fkStream)) {
++  186                  throw std::runtime_error("executeBoxBlur rejected its details");
++  187              }
+--- wins_fkl_staged_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/benchmark_wins_frame.cu 192-195 (executeOperations PerThreadRead, Resize, write chain): 4 lines
++  192          fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
++  193                                                    fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(frame),
++  194                                                    Bilinear::build(fk::Size(W2_OUT_W, W2_OUT_H)),
++  195                                                    normalizedWrite(*out));
+--- wins_fkl_staged_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/wins_common.h 661-661 (Bilinear alias): 1 lines
++  661  using Bilinear = fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>;
+--- wins_fkl_staged_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/wins_common.h 664-667 (write chain): 4 lines
++  664      return fk::Mul<fk::float3>::build(mulValue)
++  665          .then(fk::Sub<fk::float3>::build(subValue))
++  666          .then(fk::Div<fk::float3>::build(divValue))
++  667          .then(fk::TensorWrite<fk::float3>::build(out.ptr()));
+--- wins_fkl_staged_box (76a9136; 5x5, 5x5 twice, 9x9): nppdx-wins/src/wins_common.h 671-671 (read chain ReadYUV.then(YUVToRGB)): 1 lines
++  671      return fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice).then(YUVToRGB::build());
+--- wins_fkl_staged_gauss_2d (76a9136): nppdx-wins/src/wins_common.h 678-678 (DPP_TILES, the tile list): 1 lines
++  678  constexpr std::array<DppTile, 3> DPP_TILES{{{16, 8}, {32, 8}, {32, 16}}};
+--- wins_fkl_staged_gauss_2d (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 140-149 (21x21 coefficient image from the taps): 10 lines
++  140          const auto taps = S::taps();
++  141          const int n = static_cast<int>(taps.size());
++  142          coefficients = std::make_shared<fk::Ptr2D<fk::float3>>(n, n);
++  143          for (int y = 0; y < n; ++y) {
++  144              for (int x = 0; x < n; ++x) {
++  145                  coefficients->at(fk::Point{x, y, 0}) = fk::make_set<fk::float3>(static_cast<float>(taps[y] * taps[x]));
++  146              }
++  147          }
++  148          coefficients->upload(*ctx.fkStream);
++  149          gpuErrchk(cudaStreamSynchronize(ctx.stream));
+--- wins_fkl_staged_gauss_2d (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 158-158 (intermediate float3 frame): 1 lines
++  158      auto inter = std::make_shared<fk::Tensor<fk::float3>>(FRAME_W, FRAME_H, 1, 1, fk::MemType::Device);
+--- wins_fkl_staged_gauss_2d (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 160-161 (its 2D view): 2 lines
++  160      const fk::RawPtr<fk::ND::_2D, fk::float3> frame{inter->ptr().data,
++  161                                                       {FRAME_W, FRAME_H, FRAME_W * sizeof(fk::float3)}};
+--- wins_fkl_staged_gauss_2d (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 164-164 (the coefficient image of this form): 1 lines
++  164          const auto coefficients = gaussianCoefficients<Spec>(ctx);
+--- wins_fkl_staged_gauss_2d (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 166-167 (LinearFilterDPP details): 2 lines
++  166              using Details = fk::LinearFilterDPPDetails<fk::float3, TW, TH, Spec::K, Spec::K>;
++  167              const Details details{FRAME_W, FRAME_H, Spec::K, Spec::K, Spec::STEP_HALO, Spec::STEP_HALO};
+--- wins_fkl_staged_gauss_2d (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 169-176 (executeLinearFilter call with its error check): 8 lines
++  169              if (!fk::executeLinearFilter(details,
++  170                                           fk::make_tuple(rgbRead(ctx), fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(
++  171                                                                            coefficients->ptr())),
++  172                                           fk::Mul<fk::float3, fk::float3, fk::float3, fk::UnaryType>::build(),
++  173                                           fk::Add<fk::float3, fk::float3, fk::float3, fk::UnaryType>::build(),
++  174                                           fk::PerThreadWrite<fk::ND::_2D, fk::float3>::build(frame), *ctx.fkStream)) {
++  175                  throw std::runtime_error("executeLinearFilter rejected its details");
++  176              }
+--- wins_fkl_staged_gauss_2d (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 192-195 (executeOperations PerThreadRead, Resize, write chain): 4 lines
++  192          fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
++  193                                                    fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(frame),
++  194                                                    Bilinear::build(fk::Size(W2_OUT_W, W2_OUT_H)),
++  195                                                    normalizedWrite(*out));
+--- wins_fkl_staged_gauss_2d (76a9136): nppdx-wins/src/wins_common.h 661-661 (Bilinear alias): 1 lines
++  661  using Bilinear = fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>;
+--- wins_fkl_staged_gauss_2d (76a9136): nppdx-wins/src/wins_common.h 664-667 (write chain): 4 lines
++  664      return fk::Mul<fk::float3>::build(mulValue)
++  665          .then(fk::Sub<fk::float3>::build(subValue))
++  666          .then(fk::Div<fk::float3>::build(divValue))
++  667          .then(fk::TensorWrite<fk::float3>::build(out.ptr()));
+--- wins_fkl_staged_gauss_2d (76a9136): nppdx-wins/src/wins_common.h 671-671 (read chain): 1 lines
++  671      return fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice).then(YUVToRGB::build());
+--- wins_fkl_staged_separable_gauss (76a9136): nppdx-wins/src/wins_common.h 678-678 (DPP_TILES, the tile list): 1 lines
++  678  constexpr std::array<DppTile, 3> DPP_TILES{{{16, 8}, {32, 8}, {32, 16}}};
+--- wins_fkl_staged_separable_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 224-225 (two intermediate float3 frames): 2 lines
++  224      auto rowsPassed = std::make_shared<fk::Tensor<fk::float3>>(FRAME_W, FRAME_H, 1, 1, fk::MemType::Device);
++  225      auto filtered = std::make_shared<fk::Tensor<fk::float3>>(FRAME_W, FRAME_H, 1, 1, fk::MemType::Device);
+--- wins_fkl_staged_separable_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 227-231 (their 2D views): 5 lines
++  227      const auto view = [](const std::shared_ptr<fk::Tensor<fk::float3>>& t) {
++  228          return fk::RawPtr<fk::ND::_2D, fk::float3>{t->ptr().data, {FRAME_W, FRAME_H, FRAME_W * sizeof(fk::float3)}};
++  229      };
++  230      const auto rowsView = view(rowsPassed);
++  231      const auto filteredView = view(filtered);
+--- wins_fkl_staged_separable_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 233-242 (21x1 and 1x21 coefficient images from the taps, uploaded): 10 lines
++  233      const auto taps = S::taps();
++  234      auto rowTaps = std::make_shared<fk::Ptr2D<fk::float3>>(Spec::K, 1);
++  235      auto columnTaps = std::make_shared<fk::Ptr2D<fk::float3>>(1, Spec::K);
++  236      for (int i = 0; i < Spec::K; ++i) {
++  237          rowTaps->at(fk::Point{i, 0, 0}) = fk::make_set<fk::float3>(static_cast<float>(taps[i]));
++  238          columnTaps->at(fk::Point{0, i, 0}) = fk::make_set<fk::float3>(static_cast<float>(taps[i]));
++  239      }
++  240      rowTaps->upload(*ctx.fkStream);
++  241      columnTaps->upload(*ctx.fkStream);
++  242      gpuErrchk(cudaStreamSynchronize(ctx.stream));
+--- wins_fkl_staged_separable_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 243-244 (Mul3, Add3 aliases): 2 lines
++  243      using Mul3 = fk::Mul<fk::float3, fk::float3, fk::float3, fk::UnaryType>;
++  244      using Add3 = fk::Add<fk::float3, fk::float3, fk::float3, fk::UnaryType>;
+--- wins_fkl_staged_separable_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 247-248 (rows DPP details): 2 lines
++  247          using Details = fk::LinearFilterDPPDetails<fk::float3, TW, TH, Spec::K, 1>;
++  248          const Details details{FRAME_W, FRAME_H, Spec::K, 1, Spec::STEP_HALO, 0};
+--- wins_fkl_staged_separable_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 250-256 (rows executeLinearFilter call with its error check): 7 lines
++  250          if (!fk::executeLinearFilter(details,
++  251                                       fk::make_tuple(rgbRead(ctx),
++  252                                                      fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(rowTaps->ptr())),
++  253                                       Mul3::build(), Add3::build(),
++  254                                       fk::PerThreadWrite<fk::ND::_2D, fk::float3>::build(rowsView), *ctx.fkStream)) {
++  255              throw std::runtime_error("executeLinearFilter rejected its details");
++  256          }
+--- wins_fkl_staged_separable_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 260-261 (columns DPP details): 2 lines
++  260          using Details = fk::LinearFilterDPPDetails<fk::float3, TW, TH, 1, Spec::K>;
++  261          const Details details{FRAME_W, FRAME_H, 1, Spec::K, 0, Spec::STEP_HALO};
+--- wins_fkl_staged_separable_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 263-271 (columns executeLinearFilter call with its error check): 9 lines
++  263          if (!fk::executeLinearFilter(details,
++  264                                       fk::make_tuple(fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(rowsView),
++  265                                                      fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(
++  266                                                          columnTaps->ptr())),
++  267                                       Mul3::build(), Add3::build(),
++  268                                       fk::PerThreadWrite<fk::ND::_2D, fk::float3>::build(filteredView),
++  269                                       *ctx.fkStream)) {
++  270              throw std::runtime_error("executeLinearFilter rejected its details");
++  271          }
+--- wins_fkl_staged_separable_gauss (76a9136): nppdx-wins/src/benchmark_wins_frame.cu 275-278 (executeOperations PerThreadRead, Resize, write chain): 4 lines
++  275          fk::executeOperations<fk::TransformDPP<>>(*ctx.fkStream,
++  276                                                    fk::PerThreadRead<fk::ND::_2D, fk::float3>::build(filteredView),
++  277                                                    Bilinear::build(fk::Size(W2_OUT_W, W2_OUT_H)),
++  278                                                    normalizedWrite(*out));
+--- wins_fkl_staged_separable_gauss (76a9136): nppdx-wins/src/wins_common.h 661-661 (Bilinear alias): 1 lines
++  661  using Bilinear = fk::Resize<fk::InterpolationType::INTER_LINEAR, fk::AspectRatio::IGNORE_AR>;
+--- wins_fkl_staged_separable_gauss (76a9136): nppdx-wins/src/wins_common.h 664-667 (write chain): 4 lines
++  664      return fk::Mul<fk::float3>::build(mulValue)
++  665          .then(fk::Sub<fk::float3>::build(subValue))
++  666          .then(fk::Div<fk::float3>::build(divValue))
++  667          .then(fk::TensorWrite<fk::float3>::build(out.ptr()));
+--- wins_fkl_staged_separable_gauss (76a9136): nppdx-wins/src/wins_common.h 671-671 (read chain): 1 lines
++  671      return fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameDevice).then(YUVToRGB::build());
+--- bench_op_BoxBVF (76a9136, counted apart): common/bench_neighborhood_ops.h 41-113 (BoxBVFParams, BoxBVF, incomplete BoxBVF): 61 lines
++   41  struct BoxBVFParams {};
+    42  
++   43  template <int K, typename BackIOp_ = NullType>
++   44  struct BoxBVF {
++   45      static_assert(K > 0 && K % 2 == 1, "BoxBVF needs an odd box size, centered on the output value");
++   46      static_assert(isAnyCompleteReadType<BackIOp_>, "The BackIOp_ must be a complete Read type");
+    47  
++   48  private:
++   49      using SelfType = BoxBVF<K, BackIOp_>;
++   50      FK_HOST_DEVICE_FUSE int clamp(const int value, const int high) {
++   51          return value < 0 ? 0 : (value > high ? high : value);
++   52      }
+    53  
++   54  public:
++   55      FK_STATIC_STRUCT(BoxBVF, SelfType)
++   56      using Parent = ReadBackOperation<typename BackIOp_::Operation::OutputType, BoxBVFParams, BackIOp_,
++   57                                       typename BackIOp_::Operation::OutputType, BoxBVF<K, BackIOp_>>;
++   58      DECLARE_READBACK_PARENT
+    59  
++   60      FK_HOST_DEVICE_FUSE OutputType exec(const Point thread, const ParamsType& params, const BackIOp& backIOp) {
++   61          (void)params;
++   62          const int lastX = static_cast<int>(NumElems::x(thread, backIOp)) - 1;
++   63          const int lastY = static_cast<int>(NumElems::y(thread, backIOp)) - 1;
++   64          constexpr int ANCHOR = K / 2;
++   65          OutputType sum = BackIOp::Operation::exec(
++   66              Point{clamp(thread.x - ANCHOR, lastX), clamp(thread.y - ANCHOR, lastY), thread.z}, backIOp);
++   67          for (int ky = 0; ky < K; ++ky) {
++   68              const int y = clamp(thread.y + ky - ANCHOR, lastY);
++   69              for (int kx = 0; kx < K; ++kx) {
++   70                  if (kx == 0 && ky == 0) {
++   71                      continue;
++   72                  }
++   73                  sum = sum + BackIOp::Operation::exec(Point{clamp(thread.x + kx - ANCHOR, lastX), y, thread.z}, backIOp);
++   74              }
++   75          }
++   76          return sum * (1.f / static_cast<float>(K * K));
++   77      }
+    78  
+    79      // The size of the operation before: the window moves over it, it does not crop it
++   80      FK_HOST_DEVICE_FUSE uint num_elems_x(const Point thread, const OperationDataType& opData) {
++   81          return NumElems::x(thread, opData.backIOp);
++   82      }
++   83      FK_HOST_DEVICE_FUSE uint num_elems_y(const Point thread, const OperationDataType& opData) {
++   84          return NumElems::y(thread, opData.backIOp);
++   85      }
++   86      FK_HOST_DEVICE_FUSE uint num_elems_z(const Point thread, const OperationDataType& opData) {
++   87          return 1;
++   88      }
++   89      FK_HOST_DEVICE_FUSE ActiveThreads getActiveThreads(const OperationDataType& opData) {
++   90          return {num_elems_x(Point{0, 0, 0}, opData), num_elems_y(Point{0, 0, 0}, opData),
++   91                  num_elems_z(Point{0, 0, 0}, opData)};
++   92      }
++   93  };
+    94  
+    95  // The version users build, with no operation before it yet: fusion (then(), executeOperations) gives it the
+    96  // operation before, as with Crop<> and Resize<>
++   97  template <int K>
++   98  struct BoxBVF<K, NullType> {
++   99  private:
++  100      using SelfType = BoxBVF<K, NullType>;
+   101  
++  102  public:
++  103      FK_STATIC_STRUCT(BoxBVF, SelfType)
++  104      using Parent = IncompleteReadBackOperation<NullType, BoxBVFParams, NullType, NullType, BoxBVF<K, NullType>>;
++  105      DECLARE_INCOMPLETEREADBACK_PARENT
+   106  
++  107      FK_HOST_FUSE auto build() { return InstantiableType{{BoxBVFParams{}, NullType{}}}; }
+   108  
++  109      template <typename BackIOp>
++  110      FK_HOST_FUSE auto build(const BackIOp& backIOp, const InstantiableType& iOp) {
++  111          return BoxBVF<K, BackIOp>::build(iOp.params, backIOp);
++  112      }
++  113  };
+--- bench_op_BoxBVF (96cc71d, counted apart): common/bench_neighborhood_ops.h 38-110 (BoxBVFParams, BoxBVF, incomplete BoxBVF): 61 lines
++   38  struct BoxBVFParams {};
+    39  
++   40  template <int K, typename BackIOp_ = NullType>
++   41  struct BoxBVF {
++   42      static_assert(K > 0 && K % 2 == 1, "BoxBVF needs an odd box size, centered on the output value");
++   43      static_assert(isAnyCompleteReadType<BackIOp_>, "The BackIOp_ must be a complete Read type");
+    44  
++   45  private:
++   46      using SelfType = BoxBVF<K, BackIOp_>;
++   47      FK_HOST_DEVICE_FUSE int clamp(const int value, const int high) {
++   48          return value < 0 ? 0 : (value > high ? high : value);
++   49      }
+    50  
++   51  public:
++   52      FK_STATIC_STRUCT(BoxBVF, SelfType)
++   53      using Parent = ReadBackOperation<typename BackIOp_::Operation::OutputType, BoxBVFParams, BackIOp_,
++   54                                       typename BackIOp_::Operation::OutputType, BoxBVF<K, BackIOp_>>;
++   55      DECLARE_READBACK_PARENT
+    56  
++   57      FK_HOST_DEVICE_FUSE OutputType exec(const Point thread, const ParamsType& params, const BackIOp& backIOp) {
++   58          (void)params;
++   59          const int lastX = static_cast<int>(NumElems::x(thread, backIOp)) - 1;
++   60          const int lastY = static_cast<int>(NumElems::y(thread, backIOp)) - 1;
++   61          constexpr int ANCHOR = K / 2;
++   62          OutputType sum = BackIOp::Operation::exec(
++   63              Point{clamp(thread.x - ANCHOR, lastX), clamp(thread.y - ANCHOR, lastY), thread.z}, backIOp);
++   64          for (int ky = 0; ky < K; ++ky) {
++   65              const int y = clamp(thread.y + ky - ANCHOR, lastY);
++   66              for (int kx = 0; kx < K; ++kx) {
++   67                  if (kx == 0 && ky == 0) {
++   68                      continue;
++   69                  }
++   70                  sum = sum + BackIOp::Operation::exec(Point{clamp(thread.x + kx - ANCHOR, lastX), y, thread.z}, backIOp);
++   71              }
++   72          }
++   73          return sum * (1.f / static_cast<float>(K * K));
++   74      }
+    75  
+    76      // The size of the operation before: the window moves over it, it does not crop it
++   77      FK_HOST_DEVICE_FUSE uint num_elems_x(const Point thread, const OperationDataType& opData) {
++   78          return NumElems::x(thread, opData.backIOp);
++   79      }
++   80      FK_HOST_DEVICE_FUSE uint num_elems_y(const Point thread, const OperationDataType& opData) {
++   81          return NumElems::y(thread, opData.backIOp);
++   82      }
++   83      FK_HOST_DEVICE_FUSE uint num_elems_z(const Point thread, const OperationDataType& opData) {
++   84          return 1;
++   85      }
++   86      FK_HOST_DEVICE_FUSE ActiveThreads getActiveThreads(const OperationDataType& opData) {
++   87          return {num_elems_x(Point{0, 0, 0}, opData), num_elems_y(Point{0, 0, 0}, opData),
++   88                  num_elems_z(Point{0, 0, 0}, opData)};
++   89      }
++   90  };
+    91  
+    92  // The version users build, with no operation before it yet: fusion (then(), executeOperations) gives it the
+    93  // operation before, as with Crop<> and Resize<>
++   94  template <int K>
++   95  struct BoxBVF<K, NullType> {
++   96  private:
++   97      using SelfType = BoxBVF<K, NullType>;
+    98  
++   99  public:
++  100      FK_STATIC_STRUCT(BoxBVF, SelfType)
++  101      using Parent = IncompleteReadBackOperation<NullType, BoxBVFParams, NullType, NullType, BoxBVF<K, NullType>>;
++  102      DECLARE_INCOMPLETEREADBACK_PARENT
+   103  
++  104      FK_HOST_FUSE auto build() { return InstantiableType{{BoxBVFParams{}, NullType{}}}; }
+   105  
++  106      template <typename BackIOp>
++  107      FK_HOST_FUSE auto build(const BackIOp& backIOp, const InstantiableType& iOp) {
++  108          return BoxBVF<K, BackIOp>::build(iOp.params, backIOp);
++  109      }
++  110  };
+--- bench_op_GaussianBVF (76a9136, counted apart): common/bench_neighborhood_ops.h 126-212 (GaussianBVFParams, GaussianBVF, incomplete GaussianBVF): 70 lines
++  126  template <int K>
++  127  struct GaussianBVFParams {
++  128      Array<float, K> taps;
++  129  };
+   130  
++  131  template <int K, typename BackIOp_ = NullType>
++  132  struct GaussianBVF {
++  133      static_assert(K > 0 && K % 2 == 1, "GaussianBVF needs an odd window size, centered on the output value");
++  134      static_assert(isAnyCompleteReadType<BackIOp_>, "The BackIOp_ must be a complete Read type");
+   135  
++  136  private:
++  137      using SelfType = GaussianBVF<K, BackIOp_>;
++  138      FK_HOST_DEVICE_FUSE int clamp(const int value, const int high) {
++  139          return value < 0 ? 0 : (value > high ? high : value);
++  140      }
+   141  
++  142  public:
++  143      FK_STATIC_STRUCT(GaussianBVF, SelfType)
++  144      using Parent = ReadBackOperation<typename BackIOp_::Operation::OutputType, GaussianBVFParams<K>, BackIOp_,
++  145                                       typename BackIOp_::Operation::OutputType, GaussianBVF<K, BackIOp_>>;
++  146      DECLARE_READBACK_PARENT
+   147  
++  148      FK_HOST_DEVICE_FUSE OutputType exec(const Point thread, const ParamsType& params, const BackIOp& backIOp) {
++  149          const int lastX = static_cast<int>(NumElems::x(thread, backIOp)) - 1;
++  150          const int lastY = static_cast<int>(NumElems::y(thread, backIOp)) - 1;
++  151          constexpr int ANCHOR = K / 2;
++  152          OutputType sum{};
++  153          for (int ky = 0; ky < K; ++ky) {
++  154              const int y = clamp(thread.y + ky - ANCHOR, lastY);
++  155              const auto at = [&](const int kx) {
++  156                  return BackIOp::Operation::exec(Point{clamp(thread.x + kx - ANCHOR, lastX), y, thread.z}, backIOp);
++  157              };
++  158              OutputType row = at(0) * params.taps[0];
++  159              for (int kx = 1; kx < K; ++kx) {
++  160                  row = row + at(kx) * params.taps[kx];
++  161              }
++  162              sum = ky == 0 ? row * params.taps[0] : sum + row * params.taps[ky];
++  163          }
++  164          return sum;
++  165      }
+   166  
+   167      // The size of the operation before: the window moves over it, it does not crop it
++  168      FK_HOST_DEVICE_FUSE uint num_elems_x(const Point thread, const OperationDataType& opData) {
++  169          return NumElems::x(thread, opData.backIOp);
++  170      }
++  171      FK_HOST_DEVICE_FUSE uint num_elems_y(const Point thread, const OperationDataType& opData) {
++  172          return NumElems::y(thread, opData.backIOp);
++  173      }
+   174      // Every plane of the operation before (a 3D read): the window moves within the plane z (as AddBorder)
++  175      FK_HOST_DEVICE_FUSE uint num_elems_z(const Point thread, const OperationDataType& opData) {
++  176          return NumElems::z(thread, opData.backIOp);
++  177      }
++  178      FK_HOST_DEVICE_FUSE ActiveThreads getActiveThreads(const OperationDataType& opData) {
++  179          return {num_elems_x(Point{0, 0, 0}, opData), num_elems_y(Point{0, 0, 0}, opData),
++  180                  num_elems_z(Point{0, 0, 0}, opData)};
++  181      }
++  182  };
+   183  
+   184  // The version users build with the taps, with no operation before it yet (as BoxBVF<K>). An std::array of taps gives
+   185  // one set per batch plane (the batch builders of DECLARE_INCOMPLETEREADBACK_PARENT): fusion with the batched operation
+   186  // before it then builds every plane's GaussianBVF with its own taps.
++  187  template <int K>
++  188  struct GaussianBVF<K, NullType> {
++  189  private:
++  190      using SelfType = GaussianBVF<K, NullType>;
+   191  
++  192  public:
++  193      FK_STATIC_STRUCT(GaussianBVF, SelfType)
++  194      using Parent =
++  195          IncompleteReadBackOperation<NullType, GaussianBVFParams<K>, NullType, NullType, GaussianBVF<K, NullType>>;
++  196      DECLARE_INCOMPLETEREADBACK_PARENT
+   197  
+   198      // No size before fusion (BatchRead's builder asks for one): fusion replaces it with the operation before's, as for
+   199      // FKL's incomplete Crop<> and Resize<>
++  200      FK_HOST_DEVICE_FUSE uint num_elems_x(const Point, const OperationDataType&) { return 1; }
++  201      FK_HOST_DEVICE_FUSE uint num_elems_y(const Point, const OperationDataType&) { return 1; }
++  202      FK_HOST_DEVICE_FUSE uint num_elems_z(const Point, const OperationDataType&) { return 1; }
+   203  
++  204      FK_HOST_FUSE auto build(const Array<float, K>& taps) {
++  205          return InstantiableType{{GaussianBVFParams<K>{taps}, NullType{}}};
++  206      }
+   207  
++  208      template <typename BackIOp>
++  209      FK_HOST_FUSE auto build(const BackIOp& backIOp, const InstantiableType& iOp) {
++  210          return GaussianBVF<K, BackIOp>::build(iOp.params, backIOp);
++  211      }
++  212  };
+
+item                                             lines  expected
+exp1_fkl_bvf (3845b60)                              10  ok
+      10  fkl-vs-nppdx/benchmarks/figure1_common.h:173-182  executeOperations call
+exp1_nppdx (3845b60)                               109  ok
+      65  fkl-vs-nppdx/benchmarks/nppdx_figure1.h:28-109  kernel, NppdxFigure1 (init/run), nppdxFigure1Configs
+      44  fkl-vs-nppdx/benchmarks/nppdx_common.h:83-131  NppdxOps
+exp1_nppdx_npp (3845b60, calibration)              131  ok
+      87  fkl-vs-nppdx/benchmarks/nppdx_npp_figure1.h:32-144  nppdxRgbKernel, NppdxRgb, nppdxRgbConfigs, NppTail
+      44  fkl-vs-nppdx/benchmarks/nppdx_common.h:83-131  NppdxOps
+exp1_nppdx_npp (b7f6e88)                           140  ok
+      94  fkl-vs-nppdx/benchmarks/nppdx_npp_figure1.h:34-163  nppdxRgbKernel, NppdxRgb, nppdxRgbConfigs, NppTail (aligned)
+      44  fkl-vs-nppdx/benchmarks/nppdx_common.h:83-131  NppdxOps
+       1  fkl-vs-nppdx/benchmarks/benchmark_nppdx_npp.cu:70-70  the 8-bit intermediate between the NPPDx kernel and NPP (declaration)
+       1  fkl-vs-nppdx/benchmarks/benchmark_nppdx_npp.cu:74-74  its allocation
+exp3_fkl_dpp (96cc71d)                              14  ok
+       1  common/bench_neighborhood.h:70-70  DPP_TILES, the tile list
+       3  fkl-neighborhood/src/neighborhood_common.h:128-130  read chain ReadYUV.then(YUVToRGB).then(Crop)
+       4  fkl-neighborhood/src/neighborhood_common.h:147-150  write chain Mul.then(Sub).then(Div).then(TensorWrite)
+       2  fkl-neighborhood/src/neighborhood_common.h:164-165  MorphologyDPP details (tile, K, anchor)
+       4  fkl-neighborhood/src/neighborhood_common.h:167-170  executeBoxBlur call with its error check
+exp3_nppdx_as_written (96cc71d, info)               94  ok
+      39  fkl-neighborhood/src/nppdx_box.h:66-108  BoxOps (operation types, tiles, smem, block, grid)
+      36  fkl-neighborhood/src/nppdx_box.h:110-152  nppdxBoxKernel
+      18  fkl-neighborhood/src/nppdx_box.h:155-174  NppdxBox (init/run)
+       1  fkl-neighborhood/src/benchmark_nppdx_neighborhood.cu:46-46  NPPDX_CONFIGS
+exp3_nppdx (96cc71d; float-write path, the one the program instantiates)    83  ok
+      25  fkl-neighborhood/src/nppdx_box.h:66-92  BoxOps up to Blur
+       6  fkl-neighborhood/src/nppdx_box.h:98-105  BoxOps Tile, smem, blockFloatWrite (Exgest and blockExgest skipped)
+       2  fkl-neighborhood/src/nppdx_box.h:107-108  BoxOps gridOf, closing brace
+      16  fkl-neighborhood/src/nppdx_box.h:110-130  kernel up to the blur
+      14  fkl-neighborhood/src/nppdx_box.h:132-146  kernel: hand-written normalization and float write (the if/else of the 8-bit branch skipped)
+       1  fkl-neighborhood/src/nppdx_box.h:152-152  kernel closing brace
+      18  fkl-neighborhood/src/nppdx_box.h:155-174  NppdxBox (init/run)
+       1  fkl-neighborhood/src/benchmark_nppdx_neighborhood.cu:46-46  NPPDX_CONFIGS
+wins_nppdx_box (76a9136; 5x5, 5x5 twice, 9x9)      120  ok
+       5  nppdx-wins/src/benchmark_wins_frame.cu:60-64  CONFIGS, the tile and block list
+       3  nppdx-wins/src/wins_common.h:475-477  WINS_NPPDX_LAYOUT macro (tile, halos, SM, block)
+       2  nppdx-wins/src/wins_common.h:481-482  BoxSpec head
+       7  nppdx-wins/src/wins_common.h:484-490  BoxSpec K, PASSES, halos, Operator, FUNCTION (the GAUSSIAN flag of the harness skipped)
+      57  nppdx-wins/src/wins_common.h:515-574  FilterResizeOps (operation types, tiles, smem, block, device run)
+       6  nppdx-wins/src/wins_common.h:581-586  sliceTiles
+      19  nppdx-wins/src/wins_common.h:589-607  writeTile (hand-written normalization and float write)
+       9  nppdx-wins/src/wins_common.h:640-648  nppdxFrameKernel
+       6  nppdx-wins/src/wins_common.h:650-655  allowSharedMemory (init)
+       2  nppdx-wins/src/benchmark_wins_frame.cu:73-74  Ops, kernel
+       1  nppdx-wins/src/benchmark_wins_frame.cu:81-81  grid
+       3  nppdx-wins/src/benchmark_wins_frame.cu:83-85  launch and its error check
+wins_nppdx_gauss (76a9136)                         121  ok
+       5  nppdx-wins/src/benchmark_wins_frame.cu:60-64  CONFIGS, the tile and block list
+       3  nppdx-wins/src/wins_common.h:475-477  WINS_NPPDX_LAYOUT macro
+       2  nppdx-wins/src/wins_common.h:491-492  GaussianSpec head
+       1  nppdx-wins/src/wins_common.h:497-497  GaussianSpec BAND_TAPS
+       1  nppdx-wins/src/wins_common.h:499-499  GaussianSpec K
+       5  nppdx-wins/src/wins_common.h:501-505  GaussianSpec PASSES, halos, Operator, FUNCTION (GAUSSIAN flag, BAND_MIN, ROW and taps() of FKL and the references skipped)
+       1  nppdx-wins/src/wins_common.h:511-511  GaussianSpec closing brace
+      57  nppdx-wins/src/wins_common.h:515-574  FilterResizeOps
+       6  nppdx-wins/src/wins_common.h:581-586  sliceTiles
+      19  nppdx-wins/src/wins_common.h:589-607  writeTile
+       9  nppdx-wins/src/wins_common.h:640-648  nppdxFrameKernel
+       6  nppdx-wins/src/wins_common.h:650-655  allowSharedMemory
+       2  nppdx-wins/src/benchmark_wins_frame.cu:73-74  Ops, kernel
+       1  nppdx-wins/src/benchmark_wins_frame.cu:81-81  grid
+       3  nppdx-wins/src/benchmark_wins_frame.cu:83-85  launch and its error check
+wins_fkl_plain_box1 (76a9136; 5x5, 9x9)             10  ok
+       5  nppdx-wins/src/benchmark_wins_frame.cu:116-120  executeOperations ReadYUV, YUVToRGB, BoxBVF<K>, Resize, write chain
+       1  nppdx-wins/src/wins_common.h:661-661  Bilinear alias
+       4  nppdx-wins/src/wins_common.h:664-667  write chain
+wins_fkl_plain_box2 (76a9136; 5x5 twice)            11  ok
+       6  nppdx-wins/src/benchmark_wins_frame.cu:122-127  executeOperations with two BoxBVF<K>
+       1  nppdx-wins/src/wins_common.h:661-661  Bilinear alias
+       4  nppdx-wins/src/wins_common.h:664-667  write chain
+wins_fkl_plain_gauss (76a9136)                      17  ok
+       7  nppdx-wins/src/benchmark_wins_frame.cu:98-104  taps array, the parameter of GaussianBVF
+       5  nppdx-wins/src/benchmark_wins_frame.cu:110-114  executeOperations with GaussianBVF<21>
+       1  nppdx-wins/src/wins_common.h:661-661  Bilinear alias
+       4  nppdx-wins/src/wins_common.h:664-667  write chain
+wins_fkl_staged_box (76a9136; 5x5, 5x5 twice, 9x9)    21  ok
+       1  nppdx-wins/src/wins_common.h:678-678  DPP_TILES, the tile list
+       1  nppdx-wins/src/benchmark_wins_frame.cu:158-158  intermediate float3 frame
+       2  nppdx-wins/src/benchmark_wins_frame.cu:160-161  its 2D view
+       2  nppdx-wins/src/benchmark_wins_frame.cu:180-181  MorphologyDPP details
+       5  nppdx-wins/src/benchmark_wins_frame.cu:183-187  executeBoxBlur call with its error check
+       4  nppdx-wins/src/benchmark_wins_frame.cu:192-195  executeOperations PerThreadRead, Resize, write chain
+       1  nppdx-wins/src/wins_common.h:661-661  Bilinear alias
+       4  nppdx-wins/src/wins_common.h:664-667  write chain
+       1  nppdx-wins/src/wins_common.h:671-671  read chain ReadYUV.then(YUVToRGB)
+wins_fkl_staged_gauss_2d (76a9136)                  35  ok
+       1  nppdx-wins/src/wins_common.h:678-678  DPP_TILES, the tile list
+      10  nppdx-wins/src/benchmark_wins_frame.cu:140-149  21x21 coefficient image from the taps
+       1  nppdx-wins/src/benchmark_wins_frame.cu:158-158  intermediate float3 frame
+       2  nppdx-wins/src/benchmark_wins_frame.cu:160-161  its 2D view
+       1  nppdx-wins/src/benchmark_wins_frame.cu:164-164  the coefficient image of this form
+       2  nppdx-wins/src/benchmark_wins_frame.cu:166-167  LinearFilterDPP details
+       8  nppdx-wins/src/benchmark_wins_frame.cu:169-176  executeLinearFilter call with its error check
+       4  nppdx-wins/src/benchmark_wins_frame.cu:192-195  executeOperations PerThreadRead, Resize, write chain
+       1  nppdx-wins/src/wins_common.h:661-661  Bilinear alias
+       4  nppdx-wins/src/wins_common.h:664-667  write chain
+       1  nppdx-wins/src/wins_common.h:671-671  read chain
+wins_fkl_staged_separable_gauss (76a9136)           50  ok
+       1  nppdx-wins/src/wins_common.h:678-678  DPP_TILES, the tile list
+       2  nppdx-wins/src/benchmark_wins_frame.cu:224-225  two intermediate float3 frames
+       5  nppdx-wins/src/benchmark_wins_frame.cu:227-231  their 2D views
+      10  nppdx-wins/src/benchmark_wins_frame.cu:233-242  21x1 and 1x21 coefficient images from the taps, uploaded
+       2  nppdx-wins/src/benchmark_wins_frame.cu:243-244  Mul3, Add3 aliases
+       2  nppdx-wins/src/benchmark_wins_frame.cu:247-248  rows DPP details
+       7  nppdx-wins/src/benchmark_wins_frame.cu:250-256  rows executeLinearFilter call with its error check
+       2  nppdx-wins/src/benchmark_wins_frame.cu:260-261  columns DPP details
+       9  nppdx-wins/src/benchmark_wins_frame.cu:263-271  columns executeLinearFilter call with its error check
+       4  nppdx-wins/src/benchmark_wins_frame.cu:275-278  executeOperations PerThreadRead, Resize, write chain
+       1  nppdx-wins/src/wins_common.h:661-661  Bilinear alias
+       4  nppdx-wins/src/wins_common.h:664-667  write chain
+       1  nppdx-wins/src/wins_common.h:671-671  read chain
+bench_op_BoxBVF (76a9136, counted apart)            61  ok
+      61  common/bench_neighborhood_ops.h:41-113  BoxBVFParams, BoxBVF, incomplete BoxBVF
+bench_op_BoxBVF (96cc71d, counted apart)            61  ok
+      61  common/bench_neighborhood_ops.h:38-110  BoxBVFParams, BoxBVF, incomplete BoxBVF
+bench_op_GaussianBVF (76a9136, counted apart)       70  ok
+      70  common/bench_neighborhood_ops.h:126-212  GaussianBVFParams, GaussianBVF, incomplete GaussianBVF
+
+18 of 18 totals as expected

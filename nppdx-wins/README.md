@@ -277,6 +277,65 @@ kernels.
   - The Gaussian: of the two FKL forms asked for, fkl_inline is the faster, and NPPDx is 4.2x faster than it. FKL's
     LinearFilterDPP used separably (the extra, three kernels) is 1.31x faster than NPPDx in GPU time.
 
+## Lines of code (`loc/`)
+
+**What it is:** the lines of code of every FKL and NPPDx version the paper compares, in Experiments 1 and 3, counted
+from the repository.
+- **Request:** the paper coordinator, 2026-10-15, for Oscar's request to put the lines of code in the comparison tables.
+- **Files:** the counter `loc/count_loc.py` and the line ranges `loc/manifest.json` are the coordinator's. The coordinator
+  wrote the ranges and four independent reviewers checked them. `loc/totals.txt` and `loc/show.txt` are the counter's
+  output.
+
+**The rule** (the paper's Methodology): count the lines that are neither blank nor comments of the code that builds and
+launches a pipeline.
+- **NPPDx:**
+  - The kernel and the device helpers it calls.
+  - The structs with the types of its operations and tiles.
+  - Its launch configuration: init with `cudaFuncSetAttribute`, grid, block, shared memory, the launch and its error
+    check.
+  - Its list of tile and block configurations.
+- **FKL:**
+  - The call that builds and launches the pipeline, with its operation chains.
+  - The details and tile list of a DPP.
+  - The intermediates of a staged form, with their views and coefficient images.
+  - The error check of the call.
+- **Not counted, on either side:**
+  - The harness, references, validation, the sweeps that choose a configuration, and output buffers.
+  - The parameters, constants and aliases every version shares: Normalization, crop origins, `RESIZE_J/K`, `HALO`,
+    `YUVToRGB`, the `Spec` alias, the `GAUSSIAN` flag and `GaussianSpec::taps()`.
+  - Namespace and include lines.
+  - Code that no program of the experiment instantiates: the 8-bit write branch of Experiment 3's `nppdx_box.h`.
+- **Counted apart:** `BoxBVF` and `GaussianBVF`, the operations written for the benchmark.
+- **Calibration:** the rule reproduces the published 10 / 109 / 131 at 3845b60 exactly (results-v3-addendum README,
+  section 4).
+- **What every range is:** the manifest's `what` field gives it for every range.
+
+**Totals** (the manifest's `expected`; `count_loc.py` checks every one):
+
+| experiment | commit (branch) | FKL | NPPDx |
+|---|---|---|---|
+| 1, crop + resize | 3845b60 (main) | 10 | 109; NPPDx+NPP 131 |
+| 1, NPPDx+NPP with the aligned border | b7f6e88 (nppdx-npp-border-align) | | NPPDx+NPP 140 |
+| 3 (b), the box on the crops | 96cc71d (exp3-neighborhood) | MorphologyDPP pipeline 14 | 83 (94 as written, with the uninstantiated 8-bit branch) |
+
+| Experiment 3 (c), 76a9136 (nppdx-wins; sources as 57f08bc) | NPPDx | FKL plain (BVF op inline) | FKL staged | FKL staged separable |
+|---|---|---|---|---|
+| box 5x5 | 120 | 10 | 21 | |
+| box 5x5, two passes | 120 | 11 | 21 | |
+| box 9x9 | 120 | 10 | 21 | |
+| Gaussian, 21 taps | 121 | 17 | 35 (21x21) | 50 |
+
+**Operations counted apart:** `BoxBVF` 61 (the same at 96cc71d and 76a9136) and `GaussianBVF` 70 (76a9136). FKL plain
+uses them.
+
+**Run:** from any checkout that has fetched main, nppdx-npp-border-align, exp3-neighborhood and nppdx-wins.
+- The counter reads every file with `git show <commit>:<path>`, so the checked-out branch does not matter.
+- `--repo` reads the commits from another checkout.
+- `--show` prints every range with a `+` on each counted line.
+
+        nppdx-wins/loc/count_loc.py              # totals, per-range subtotals, a check against "expected"
+        nppdx-wins/loc/count_loc.py --show       # every range, counted lines marked
+
 ## Reproduce
 
     cmake -S nppdx-wins -B build-wins -DBENCH_ITERATIONS=10 -DBENCH_WARMUP_ITERATIONS=3
