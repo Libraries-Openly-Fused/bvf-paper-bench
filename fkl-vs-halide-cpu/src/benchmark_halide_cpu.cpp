@@ -57,7 +57,9 @@ const char* scheduleName(Schedule s) {
 
 // The pipeline of one schedule, JIT compiled for the host; its lowered statement (Halide's loops, after bounds inference
 // and loop partitioning) is written to stmtFile
-Halide::Callable compilePipeline(Schedule schedule, const Halide::Target& target, const std::filesystem::path& stmtFile) {
+// compileMs: plus the JIT compilation's time (compile_to_callable only, not the lowering to the .stmt file)
+Halide::Callable compilePipeline(Schedule schedule, const Halide::Target& target, const std::filesystem::path& stmtFile,
+                                 double& compileMs) {
     using namespace Halide;
     const Conversion k = fklConversion();
     ImageParam frame(UInt(8), 2, "frame");     // FRAME_W x FRAME_H * 3 / 2 bytes: the luma plane, then the chroma one
@@ -117,7 +119,10 @@ Halide::Callable compilePipeline(Schedule schedule, const Halide::Target& target
         out.bound(c, 0, 3).reorder(c, x, n, y).unroll(c).vectorize(x, 8).parallel(y);
     }
     out.compile_to_lowered_stmt(stmtFile.string(), {frame, regions}, Halide::Text, target);
-    return out.compile_to_callable({frame, regions}, target);
+    const auto start = Clock::now();
+    Halide::Callable callable = out.compile_to_callable({frame, regions}, target);
+    compileMs += std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    return callable;
 }
 
 // One schedule on n regions per iteration: the region table (4 x n int32: x, y, width, height), filled in every run
@@ -277,12 +282,11 @@ int main(int argc, char** argv) {
 
         // Both schedules JIT compiled once, before any loop, then Halide's thread count, once
         const Halide::Target target = Halide::get_host_target();
-        const auto compileStart = Clock::now();
-        Halide::Callable defaultCallable =
-            compilePipeline(Schedule::Default, target, outDir / (std::string(scheduleName(Schedule::Default)) + ".stmt"));
+        double compileMs = 0.;
+        Halide::Callable defaultCallable = compilePipeline(
+            Schedule::Default, target, outDir / (std::string(scheduleName(Schedule::Default)) + ".stmt"), compileMs);
         Halide::Callable parallelCallable = compilePipeline(
-            Schedule::Parallel, target, outDir / (std::string(scheduleName(Schedule::Parallel)) + ".stmt"));
-        const double compileMs = std::chrono::duration<double, std::milli>(Clock::now() - compileStart).count();
+            Schedule::Parallel, target, outDir / (std::string(scheduleName(Schedule::Parallel)) + ".stmt"), compileMs);
         setHalideThreads(threads);
 
         // How long each pool's workers stay busy after a parallel run with little work (their spin and wake-up), which
@@ -337,8 +341,8 @@ int main(int argc, char** argv) {
         p << "Halide: " << HALIDE_VERSION_MAJOR << "." << HALIDE_VERSION_MINOR << "." << HALIDE_VERSION_PATCH
           << " (release binary " << BENCH_HALIDE_RELEASE << ", libHalide " << BENCH_HALIDE_LIBRARY << " SHA-256 "
           << BENCH_HALIDE_LIBRARY_SHA256 << "), JIT target " << target.to_string()
-          << ", both schedules compiled once before the loops in " << compileMs << " ms (Halide::Callable); lowered "
-          << "statements in halide_default.stmt and halide_parallel.stmt\n"
+          << ", both schedules JIT-compiled once before the loops in " << compileMs << " ms (compile_to_callable only; "
+          << "lowered statements written first to halide_default.stmt and halide_parallel.stmt, not timed)\n"
           << "Halide pipeline: one Func out(c, x, y, n), every producer inlined; region table (4 x N int32) as an input "
              "buffer, filled from the regions of the iteration in every run (timed); FKL's bilinear sampling and BT.601 "
              "limited range "
@@ -359,20 +363,29 @@ int main(int argc, char** argv) {
         if (!multithreaded) {
             p << "Validation of the thread count: CPU time of the process's other threads per halide_parallel run on "
               << BATCHES.back() << " regions, on one Halide thread: " << singleThreadCheckUs << " us (0: Halide ran on "
-              << "the calling thread only; the program fails above " << SINGLE_THREAD_LIMIT_US << " us)\n";
+              << "the calling thread only; the program fails above " << SINGLE_THREAD_LIMIT_US << " us, or if the "
+              << "threads' CPU times cannot be read on Linux; not checked on Windows)\n";
             std::printf("Other threads' CPU time per halide_parallel run on one Halide thread: %.1f us\n",
                         singleThreadCheckUs);
         }
-        writeCpuPlatform(p, poolSize, "cpu_validation_" + threadLabel + ".csv");
+        writeCpuPlatform(p, poolSize,
+                         {"cpu_validation_" + threadLabel + ".csv",
+                          "each timed Halide schedule, on this process's thread count, against the reference with "
+                          "FKL's conventions",
+                          "Halide's region table (4 x N int32) is filled from the regions of the iteration in every "
+                          "run, which is timed"});
         std::cout << "Results written to " << std::filesystem::absolute(outDir) << std::endl;
         if (!passed) {
             throw std::runtime_error("validation failed (FKL or Halide against the reference, or FKL's pool against "
                                      "FKL, beyond the tolerance): see cpu_validation_" + threadLabel + ".csv");
         }
-        if (!multithreaded && std::isfinite(singleThreadCheckUs) && singleThreadCheckUs > SINGLE_THREAD_LIMIT_US) {
-            throw std::runtime_error("Halide used other threads on one thread: " + std::to_string(singleThreadCheckUs) +
-                                     " us of their CPU time per run");
+#ifndef _WIN32
+        // On Linux the threads' CPU times are read from /proc: a value that cannot be read fails the check too
+        if (!multithreaded && !(std::isfinite(singleThreadCheckUs) && singleThreadCheckUs <= SINGLE_THREAD_LIMIT_US)) {
+            throw std::runtime_error("Halide used other threads on one thread, or their CPU time could not be read: " +
+                                     std::to_string(singleThreadCheckUs) + " us per run");
         }
+#endif
     } catch (const std::exception& e) {
         std::cerr << "ERROR: " << e.what() << std::endl;
         return 1;

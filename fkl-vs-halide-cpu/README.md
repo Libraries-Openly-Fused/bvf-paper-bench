@@ -26,7 +26,7 @@ interleaved float3 layout. Every producer is inlined into it. For each output va
 
 1. reads the region of plane `n` from the **region table**, an input buffer of 4 x N int32 (x, y, width, height);
 2. samples the frame with **FKL's bilinear convention** (fused_kernel's `resize.h` and `interpolation.h`):
-   `src = dst * (size / 64)`, `x1 = floor(src)`, `x2 = x1 + 1` read at `min(x2, size - 1)`, and FKL's weights
+   `src = dst * (size / output size)` (64 for x, 32 for y), `x1 = floor(src)`, `x2 = x1 + 1` read at `min(x2, size - 1)`, and FKL's weights
    `(x2 - sx)(y2 - sy)`, ...;
 3. converts the four NV12 samples with **FKL's BT.601 limited range matrix** (chroma replicated, float, no
    clamping), taken from FKL itself (`common/bench_reference.h`);
@@ -64,8 +64,8 @@ Two schedules:
 ## Comparisons and thread counts
 
 FKL runs one `executeOperations` call with the whole chain on its CPU backend (one thread, `ParArch::CPU`) and on its
-`CPU_MULTITHREAD` backend (FKL's thread pool, one worker per hardware thread). Both schedules are compared with each,
-at the same thread count on both sides:
+`CPU_MULTITHREAD` backend (FKL's thread pool, one worker per hardware thread): both schedules against FKL CPU on one
+thread, and `halide_parallel` against FKL CPU_MULTITHREAD on the pool size, at the same thread count on both sides:
 
 | Halide threads | Schedules | Compared with | Files |
 |---|---|---|---|
@@ -86,7 +86,8 @@ the thread count once, before any run, and runs once per thread count:
 
 The 1-thread run checks this. It measures the CPU time of the process's other threads per `halide_parallel` run on
 100 regions on one Halide thread, records it in `cpu_platform_1thread.txt`, and fails above 5 us (a Halide worker
-taking tasks uses hundreds).
+taking tasks uses hundreds) or if the threads' CPU times cannot be read. This check reads `/proc`: on Linux only, it
+is not made on Windows.
 
 The protocol is the one of every CPU benchmark:
 
@@ -109,9 +110,11 @@ Halide, compared with FKL:
 
 - **Vectorizes.** `halide_parallel` computes 8 output pixels per AVX2 instruction (the four samples' loads are
   gathered). FKL's CPU backend runs its fused loop one output pixel at a time, without SIMD across pixels.
-- **Simplifies the arithmetic.** Halide's simplifier folds the conversion's offsets into one constant per channel, and
-  `(x * MUL - SUB) / DIV` into one multiply-add (in the `.stmt` files). FKL computes each operation of the chain as
-  written. Both must stay within 1e-3 of the reference; the validation files have their errors.
+- **Simplifies the arithmetic (`halide_parallel`).** With the channel loop bounded to 3 and unrolled, Halide's
+  simplifier folds each channel's constants, and `(x * MUL - SUB) / DIV` becomes one multiply-add
+  (`halide_parallel.stmt`). `halide_default` keeps the channel a loop variable: its `.stmt` selects the constants per
+  channel (`mux`), divides, and samples the frame inside the channel loop. FKL computes each operation of the chain as
+  written. All must stay within 1e-3 of the reference; the validation files have their errors.
 - **Compiles for the exact CPU.** The JIT compiles for the host CPU (`tune_znver3`), at run time and once. FKL's code
   is compiled ahead of time with `-march=native`, the same CPU.
 - **Has the regions in a table.** Halide reads the regions from a table in memory, which every run fills from the
