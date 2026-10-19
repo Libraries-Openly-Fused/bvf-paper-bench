@@ -44,7 +44,9 @@ machine, the CUDA runtime library both libraries load is the system's (CUDA 13.3
      NCHW), or unsqueezed then permuted, which it treats as channels-last (the output is channels-last);
    - **copy:** into the 32 rows of its output plane between the borders: a transposing copy from NCHW, a straight one
      from channels-last;
-3. `mul_`, `sub_` and `div_` in place on the whole N x 64 x 64 x 3 output tensor, FKL's layout.
+3. `mul_`, `sub_` and `div_` in place on the whole N x 64 x 64 x 3 output tensor, FKL's layout, with the constants as
+   contiguous 64 x 64 x 3 planes, made once: with a `{3}` operand broadcast over the pixels, PyTorch's CPU kernels
+   loop over the 3 channels innermost and do not vectorize, several times slower (the output is bitwise the same).
 
 **Batched, without a loop over the regions.** Step 2 can also run on all regions at once (`ResizeInput::Batched`,
 `Pipeline::runBatched`):
@@ -130,6 +132,10 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
 - **The arithmetic folded, and the fastest variant per comparison.** The offsets of the conversion are folded into
   the bias, and the luma term into one broadcast add; PyTorch's pipeline takes the variant that was fastest in the
   sweep before each comparison, per-region or batched (FKL's pipeline is its generic operations).
+- **Operands laid out for its CPU kernels.** The tail's constants are whole planes, so that `mul_`, `sub_` and `div_`
+  vectorize. A channel-planar formulation (RGB as 3 x h x w, so that the luma add vectorizes too) needs `interpolate`'s
+  NCHW output transposed into the interleaved output, and was slower on the CPU in development runs; it is not among
+  the variants, and the luma add keeps the 3 channels innermost.
 - **Few operators for an eager pipeline.** In the per-region variants, region views without copies (the batched ones
   copy every window in one `take`); in every variant two fills per iteration for every border instead of a pad per
   region, and in-place tail operators.

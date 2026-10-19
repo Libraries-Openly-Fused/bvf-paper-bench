@@ -227,7 +227,16 @@ int main(int argc, char** argv) {
                << r.timing.mean / 1000. << ", " << (r.chosen ? "yes" : "no") << std::endl;
         }
         writeRegionStats((outDir / "regions.csv").string(), *w.regions, WARMUP_ITERS, ITERS);
-        std::ofstream(outDir / "pytorch_build_information.txt") << at::show_config() << "\n" << at::get_parallel_info();
+        {
+            // The parallel configuration with each thread count of the comparisons
+            std::ofstream b(outDir / "pytorch_build_information.txt");
+            b << at::show_config();
+            for (const int t : {1, threads}) {
+                at::set_num_threads(t);
+                b << "\nat::get_parallel_info() with at::set_num_threads(" << t << "):\n" << at::get_parallel_info();
+            }
+            at::set_num_threads(1);
+        }
         std::ofstream p(outDir / "cpu_platform.txt");
         p << "PyTorch: " << BENCH_TORCH_VERSION << " (LibTorch C++ API of the wheel, eager mode, c10::InferenceMode), "
           << "CPU capability " << at::get_cpu_capability()

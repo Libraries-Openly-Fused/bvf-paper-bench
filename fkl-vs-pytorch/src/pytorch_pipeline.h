@@ -24,7 +24,8 @@
 //     clamping, FKL's BT.601 limited range formula; bilinear
 //     resize to 64x32 (torch::nn::functional::interpolate, align_corners=false); copy into the rows of its output
 //     plane between the borders;
-//   - multiply, subtract and divide in place on the whole N x 64 x 64 x 3 output tensor.
+//   - multiply, subtract and divide in place on the whole N x 64 x 64 x 3 output tensor (the constants as 64 x 64 x 3
+//     planes, so that the CPU kernels vectorize).
 // Or, with the batched variants (ResizeInput::Batched), without a host loop over the regions: the region parameters
 // written into one buffer (on the GPU uploaded in one copy), the 48 x 24 window at every region's origin (the largest
 // region size; the geometry draws every position for that box) gathered with one take from the NV12 frame, converted
@@ -128,10 +129,14 @@ public:
             // from_blob does not copy: the CPU tensors must own their values
             m_chromaMatrix = m_chromaMatrix.clone();
             m_bias = m_bias.clone();
-            m_mul = m_mul.clone();
-            m_sub = m_sub.clone();
-            m_div = m_div.clone();
         }
+        // The tail's constants as whole output planes, 64 x 64 x 3, made once: with a {3} operand, broadcast over the
+        // pixels, the innermost dimension of PyTorch's CPU loops is the 3 channels and its kernels run scalar loops of
+        // 3, several times slower; with a contiguous plane operand they vectorize over the plane. The values and the
+        // operations are the same (bitwise equal output).
+        m_mul = m_mul.expand({OUT_H, OUT_W, 3}).contiguous();
+        m_sub = m_sub.expand({OUT_H, OUT_W, 3}).contiguous();
+        m_div = m_div.expand({OUT_H, OUT_W, 3}).contiguous();
         m_chromaU = m_chromaMatrix.select(0, 0);
         m_chromaV = m_chromaMatrix.select(0, 1);
         // The offsets of the bytes of 12 rows of 48 bytes in the NV12 frame from their first one, row * pitch +
