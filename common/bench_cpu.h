@@ -13,7 +13,7 @@
    limitations under the License. */
 
 // The harness of the CPU benchmarks that compare a library with FKL's CPU backends (BVF) on the Figure 1 pipeline
-// (fkl-vs-opencv-cpu, fkl-vs-pytorch, fkl-vs-halide-cpu, fkl-vs-fern-cpu):
+// (fkl-vs-opencv-cpu; fkl-vs-pytorch, fkl-vs-halide-cpu and fkl-vs-fern-cpu are added by pull requests #18, #16, #17):
 //   ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
 // One 3840x2160 NV12 frame in host memory and N regions, new every iteration, with the sizes and positions of
 // common/bench_geometry.h, bilinear resize to 64x32, black rows on top and bottom up to a square, then
@@ -32,9 +32,9 @@
 // are timed; each program says what its library does with them inside its timed run (CpuPlatformText). FKL's speedup is
 // the mean over the timed iterations of (library time / FKL time) of the same iteration, which pairs runs on identical
 // inputs. Every timed run is preceded by a 1 ms idle gap, as when a pipeline runs once per video frame: a pool whose
-// workers spin for less than that after a run (FKL's, OpenCV's, Halide's) is asleep when the run starts, one that spins
-// longer (PyTorch's libgomp) is still spinning; each library keeps its own threads, if it has any (Fern runs on FKL's
-// pool), and its own idle behaviour. The timing thread busy-waits the gap instead of sleeping: a sleeping
+// workers spin for less than that after a run (FKL's, OpenCV's) is asleep when the run starts, one that spins longer
+// (libgomp's by default, PyTorch's in #18) is still spinning; each library keeps its own threads, if it has any (a
+// library without threads runs on FKL's pool through runOnFklPool, Fern in #17), and its own idle behaviour. The timing thread busy-waits the gap instead of sleeping: a sleeping
 // core enters its deepest C-state, and the run right after it then pays a wake-up whose cost depends on each binary's
 // code (fkl-vs-opencv-cpu/README.md).
 
@@ -126,7 +126,7 @@ int poolThreads();
 
 // Runs function(0) ... function(chunks - 1) on FKL's thread pool, the way FKL's CPU_MULTITHREAD executions run their
 // chunks (an execution of a CPU_MULTITHREAD stream that enqueues them in the pool), and returns when all of them have
-// finished: for a library whose generated code is serial, parallelized by the benchmark (fkl-vs-fern-cpu)
+// finished: for a library whose generated code is serial, parallelized by the benchmark (fkl-vs-fern-cpu, #17)
 void runOnFklPool(size_t chunks, const std::function<void(size_t)>& function);
 
 // ------------------------------------------------------------------------------------------------
@@ -283,6 +283,8 @@ struct CpuPlatformText {
     std::string libraryValidation;
     // What the library does with the regions of an iteration, and whether it is timed
     std::string libraryRegions;
+    // The rows of the validation CSV
+    std::string validationRows = "one row per iteration";
 };
 
 // The lines of the platform file that every CPU benchmark shares: the CPU, FKL, the OS, the workload, the regions, the
@@ -326,7 +328,7 @@ inline void writeCpuPlatform(std::ostream& p, int threads, const CpuPlatformText
          "the timed iterations of (library time / FKL time) of the same iteration (the *_per_iteration.csv files, times "
          "in ms, as in the comparison CSVs).\n"
       << "Validation: before the timing, on the regions of the first, every " << validation::VALIDATION_STRIDE
-      << "th and the last timed iteration (" << text.validationFile << ", one row per iteration): FKL against the "
+      << "th and the last timed iteration (" << text.validationFile << ", " << text.validationRows << "): FKL against the "
       << "reference with its conventions, FKL's pool against FKL on one thread, and " << text.libraryValidation
       << " must agree within " << validation::TOLERANCE << " (maximum absolute difference); the program exits with an "
       << "error otherwise.\n";
