@@ -50,8 +50,10 @@ EXPERIMENT=${EXPERIMENT:-1}
 [ "$EXPERIMENT" = 1 ] || [ "$EXPERIMENT" = 3 ] || { echo "run_all.sh: STOP: EXPERIMENT is 1 or 3, not $EXPERIMENT" >&2; exit 1; }
 # The paper's FKL commit of every experiment (and of the CPU benchmark): the commit recorded for the repository's fkl
 # submodule, which has MorphologyDPP's executeBoxBlur for Experiment 3
-FKL_PAPER_COMMIT=$(git -C "$REPO" ls-tree HEAD fkl | awk '{print substr($3, 1, 7)}')
-[ -n "$FKL_PAPER_COMMIT" ] || { echo "run_all.sh: STOP: no fkl submodule recorded in $REPO" >&2; exit 1; }
+# (full SHA for the checks below, its first 7 characters for messages)
+FKL_PAPER_SHA=$(git -C "$REPO" ls-tree HEAD fkl | awk '{print $3}')
+[ -n "$FKL_PAPER_SHA" ] || { echo "run_all.sh: STOP: no fkl submodule recorded in $REPO" >&2; exit 1; }
+FKL_PAPER_COMMIT=${FKL_PAPER_SHA:0:7}
 # FKL_GPU_DIR / FKL_CPU_DIR, or by default the repository's fkl submodule (see the FKL checks below)
 FKL_DEFAULT_DIR=$REPO/fkl
 FKL_GPU_DIR=${FKL_GPU_DIR:-$FKL_DEFAULT_DIR}
@@ -94,16 +96,16 @@ command -v rocminfo > /dev/null || die "rocminfo not found"
 [ "$EXPERIMENT" = 3 ] || allowed SKIP_COUNTERS || command -v rocprofv3 > /dev/null ||
     die "rocprofv3 not found (install amdrocm-profiler-base10.1)"
 allowed SKIP_CPU || command -v "$CXX_CPU" > /dev/null || die "C++ compiler $CXX_CPU not found (set CXX_CPU)"
-FKL_GPU_COMMIT=$(git -C "$FKL_GPU_DIR" rev-parse --short=7 HEAD 2>/dev/null) && [ -f "$FKL_GPU_DIR/CMakeLists.txt" ] ||
+FKL_GPU_SHA=$(git -C "$FKL_GPU_DIR" rev-parse HEAD 2>/dev/null) && [ -f "$FKL_GPU_DIR/CMakeLists.txt" ] ||
     die "no FKL checkout in $FKL_GPU_DIR (git -C $REPO submodule update --init --recursive fkl)"
 FKL_DIRS=("$FKL_GPU_DIR")
-[ "$FKL_GPU_COMMIT" = "$FKL_PAPER_COMMIT" ] || allowed ALLOW_OTHER_FKL ||
-    die "FKL_GPU_DIR is at $FKL_GPU_COMMIT, not $FKL_PAPER_COMMIT (the FKL commit of experiment $EXPERIMENT)"
+[ "$FKL_GPU_SHA" = "$FKL_PAPER_SHA" ] || allowed ALLOW_OTHER_FKL ||
+    die "FKL_GPU_DIR is at ${FKL_GPU_SHA:0:7}, not $FKL_PAPER_COMMIT (the commit recorded for the repository's fkl submodule)"
 if ! allowed SKIP_CPU; then
-    FKL_CPU_COMMIT=$(git -C "$FKL_CPU_DIR" rev-parse --short=7 HEAD 2>/dev/null) && [ -f "$FKL_CPU_DIR/CMakeLists.txt" ] ||
+    FKL_CPU_SHA=$(git -C "$FKL_CPU_DIR" rev-parse HEAD 2>/dev/null) && [ -f "$FKL_CPU_DIR/CMakeLists.txt" ] ||
         die "no FKL checkout in $FKL_CPU_DIR (git -C $REPO submodule update --init --recursive fkl)"
-    [ "$FKL_CPU_COMMIT" = "$FKL_PAPER_COMMIT" ] || allowed ALLOW_OTHER_FKL ||
-        die "FKL_CPU_DIR is at $FKL_CPU_COMMIT, not $FKL_PAPER_COMMIT"
+    [ "$FKL_CPU_SHA" = "$FKL_PAPER_SHA" ] || allowed ALLOW_OTHER_FKL ||
+        die "FKL_CPU_DIR is at ${FKL_CPU_SHA:0:7}, not $FKL_PAPER_COMMIT (the commit recorded for the repository's fkl submodule)"
     FKL_DIRS+=("$FKL_CPU_DIR")
 fi
 for dir in "${FKL_DIRS[@]}"; do

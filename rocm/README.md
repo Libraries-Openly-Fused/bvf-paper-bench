@@ -74,7 +74,9 @@ Output files: those of the CUDA benchmark with `GPU_AMD` instead of `GPU_NVIDIA`
 `kernels.csv`, `kernel_breakdown.csv`, `<baseline>_vs_fkl_bvf_[gpu_only_|gpu_only_l2_flushed_]GPU_AMD.csv`,
 `gpu_time.csv`, `gpu_time_l2_flushed.csv`, `platform.txt`), plus each `<baseline>_vs_fkl_bvf_*.csv` file's
 `_per_iteration.csv` sibling (`Batch size, Iteration, <baseline> Time, fkl_bvf Time, Speedup`, times in ms, one row
-per N and timed iteration), and
+per N and timed iteration; `Iteration` is the iteration t of the regions, W to W + T - 1 with W warm-up and T timed
+iterations, the argument of `--regions`; the CPU and Experiment 3 per-iteration files number their rows the same
+way), and
 `kernel_counts_per_operation.csv`, `rpp_selection.csv`, `rpp_resize_convention.csv` and `regions.csv` (the sizes and
 areas of the regions of the timed iterations per N, as in every results folder); the RPP pipelines' memcpy counts
 include the upload of the ROIs (9 per execution: that one and the 8 of `rppt_yuv_to_rgb`); `validation.csv` has an
@@ -130,8 +132,9 @@ repository's `fkl` submodule (CMake builds `rocm_neighborhood` only with an FKL 
 
 Output files (in `<results dir>/neighborhood` with `run_all.sh`): `latency.csv`, `validation.csv`, `gpu_time.csv`,
 `gpu_time_l2_flushed.csv`, their per-iteration siblings `latency_per_iteration.csv`, `gpu_time_per_iteration.csv` and
-`gpu_time_l2_flushed_per_iteration.csv` (every implementation's time in every timed iteration, the chosen DPP tile's
-time in that iteration and their ratio, in us), `kernel_breakdown.csv`, `kernel_counts_per_operation.csv`,
+`gpu_time_l2_flushed_per_iteration.csv` (for every implementation and timed iteration, its time and the chosen DPP
+tile's time in that iteration, in us, and their ratio, empty on the chosen tile's own rows; `iteration` is the
+iteration t of the regions, W to W + T - 1), `kernel_breakdown.csv`, `kernel_counts_per_operation.csv`,
 `regions.csv`, `regions_resize.csv` and `platform.txt`,
 with the group in the first columns (`part,operation,K,passes,N,implementation,chosen`) or in the implementation name
 (`<part>_<operation>_k<K>_p<passes>_n<N>/<implementation>`); `regions_resize.csv` has the regions of the resize
@@ -195,9 +198,9 @@ thread pool, so that the idle gap before every timed run puts both pools to slee
 
 ## Build and run
 
-Everything, in one command (it writes a platform snapshot first, builds, checks that FKL is at the right commits and
-unmodified and that kernel dispatch tracing and the hardware counters are available and count, then runs the GPU
-benchmark, the counters and the CPU benchmark; the counters default to `FETCH_SIZE GL2C_EA_WRREQ_sum
+Everything, in one command (it writes a platform snapshot first, builds, checks that FKL is at the commit recorded for
+the fkl submodule and unmodified and that kernel dispatch tracing and the hardware counters are available and count,
+then runs the GPU benchmark, the counters and the CPU benchmark; the counters default to `FETCH_SIZE GL2C_EA_WRREQ_sum
 GL2C_EA_WRREQ_64B_sum`, since rocprofiler-sdk 1.4.1 defines no `WRITE_SIZE` for gfx12):
 
     rocm/scripts/run_all.sh ../results/rocm
@@ -237,10 +240,10 @@ measured execution exceeds the smallest of its three warm-up executions (the sam
 flushed) by more than 2 % and 256 KiB of traffic, up to `MAX_REPEATS` (3) rounds; the rejected profiles stay in
 `raw_rejected/` and `traffic_repeats.csv`, and `traffic.csv` has their count per row and whether a leak is still
 suspected. Duration on the paper's machine (bare metal, Ubuntu 26.04, Ryzen 7 5800X3D, RX 9060, performance level
-`STABLE_STD`), the paper run with `SKIP_COUNTERS=1`: 466 s, of which the builds 57 s (the GPU build also builds
-`rocm_neighborhood`), the GPU benchmark with its GPU time only passes 102 s and the CPU benchmark 306 s (the counters
-took 61 s in an earlier run with one region size); Experiment 3's paper run (`EXPERIMENT=3`): 378 s, of which the
-build 47 s and `rocm_neighborhood` 331 s.
+`STABLE_STD`), from `run_all.sh` started to finished: the paper run of Experiment 1 and the CPU benchmark, with
+`SKIP_COUNTERS=1`, 466 s, of which the builds 57 s (the GPU build also builds `rocm_neighborhood`), the GPU benchmark
+with its GPU time only passes 102 s and the CPU benchmark 306 s (the counters took 61 s in an earlier run with one
+region size); Experiment 3's paper run (`EXPERIMENT=3`) 379 s, of which the build 47 s and `rocm_neighborhood` 331 s.
 
 The workload is the one of `common/bench_geometry.h`, with the three region sizes by turns (`BENCH_REGIONS=mixed`,
 the paper's); one size for every region, as the NPPDx builds use, is another CMake option in `BENCH_CMAKE_ARGS`, for
