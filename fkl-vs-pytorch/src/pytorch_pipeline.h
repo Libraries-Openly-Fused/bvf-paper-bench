@@ -18,8 +18,8 @@
 // Per iteration, with the regions of the iteration (host integers, so nothing waits for the device):
 //   - the border rows of the output tensor are set to 0 (two zero_ on strided views of all the planes);
 //   - per region: views of the luma and chroma planes of the region (slices, no copy); the chroma multiplied by FKL's
-//     chroma coefficients, with every offset of the conversion folded into the bias, once per chroma sample (on the
-//     GPU two addcmul on the 8-bit U and V views, on the CPU addmm on the chroma converted to float); the 8-bit luma
+//     chroma coefficients, with every offset of the conversion folded into the bias, once per chroma sample (addmm on
+//     the chroma converted to float, or two addcmul on the 8-bit U and V views: ChromaTerms); the 8-bit luma
 //     added with its coefficient, the chroma replicated to its 2x2 luma pixels by broadcasting (add): float RGB, no
 //     clamping, FKL's BT.601 limited range formula; bilinear
 //     resize to 64x32 (torch::nn::functional::interpolate, align_corners=false); copy into the rows of its output
@@ -40,6 +40,7 @@
 #include "bench_geometry.h"
 #include "bench_pipeline.h"
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -50,6 +51,17 @@ namespace bench::pytorch {
 
 using namespace geometry;
 using namespace pipeline;
+
+// The two formulations of the chroma terms, M_U U + M_V V + bias per chroma sample: addmm (the chroma converted to
+// float, then a 2 x 3 matrix product with the bias, cuBLASLt on the GPU and MKL on the CPU) and addcmul (two addcmul on
+// the 8-bit U and V views). Which is faster depends on the device, the thread count and the batch size, so the
+// programs time PyTorch's complete loop with each before every comparison and compare FKL with the faster one, as FKL
+// vs NPPDx chooses NPPDx's configuration.
+enum class ChromaTerms { Addmm, Addcmul };
+inline constexpr std::array<ChromaTerms, 2> CHROMA_TERMS{ChromaTerms::Addmm, ChromaTerms::Addcmul};
+inline const char* chromaTermsName(ChromaTerms f) {
+    return f == ChromaTerms::Addmm ? "addmm" : "addcmul";
+}
 
 class Pipeline {
 public:
@@ -92,14 +104,10 @@ public:
         }
         m_chromaU = m_chromaMatrix.select(0, 0);
         m_chromaV = m_chromaMatrix.select(0, 1);
-        m_addcmul = !device.is_cpu();
     }
 
-    // The formulation of the chroma terms on this device (chromaTermsOnGpu, chromaTermsOnCpu)
-    static const char* chromaTerms(bool gpu) {
-        return gpu ? "two addcmul on the 8-bit U and V views (bias + U M_U, then + V M_V)"
-                   : "addmm of the bias with the chroma converted to float and the 2 x 3 chroma matrix";
-    }
+    // The formulation of the chroma terms of the next runs
+    void setChromaTerms(ChromaTerms f) { m_chromaTerms = f; }
 
     // The pipeline on the first n regions of an iteration, enqueued on the device's current stream
     void run(const Region* regions) {
@@ -116,14 +124,12 @@ public:
             const int64_t h = r.height, w = r.width;
             const torch::Tensor luma = m_luma.slice(0, r.y, r.y + h).slice(1, r.x, r.x + w);
             const torch::Tensor chroma = m_chroma.slice(0, r.y / 2, (r.y + h) / 2).slice(1, r.x / 2, (r.x + w) / 2);
-            // M_U U + M_V V + bias per chroma sample, (h / 2) x (w / 2) x 3, in the formulation that was faster on each
-            // device in development runs: on the GPU two addcmul on the 8-bit U and V views (2 kernels; the addmm
-            // form takes a conversion and cuBLASLt's split-K GEMM, 3 kernels), on the CPU addmm (MKL) on the chroma
-            // converted to float (addcmul was slower on one thread, and much slower on 32 threads at N = 100)
+            // M_U U + M_V V + bias per chroma sample, (h / 2) x (w / 2) x 3 (ChromaTerms: addcmul is 2 kernels on the
+            // GPU, addmm a conversion and cuBLASLt's split-K GEMM, 3 kernels)
             const torch::Tensor chromaTerms =
-                m_addcmul ? torch::addcmul(m_bias, chroma.narrow(2, 0, 1), m_chromaU)
-                                .addcmul_(chroma.narrow(2, 1, 1), m_chromaV)
-                          : torch::addmm(m_bias, chroma.to(torch::kFloat32).reshape({-1, 2}), m_chromaMatrix);
+                m_chromaTerms == ChromaTerms::Addcmul
+                    ? torch::addcmul(m_bias, chroma.narrow(2, 0, 1), m_chromaU).addcmul_(chroma.narrow(2, 1, 1), m_chromaV)
+                    : torch::addmm(m_bias, chroma.to(torch::kFloat32).reshape({-1, 2}), m_chromaMatrix);
             // + M_Y Y, each chroma sample broadcast to its 2x2 luma pixels: h x w x 3 float RGB. The 8-bit luma view goes
             // in as it is: the add promotes it to float (on the GPU in its own kernel; on the CPU TensorIterator makes a
             // float copy of it first)
@@ -152,7 +158,7 @@ private:
     torch::Device m_device;
     torch::Tensor m_luma, m_chroma, m_chromaMatrix, m_bias, m_mul, m_sub, m_div, m_out;
     torch::Tensor m_chromaU, m_chromaV;
-    bool m_addcmul{false};
+    ChromaTerms m_chromaTerms{ChromaTerms::Addmm};
     float m_lumaScale{0.f};
 };
 

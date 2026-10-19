@@ -88,6 +88,8 @@ struct Implementation {
     std::function<void(size_t)> run;
     std::function<std::vector<float>()> download;
     std::function<void()> fillNaN;
+    // PyTorch's: the formulation of the chroma terms of the next runs (empty for FKL)
+    std::function<void(ChromaTerms)> setChromaTerms;
 };
 
 // Device activities of one execution, from the trace
@@ -114,10 +116,13 @@ struct Result {
     // Over the validated iterations together, and per validated iteration (iteration, against its own reference,
     // against FKL's float reference)
     ErrorStats errorVsOwnReference, errorVsFklReference;
-    std::vector<std::tuple<size_t, ErrorStats, ErrorStats>> errorsPerIteration;
+    // (and the variant: PyTorch's chroma terms, validated with each formulation; "-" for FKL)
+    std::vector<std::tuple<size_t, std::string, ErrorStats, ErrorStats>> errorsPerIteration;
+    // PyTorch's chroma terms in the timed loops: the faster of the sweep (latencyBatch)
+    std::string chromaTerms{"-"};
     bool withinTolerance() const {
         return std::all_of(errorsPerIteration.begin(), errorsPerIteration.end(),
-                           [](const auto& e) { return validation::withinTolerance(std::get<1>(e), TOLERANCE); });
+                           [](const auto& e) { return validation::withinTolerance(std::get<2>(e), TOLERANCE); });
     }
 };
 
@@ -127,6 +132,16 @@ struct Context {
     void* handle;
     std::unique_ptr<RegionSets> regions;
     pipeline::Conversion conversion;
+    // PyTorch's chroma terms chosen for each batch size by latencyBatch's sweep, used by gpuOnlyBatch too
+    std::map<size_t, ChromaTerms> chromaTerms;
+};
+
+// PyTorch's latency loop with one formulation of the chroma terms, before the comparison of a batch size
+struct SweepRow {
+    size_t batch;
+    ChromaTerms chromaTerms;
+    TimingStats timing;
+    bool chosen;
 };
 
 template <size_t N>
@@ -143,9 +158,10 @@ std::vector<Implementation> implementations(Context& ctx) {
                          torchPipeline->run(&regions->at(t, 0));
                      },
                      [torchPipeline]() { return torchPipeline->download(); },
-                     [torchPipeline]() { torchPipeline->fillNaN(); }});
+                     [torchPipeline]() { torchPipeline->fillNaN(); },
+                     [torchPipeline](ChromaTerms f) { torchPipeline->setChromaTerms(f); }});
     impls.push_back({FKL_BVF, FKL_REFERENCE, [fkl](size_t t) { fkl->run(t); }, [fkl]() { return fkl->download(); },
-                     [fkl]() { fkl->fillNaN(); }});
+                     [fkl]() { fkl->fillNaN(); }, {}});
     return impls;
 }
 
@@ -261,7 +277,7 @@ std::vector<Activities> traceExecutions(const Context& ctx, const Implementation
 // Validation and latency of batch N. Every batch's latency is measured before any profiler session of the process
 // (gpuOnlyBatch), as in common/bench_gpu.h.
 template <size_t N>
-void latencyBatch(Context& ctx, std::vector<Result>& results) {
+void latencyBatch(Context& ctx, std::vector<Result>& results, std::vector<SweepRow>& sweep) {
     std::cout << "=== N = " << N << ": validation and latency" << std::endl;
     const auto impls = implementations<N>(ctx);
     const size_t bvf = impls.size() - 1;
@@ -272,24 +288,58 @@ void latencyBatch(Context& ctx, std::vector<Result>& results) {
         batchResults[k].reference = impls[k].reference;
     }
     // Before the timing, on the regions of the validated timed iterations: every pipeline against the reference of
-    // its own conventions, and against FKL's float reference
+    // its own conventions, and against FKL's float reference; PyTorch with each formulation of the chroma terms
     for (const size_t k : validatedIterations(TIMED_ITERS)) {
         const size_t t = WARMUP_ITERS + k;
         const auto fklReference = fklCpuReference(N, *ctx.regions, t);
         const auto pytorchReference = pixelCenterReference(N, *ctx.regions, t);
         for (size_t i = 0; i < impls.size(); ++i) {
-            impls[i].fillNaN();
-            impls[i].run(t);
-            const auto output = impls[i].download();
-            Result& r = batchResults[i];
-            const ErrorStats own = compare(output, impls[i].name == PYTORCH ? pytorchReference : fklReference);
-            const ErrorStats vsFkl = compare(output, fklReference);
-            r.errorsPerIteration.emplace_back(t, own, vsFkl);
-            r.errorVsOwnReference = r.errorsPerIteration.size() == 1 ? own : validation::combine(r.errorVsOwnReference, own);
-            r.errorVsFklReference =
-                r.errorsPerIteration.size() == 1 ? vsFkl : validation::combine(r.errorVsFklReference, vsFkl);
+            std::vector<std::string> variants{"-"};
+            if (impls[i].setChromaTerms) {
+                variants.clear();
+                for (const ChromaTerms f : CHROMA_TERMS) {
+                    variants.push_back(chromaTermsName(f));
+                }
+            }
+            for (size_t v = 0; v < variants.size(); ++v) {
+                if (impls[i].setChromaTerms) {
+                    impls[i].setChromaTerms(CHROMA_TERMS[v]);
+                }
+                impls[i].fillNaN();
+                impls[i].run(t);
+                const auto output = impls[i].download();
+                Result& r = batchResults[i];
+                const ErrorStats own = compare(output, impls[i].name == PYTORCH ? pytorchReference : fklReference);
+                const ErrorStats vsFkl = compare(output, fklReference);
+                r.errorsPerIteration.emplace_back(t, variants[v], own, vsFkl);
+                r.errorVsOwnReference =
+                    r.errorsPerIteration.size() == 1 ? own : validation::combine(r.errorVsOwnReference, own);
+                r.errorVsFklReference =
+                    r.errorsPerIteration.size() == 1 ? vsFkl : validation::combine(r.errorVsFklReference, vsFkl);
+            }
         }
     }
+    // The sweep: PyTorch's latency loop with each formulation of the chroma terms (events as in the comparison); the
+    // comparison uses the one with the lower median
+    ChromaTerms best = ChromaTerms::Addmm;
+    double bestMedian = INFINITY;
+    const size_t first = sweep.size();
+    for (const ChromaTerms f : CHROMA_TERMS) {
+        impls[0].setChromaTerms(f);
+        std::vector<int64_t> unused;
+        const TimingStats timing = computeStats(measureSequential(ctx, {impls[0]}, unused)[0]);
+        sweep.push_back({N, f, timing, false});
+        if (timing.median < bestMedian) {
+            bestMedian = timing.median;
+            best = f;
+        }
+    }
+    for (size_t i = first; i < sweep.size(); ++i) {
+        sweep[i].chosen = sweep[i].chromaTerms == best;
+    }
+    impls[0].setChromaTerms(best);
+    ctx.chromaTerms[N] = best;
+    batchResults[0].chromaTerms = chromaTermsName(best);
     std::vector<int64_t> segments;
     const auto ms = measureSequential(ctx, impls, segments);
     for (size_t k = 0; k < impls.size(); ++k) {
@@ -314,6 +364,8 @@ template <size_t N>
 void gpuOnlyBatch(Context& ctx, std::vector<Result>& results) {
     std::cout << "=== N = " << N << ": GPU time only" << std::endl;
     const auto impls = implementations<N>(ctx);
+    // The chroma terms of the latency comparison
+    impls[0].setChromaTerms(ctx.chromaTerms.at(N));
     const size_t bvf = impls.size() - 1;
     std::vector<Result*> batchResults;
     for (const auto& impl : impls) {
@@ -405,8 +457,11 @@ void writePlatform(const std::filesystem::path& outDir, const Context& ctx) {
        << "OS: " << osName() << ", kernel " << kernelVersion() << "\n\n"
        << "Workload: " << describe() << ". AddBorder (black), then Mul (1/255), Sub (0.485, 0.456, 0.406), Div (0.229, "
        << "0.224, 0.225), float3 tensor of N planes " << OUT_W << "x" << OUT_H << "\n"
-       << "PyTorch pipeline: per region, views of the region's luma and chroma planes, the chroma terms ("
-       << Pipeline::chromaTerms(true) << ", FKL's chroma coefficients and every offset folded into the bias), a "
+       << "PyTorch pipeline: per region, views of the region's luma and chroma planes, the chroma terms (FKL's "
+          "chroma coefficients and every offset folded into the bias: addmm on the chroma converted to float, or two "
+          "addcmul on the 8-bit U and V views; for every batch size PyTorch's latency loop runs with each before the "
+          "comparison, which uses the one with the lower median, also in the GPU time pass: pytorch_chroma_sweep.csv, "
+          "and kernels.csv's chroma_terms), a "
           "broadcast add of the 8-bit luma with its coefficient (chroma replicated to 2x2 pixels; the add converts the "
           "luma), interpolate (bilinear, align_corners=false: "
           "pixel-center sampling) and a device to device copy into its output plane; per iteration the border rows "
@@ -458,18 +513,26 @@ int run(int argc, char** argv) {
     std::cout << "=== FKL vs PyTorch on the GPU (fkl-vs-pytorch)" << std::endl;
     std::vector<Result> results;
     // Every batch's validation and latency first, then every batch's GPU time: no profiler session before a latency
-    forEachBatch([&]<size_t N>() { latencyBatch<N>(ctx, results); });
+    std::vector<SweepRow> sweep;
+    forEachBatch([&]<size_t N>() { latencyBatch<N>(ctx, results, sweep); });
     forEachBatch([&]<size_t N>() { gpuOnlyBatch<N>(ctx, results); });
 
     std::ofstream latency(outDir / "latency.csv");
     latency << "implementation,N,median_us,p10_us,p90_us,iterations,max_abs_err,kernels_launched,mean_us,"
             << FKL_BVF << "_mean_speedup\n";
     std::ofstream validationCsv(outDir / "validation.csv");
-    validationCsv << "implementation,N,iteration,reference,max_abs_err_r,max_abs_err_g,max_abs_err_b,mean_abs_err,"
+    validationCsv << "implementation,chroma_terms,N,iteration,reference,max_abs_err_r,max_abs_err_g,max_abs_err_b,mean_abs_err,"
                      "non_finite_values,max_abs_err_vs_float_reference,values_beyond_1e-3,values,tolerance,"
                      "within_tolerance\n";
+    std::ofstream sweepCsv(outDir / "pytorch_chroma_sweep.csv");
+    sweepCsv << "Batch size, Chroma terms, MedianTime, P10Time, P90Time, MeanTime, Chosen\n";
+    for (const auto& r : sweep) {
+        sweepCsv << r.batch << ", " << chromaTermsName(r.chromaTerms) << ", " << r.timing.median / 1000. << ", "
+                 << r.timing.p10 / 1000. << ", " << r.timing.p90 / 1000. << ", " << r.timing.mean / 1000. << ", "
+                 << (r.chosen ? "yes" : "no") << "\n";
+    }
     std::ofstream kernels(outDir / "kernels.csv");
-    kernels << "implementation,N,kernels,memsets,memcpys,device_mallocs_in_timed_iterations\n";
+    kernels << "implementation,chroma_terms,N,kernels,memsets,memcpys,device_mallocs_in_timed_iterations\n";
     std::ofstream gpuTime(outDir / "gpu_time.csv");
     gpuTime << "implementation,N,gpu_median_us,gpu_p10_us,gpu_p90_us,gpu_mean_us,iterations,kernels_launched,"
             << FKL_BVF << "_mean_gpu_speedup,span_median_us,memcpys,memsets\n";
@@ -483,14 +546,14 @@ int run(int argc, char** argv) {
             latency << std::setprecision(3) << r.meanSpeedupOfBvf;
         }
         latency << "\n";
-        for (const auto& [iteration, e, vsFkl] : r.errorsPerIteration) {
-            validationCsv << r.name << "," << r.batch << "," << iteration << "," << r.reference << ","
+        for (const auto& [iteration, variant, e, vsFkl] : r.errorsPerIteration) {
+            validationCsv << r.name << "," << variant << "," << r.batch << "," << iteration << "," << r.reference << ","
                           << std::scientific << std::setprecision(3) << e.maxPerChannel[0] << "," << e.maxPerChannel[1]
                           << "," << e.maxPerChannel[2] << "," << e.mean << "," << e.nonFinite << "," << vsFkl.max()
                           << "," << e.beyond << "," << e.values << "," << TOLERANCE << ","
                           << (validation::withinTolerance(e, TOLERANCE) ? "yes" : "no") << "\n";
         }
-        kernels << r.name << "," << r.batch << "," << r.counts.kernels << "," << r.counts.memsets << ","
+        kernels << r.name << "," << r.chromaTerms << "," << r.batch << "," << r.counts.kernels << "," << r.counts.memsets << ","
                 << r.counts.memcpys << "," << r.timedSegmentAllocations << "\n";
         gpuTime << r.name << "," << r.batch << "," << std::fixed << std::setprecision(2) << r.gpuTiming.median << ","
                 << r.gpuTiming.p10 << "," << r.gpuTiming.p90 << "," << r.gpuTiming.mean << "," << TIMED_ITERS << ","

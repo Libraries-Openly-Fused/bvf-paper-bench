@@ -39,9 +39,10 @@
 
 namespace bench::cpu {
 
-// The errors on the regions of one validated iteration
+// The errors on the regions of one validated iteration, with one formulation of PyTorch's chroma terms
 struct Check {
     size_t batch, iteration;
+    pytorch::ChromaTerms chromaTerms;
     float fklVsReference, pytorchVsReference, pytorchVsFkl, fklMultithreadVsFkl, pytorchThreadsVsOneThread;
     // What the program requires (withinTolerance): FKL and PyTorch against the references of their conventions, FKL's
     // pool against FKL, and PyTorch on `threads` threads against PyTorch on one
@@ -51,56 +52,94 @@ struct Check {
     }
 };
 
+// PyTorch's complete loop with one formulation of the chroma terms, on one thread count, before a comparison
+struct SweepRow {
+    int threads;
+    size_t batch;
+    pytorch::ChromaTerms chromaTerms;
+    TimingStats timing;
+    bool chosen;
+};
+
 template <size_t N>
 void runBatch(Workload& w, std::vector<Row>& singleThread, std::vector<Row>& multiThread, std::vector<Check>& checks,
-              int threads) {
+              std::vector<SweepRow>& sweep, int threads) {
     pytorch::Pipeline torchPipeline(w.frame, w.pitch, torch::kCPU, N, fklConversion());
     const auto fkl = makeFklCpu(N, false, w);
     const auto fklMT = makeFklCpu(N, true, w);
     const auto runPytorch = [&](size_t t) { torchPipeline.run(&w.regions->at(t, 0)); };
-    // Before the timing, on the regions of the first, every 50th and the last timed iteration: PyTorch on 1 thread
-    // against the pixel-center reference and FKL, and on `threads` threads against itself on 1
-    Check worst{N, 0, 0.f, 0.f, 0.f, 0.f, 0.f};
-    for (const size_t k : validatedIterations(ITERS)) {
-        const size_t t = WARMUP_ITERS + k;
-        at::set_num_threads(1);
-        torchPipeline.fillNaN();
-        runPytorch(t);
-        const auto torchOut = torchPipeline.download();
-        at::set_num_threads(threads);
-        torchPipeline.fillNaN();
-        runPytorch(t);
-        const auto torchThreadsOut = torchPipeline.download();
-        fkl->run(t);
-        fklMT->run(t);
-        const auto fklOut = fkl->output();
-        const Check c{N, t, maxAbsError(fklOut, referenceOutput(w, N, t, Conventions::Fkl)),
-                      maxAbsError(torchOut, referenceOutput(w, N, t, Conventions::PixelCenters)),
-                      maxAbsError(torchOut, fklOut), maxAbsError(fklMT->output(), fklOut),
-                      maxAbsError(torchThreadsOut, torchOut)};
-        checks.push_back(c);
-        worst = Check{N, t, worstError(c.fklVsReference, worst.fklVsReference),
-                      worstError(c.pytorchVsReference, worst.pytorchVsReference),
-                      worstError(c.pytorchVsFkl, worst.pytorchVsFkl),
-                      worstError(c.fklMultithreadVsFkl, worst.fklMultithreadVsFkl),
-                      worstError(c.pytorchThreadsVsOneThread, worst.pytorchThreadsVsOneThread)};
+    // Before the timing, on the regions of the first, every 50th and the last timed iteration, with each formulation
+    // of the chroma terms: PyTorch on 1 thread against the pixel-center reference and FKL, and on `threads` threads
+    // against itself on 1
+    std::vector<Check> worst;
+    for (const pytorch::ChromaTerms f : pytorch::CHROMA_TERMS) {
+        torchPipeline.setChromaTerms(f);
+        Check worstOfF{N, 0, f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        for (const size_t k : validatedIterations(ITERS)) {
+            const size_t t = WARMUP_ITERS + k;
+            at::set_num_threads(1);
+            torchPipeline.fillNaN();
+            runPytorch(t);
+            const auto torchOut = torchPipeline.download();
+            at::set_num_threads(threads);
+            torchPipeline.fillNaN();
+            runPytorch(t);
+            const auto torchThreadsOut = torchPipeline.download();
+            fkl->run(t);
+            fklMT->run(t);
+            const auto fklOut = fkl->output();
+            const Check c{N, t, f, maxAbsError(fklOut, referenceOutput(w, N, t, Conventions::Fkl)),
+                          maxAbsError(torchOut, referenceOutput(w, N, t, Conventions::PixelCenters)),
+                          maxAbsError(torchOut, fklOut), maxAbsError(fklMT->output(), fklOut),
+                          maxAbsError(torchThreadsOut, torchOut)};
+            checks.push_back(c);
+            worstOfF = Check{N, t, f, worstError(c.fklVsReference, worstOfF.fklVsReference),
+                             worstError(c.pytorchVsReference, worstOfF.pytorchVsReference),
+                             worstError(c.pytorchVsFkl, worstOfF.pytorchVsFkl),
+                             worstError(c.fklMultithreadVsFkl, worstOfF.fklMultithreadVsFkl),
+                             worstError(c.pytorchThreadsVsOneThread, worstOfF.pytorchThreadsVsOneThread)};
+        }
+        worst.push_back(worstOfF);
     }
-    const Check& c = worst;
 
-    at::set_num_threads(1);
-    singleThread.push_back(timeTwo(N, runPytorch, [&](size_t t) { fkl->run(t); }));
-    at::set_num_threads(threads);
-    multiThread.push_back(timeTwo(N, runPytorch, [&](size_t t) { fklMT->run(t); }));
-    at::set_num_threads(1);
-    const Row& s = singleThread.back();
-    const Row& m = multiThread.back();
-    std::printf("N %3zu | PyTorch 1 thread %8.1f us, FKL CPU %8.1f us, mean speedup %6.2fx | PyTorch %d threads %8.1f us, "
-                "FKL CPU_MULTITHREAD %8.1f us, mean speedup %6.2fx | max err: FKL vs "
-                "reference %.2e, PyTorch vs pixel-center reference %.2e, PyTorch vs FKL %.2e, FKL CPU_MULTITHREAD vs "
-                "FKL CPU %.2e, PyTorch %d threads vs 1 thread %.2e\n",
-                N, s.baseline.median, s.fkl.median, s.meanSpeedup, threads, m.baseline.median, m.fkl.median,
-                m.meanSpeedup, c.fklVsReference,
-                c.pytorchVsReference, c.pytorchVsFkl, c.fklMultithreadVsFkl, threads, c.pytorchThreadsVsOneThread);
+    // On each thread count: PyTorch's complete loop with each formulation (the sweep), then the comparison of FKL with
+    // the faster one (lower median), PyTorch's loop first
+    const auto compare = [&](int pytorchThreads, FklCpu& fklSide) {
+        at::set_num_threads(pytorchThreads);
+        pytorch::ChromaTerms best = pytorch::ChromaTerms::Addmm;
+        double bestMedian = INFINITY;
+        const size_t first = sweep.size();
+        for (const pytorch::ChromaTerms f : pytorch::CHROMA_TERMS) {
+            torchPipeline.setChromaTerms(f);
+            const TimingStats timing = computeStats(timeLoop(runPytorch));
+            sweep.push_back({pytorchThreads, N, f, timing, false});
+            if (timing.median < bestMedian) {
+                bestMedian = timing.median;
+                best = f;
+            }
+        }
+        for (size_t i = first; i < sweep.size(); ++i) {
+            sweep[i].chosen = sweep[i].chromaTerms == best;
+        }
+        torchPipeline.setChromaTerms(best);
+        Row row = timeTwo(N, runPytorch, [&](size_t t) { fklSide.run(t); });
+        at::set_num_threads(1);
+        return std::make_pair(row, best);
+    };
+    const auto [s, sBest] = compare(1, *fkl);
+    singleThread.push_back(s);
+    const auto [m, mBest] = compare(threads, *fklMT);
+    multiThread.push_back(m);
+    for (const Check& c : worst) {
+        std::printf("N %3zu, PyTorch with %s: max err: FKL vs reference %.2e, PyTorch vs pixel-center reference %.2e, "
+                    "PyTorch vs FKL %.2e, FKL CPU_MULTITHREAD vs FKL CPU %.2e, PyTorch %d threads vs 1 thread %.2e\n",
+                    N, pytorch::chromaTermsName(c.chromaTerms), c.fklVsReference, c.pytorchVsReference,
+                    c.pytorchVsFkl, c.fklMultithreadVsFkl, threads, c.pytorchThreadsVsOneThread);
+    }
+    std::printf("N %3zu | PyTorch 1 thread (%s) %8.1f us, FKL CPU %8.1f us, mean speedup %6.2fx | PyTorch %d threads "
+                "(%s) %8.1f us, FKL CPU_MULTITHREAD %8.1f us, mean speedup %6.2fx\n",
+                N, pytorch::chromaTermsName(sBest), s.baseline.median, s.fkl.median, s.meanSpeedup, threads,
+                pytorch::chromaTermsName(mBest), m.baseline.median, m.fkl.median, m.meanSpeedup);
 }
 
 // libgomp's workers (through PyTorch, on an add of 32768 floats per thread, PyTorch's grain size, so that every thread
@@ -152,23 +191,34 @@ int main(int argc, char** argv) {
 
         std::vector<Row> singleThread, multiThread;
         std::vector<Check> checks;
-        forEachBatch([&]<size_t N>() { runBatch<N>(w, singleThread, multiThread, checks, threads); });
+        std::vector<SweepRow> sweep;
+        forEachBatch([&]<size_t N>() { runBatch<N>(w, singleThread, multiThread, checks, sweep, threads); });
 
         writeCSV(outDir / "benchmark_cpu_pytorch_1thread_vs_fkl_bvf_CPU.csv", "PyTorch 1 thread", singleThread,
                  "FKL CPU");
         writeCSV(outDir / ("benchmark_cpu_pytorch_" + std::to_string(threads) + "threads_vs_fkl_bvf_CPU_MULTITHREAD.csv"),
                  "PyTorch " + std::to_string(threads) + " threads", multiThread, "FKL CPU_MULTITHREAD");
         std::ofstream v(outDir / "cpu_validation.csv");
-        v << "Batch size, Iteration, FKL MaxAbsError vs FKL-convention reference, PyTorch MaxAbsError vs "
+        v << "Batch size, Iteration, PyTorch chroma terms, FKL MaxAbsError vs FKL-convention reference, PyTorch MaxAbsError vs "
              "pixel-center reference, PyTorch vs FKL MaxAbsDifference, FKL CPU_MULTITHREAD vs FKL CPU "
              "MaxAbsDifference, PyTorch "
           << threads << " threads vs PyTorch 1 thread MaxAbsDifference, Within tolerance" << std::endl;
         bool passed = true;
         for (const auto& c : checks) {
-            v << c.batch << ", " << c.iteration << ", " << c.fklVsReference << ", " << c.pytorchVsReference << ", "
+            v << c.batch << ", " << c.iteration << ", " << bench::pytorch::chromaTermsName(c.chromaTerms) << ", "
+              << c.fklVsReference << ", " << c.pytorchVsReference << ", "
               << c.pytorchVsFkl << ", " << c.fklMultithreadVsFkl << ", " << c.pytorchThreadsVsOneThread << ", "
               << (c.passed() ? "yes" : "no") << std::endl;
             passed &= c.passed();
+        }
+        // The sweep: PyTorch's complete loop with each formulation of the chroma terms, per thread count and batch size;
+        // the comparison used the chosen one
+        std::ofstream sw(outDir / "pytorch_chroma_sweep.csv");
+        sw << "Threads, Batch size, Chroma terms, MedianTime, P10Time, P90Time, MeanTime, Chosen" << std::endl;
+        for (const auto& r : sweep) {
+            sw << r.threads << ", " << r.batch << ", " << bench::pytorch::chromaTermsName(r.chromaTerms) << ", "
+               << r.timing.median / 1000. << ", " << r.timing.p10 / 1000. << ", " << r.timing.p90 / 1000. << ", "
+               << r.timing.mean / 1000. << ", " << (r.chosen ? "yes" : "no") << std::endl;
         }
         writeRegionStats((outDir / "regions.csv").string(), *w.regions, WARMUP_ITERS, ITERS);
         std::ofstream(outDir / "pytorch_build_information.txt") << at::show_config() << "\n" << at::get_parallel_info();
@@ -182,9 +232,11 @@ int main(int argc, char** argv) {
           << "stays busy " << spin.ompBusyUs << " us per parallel run of PyTorch (an add with 32768 floats per thread) "
           << "and each of FKL's CPU_MULTITHREAD workers " << spin.fklBusyUs << " us per run (1 region): work plus spin "
           << "before sleeping (libgomp's default spin is kept)\n"
-          << "PyTorch pipeline: per region, views of the region's luma and chroma planes, the chroma terms ("
-          << bench::pytorch::Pipeline::chromaTerms(false) << ", FKL's chroma coefficients and every offset folded into the "
-             "bias), a broadcast add of the 8-bit luma with its coefficient (chroma replicated to 2x2 pixels; the add "
+          << "PyTorch pipeline: per region, views of the region's luma and chroma planes, the chroma terms (FKL's "
+             "chroma coefficients and every offset folded into the bias: addmm on the chroma converted to float, or two "
+             "addcmul on the 8-bit U and V views; for every thread count and batch size PyTorch's complete loop runs "
+             "with each before the comparison, which uses the one with the lower median: pytorch_chroma_sweep.csv), a "
+             "broadcast add of the 8-bit luma with its coefficient (chroma replicated to 2x2 pixels; the add "
              "makes a float copy of the luma first), interpolate (bilinear, align_corners=false: "
              "pixel-center sampling) and a copy into its output plane; per iteration the border rows set to 0 and "
              "mul_, sub_, div_ on the whole N x 64 x 64 x 3 tensor\n";
