@@ -250,7 +250,8 @@ OpenCV on the CPU explains the change.
 Output files: `latency.csv`, `gpu_time.csv`, `pytorch_vs_fkl_bvf_<GPU_NVIDIA|GPU_AMD>.csv` and
 `pytorch_vs_fkl_bvf_gpu_only_<...>.csv` (FKL's two-execution format) with their `_per_iteration.csv`,
 `pytorch_variant_sweep.csv`, `validation.csv`, `kernels.csv`, `regions.csv`, `platform.txt` and
-`pytorch_build_information.txt`.
+`pytorch_build_information.txt`. `latency.csv`'s `max_abs_err` is, for `pytorch`, the largest error over every
+validated variant; `validation.csv` has each variant's.
 
 **Two compilations.** FKL's side ([`src/fkl_gpu.cu`](src/fkl_gpu.cu)) is compiled separately from PyTorch's, as
 CUDA by nvcc or as HIP. It gets the nvcc options of every GPU benchmark ([`common/bench_gpu.cmake`](../common/bench_gpu.cmake)),
@@ -275,4 +276,7 @@ code; `HIP_ARCH` (default `gfx1200`) is its HIP architecture with a ROCm wheel.
 **ROCm.** The same commands build against a ROCm wheel's LibTorch, with `ROCM_PATH` set to the ROCm installation (for
 example `/opt/rocm/core-10.1`). LibTorch's CMake enables HIP with its own compiler and architectures, and the project
 then sets `HIP_ARCH` on FKL's side only. PyTorch's device is still `torch::kCUDA`, and its streams and guards keep
-their `c10::cuda` names in the hipified headers.
+their `c10::cuda` names in the hipified headers. A ROCm wheel ships its own HIP runtime (`_rocm_sdk_core/lib` next to
+`torch`); the GPU program's run path has the wheel's folders, so that it loads that runtime, as LibTorch does: with
+the system's HIP runtime (for example through `LD_LIBRARY_PATH`), Kineto records no device activity and the GPU time
+pass fails. On RDNA, `platform.txt`'s `multiProcessorCount` counts work-group processors (2 compute units each).

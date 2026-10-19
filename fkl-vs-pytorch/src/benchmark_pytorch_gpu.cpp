@@ -515,7 +515,8 @@ void writePlatform(const std::filesystem::path& outDir, const Context& ctx) {
        << "variant): "
        << "PyTorch against the plain C++ reference with its pixel-center sampling (common/bench_reference.h), FKL BVF "
        << "against FKL's chain on its CPU backend, both 1e-3; max_abs_err_vs_float_reference is against FKL's "
-          "reference for both.\n"
+          "reference for both. latency.csv's max_abs_err is, for pytorch, the largest over every validated variant "
+          "(validation.csv has each variant's).\n"
        << "Counts: kernels, memcpys and memsets of one execution (the first timed iteration), from the trace.\n";
 }
 

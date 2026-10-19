@@ -215,7 +215,9 @@ std::string describeGpuAndFkl() {
     gpuErrchk(hipGetDeviceProperties(&prop, device));
     gpuErrchk(hipRuntimeGetVersion(&runtime));
     gpuErrchk(hipDriverGetVersion(&driver));
-    os << "GPU: " << prop.name << " (" << prop.gcnArchName << ", " << prop.multiProcessorCount << " CUs, "
+    // multiProcessorCount counts compute units on CDNA but work-group processors (2 compute units each) on RDNA
+    os << "GPU: " << prop.name << " (" << prop.gcnArchName << ", hipDeviceProp_t::multiProcessorCount "
+       << prop.multiProcessorCount << ": compute units on CDNA, work-group processors of 2 compute units on RDNA, "
        << (prop.totalGlobalMem >> 20) << " MiB)\n"
        << "HIP runtime: " << runtime << ", HIP driver: " << driver << "\n"
        << "FKL's code: HIP, " << BENCH_GPU_COMPILER << ", flags " << BENCH_GPU_FLAGS << "\n";

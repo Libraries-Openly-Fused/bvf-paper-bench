@@ -135,6 +135,17 @@ if(BENCH_GPU_LANGUAGE)
         BENCH_ITERATIONS=${BENCH_ITERATIONS} BENCH_WARMUP_ITERATIONS=${BENCH_WARMUP_ITERATIONS}
         BENCH_REPO_COMMIT="${BENCH_REPO_COMMIT}" BENCH_TORCH_VERSION="${BENCH_TORCH_VERSION}")
     target_link_libraries(benchmark_pytorch_gpu PRIVATE fkl_gpu ${TORCH_LIBRARIES})
+    # A ROCm wheel ships its own HIP runtime (<site-packages>/_rocm_sdk_core/lib, with its dependencies in
+    # rocm_sysdeps/lib), which LibTorch loads with its profiler SDK; the program links the system's HIP (ROCM_PATH),
+    # whose folder is not in its run path. The wheel's folders go into the run path, so that the program loads the
+    # wheel's runtime: with the system's, Kineto records no device activity (found on the RX 9060, torch
+    # 2.14.1+rocm7.14). A CUDA wheel has no such folder, and nothing changes.
+    get_filename_component(BENCH_TORCH_SITE "${Torch_DIR}/../../../.." ABSOLUTE)
+    if(BENCH_GPU_LANGUAGE STREQUAL "HIP" AND EXISTS "${BENCH_TORCH_SITE}/_rocm_sdk_core/lib")
+        set_property(TARGET benchmark_pytorch_gpu APPEND PROPERTY BUILD_RPATH
+                     "${BENCH_TORCH_SITE}/_rocm_sdk_core/lib" "${BENCH_TORCH_SITE}/_rocm_sdk_core/lib/rocm_sysdeps/lib")
+        message(STATUS "GPU program run path: the wheel's HIP runtime, ${BENCH_TORCH_SITE}/_rocm_sdk_core/lib")
+    endif()
     message(STATUS "GPU program: FKL's code as ${BENCH_GPU_LANGUAGE} (${BENCH_GPU_COMPILER}, ${BENCH_GPU_ARCH})")
 else()
     message(STATUS "GPU program not built: LibTorch has no GPU backend here, or BENCH_PYTORCH_GPU is OFF")
