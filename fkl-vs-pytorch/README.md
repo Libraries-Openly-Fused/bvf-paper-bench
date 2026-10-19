@@ -47,9 +47,8 @@ machine, the CUDA runtime library both libraries load is the system's (CUDA 13.3
 3. `mul_`, `sub_` and `div_` in place on the whole N x 64 x 64 x 3 output tensor, FKL's layout.
 
 **Variants, chosen by a sweep.** The two formulations of the chroma terms and the two views for the resize make four
-variants of PyTorch's pipeline. Which is fastest depends on the device, the thread count and the batch size (in
-development runs, `addcmul` on the GPU, and on 32 CPU threads except at N = 100; the channels-last view on the CPU).
-So before every comparison the program runs PyTorch's complete loop with each variant (on that thread count) and
+variants of PyTorch's pipeline. Which is fastest can depend on the device, the thread count and the batch size. So
+before every comparison the program runs PyTorch's complete loop with each variant (on that thread count) and
 compares FKL with the fastest by median, as FKL vs NPPDx chooses NPPDx's configuration: `pytorch_variant_sweep.csv`
 has the sweep and the choice, and the validation checks every variant.
 
@@ -67,15 +66,18 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
 ## What PyTorch is forced to do that FKL does not
 
 - **A host loop over the regions.** The regions have different sizes, and `interpolate` takes one input size per call,
-  so every region is its own sequence of operator calls: 5 or 6 kernel launches per region on the GPU (by variant), and
-  about as many operator calls on the CPU. FKL processes the N regions in one call and one kernel. Grouping regions by size would batch them here,
-  only because this workload has three sizes; detections in general have any size.
+  so every region is its own sequence of operator calls: 5 or 6 device operations per region on the GPU (by variant: 4
+  to 6 kernels, plus a device to device memcpy in the channels-last variants), and about as many operator calls on the
+  CPU. FKL processes the N regions in one call and one kernel. Grouping regions by size would batch them here, only
+  because this workload has three sizes; detections in general have any size.
 - **No code for this GPU in the wheel.** The cu132 wheel has SASS for sm_75, sm_80, sm_86, sm_90, sm_100 and sm_120
   (`pytorch_build_information.txt`), none for the RTX 4090's sm_89: PyTorch's kernels run as sm_86 code there. FKL's
   kernel is compiled for the GPU it runs on.
-- **Intermediates in memory.** Per region: the chroma terms, the h x w x 3 float RGB crop and the resized
-  3 x 32 x 64 image, and on the CPU also the float chroma and the float copy of the luma. The output is written, then rewritten three times by `mul_`, `sub_` and `div_`, plus
-  the two border fills. FKL keeps everything in registers and writes each output value once.
+- **Intermediates in memory.** Per region: the chroma terms, the h x w x 3 float RGB crop and the resized 3 x 32 x 64
+  image; with `addmm` also the float chroma (on both devices), and on the CPU the float copies TensorIterator makes of
+  the 8-bit inputs (the luma, and with `addcmul` the U and V views). The output is written, then rewritten three times
+  by `mul_`, `sub_` and `div_`, plus the two border fills. FKL keeps everything in registers and writes each output
+  value once.
 - **Allocation and dispatch.** Every operator allocates its output (PyTorch's caching allocator on the GPU, its CPU
   allocator on the CPU), and goes through the dispatcher and TensorIterator's setup. FKL's `build()` calls and fusion
   are compile-time types plus a few parameters.

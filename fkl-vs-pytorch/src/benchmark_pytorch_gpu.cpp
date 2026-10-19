@@ -23,7 +23,7 @@
 // - GPU time only: a second pass with the same loops, PyTorch's then FKL's, the timed iterations traced with PyTorch's
 //   profiler (Kineto: CUPTI on CUDA, the ROCm tracer on ROCm) in chunks of PROFILE_CHUNK iterations, an empty marker
 //   kernel after every execution splitting the trace; the GPU time of one execution is the sum of the execution times
-//   of its device activities (kernels, and PyTorch's device to device copies and fills);
+//   of its device activities (kernels, and memcpys and memsets when there are any);
 // - kernel, memset and memcpy counts of one execution of each, from the same trace.
 
 #include <torch/torch.h>
