@@ -29,7 +29,7 @@
 #   CPU_CXX      C++ compiler of the CPU benchmark (default clang++; the README recommends a recent clang)
 #   CMAKE_ARGS   more options for every CMake project (for example -DBENCH_ITERATIONS=1 for a quick check). They
 #                come before the options this script sets for each project (BENCH_REGIONS, OpenCV_DIR, and CPU_CXX for
-#                the CPU benchmark), which win. Setting or unsetting BENCH_REGIONS in them is an error: this script sets
+#                the CPU benchmarks), which win. Setting or unsetting BENCH_REGIONS in them is an error: this script sets
 #                it for every project (mixed, or the NPPDx sizes of NPPDX_SIZES)
 # Results: <results>/<benchmark folder>, FKL vs NPPDx in <results>/fkl-vs-nppdx/<size> (the runner-up configurations in
 # its runner-up/), the neighborhood experiment in <results>/fkl-neighborhood/<program>, logs in <results>/logs. The GPU benchmarks run one at a time; leave the GPU otherwise idle.
@@ -169,7 +169,7 @@ if has_step nppdx; then
         for program in benchmark_nppdx benchmark_nppdx_npp; do
             run "$LOGS/${program}_$size.log" "$build/$program" "$out"
             run "$LOGS/${program}_${size}_l2_flushed.log" "$build/$program" "$out" --gpu-only-l2-flushed
-            # The second fastest configuration of the sweep against FKL, in the same interleaved iterations
+            # The second fastest configuration of the sweep against FKL, with the protocol and regions of the chosen one
             run "$LOGS/${program}_${size}_runner_up_configs.log" python3 "$REPO/scripts/nppdx_runner_up.py" \
                 "$out/${program}_nppdx_block_sweep_GPU_NVIDIA.csv" "$out/${program}_runner_up_config.csv"
             run "$LOGS/${program}_${size}_runner_up.log" "$build/$program" "$out/runner-up" --configs \

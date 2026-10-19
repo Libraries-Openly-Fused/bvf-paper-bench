@@ -29,8 +29,10 @@ One folder per library compared with FKL, each its own CMake project with its ow
 Next to them:
 
 - [`common/`](common): the workload of every benchmark (`bench_geometry.h`, `bench_geometry.cmake`), the harness of the
-  GPU benchmarks of OpenCV CUDA, NPP and FKL's ablation (`bench_gpu.h`, `bench_gpu.cmake`), the validation rules
-  shared by every GPU benchmark (`bench_validation.h`), NPP's error check and NV12 conversion (`bench_npp.h`), the
+  GPU benchmarks of OpenCV CUDA, NPP and FKL's ablation (`bench_gpu.h`, `bench_gpu.cmake`), the harness of the CPU
+  benchmarks (`bench_cpu.h`, `bench_cpu.cmake`, FKL's side in `bench_fkl_cpu.cpp`), the pipeline's constants and its
+  plain C++ reference (`bench_pipeline.h`, `bench_reference.h`), the timing statistics and FKL's two-execution CSV
+  format (`bench_timing.h`), the validation rules shared by every GPU benchmark (`bench_validation.h`), NPP's error check and NV12 conversion (`bench_npp.h`), the
   platform description (`bench_platform.h`), the common part of the compile-time units (`compile_time_unit.h`), and the
   workload and BVF box operation of the neighborhood experiment (`bench_neighborhood.h`,
   `bench_neighborhood_ops.h`, shared with `rocm/`);
@@ -86,9 +88,23 @@ program runs its library's pipeline (the baseline) and FKL BVF, one `executeOper
 whole chain (the paper's Listing 2). FKL vs NPPDx has its own harness, described in its README, with the same three
 timings.
 
-In each of the 1000 timed iterations (after 100 warm-up ones) the baseline and FKL BVF run one after the other on the
-regions of that iteration, and FKL BVF's speedup over the baseline is computed per iteration and then averaged, as in
-FKL's two-execution benchmarks. Every run produces two benchmarks:
+The implementations never run at the same time:
+
+- **Sequential loops.** For every batch size, each implementation's complete loop (100 warm-up and 1000 timed
+  iterations) runs before the next one's, on the same regions, in a fixed order: the baselines first, FKL BVF last.
+  Each loop therefore starts with the L2 state its own previous iteration left.
+- **Paired speedups.** FKL BVF's speedup over a baseline is computed per iteration (baseline time / FKL BVF time of the
+  same iteration, identical inputs) and averaged, as in FKL's two-execution benchmarks. Every timed iteration's time of
+  every implementation is in `per_iteration_<mode>.csv` (latency, GPU only, GPU only with the L2 flushed), and FKL vs
+  NPPDx writes the pairs of each comparison CSV in its `_per_iteration.csv`.
+- **Earlier results.** The paper's first results (`results-v3`) alternated the implementations within every
+  iteration instead.
+- **`rocm/`.** The programs of `rocm/` (AMD GPU and RPP on the CPU) have their own harness, which pull request #19
+  moves to this protocol. Until it is merged, they still alternate the implementations within every iteration, and
+  their CPU program sleeps the idle gap and sets the thread pools' spin times, so their results are not comparable with
+  those of this protocol.
+
+Every run produces two benchmarks:
 
 - CPU + GPU: CUDA events around everything the host does to enqueue a pipeline, plus its GPU execution.
 - GPU only: a second pass with CUPTI kernel tracing, where the time of an execution is the sum of its kernels'
@@ -175,6 +191,56 @@ and max), `compile_time_kernels.csv` and `compile_time_phases.csv`, and prints a
     SET=ablation BUILD=build-ablation scripts/compile_time.sh ../results/compile_time/fkl-ablation
     SET=nppdx BUILD=build-nppdx-32x16 scripts/compile_time.sh ../results/compile_time/fkl-vs-nppdx-32x16   # after benchmark_nppdx
 
+## The CPU benchmarks
+
+FKL vs OpenCV on the CPU shares one harness with the other CPU benchmarks (FKL vs PyTorch, Halide and Fern, added by
+pull requests #18, #16 and #17; not `rocm/`'s RPP program, see [the GPU benchmarks](#the-gpu-benchmarks)),
+[`common/bench_cpu.h`](common/bench_cpu.h). FKL's side is [`common/bench_fkl_cpu.cpp`](common/bench_fkl_cpu.cpp):
+one `executeOperations` call (BVF) on FKL's CPU backend (one thread) and on its `CPU_MULTITHREAD` backend (FKL's
+thread pool, one worker per hardware thread). Each program compares its library on one thread with FKL on one thread,
+and on as many threads as FKL's pool has workers with FKL's pool.
+
+The two libraries of a comparison never run at the same time:
+
+- **Sequential loops.** For every batch size, the library's complete loop (100 warm-up and 1000 timed iterations) runs
+  first, then FKL's, on the same regions.
+- **Paired speedups.** FKL's speedup is the mean over the timed iterations of (library time / FKL time) of the same
+  iteration, which pairs runs on identical inputs. Every comparison CSV has a `_per_iteration.csv` sibling with the
+  pairs.
+- **Idle gap.** Every run follows a 1 ms idle gap, which the timing thread busy-waits, so that its core stays out of a
+  deep C-state. A pool whose workers spin for less than that after a run (FKL's and OpenCV's, as the platform file's
+  busy times show) is asleep when the next run starts; one that spins longer (libgomp's, by default: PyTorch's, #18)
+  is still spinning. Each library keeps its
+  own threads, if it has any, and its own idle behaviour.
+- **Worker busy time.** Each program measures how long the workers of every pool it uses (FKL's, and the library's if
+  it has one) stay busy after a run with little
+  work: their spin and wake-up, from `/proc/self/task/*/schedstat` on Linux. It records them in its platform file
+  (`cpu_platform*.txt`).
+- **Validation.** Before the timing, on the regions of the first, every 50th and the last timed iteration, FKL against
+  the reference with its conventions, FKL's pool against FKL on one thread, and what each program requires of its
+  library (its README and platform file say what: against a reference of its conventions, or on its thread count
+  against itself on one thread) must agree within 1e-3: otherwise the program writes its files and exits with an
+  error.
+
+FKL's side is the only translation unit of a program that includes FKL: FKL's headers define variable template
+specializations that are not `inline`, so a program can include them in one translation unit only. It is compiled with
+FKL's options only (none of the compared library's), so its object file is the same in every CPU benchmark built with
+the same compiler and flags. It is linked first, and with GCC and Clang a function and five variables in it are
+aligned to 4096 bytes, which aligns its code, read-only data, vtables, data and zero-initialized data sections: FKL's
+functions (its template instantiations, in sections of their own, follow in the same order), vtables and static
+objects then have the same addresses modulo 4096 in every CPU benchmark, whatever the sections before them (which grow
+with each library's imported symbols) take. Not aligned: the constants, strings and exception tables the linker merges
+with the other objects', the read-only data the object places after its strings (the type names of its type
+information), and its per-function read-only data (switch tables, not in the timed loops). FKL's timed code reads some
+of those merged 8-, 16- and 32-byte constants, whose addresses modulo 4096 differ by a few cache lines between programs;
+whether that changes FKL's times is not measured separately: the cross-program FKL times of the paper's runs show it.
+The platform file records the addresses modulo 4096 of two aligned symbols (`benchFklCodeStart` and `benchFklBssStart`,
+0 by construction) and of one function in FKL's aligned code section (`fklFrame`), and `nm` on two programs compares
+every FKL symbol; the merged constants have no symbols
+(`objdump -d` shows the addresses FKL's code loads them from). The
+[protocol change](fkl-vs-opencv-cpu/README.md#protocol-change) section of FKL vs OpenCV on the CPU explains the
+busy-waited gap and the separate translation unit.
+
 ## Requirements
 
 Each benchmark has its own requirements, besides a C++20 compiler:
@@ -237,8 +303,9 @@ Every job runs [`scripts/ci/run_benchmarks.cmake`](scripts/ci/run_benchmarks.cma
 `~/bvf-paper-bench-deps` (so the first run on a runner takes much longer), builds the benchmarks (FKL vs NPPDx for
 every region size, `NPPDX_SIZES`, and the NPPDx neighborhood programs) with one timed iteration and no warm-up (`ITERATIONS` and `WARMUP_ITERATIONS` of the
 script), runs every mode except those for Nsight Compute (`--ncu-target` and the profiling scripts), and fails if a
-benchmark fails or if FKL's or NPPDx's outputs do not match their references (OpenCV's and NPP's are in
-`validation.csv` but not required: they come from the OpenCV build and the CUDA toolkit of each runner). The results
+benchmark fails (a CPU benchmark fails when its own validation fails: FKL's checks and what it checks of its library,
+as its README says) or if FKL's or NPPDx's outputs do not match their references (on the GPU, OpenCV's and NPP's are
+in the validation files but not required: they come from the OpenCV build and the CUDA toolkit of each runner). The results
 and logs of every job are uploaded as artifacts. Times measured on shared CI runners are not the paper's numbers.
 
 The runners are persistent machines and this repository is public, so the workflow only runs trusted code: pull

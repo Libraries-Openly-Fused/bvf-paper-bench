@@ -77,6 +77,12 @@ jobs:
             artifact: linux-cuda-arm64
 
     steps:
+      - name: Remove gern from the previous job's checkout
+        # The runners keep their workspace, and actions/checkout runs `git submodule foreach --recursive` in it before
+        # fetching. That fails while gern (the Fern baseline's submodule) is checked out: gern records a submodule it
+        # does not declare. The Fern branch no longer checks gern out; this clears the workspaces where it did
+        run: rm -rf gern
+
       - uses: actions/checkout@v6
         with:
           submodules: recursive
@@ -136,6 +142,11 @@ jobs:
             artifact: windows-cuda-x64-cuda13.4
 
     steps:
+      - name: Remove gern from the previous job's checkout
+        # As on Linux
+        run: |
+          if (Test-Path gern) { Remove-Item -Recurse -Force gern }
+
       - uses: actions/checkout@v6
         with:
           submodules: recursive

@@ -48,6 +48,12 @@ inline std::string shell(const std::string& command) {
     return output;
 }
 
+// nvidia-smi's answer about one GPU, the one with this PCI bus ID (cudaDeviceGetPCIBusId): nvidia-smi's indices need
+// not be CUDA's, and CUDA_VISIBLE_DEVICES does not apply to it. fields: nvidia-smi's --query-gpu fields
+inline std::string nvidiaSmi(const std::string& busId, const std::string& fields) {
+    return shell("nvidia-smi --id=" + busId + " --query-gpu=" + fields + " --format=csv,noheader");
+}
+
 inline std::string cpuName() {
 #ifdef _WIN32
     return shell("powershell -NoProfile -Command \"(Get-CimInstance Win32_Processor).Name\"");
