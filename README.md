@@ -163,8 +163,8 @@ display on the same GPU adds other processes' traffic to some profiles, and the 
 (`--workload`), take the batch sizes from the benchmarks (`--batches`), and write the regions of iteration 0 to
 `ncu_regions.csv` in the results folder (`--regions 0`) for the traffic model. The paths and their environment variables
 are at the top of `scripts/ncu_common.sh`; `PIPELINES` limits the profiles to some of the pipelines (e.g. one profiled
-again after a change of its program); with only some of them, the scripts require `OUT`, a new folder for their reports,
-since each script deletes the earlier reports of its folder.
+again after a change of its program); with only some of them, the scripts require `OUT`, a folder without reports, since
+each script deletes the earlier reports of its folder.
 
 They need root while the driver restricts the GPU performance counters to administrators (`RmProfilingAdminOnly=1` in
 `/proc/driver/nvidia/params`, the default); with the nvidia module option `NVreg_RestrictProfilingToAdminUsers=0` they

@@ -24,18 +24,23 @@ if [ "$(id -u)" -ne 0 ] && ! grep -q "RmProfilingAdminOnly: 0" /proc/driver/nvid
 fi
 ALL_PIPELINES="opencv_cuda npp npp_crop_nv12 fkl_vf_hf fkl_bvf"
 PIPELINES=${PIPELINES:-$ALL_PIPELINES}
+PIPELINES=$(echo $PIPELINES)  # one space between names, whatever separated them
 for pipeline in $PIPELINES; do
     if [[ " $ALL_PIPELINES " != *" $pipeline "* ]]; then
         echo "PIPELINES: $pipeline is not one of the profiled pipelines ($ALL_PIPELINES)" >&2
         exit 1
     fi
 done
-# Each script deletes the earlier reports of its OUT folder, so some pipelines profiled into the default folder would
-# leave the others' reports deleted and the summaries incomplete
+# Each script deletes the earlier reports of its OUT folder, so some pipelines profiled into the default folder, or
+# into a folder with reports, would leave the others' reports deleted and the summaries incomplete
 for pipeline in $ALL_PIPELINES; do
-    if [[ " $(echo $PIPELINES) " != *" $pipeline "* ]] && [ -z "${OUT:-}" ]; then
-        echo "PIPELINES lists only some of the pipelines: set OUT to a new folder for their reports" >&2
-        exit 1
+    if [[ " $PIPELINES " != *" $pipeline "* ]]; then
+        if [ -z "${OUT:-}" ] || compgen -G "$OUT/*.ncu-rep" > /dev/null; then
+            echo "PIPELINES lists only some of the pipelines: set OUT to a new folder (without reports) for their" \
+                 "reports" >&2
+            exit 1
+        fi
+        break
     fi
 done
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
