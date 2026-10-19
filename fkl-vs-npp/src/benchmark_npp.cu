@@ -13,7 +13,8 @@
 //                  the rest of the pipeline reads as before): 3N + 4 kernels
 //   fkl_bvf        one FKL kernel for the whole chain (BVF)
 // The two NPP forms each have their own loop and speedup in every mode; per batch size, each view (latency, GPU only,
-// GPU only with the L2 flushed) reports the form with the lower median in that view (the results report says which).
+// GPU only with the L2 flushed) reports the validated form with the lower median in that view (the results report says
+// which).
 
 #include <npp.h>
 
@@ -197,7 +198,7 @@ struct NppVsFkl {
               "NaN.\n"
            << "The two NPP forms each run their own loop (npp, then npp_crop_nv12, then FKL BVF) and have their own "
               "speedup in every mode; per batch size, each view (latency, GPU only, GPU only with the L2 flushed) "
-              "reports the form with the lower median in that view.\n";
+              "reports the validated form with the lower median in that view.\n";
     }
 
     static std::string diagnostic(const Context& ctx) { return nppConversionDiagnostic(ctx); }

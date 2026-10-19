@@ -10,8 +10,8 @@ the [workload](../README.md#workload) of every benchmark of this repository (NV1
 | `fkl_bvf` | FKL with BVF: one `executeOperations` call, one kernel for the whole chain, with no intermediates in memory |
 
 The two OpenCV forms each have their own loop and speedup in every mode; per batch size, each view (latency, GPU only,
-GPU only with the L2 flushed) reports the form with the lower median in that view (the results report says which form
-each view reports, and the CSVs keep both).
+GPU only with the L2 flushed) reports the validated form with the lower median in that view (the results report says
+which form each view reports, and the CSVs keep both).
 
 OpenCV's converter computes in float with the standard's coefficients and truncates to 8 bits, so both OpenCV forms are
 checked against the chain on FKL's CPU backend with the RGB truncated to 8 bits (`fkl_cpu_8bit_rgb_truncated`; OpenCV's

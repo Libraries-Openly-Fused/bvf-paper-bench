@@ -77,19 +77,21 @@ These programs use a 5x5 box, one pass, and every batch size.
 | `benchmark_nppdx_neighborhood` | `nppdx` | one kernel ([`src/nppdx_box.h`](src/nppdx_box.h)): NPPDx's NV12 ingest of the crop (the crop is the image, so the halo replicates its edge), `FromLimitedLuma` / `FromLimitedChroma`, `ColorConvert` BT.601 and `BoxBlur<5, 5>`, then the normalization and the float3 write written by hand, as `fkl-vs-nppdx`'s NPPDx kernel (NPPDx has no float output); one launch for the N crops | 1 |
 | every program | `fkl_dpp` | one kernel (see above) | 1 |
 
-**NV12 conversions:** every baseline converts with its own library (OpenCV CUDA with cudacodec's converter, NPP with
-its color twist), of the whole frame or, in the `_crop_nv12` forms, of what the crops need. NPP's per-crop conversion
-writes each crop at its position in the 8 bit frame. OpenCV's converter cannot restrict the rows (its kernel reads the
-chroma of a luma row at a distance fixed by the surface's height), but it can the columns: its per-crop form converts
-the full-height strip of each crop's columns (2160 x 64 pixels) into those columns of the 8 bit frame. The frame of a
+**NV12 conversions:** every baseline converts with its own library (OpenCV CUDA with cudacodec's converter, NPP with its
+color twist), of the whole frame or, in the `_crop_nv12` forms, of what the crops need. NPP's per-crop conversion writes
+each crop at its position in the 8 bit frame. OpenCV's converter cannot restrict the rows (its kernel reads the chroma
+of a luma row at a distance fixed by the surface's height), but it can the columns: its per-crop form converts the
+full-height strip of each crop's columns (2160 x 64 pixels) into those columns of the 8 bit frame. The frame of a
 per-crop form is written only where the crops (or their strips) of the iteration land, and only pixels of the crops are
 read; before every validated run of a per-crop form the 8 bit frame is filled with 0, so that a pixel the crops do not
 convert would fail the check. Each form has its own loop and speedup in every mode. Per batch size, of each pipeline's
 two conversion forms (`npp` and `npp_crop_nv12`, `npp_32f` and `npp_32f_crop_nv12`, `opencv_cuda` and
 `opencv_cuda_crop_nv12`, `opencv_cuda_rgba` and `opencv_cuda_rgba_crop_nv12`), each view (latency, GPU only, GPU only
-with the L2 flushed) reports the one with the lower median in that view (the results report says which form each view
-reports, and the CSVs keep both); the pipelines themselves (NPP's 8 bit and float boxes, OpenCV's RGB and RGBA) are
-reported as before.
+with the L2 flushed) reports the validated one with the lower median in that view (the results report says which form
+each view reports, and the CSVs keep both). The pipelines themselves are not variants of one another: `npp`, `npp_32f`
+and `npp_32f_frame` (NPP's 8 bit box, float box on float crops, float box on the float frame) and `opencv_cuda` and
+`opencv_cuda_rgba` (OpenCV's RGB and RGBA pipelines) are each reported on their own, with their own speedups, as in
+results-v4; the choice by view is only between a pipeline's two conversion forms.
 
 **NPPDx configurations:** every tile of the crop that NPPDx supports (64x32, then halvings of
 the longer side down to 8x8, in 4x2 pixel cells) runs with NPPDx's recommended block and with `BlockDim` 64, 128, 256

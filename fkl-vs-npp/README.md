@@ -10,8 +10,8 @@ Part of the [BVF paper benchmarks](../README.md): the Figure 1 pipeline with NVI
 | `fkl_bvf` | FKL with BVF: one `executeOperations` call, one kernel for the whole chain, with no intermediates in memory |
 
 The two NPP forms each run their own loop (`npp`, then `npp_crop_nv12`, then `fkl_bvf`) in every mode, each with its
-speedup; per batch size, each view (latency, GPU only, GPU only with the L2 flushed) reports the form with the lower
-median in that view (the results report says which form each view reports, and the CSVs keep both).
+speedup; per batch size, each view (latency, GPU only, GPU only with the L2 flushed) reports the validated form with the
+lower median in that view (the results report says which form each view reports, and the CSVs keep both).
 
 NPP's bilinear resize samples at `dst * scale - 0.25` (measured with linear ramps, for upscales), not at
 `dst * scale` like FKL's, so NPP is checked against the chain on FKL's CPU backend with the RGB rounded to 8 bits and

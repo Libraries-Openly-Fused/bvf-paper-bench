@@ -2,7 +2,8 @@
 # checks that the benchmarks are of one workload, sets BATCHES (the batch sizes of the benchmarks) and the batch sizes
 # of the warm and SM-L2 profiles, writes the regions of the profiled iteration to ncu_regions.csv in the results folder
 # (for the traffic model), and defines profile_pipelines <N>, which calls the script's profile function for every
-# pipeline: OpenCV CUDA, NPP, FKL VF+HF and FKL BVF, with report names <benchmark folder>__<implementation>_N<N>.
+# pipeline: OpenCV CUDA and NPP, each in both forms of its NV12 conversion (opencv_cuda and opencv_cuda_crop_nv12, npp
+# and npp_crop_nv12), FKL VF+HF and FKL BVF, with report names <benchmark folder>__<implementation>_N<N>.
 #
 # Every profile is one execution on the regions of iteration 0 (the --ncu-target mode of the benchmarks), the same
 # regions for every pipeline.

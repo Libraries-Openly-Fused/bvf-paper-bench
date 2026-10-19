@@ -14,7 +14,7 @@
 //                 kernels
 //   fkl_bvf       one FKL kernel for the whole chain (BVF)
 // The two OpenCV forms each have their own loop and speedup in every mode; per batch size, each view (latency, GPU
-// only, GPU only with the L2 flushed) reports the form with the lower median in that view.
+// only, GPU only with the L2 flushed) reports the validated form with the lower median in that view.
 
 #include <opencv2/core.hpp>
 #include <opencv2/core/cuda.hpp>
@@ -148,8 +148,8 @@ struct OpenCVCudaVsFkl {
               "(overlapping strips are converted twice), and only pixels of the regions are read; before every "
               "validated run, the 8 bit frame is filled with 0 as well as the output with NaN.\n"
            << "The two OpenCV forms each have their own loop and speedup in every mode; per batch size, each view "
-              "(latency, GPU only, GPU only with the L2 flushed) reports the form with the lower median in that "
-              "view.\n";
+              "(latency, GPU only, GPU only with the L2 flushed) reports the validated form with the lower median "
+              "in that view.\n";
     }
 
     static std::string diagnostic(const Context& ctx) { return opencv::conversionDiagnostic(ctx); }

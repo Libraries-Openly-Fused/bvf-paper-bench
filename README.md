@@ -28,14 +28,15 @@ One folder per library compared with FKL, each its own CMake project with its ow
 
 Next to them:
 
-- [`common/`](common): the workload of every benchmark (`bench_geometry.h`, `bench_geometry.cmake`), the harness of the
-  GPU benchmarks of OpenCV CUDA, NPP and FKL's ablation (`bench_gpu.h`, `bench_gpu.cmake`), the harness of the CPU
+- [`common/`](common): the workload of every benchmark (`bench_geometry.h`, `bench_geometry.cmake`), the harness of
+  the GPU benchmarks of OpenCV CUDA, NPP and FKL's ablation (`bench_gpu.h`, `bench_gpu.cmake`), the harness of the CPU
   benchmarks (`bench_cpu.h`, `bench_cpu.cmake`, FKL's side in `bench_fkl_cpu.cpp`), the pipeline's constants and its
   plain C++ reference (`bench_pipeline.h`, `bench_reference.h`), the timing statistics and FKL's two-execution CSV
-  format (`bench_timing.h`), the validation rules shared by every GPU benchmark (`bench_validation.h`), NPP's error check and NV12 conversion (`bench_npp.h`), the
-  platform description (`bench_platform.h`), the common part of the compile-time units (`compile_time_unit.h`), and the
-  workload and BVF box operation of the neighborhood experiment (`bench_neighborhood.h`,
-  `bench_neighborhood_ops.h`, shared with `rocm/`);
+  format (`bench_timing.h`), the validation rules shared by every GPU benchmark (`bench_validation.h`), NPP's error
+  check and NV12 conversion (`bench_npp.h`), OpenCV CUDA's NV12 conversion (`bench_opencv_cuda.h`), the platform
+  description (`bench_platform.h`), the common part of the compile-time units (`compile_time_unit.h`), and the workload
+  and BVF box operation of the neighborhood experiment (`bench_neighborhood.h`, `bench_neighborhood_ops.h`, shared with
+  `rocm/`);
 - [`scripts/`](scripts): `run_all.sh` (every benchmark but `rocm/`), the memory traffic with Nsight Compute
   (`ncu_dram.sh`, `ncu_l2.sh`, `ncu_common.sh`, `ncu_summarize.py`, `ncu_traffic_model.py`), the compile time
   (`compile_time.sh`, `compile_time_summarize.py`), the runner-up NPPDx configurations (`nppdx_runner_up.py`) and the
@@ -51,14 +52,14 @@ Every benchmark of this repository takes its workload from [`common/bench_geomet
 
 - the frame: 3840x2160 NV12, uniform random values in the legal range of limited (video) range NV12, Y in [16, 235]
   and U, V in [16, 240] (seed 1), as in real video;
-- the color conversion: NV12 to RGB with BT.601 in limited range, in every implementation, because it is the only
-  NV12 conversion that every library offers (OpenCV's CPU `cvtColor` and `cvtColorTwoPlane` have no other; OpenCV
-  CUDA's through cudacodec's `NVSurfaceToColorConverter`, NPP's through its color twist with the BT.601 matrix,
-  NPPDx's through `FromLimitedLuma`, `FromLimitedChroma` and `ColorConvert<yuv_bt601, rgb>`). Every baseline converts
-  with its own library, and where the library can convert less than the frame, the per-crop form is a variant of the
-  full-frame one (NPP and OpenCV on the CPU convert each crop; OpenCV CUDA's converter cannot restrict the rows, so it
-  converts the full-height strip of each crop's columns). Both forms are measured in every mode, and per batch size
-  each view (latency, GPU only, GPU only with the L2 flushed; on the CPU, each thread count) reports the library's form
+- the color conversion: NV12 to RGB with BT.601 in limited range, in every implementation, because it is the only NV12
+  conversion that every library offers (OpenCV's CPU `cvtColor` and `cvtColorTwoPlane` have no other; OpenCV CUDA's
+  through cudacodec's `NVSurfaceToColorConverter`, NPP's through its color twist with the BT.601 matrix, NPPDx's through
+  `FromLimitedLuma`, `FromLimitedChroma` and `ColorConvert<yuv_bt601, rgb>`). Every baseline converts with its own
+  library, and where the library can convert less than the frame, the per-crop form is a variant of the full-frame one
+  (NPP and OpenCV on the CPU convert each crop; OpenCV CUDA's converter cannot restrict the rows, so it converts the
+  full-height strip of each crop's columns). Both forms are measured in every mode, and per batch size each view
+  (latency, GPU only, GPU only with the L2 flushed; on the CPU, each thread count) reports the library's validated form
   with the lower median in that view;
 - the regions, new in every iteration (warm-up and timed): 100 per iteration, batch N uses the first N. Their sizes are
   20x10, 32x16 and 48x24 by turns: region i of iteration t has the size (i + t) mod 3 of that list, so every iteration
