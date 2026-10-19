@@ -246,12 +246,13 @@ int main(int argc, char** argv) {
              "rows set to 0 and mul_, sub_, div_ on the whole N x 64 x 64 x 3 tensor. Variants: the 2 x 2 "
              "combinations of chroma terms and resize input; for every thread count and batch size PyTorch's complete "
              "loop runs with each before the comparison, which uses the one with the lower median "
-             "(pytorch_variant_sweep.csv). cpu_validation.csv has one row per validated iteration and variant\n";
+             "(pytorch_variant_sweep.csv)\n";
         writeCpuPlatform(p, threads,
                          {"cpu_validation.csv",
                           "PyTorch against the reference with its pixel-center sampling, and PyTorch on its thread "
                           "count against PyTorch on one thread",
-                          "PyTorch's per-region views and operator calls are timed"});
+                          "PyTorch's per-region views and operator calls are timed",
+                          "one row per validated iteration and PyTorch variant"});
         std::cout << "Results written to " << std::filesystem::absolute(outDir) << std::endl;
         if (!passed) {
             throw std::runtime_error("validation failed (FKL or PyTorch against its reference, FKL's pool against FKL, "
