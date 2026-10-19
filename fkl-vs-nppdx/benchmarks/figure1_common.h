@@ -706,14 +706,17 @@ int figure1Main(int argc, char** argv) {
                     "iteration), generated before the loops; NPPDx gets their origins as a kernel parameter and FKL "
                     "their rectangles in its build() calls, both converted before the loops (statistics of the timed "
                     "ones in regions.csv).\n"
-                 << "Timing, three benchmarks: " << benchmark::WARMUP_ITERS << " warm-up and " << benchmark::ITERS
-                 << " timed iterations, in each one " << P::label << " and then FKL, with a synchronization after each. "
+                 << "Timing, three benchmarks: the two pipelines never run at the same time: for every batch size, "
+                 << P::label << "'s complete loop (" << benchmark::WARMUP_ITERS << " warm-up and " << benchmark::ITERS
+                 << " timed iterations) runs first, then FKL's on the same regions, with a synchronization after every "
+                    "run. "
                     "CPU + GPU (" << name << "_" << parArch << ".csv): CUDA events around everything the host does "
                     "to enqueue the pipeline plus its execution. GPU only (" << name << "_gpu_only_" << parArch
                  << ".csv): a second pass with CUPTI kernel tracing, the sum of the GPU execution times of the "
                     "pipeline's kernels. GPU only with the L2 flushed before every kernel (" << name
                  << "_gpu_only_l2_flushed_" << parArch << ".csv, --gpu-only-l2-flushed, a separate run). The speedup is "
-                    "computed per iteration and averaged. Times in the CSV are in ms.\n"
+                    "computed per iteration (the runs of the same iteration, identical inputs) and averaged. Times in "
+                    "the CSV are in ms.\n"
                  << "nvcc flags: -O3 -DNDEBUG -std=c++20 --threads 0 -rdc=false -split-compile=0 -ftemplate-depth=1000 "
                     "-lineinfo --expt-relaxed-constexpr, CUDA_ARCHITECTURES " << CUDA_ARCHITECTURES_STR << "\n"
                  << "Correctness: before the timing, on the regions of the first, every "
