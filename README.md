@@ -56,11 +56,12 @@ Every benchmark of this repository takes its workload from [`common/bench_geomet
   conversion that every library offers (OpenCV's CPU `cvtColor` and `cvtColorTwoPlane` have no other; OpenCV CUDA's
   through cudacodec's `NVSurfaceToColorConverter`, NPP's through its color twist with the BT.601 matrix, NPPDx's through
   `FromLimitedLuma`, `FromLimitedChroma` and `ColorConvert<yuv_bt601, rgb>`). Every baseline converts with its own
-  library, and where the library can convert a crop on its own (NPP, OpenCV on the CPU), the per-crop form is a variant
-  of the full-frame one (OpenCV CUDA's converter cannot convert a crop: it cannot restrict the rows, and a full-height
-  strip of a crop's columns is not a crop, so it converts the whole frame). Both forms are measured in every mode, and
-  per batch size each view (latency, GPU only, GPU only with the L2 flushed; on the CPU, each thread count) reports the
-  library's validated form with the lower median in that view;
+  library (except rocm/'s RPP HOST pipelines: RPP's NV12 conversion is HIP only, so they start with FKL's CPU conversion
+  of the full frame; see [rocm/README.md](rocm/README.md)), and where the library can convert a crop on its own (NPP,
+  OpenCV on the CPU), the per-crop form is a variant of the full-frame one (OpenCV CUDA's converter cannot convert a
+  crop: it cannot restrict the rows, and a full-height strip of a crop's columns is not a crop, so it converts the whole
+  frame). Both forms are measured in every mode, and per batch size each view (latency, GPU only, GPU only with the L2
+  flushed; on the CPU, each thread count) reports the library's validated form with the lower median in that view;
 - the regions, new in every iteration (warm-up and timed): 100 per iteration, batch N uses the first N. Their sizes are
   20x10, 32x16 and 48x24 by turns: region i of iteration t has the size (i + t) mod 3 of that list, so every iteration
   mixes the three and every region cycles through them. Their positions are uniform random (seed 42), with even
@@ -162,7 +163,8 @@ display on the same GPU adds other processes' traffic to some profiles, and the 
 (`--workload`), take the batch sizes from the benchmarks (`--batches`), and write the regions of iteration 0 to
 `ncu_regions.csv` in the results folder (`--regions 0`) for the traffic model. The paths and their environment variables
 are at the top of `scripts/ncu_common.sh`; `PIPELINES` limits the profiles to some of the pipelines (e.g. one profiled
-again, into a new `OUT` folder, after a change of its program).
+again after a change of its program); with only some of them, the scripts require `OUT`, a new folder for their reports,
+since each script deletes the earlier reports of its folder.
 
 They need root while the driver restricts the GPU performance counters to administrators (`RmProfilingAdminOnly=1` in
 `/proc/driver/nvidia/params`, the default); with the nvidia module option `NVreg_RestrictProfilingToAdminUsers=0` they
