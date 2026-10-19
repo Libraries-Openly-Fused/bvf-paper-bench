@@ -28,12 +28,12 @@
 //
 // The two libraries of a comparison never run at the same time: the library's complete loop (warm-up and timed
 // iterations) runs first, then FKL's, on the same regions. Iteration t of each loop uses the regions of iteration t,
-// generated before the loops; each library converts them into its own arguments before the loops too, and what it does
-// with them in the iteration (FKL's build() calls and fusion, the library's per-region work) is timed. FKL's speedup is
+// generated before the loops; FKL converts them into its rectangles before the loops, and its build() calls and fusion
+// are timed; each program says what its library does with them inside its timed run (CpuPlatformText). FKL's speedup is
 // the mean over the timed iterations of (library time / FKL time) of the same iteration, which pairs runs on identical
-// inputs. Every timed run is preceded by a 1 ms idle gap, so that the library's own thread pool, whose workers spin for
-// a while after a run and then sleep, is asleep when the run starts, as when a pipeline runs once per video frame; each
-// library keeps its own pool and idle behaviour. The timing thread busy-waits the gap instead of sleeping: a sleeping
+// inputs. Every timed run is preceded by a 1 ms idle gap, as when a pipeline runs once per video frame: a pool whose
+// workers spin for less than that after a run (FKL's, OpenCV's, Halide's) is asleep when the run starts, one that spins
+// longer (PyTorch's libgomp) is still spinning; each library keeps its own threads and idle behaviour. The timing thread busy-waits the gap instead of sleeping: a sleeping
 // core enters its deepest C-state, and the run right after it then pays a wake-up whose cost depends on each binary's
 // code (fkl-vs-opencv-cpu/README.md).
 
@@ -267,10 +267,19 @@ inline bool withinTolerance(float error) {
     return std::isfinite(error) && error <= validation::TOLERANCE;
 }
 
+// What a program says about its library in the lines every CPU benchmark shares
+struct CpuPlatformText {
+    // The program's validation CSV
+    std::string validationFile = "cpu_validation.csv";
+    // What the program requires of its library, besides FKL's checks (within the tolerance)
+    std::string libraryValidation;
+    // What the library does with the regions of an iteration, and whether it is timed
+    std::string libraryRegions;
+};
+
 // The lines of the platform file that every CPU benchmark shares: the CPU, FKL, the OS, the workload, the regions, the
-// timing and the validation (validationFile: the program's validation CSV); the program writes its library's lines
-// before them
-inline void writeCpuPlatform(std::ostream& p, int threads, const std::string& validationFile = "cpu_validation.csv") {
+// timing and the validation; the program writes its library's lines before them
+inline void writeCpuPlatform(std::ostream& p, int threads, const CpuPlatformText& text) {
     p << "CPU: " << cpuName() << ", " << std::thread::hardware_concurrency() << " hardware threads; a multithreaded "
       << "comparison gives each side " << threads << " threads, FKL's pool size (the program's lines say how the "
       << "library uses them)\n"
@@ -286,32 +295,32 @@ inline void writeCpuPlatform(std::ostream& p, int threads, const std::string& va
       << poolThreads() << " workers, thread-pool " << BENCH_THREAD_POOL_COMMIT
       << ", workers spin 100 us before sleeping, one chunk per output row of each crop), compiled with "
       << BENCH_COMPILER << ", flags " << BENCH_CXX_FLAGS
-      << ", in its own translation unit (common/bench_fkl_cpu.cpp), the first of the program, its code section aligned to "
-         "4096 bytes (" << fklCodeAlignment() << ")\n"
+      << ", in its own translation unit (common/bench_fkl_cpu.cpp), the first of the program; " << fklCodeAlignment()
+      << "\n"
       << "Benchmark repository: commit " << BENCH_REPO_COMMIT << "\n"
       << "OS: " << osName() << "\n"
       << "Workload: " << describe() << "\n"
       << "Pipeline: as the GPU benchmarks, with BT.601 limited range for NV12 -> RGB\n"
       << "Regions: iteration t of each loop (the " << WARMUP_ITERS << " warm-up iterations are t in [0, " << WARMUP_ITERS
       << "), the " << ITERS << " timed ones t in [" << WARMUP_ITERS << ", " << WARMUP_ITERS + ITERS
-      << ")) runs on the regions of iteration t, generated before the loops and "
-      << "converted into each library's arguments before them too (statistics of the timed ones in regions.csv); "
-      << "FKL's build() calls and fusion and the library's per-region work are timed.\n"
+      << ")) runs on the regions of iteration t, generated before the loops (statistics of the timed ones in "
+      << "regions.csv). FKL converts them into its rectangles before the loops, and its build() calls and fusion are "
+      << "timed; " << text.libraryRegions << ".\n"
       << "Timing: steady_clock around each pipeline; for every batch size, the library's loop (" << WARMUP_ITERS
       << " warm-up and " << ITERS << " timed iterations) runs to completion first, then FKL's on the same regions: the "
       << "two libraries never run at the same time. Every run is preceded by a "
       << std::chrono::milliseconds(IDLE_GAP).count()
-      << " ms idle gap, busy-waited by the timing thread (so that its core does not enter a deep C-state), while the "
-         "worker threads of the previous run fall asleep; each library keeps its own threads and idle behaviour. "
+      << " ms idle gap, busy-waited by the timing thread (so that its core does not enter a deep C-state), in which "
+         "the worker threads of the previous run fall asleep if they spin for less than that (the lines above say how "
+         "long each pool's workers stay busy after a run); each library keeps its own threads and idle behaviour. "
          "Speedup: mean over "
          "the timed iterations of (library time / FKL time) of the same iteration (the *_per_iteration.csv files, times "
          "in ms, as in the comparison CSVs).\n"
       << "Validation: before the timing, on the regions of the first, every " << validation::VALIDATION_STRIDE
-      << "th and the last timed iteration (" << validationFile << ", one row per iteration): FKL against the "
-      << "reference with its conventions, FKL's pool against FKL on one thread, and the library on its thread count "
-      << "against itself on one thread must agree within " << validation::TOLERANCE << " (maximum absolute difference); "
-      << "the program exits with an error otherwise. The library's errors against a reference of its own conventions "
-      << "are written next to them.\n";
+      << "th and the last timed iteration (" << text.validationFile << ", one row per iteration): FKL against the "
+      << "reference with its conventions, FKL's pool against FKL on one thread, and " << text.libraryValidation
+      << " must agree within " << validation::TOLERANCE << " (maximum absolute difference); the program exits with an "
+      << "error otherwise.\n";
 }
 
 } // namespace bench::cpu

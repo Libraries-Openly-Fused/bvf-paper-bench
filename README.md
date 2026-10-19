@@ -209,24 +209,29 @@ The two libraries of a comparison never run at the same time:
 - **Paired speedups.** FKL's speedup is the mean over the timed iterations of (library time / FKL time) of the same
   iteration, which pairs runs on identical inputs. Every comparison CSV has a `_per_iteration.csv` sibling with the
   pairs.
-- **Idle gap.** Every run follows a 1 ms idle gap. The timing thread busy-waits it, so the library's thread pool,
-  whose workers spin for a while after a run and then sleep, is asleep when a run starts, while the timing thread's
-  core stays out of a deep C-state. Each library keeps its own pool and idle behaviour.
+- **Idle gap.** Every run follows a 1 ms idle gap, which the timing thread busy-waits, so that its core stays out of a
+  deep C-state. A pool whose workers spin for less than that after a run (FKL's, OpenCV's, Halide's) is asleep when
+  the next run starts; one that spins longer (PyTorch's libgomp, by default) is still spinning. Each library keeps its
+  own threads and idle behaviour.
 - **Worker busy time.** Each program measures how long the workers of both pools stay busy after a run with little
   work: their spin and wake-up, from `/proc/self/task/*/schedstat` on Linux. It records them in its platform file
   (`cpu_platform*.txt`).
 - **Validation.** Before the timing, on the regions of the first, every 50th and the last timed iteration, FKL against
-  the reference with its conventions and FKL's pool against FKL on one thread, and the library on its thread count
-  against itself on one thread, must agree within 1e-3: otherwise the program writes its files and exits with an
-  error. The library's errors against a reference of its own conventions are written next to them.
+  the reference with its conventions, FKL's pool against FKL on one thread, and what each program requires of its
+  library (its README and platform file say what: against a reference of its conventions, or on its thread count
+  against itself on one thread) must agree within 1e-3: otherwise the program writes its files and exits with an
+  error.
 
 FKL's side is the only translation unit of a program that includes FKL: FKL's headers define variable template
 specializations that are not `inline`, so a program can include them in one translation unit only. It is compiled with
 FKL's options only (none of the compared library's), so its object file is the same in every CPU benchmark built with
-the same compiler and flags. It is linked first, and a function in it is aligned to 4096 bytes (GCC and Clang), which
-aligns its code section: every FKL function then has the same address modulo 4096 in every CPU benchmark, whatever the
-sections before the code (which grow with each library's imported symbols) take. The platform file records the
-addresses modulo 4096 of that function (0) and of one more FKL function, the same in every CPU benchmark. The [protocol change](fkl-vs-opencv-cpu/README.md#protocol-change)
+the same compiler and flags. It is linked first, and with GCC and Clang a function and five variables in it are
+aligned to 4096 bytes, which aligns its code, read-only data, vtables, data and zero-initialized data sections: FKL's
+functions (its template instantiations, in sections of their own, follow in the same order), vtables and static
+objects then have the same addresses modulo 4096 in every CPU benchmark, whatever the sections before them (which grow
+with each library's imported symbols) take. Only the constants and exception tables the linker merges with the other
+objects' are not aligned. The platform file records three of those addresses; `nm` on two programs compares all of
+them. The [protocol change](fkl-vs-opencv-cpu/README.md#protocol-change)
 section of FKL vs OpenCV on the CPU explains the busy-waited gap and the separate translation unit.
 
 ## Requirements
