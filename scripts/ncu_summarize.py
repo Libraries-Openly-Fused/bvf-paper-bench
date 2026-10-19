@@ -85,7 +85,7 @@ def main():
     cfg = MODES[mode]
     # The benchmarks and pipelines the profiling scripts profile, in the order of the summary
     benches = ["fkl-vs-opencv-cuda", "fkl-vs-npp", "fkl-ablation"]
-    order = ["opencv_cuda", "npp", "npp_crop_nv12", "fkl_vf_hf", "fkl_bvf"]
+    order = ["opencv_cuda", "opencv_cuda_crop_nv12", "npp", "npp_crop_nv12", "fkl_vf_hf", "fkl_bvf"]
     summary = []
     for report in sorted((RESULTS / cfg["dir"]).glob("*.ncu-rep")):
         match = REPORT_NAME.match(report.stem)

@@ -9,7 +9,8 @@
 #
 #   SET=ablation      fkl-ablation: FKL's headers alone (HEADERS 1), FKL VF+HF at N = 1 and 100, FKL BVF at every N,
 #                     FKL BVF with CONDITIONAL_WITH_DEFAULT at N = 100
-#   SET=opencv-cuda   fkl-vs-opencv-cuda: the headers of FKL, OpenCV CUDA and NPP, the OpenCV pipeline at N = 100
+#   SET=opencv-cuda   fkl-vs-opencv-cuda: the headers of FKL and OpenCV CUDA (with cudacodec, for OpenCV's NV12
+#                     conversion; before bvf-paper-bench #20 NPP's, with npp.h), the OpenCV pipeline at N = 100
 #   SET=npp           fkl-vs-npp: the headers of FKL and NPP, the NPP pipeline at N = 100
 #   SET=nppdx         fkl-vs-nppdx: the headers of FKL and NPPDx, FKL BVF and the NPPDx kernel at N = 100
 #

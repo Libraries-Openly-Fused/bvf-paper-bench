@@ -7,8 +7,8 @@ cmake_minimum_required(VERSION 3.28)
 project(fkl_neighborhood LANGUAGES CXX CUDA)
 include(${CMAKE_CURRENT_SOURCE_DIR}/../common/bench_gpu.cmake)
 
-# The OpenCV CUDA program needs OpenCV 4.14 with CUDA and the opencv_contrib modules cudaarithm, cudafilters and
-# cudaimgproc (-DOpenCV_DIR=<OpenCV build or install>), and NPP for the NV12 conversion
+# The OpenCV CUDA program needs OpenCV 4.14 with CUDA and the opencv_contrib modules cudaarithm, cudacodec (its NV12
+# conversion; it needs videoio and cudawarping), cudafilters and cudaimgproc (-DOpenCV_DIR=<OpenCV build or install>)
 option(BENCH_OPENCV "Build the OpenCV CUDA program" ON)
 # The NPPDx programs need CMake 3.30 or newer and the nppdx submodule (or NPPDX_DIR)
 option(BENCH_NPPDX "Build the NPPDx programs" ON)

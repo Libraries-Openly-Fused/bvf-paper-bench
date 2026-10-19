@@ -19,16 +19,23 @@
 // separable filter takes 3 channels, the 2D one (createLinearFilter) 1 or 4. Its filters build their border from the
 // image they are given (a view of the crop), so REPLICATE replicates the edge of the crop.
 // The NV12 -> RGB is OpenCV's own (cudacodec's NVSurfaceToColorConverter, common/bench_opencv_cuda.h), of the whole
-// frame: it converts whole surfaces only.
+// frame or, in the _crop_nv12 forms, per crop of the full-height strip of the crop's columns (FRAME_H x w: the
+// converter cannot restrict the rows), written at those columns of the 8 bit frame.
 //   opencv_cuda       OpenCV's NV12->RGB of the whole frame; per crop convertTo 32FC3 of the crop of the 8 bit frame,
 //                     then createSeparableLinearFilter (CV_32FC3, row and column taps 1/5, BORDER_REPLICATE; a row and
 //                     a column kernel) into its plane of the float3 output; then multiply, subtract and divide on the
 //                     whole output: 3N + 4 kernels
+//   opencv_cuda_crop_nv12
+//                     the same with the conversion of each crop's strip: 4N + 3 kernels
 //   opencv_cuda_rgba  OpenCV's NV12->RGBA of the whole frame (the converter writes RGBA directly); per crop convertTo
 //                     32FC4, then createLinearFilter (CV_32FC4, 5x5 taps 1/25, BORDER_REPLICATE; one kernel) into its
 //                     plane of a 4 channel output; multiply, subtract and divide on it; cvtColor RGBA2RGB into the
 //                     float3 output: 2N + 5 kernels
+//   opencv_cuda_rgba_crop_nv12
+//                     the same with the conversion of each crop's strip: 3N + 4 kernels
 //   fkl_dpp           FKL's MorphologyDPP box blur, one kernel (neighborhood_common.h)
+// Each OpenCV form has its own loop and speedup in every mode; per batch size, the one with the lower latency median is
+// OpenCV's, in every mode.
 
 #include <opencv2/core/cuda_stream_accessor.hpp>
 #include <opencv2/cudaarithm.hpp>
@@ -60,7 +67,9 @@ struct OpenCVState {
     cv::cuda::GpuMat tensor;
 };
 
-template <size_t N, bool RGBA>
+using opencv::Nv12Form;
+
+template <size_t N, bool RGBA, Nv12Form F>
 Implementation makeOpenCV(Context& ctx) {
     auto st = std::make_shared<OpenCVState>();
     st->stream = cv::cuda::StreamAccessor::wrapStream(ctx.stream);
@@ -91,14 +100,29 @@ Implementation makeOpenCV(Context& ctx) {
     }
     cv::cuda::createContinuous(static_cast<int>(N) * PLANE_H, PLANE_W, CV_32FC3, st->tensor);
 
-    Implementation impl{RGBA ? "opencv_cuda_rgba" : "opencv_cuda", Reference::Fkl8bitTruncated};
-    impl.stages.emplace_back(RGBA ? "1_nv12_to_rgba8_full_frame" : "1_nv12_to_rgb8_full_frame", [&ctx, st](size_t) {
-        if constexpr (RGBA) {
-            st->converter.convert(ctx, st->rgba8, cv::cudacodec::ColorFormat::RGBA, st->stream);
-        } else {
-            st->converter.convert(ctx, st->rgb8, cv::cudacodec::ColorFormat::RGB, st->stream);
-        }
-    });
+    constexpr bool strip = F == Nv12Form::CropStrip;
+    Implementation impl{RGBA ? (strip ? "opencv_cuda_rgba_crop_nv12" : "opencv_cuda_rgba")
+                             : (strip ? "opencv_cuda_crop_nv12" : "opencv_cuda"),
+                        Reference::Fkl8bitTruncated};
+    const auto format = RGBA ? cv::cudacodec::ColorFormat::RGBA : cv::cudacodec::ColorFormat::RGB;
+    if constexpr (strip) {
+        // Written at each crop's columns of the 8 bit frame, every row: the rest of the pipeline reads only the crops'
+        // pixels
+        impl.stages.emplace_back(RGBA ? "1_nv12_to_rgba8_per_crop_column_strip"
+                                      : "1_nv12_to_rgb8_per_crop_column_strip",
+                                 [&ctx, st, format](size_t t) {
+            for (size_t i = 0; i < N; ++i) {
+                const cv::Rect& r = st->rects[t * N + i];
+                st->converter.convertStrip(ctx, RGBA ? st->rgba8 : st->rgb8, fk::Rect(r.x, r.y, r.width, r.height),
+                                           format, st->stream);
+            }
+        });
+    } else {
+        impl.stages.emplace_back(RGBA ? "1_nv12_to_rgba8_full_frame" : "1_nv12_to_rgb8_full_frame",
+                                 [&ctx, st, format](size_t) {
+            st->converter.convert(ctx, RGBA ? st->rgba8 : st->rgb8, format, st->stream);
+        });
+    }
     impl.stages.emplace_back(RGBA ? "3_per_crop_convertTo_linear_filter" : "3_per_crop_convertTo_separable_filter",
                              [st](size_t t) {
         cv::cuda::GpuMat& output = RGBA ? st->tensor4 : st->tensor;
@@ -141,7 +165,15 @@ Implementation makeOpenCV(Context& ctx) {
     }
     impl.run = runStages(impl.stages);
     impl.download = [st]() { return downloadDevice(st->tensor.data, N * PLANE_FLOATS); };
-    impl.fillNaN = [st]() { gpuErrchk(cudaMemset(st->tensor.data, 0xFF, N * PLANE_FLOATS * sizeof(float))); };
+    impl.fillNaN = [st]() {
+        gpuErrchk(cudaMemset(st->tensor.data, 0xFF, N * PLANE_FLOATS * sizeof(float)));
+        if constexpr (strip) {
+            // The 8 bit frame too, which keeps the strips of earlier runs: a pixel the strips of the validated
+            // iteration do not convert, if the pipeline read it, would be 0 instead of a converted value
+            const cv::cuda::GpuMat& frame = RGBA ? st->rgba8 : st->rgb8;
+            gpuErrchk(cudaMemset(frame.data, 0, frame.step * FRAME_H));
+        }
+    };
     return impl;
 }
 
@@ -156,8 +188,10 @@ struct OpenCVCudaVsFklDpp {
     template <size_t N>
     static std::vector<Implementation> implementations(Context& ctx) {
         std::vector<Implementation> impls;
-        impls.push_back(makeOpenCV<N, false>(ctx));
-        impls.push_back(makeOpenCV<N, true>(ctx));
+        impls.push_back(makeOpenCV<N, false, Nv12Form::Frame>(ctx));
+        impls.push_back(makeOpenCV<N, false, Nv12Form::CropStrip>(ctx));
+        impls.push_back(makeOpenCV<N, true, Nv12Form::Frame>(ctx));
+        impls.push_back(makeOpenCV<N, true, Nv12Form::CropStrip>(ctx));
         return impls;
     }
 
@@ -186,19 +220,28 @@ struct OpenCVCudaVsFklDpp {
            << "OpenCV CUDA pipelines: OpenCV's NV12->RGB of the whole frame into an 8 bit RGB (opencv_cuda) or RGBA "
               "(opencv_cuda_rgba) frame (cudacodec::createNVSurfaceToColorConverter(ColorSpaceStandard::BT601, "
               "videoFullRangeFlag false) and convert(SF_NV12, ColorFormat::RGB or RGBA, BitDepth::EIGHT, "
-              "interleaved): one kernel, on the raw NV12 frame without a decoder session; it converts whole surfaces "
-              "only, and truncates to 8 bits), then per crop "
+              "interleaved): one kernel, on the raw NV12 frame without a decoder session; it truncates to 8 bits), or "
+              "in the _crop_nv12 forms per crop one convert of the full-height strip of the frame's columns [x, x + "
+              "w) (a GpuMat view of FRAME_H x w at column x with the frame's pitch: the converter cannot restrict the "
+              "rows, as its kernel reads the chroma of a luma row at a distance fixed by the surface's height, but "
+              "the strip's chroma is where it reads it, x being even) into the same columns of the 8 bit frame; the "
+              "frame is then written only at the columns of the iteration's crops (overlapping strips are converted "
+              "twice), only pixels of the crops are read, and before every validated run the 8 bit frame is filled "
+              "with 0 as well as the output with NaN. Then per crop "
               "convertTo of the crop of the frame (a view of it) into a float crop and the box as a linear filter on "
               "it, written into the crop's plane of the output (OpenCV CUDA's createBoxFilter takes 8UC1, 8UC4 and "
               "32FC1 only). The filters build their border from the float crop, so BORDER_REPLICATE replicates the "
               "edge of the crop.\n"
            << "  opencv_cuda: convertTo 32FC3 and createSeparableLinearFilter(CV_32FC3, CV_32FC3, " << K << " taps of "
               "1/" << K << " for the rows and the columns, BORDER_REPLICATE), a row and a column kernel per call, "
-              "then multiply, subtract and divide on the float3 output: 3N + 4 kernels\n"
+              "then multiply, subtract and divide on the float3 output: 3N + 4 kernels (opencv_cuda_crop_nv12: 4N + "
+              "3)\n"
            << "  opencv_cuda_rgba: the converter's RGBA output (no cvtColor RGB2RGBA), convertTo 32FC4 and "
               "createLinearFilter(CV_32FC4, CV_32FC4, " << K << "x" << K << " taps of 1/" << K * K << ", "
               "BORDER_REPLICATE), one kernel per call, then multiply, subtract and divide on the 4 channel output and "
-              "one cvtColor RGBA2RGB into the float3 output: 2N + 5 kernels\n"
+              "one cvtColor RGBA2RGB into the float3 output: 2N + 5 kernels (opencv_cuda_rgba_crop_nv12: 3N + 4)\n"
+           << "Each OpenCV form has its own loop and speedup in every mode; per batch size, the one with the lower "
+              "latency median is OpenCV's, in every mode.\n"
            << "With the L2 flushed, the flush runs before every OpenCV call, not between the two kernels of the "
               "separable filter.\n"
            << "References: the 8 bit RGB of OpenCV's conversion (FKL's conversion truncated, see the diagnostic "

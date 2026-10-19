@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Compulsory-read model of the profiled pipelines (OpenCV CUDA, NPP in its two forms, FKL VF+HF, FKL BVF), next to the
-Nsight Compute measurements.
+"""Compulsory-read model of the profiled pipelines (OpenCV CUDA and NPP, each in its two forms, FKL VF+HF, FKL BVF),
+next to the Nsight Compute measurements.
 
 Run without sudo after ncu_dram.sh and ncu_l2.sh and the two ncu_summarize.py modes:
     ncu_traffic_model.py        BVF_RESULTS (default results/ next to this repository) -> traffic_model.csv in it
@@ -16,6 +16,9 @@ Model, per execution, summed over the N regions, each with its own width w and h
   - NPP's per-crop conversion (npp_crop_nv12) reads the NV12 footprint of each region in 32 byte sectors, its luma rows
     and its chroma rows, once per region: the caches are flushed before every kernel, so a region that overlaps
     another one is read again;
+  - OpenCV's per-crop conversion (opencv_cuda_crop_nv12) reads per region the full-height strip of its columns (the
+    converter cannot restrict the rows): every luma and chroma row of the frame, over the region's columns in 32 byte
+    sectors, once per region, as NPP's;
   - OpenCV and NPP: per region the crop stage reads the 8 bit RGB region (3 w h bytes), the resize stage the float3
     region (12 w h) and the border stage the float3 resized region, once each; the three pointwise passes read the
     whole output three times;
@@ -48,8 +51,9 @@ import sys
 RESULTS = pathlib.Path(os.environ.get("BVF_RESULTS", pathlib.Path(__file__).resolve().parents[2] / "results"))
 SECTOR = 32
 # (benchmark folder, implementation) of every profiled pipeline (scripts/ncu_common.sh)
-PIPELINES = [("fkl-vs-opencv-cuda", "opencv_cuda"), ("fkl-vs-npp", "npp"), ("fkl-vs-npp", "npp_crop_nv12"),
-             ("fkl-ablation", "fkl_vf_hf"), ("fkl-ablation", "fkl_bvf")]
+PIPELINES = [("fkl-vs-opencv-cuda", "opencv_cuda"), ("fkl-vs-opencv-cuda", "opencv_cuda_crop_nv12"),
+             ("fkl-vs-npp", "npp"), ("fkl-vs-npp", "npp_crop_nv12"), ("fkl-ablation", "fkl_vf_hf"),
+             ("fkl-ablation", "fkl_bvf")]
 
 
 def workload():
@@ -109,6 +113,9 @@ def main():
     def requested(n):  # the footprints of the first n regions, summed: what their loads request from L2
         return sum(footprint(x, rw, rh) for x, _, rw, rh in regs[:n])
 
+    def strips(n):  # the full-height NV12 strips of the columns of the first n regions, summed (OpenCV's per-crop form)
+        return sum(footprint(x, rw, w["frame_h"]) for x, _, rw, _ in regs[:n])
+
     def sources(n):  # the NV12 sectors of the first n regions, each once: what a cold execution reads from DRAM
         sectors = set()
         for x, y, rw, rh in regs[:n]:
@@ -150,8 +157,8 @@ def main():
                     warnings.append(f"{bench} {impl}: the fixed term at N = {anchor} ({fixed / 1e3:.3f} KB) differs "
                                     f"from the median over N ({median / 1e3:.3f} KB) by more than 1 KB")
         for n in w["batches"]:
-            if impl in ("opencv_cuda", "npp", "npp_crop_nv12"):
-                conversion = requested(n) if impl == "npp_crop_nv12" else frame
+            if impl in ("opencv_cuda", "opencv_cuda_crop_nv12", "npp", "npp_crop_nv12"):
+                conversion = {"npp_crop_nv12": requested(n), "opencv_cuda_crop_nv12": strips(n)}.get(impl, frame)
                 model = conversion + 3 * area(n) + 12 * area(n) + n * resized32 + 3 * n * output
             elif impl == "fkl_vf_hf":
                 model = frame + 3 * box(n) + 12 * area(n) + n * resized32

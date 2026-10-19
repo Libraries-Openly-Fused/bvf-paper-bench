@@ -405,8 +405,9 @@ void describeWorkload(std::ostream& os, const int k, const int passes, const std
        << "color conversion to the write.\n"
        << tileSummary()
        << "References: the " << (resize ? "resized regions" : "crops") << " of FKL's CPU backend (ReadNV12 -> "
-       << "YUVtoRGB -> Crop" << (resize ? " -> Resize" : "") << "), in float or with the RGB rounded to 8 bits after "
-       << "the conversion (the 8 bit RGB frame of the libraries that convert with NPP), the box in double, rounded as "
+       << "YUVtoRGB -> Crop" << (resize ? " -> Resize" : "") << "), in float or with the RGB rounded to nearest "
+       << "(NPP's conversion) or truncated (OpenCV's cudacodec conversion) to 8 bits after the conversion, the box in "
+       << "double, rounded as "
        << "the implementation rounds it (none, half up for NPPDx's 8 bit write, down for NPP's 8 bit box), then the "
        << "normalization in float (boxReference, common/bench_neighborhood.h): the box before the normalization, as "
        << "every pipeline.\n";

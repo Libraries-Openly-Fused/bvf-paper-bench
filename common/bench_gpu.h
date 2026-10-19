@@ -206,8 +206,8 @@ inline void beforeKernel() {
     }
 }
 
-// NPP's NV12 -> 8 bit RGB, BT.601 limited range (common/bench_npp.h): the first step of the pipelines with an 8 bit
-// RGB frame, OpenCV's (OpenCV CUDA has no NV12 conversion) and NPP's
+// NPP's NV12 -> 8 bit RGB, BT.601 limited range (common/bench_npp.h): the first step of NPP's pipelines with an 8 bit
+// RGB frame (the OpenCV CUDA pipelines convert with OpenCV's own converter, common/bench_opencv_cuda.h)
 inline void nv12ToRgb8(const Context& ctx, Npp8u* dst, int dstStep) {
     beforeKernel();
     npp::nv12ToRgb8Bt601Limited(ctx.y, ctx.uv, ctx.pitch, dst, dstStep, NppiSize{FRAME_W, FRAME_H}, ctx.npp);
@@ -221,8 +221,9 @@ inline void nv12ToRgb8Crop(const Context& ctx, Npp8u* dst, int dstStep, const fk
 }
 
 // The reference an implementation is checked against, with its tolerance: the Figure 1 chain on FKL's CPU backend in
-// float (FKL BVF); the same with the RGB rounded to 8 bits, for the pipelines with an 8 bit RGB frame (OpenCV, FKL
-// VF+HF), which resize at dst * scale like FKL; or that with NPP's resize sampling (NPP, nppConventionReference8bit).
+// float (FKL BVF); the same with the RGB rounded to 8 bits, for FKL VF+HF's 8 bit RGB frame, or truncated to 8 bits
+// (Fkl8bitTruncated), for OpenCV's (its converter truncates), both resizing at dst * scale like FKL; or the rounded one
+// with NPP's resize sampling (NPP, nppConventionReference8bit).
 // Fkl8bitFloorBox (the 8 bit RGB and a box filter that rounds down, NPP's 8 bit one) and FklFloatRounded (the float
 // chain with the filtered RGB rounded half up to 8 bits, NPPDx's 8 bit write) are only for programs with their own
 // reference() (fkl-neighborhood/). NppdxPixelCenterFloat (float, NPPDx's resize sampling at pixel centers) is for

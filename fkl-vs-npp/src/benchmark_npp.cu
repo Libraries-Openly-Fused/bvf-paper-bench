@@ -12,8 +12,8 @@
 //                  the crop's origin and the crop's size, writing at the crop's position in the 8 bit RGB frame, which
 //                  the rest of the pipeline reads as before): 3N + 4 kernels
 //   fkl_bvf        one FKL kernel for the whole chain (BVF)
-// The two NPP forms each have their own loop and speedup; per batch size, the one with the lower latency median is
-// NPP's (the README and the results report say which).
+// The two NPP forms each have their own loop and speedup in every mode; per batch size, the one with the lower latency
+// median is NPP's, in every mode (the README and the results report say which).
 
 #include <npp.h>
 
@@ -196,7 +196,8 @@ struct NppVsFkl {
               "are read; before every validated run, the 8 bit frame is filled with 0 as well as the output with "
               "NaN.\n"
            << "The two NPP forms each run their own loop (npp, then npp_crop_nv12, then FKL BVF) and have their own "
-              "speedup; per batch size, the one with the lower latency median is NPP's.\n";
+              "speedup in every mode; per batch size, the one with the lower latency median is NPP's, in every "
+              "mode.\n";
     }
 
     static std::string diagnostic(const Context& ctx) { return nppConversionDiagnostic(ctx); }

@@ -55,8 +55,10 @@ Every benchmark of this repository takes its workload from [`common/bench_geomet
   NV12 conversion that every library offers (OpenCV's CPU `cvtColor` and `cvtColorTwoPlane` have no other; OpenCV
   CUDA's through cudacodec's `NVSurfaceToColorConverter`, NPP's through its color twist with the BT.601 matrix,
   NPPDx's through `FromLimitedLuma`, `FromLimitedChroma` and `ColorConvert<yuv_bt601, rgb>`). Every baseline converts
-  with its own library, and where the library can convert a crop on its own (NPP, OpenCV on the CPU), the per-crop
-  form is a variant of the full-frame one, and the faster of the two is the library's per batch size;
+  with its own library, and where the library can convert less than the frame, the per-crop form is a variant of the
+  full-frame one (NPP and OpenCV on the CPU convert each crop; OpenCV CUDA's converter cannot restrict the rows, so it
+  converts the full-height strip of each crop's columns), and per batch size the form with the lower latency median is
+  the library's, in every mode (on the CPU, per thread count);
 - the regions, new in every iteration (warm-up and timed): 100 per iteration, batch N uses the first N. Their sizes are
   20x10, 32x16 and 48x24 by turns: region i of iteration t has the size (i + t) mod 3 of that list, so every iteration
   mixes the three and every region cycles through them. Their positions are uniform random (seed 42), with even
@@ -135,27 +137,29 @@ format, times in ms), `kernel_breakdown.csv` (time of each kernel or stage of th
 Every implementation is checked before the timing, on the regions of the first, every 50th and the last timed
 iteration (iterations 100, 150, ..., 1050 and 1099; one row per implementation, N and iteration in `validation.csv`;
 `latency.csv` has the largest error over them), against a reference with its own conventions: FKL BVF
-against the chain on FKL's CPU backend in float (tolerance 1e-3); OpenCV and FKL VF+HF, which write an 8 bit RGB
-frame, against the same chain with the RGB rounded to 8 bits; NPP, which also samples its resize differently (at
-`dst * scale - 0.25`, measured for upscales only), against that with NPP's sampling. Against an 8 bit reference the
-tolerance is one 8 bit level (a value on a half level can round either way), and at most one value in a thousand may be
+against the chain on FKL's CPU backend in float (tolerance 1e-3); FKL VF+HF, which writes an 8 bit RGB frame, against
+the same chain with the RGB rounded to 8 bits; OpenCV, whose converter truncates to 8 bits, against the chain with the
+RGB truncated to 8 bits (`fkl_cpu_8bit_rgb_truncated`); NPP, which rounds and also samples its resize differently (at
+`dst * scale - 0.25`, measured for upscales only), against the rounded chain with NPP's sampling. Against an 8 bit
+reference the tolerance is one 8 bit level (a value on a half level, or close to a whole one, can come out either
+way), and at most one value in a thousand may be
 more than 1e-3 away ([`common/bench_validation.h`](common/bench_validation.h)). The errors against FKL's float
 reference are in `validation.csv` too. A program fails if one of FKL's outputs is not within its tolerance in one of
 the validated iterations.
 
 ## Memory traffic with Nsight Compute
 
-`scripts/ncu_dram.sh` (DRAM traffic) and `scripts/ncu_l2.sh` (traffic between the SMs and L2) profile the OpenCV CUDA,
-NPP (both forms of its NV12 conversion: `npp` and `npp_crop_nv12`), FKL VF+HF and FKL BVF pipelines with Nsight Compute,
-through the `--ncu-target` modes: one execution on the regions of iteration 0, the same for every pipeline.
-`ncu_dram.sh` profiles every batch size with the caches flushed before every kernel (cold), and N = 1 and 100 without
-flushing (warm: L2 holds what the executions on iterations 1 to 3 left there, as in the timed loop, where every
-iteration has new regions), each profile twice (`REPEATS`): the DRAM counters are device-wide, so a display on the same
-GPU adds other processes' traffic to some profiles, and the summary keeps the smallest of them. `ncu_l2.sh` profiles N =
-1 and 100 (cold). They stop unless every benchmark was built for the same workload (`--workload`), take the batch sizes
-from the benchmarks (`--batches`), and write the regions of iteration 0 to `ncu_regions.csv` in the results folder
-(`--regions 0`) for the traffic model. The paths and their environment variables are at the top of
-`scripts/ncu_common.sh`.
+`scripts/ncu_dram.sh` (DRAM traffic) and `scripts/ncu_l2.sh` (traffic between the SMs and L2) profile the OpenCV CUDA
+and NPP pipelines, each in both forms of its NV12 conversion (`opencv_cuda` and `opencv_cuda_crop_nv12`, `npp` and
+`npp_crop_nv12`), and the FKL VF+HF and FKL BVF pipelines with Nsight Compute, through the `--ncu-target` modes: one
+execution on the regions of iteration 0, the same for every pipeline. `ncu_dram.sh` profiles every batch size with the
+caches flushed before every kernel (cold), and N = 1 and 100 without flushing (warm: L2 holds what the executions on
+iterations 1 to 3 left there, as in the timed loop, where every iteration has new regions), each profile twice
+(`REPEATS`): the DRAM counters are device-wide, so a display on the same GPU adds other processes' traffic to some
+profiles, and the summary keeps the smallest of them. `ncu_l2.sh` profiles N = 1 and 100 (cold). They stop unless every
+benchmark was built for the same workload (`--workload`), take the batch sizes from the benchmarks (`--batches`), and
+write the regions of iteration 0 to `ncu_regions.csv` in the results folder (`--regions 0`) for the traffic model. The
+paths and their environment variables are at the top of `scripts/ncu_common.sh`.
 
 They need root while the driver restricts the GPU performance counters to administrators (`RmProfilingAdminOnly=1` in
 `/proc/driver/nvidia/params`, the default); with the nvidia module option `NVreg_RestrictProfilingToAdminUsers=0` they
@@ -250,10 +254,10 @@ Each benchmark has its own requirements, besides a C++20 compiler:
 
 | Benchmark | Needs |
 |---|---|
-| `fkl-vs-opencv-cuda` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.28, OpenCV 4.14 built with CUDA and the opencv_contrib modules `cudaarithm` and `cudawarping` |
+| `fkl-vs-opencv-cuda` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.28, OpenCV 4.14 built with CUDA and the opencv_contrib modules `cudaarithm`, `cudacodec` (which needs `videoio`) and `cudawarping` |
 | `fkl-vs-npp`, `fkl-ablation` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.28; no OpenCV |
 | `fkl-vs-nppdx` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.30, a Linux x86_64 or Windows x64 machine (NPPDx's platforms); no OpenCV |
-| `fkl-neighborhood` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.28, FusedKernelLibrary with the batched `MorphologyDPP` and `executeBoxBlur` (PR #393, the `fkl` submodule), OpenCV 4.14 built with CUDA and the opencv_contrib modules `cudaarithm`, `cudafilters` and `cudaimgproc` for its OpenCV program, and for its NPPDx programs what `fkl-vs-nppdx` needs (or `-DBENCH_NPPDX=OFF`) |
+| `fkl-neighborhood` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.28, FusedKernelLibrary with the batched `MorphologyDPP` and `executeBoxBlur` (PR #393, the `fkl` submodule), OpenCV 4.14 built with CUDA and the opencv_contrib modules `cudaarithm`, `cudacodec` (which needs `videoio` and `cudawarping`), `cudafilters` and `cudaimgproc` for its OpenCV program, and for its NPPDx programs what `fkl-vs-nppdx` needs (or `-DBENCH_NPPDX=OFF`) |
 | `fkl-vs-opencv-cpu` | CMake 3.28 and OpenCV 4.14 with `core` and `imgproc`; no GPU or CUDA |
 | `rocm` | Linux, an AMD GPU (gfx1200 by default, another one with `-DCMAKE_HIP_ARCHITECTURES`), ROCm 10.1 with RPP 3.2.0 and rocprofiler-sdk, CMake 3.28, Ninja (see [its README](rocm/README.md)); no CUDA or OpenCV |
 
