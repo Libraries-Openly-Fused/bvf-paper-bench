@@ -8,8 +8,8 @@
 # recursive clone or update skips it). Another checkout of gern must be at the submodule's pinned commit.
 #
 # It builds gern (CMake 3.30 or newer, a C++20 compiler; Linux or macOS: gern's runner, which the library includes,
-# uses dlfcn.h) without its tests, then fern_pipeline_gen.cpp against it, and runs it. gern at d05bc66 calls std::find
-# in src/codegen/codegen.cpp without including <algorithm>, which libstdc++ 15 no longer includes indirectly: the
+# uses dlfcn.h) without its tests, then fern_pipeline_gen.cpp against it, and runs it. gern at d05bc66 calls
+# std::set_difference and std::transform in src/codegen/codegen.cpp without including <algorithm>, which libstdc++ 15 no longer includes indirectly: the
 # header is forced on every gern source (-include algorithm) instead of patching gern.
 #
 # The generated text is the same for every compiler but for the numbers in the names of Fern's temporaries

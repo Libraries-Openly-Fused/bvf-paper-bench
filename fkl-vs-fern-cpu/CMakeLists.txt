@@ -7,19 +7,13 @@ project(fkl_vs_fern_cpu LANGUAGES CXX)
 # FKL, CPU_ARCH_FLAGS, the iterations, the workload and add_cpu_bench_target, shared by every CPU benchmark
 include(${CMAKE_CURRENT_SOURCE_DIR}/../common/bench_cpu.cmake)
 
-# The gern commit the code was generated with: the repository's gern submodule. Only a checked-out submodule (with its
-# .git) is asked: in an empty submodule folder, git would answer with the parent repository's commit
-set(GERN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../gern" CACHE PATH "gern checkout the generated code comes from")
-set(GERN_COMMIT "")
-if(EXISTS "${GERN_DIR}/.git")
-    execute_process(COMMAND git -C ${GERN_DIR} rev-parse --short HEAD OUTPUT_VARIABLE GERN_COMMIT
-                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-endif()
+# The gern commit the code was generated with: the commit the repository pins for the gern submodule, which
+# fern/regenerate.cmake checks the generated code against (whatever is checked out in gern/, if anything)
+execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR}/.. ls-tree HEAD gern OUTPUT_VARIABLE GERN_ENTRY
+                OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+string(REGEX MATCH "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]" GERN_COMMIT "${GERN_ENTRY}")
 if(NOT GERN_COMMIT)
-    # Without the submodule checked out, the commit the repository records for it
-    execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR}/.. ls-tree HEAD gern OUTPUT_VARIABLE GERN_ENTRY
-                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-    string(REGEX MATCH "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]" GERN_COMMIT "${GERN_ENTRY}")
+    message(FATAL_ERROR "No gern submodule in the repository's tree (git ls-tree HEAD gern): ${GERN_ENTRY}")
 endif()
 
 # The generated code and the black boxes are compiled with the flags of FKL's code (CPU_ARCH_FLAGS), like the harness

@@ -48,13 +48,13 @@ recompilation. Run-time scalars cannot be used for this: they lower to 0 in the 
    output plane.
 
 The band height is a compile-time template parameter that must divide the 64 rows, because Fern never clamps the last
-tile (`src/codegen/codegen.cpp:336-344`). The research prototype measured 8, 16 and 64 rows on one thread: 8 and 16
-were the same, and 64 about 10 % slower.
+tile (`src/codegen/codegen.cpp:336-344`). 16 rows was chosen in development runs of a research prototype (8, 16 and 64
+rows on one thread; those runs are not part of this repository).
 
 **The top-level `Tile` is required.** Without it, or with only the tail tiled, Fern treats the program's inputs as
 already restricted to the subsets they consume. It passes the whole frame to `nv12_to_rgb` without the region's
-offset, and the output is wrong (11.86 away from the reference) with no error (`generated/pitfall_untiled.cpp`,
-`generated/pitfall_tail_tiled.cpp`).
+offset, and the output is wrong with no error (`generated/pitfall_untiled.cpp`, `generated/pitfall_tail_tiled.cpp`:
+the generated calls have no region offset).
 
 **Compiled ahead of time.** Fern's runner compiles generated code with `g++` and no optimization flag (so `-O0`),
 then `dlopen`s it (`src/codegen/runner.cpp:26-42`). The benchmark does not use the runner: the generated source is
@@ -62,8 +62,8 @@ compiled with the benchmark, with the flags of FKL's code (clang, `-O3 -march=na
 directly. There is no compilation or `dlopen` in the timed loop.
 
 **Intermediates.** The intermediates come from a per-thread stack arena in `fern_impl.h`'s `ImageF3::allocate`, so
-there is no `malloc` in the timed loop. Fern lets the data structure decide how to allocate. With `malloc`, the
-prototype was about 1 us per region slower.
+there is no `malloc` in the timed loop. Fern lets the data structure decide how to allocate, and an arena is what a
+user would write for small per-call buffers; it can only make Fern faster.
 
 ## Comparisons and thread counts
 
@@ -76,7 +76,7 @@ mapping is to CUDA blocks and threads. So:
 | Comparison | Fern | FKL | File |
 |---|---|---|---|
 | 1 thread | one call per region, on the calling thread | CPU backend (`ParArch::CPU`) | `benchmark_cpu_fern_1thread_vs_fkl_bvf_CPU.csv` |
-| FKL's pool size (32 on the paper's machine) | **"Fern code, FKL thread pool"**: Fern's generated serial code, parallelized by the benchmark. The per-region calls run as the chunks of one execution on FKL's own thread pool (`runOnFklPool`), one chunk per region, so at most N workers are busy | `CPU_MULTITHREAD` backend on the same pool, one chunk per output row of each region | `benchmark_cpu_fern_code_fkl_thread_pool_32threads_vs_fkl_bvf_CPU_MULTITHREAD.csv` |
+| FKL's pool size (32 on the paper's machine) | **"Fern code, FKL thread pool"**: Fern's generated serial code, parallelized by the benchmark. The per-region calls run as the chunks of one execution on FKL's own thread pool (`runOnFklPool`), one chunk per region, so at most N workers run Fern's code (every run wakes all of the pool's sleeping workers, which spin as after FKL's runs) | `CPU_MULTITHREAD` backend on the same pool, one chunk per output row of each region | `benchmark_cpu_fern_code_fkl_thread_pool_32threads_vs_fkl_bvf_CPU_MULTITHREAD.csv` |
 
 Fern has no parallel code of its own, so the multithreaded row is not Fern parallelizing anything. It is what a user of
 Fern's serial code can do, on the same pool, workers, spin and wake-up as FKL. The protocol is the one of every CPU
@@ -90,8 +90,9 @@ benchmark:
 
 The program also writes the validation (`cpu_validation.csv`): before the timing, on the regions of the first, every
 50th and the last timed iteration, Fern and FKL against the plain C++ reference with FKL's conventions
-([`common/bench_reference.h`](../common/bench_reference.h)), Fern against FKL's output, and Fern on the pool against
-Fern.
+([`common/bench_reference.h`](../common/bench_reference.h)), Fern against FKL's output, Fern on the pool against Fern,
+and FKL's pool against FKL. All but Fern against FKL must be within 1e-3, or the program exits with an error after
+writing its files.
 
 ## What each side does that the other does not
 
@@ -101,14 +102,15 @@ Fern, compared with FKL:
   float3, 24 KB) and a padded band (16 x 64 float3, 12 KB) per band. They are small enough to stay in the L1 and L2
   caches. FKL writes nothing but the output.
 - **Makes N opaque calls.** It calls the generated function once per region per iteration, where FKL makes one
-  `executeOperations` call for the batch. Building each call's `Rect` and plane view is timed, as FKL's `build()`
-  calls are.
+  `executeOperations` call for the batch. The regions are converted into Fern's `Rect`s before the loops, as FKL's
+  into `fk::Rect`s; copying them and building each call's frame view, plane view and argument array is timed, as
+  FKL's `build()` calls are.
 - **Converts each source pixel once.** Fern converts w x h pixels per region: 200 to 1152. FKL's backwards fusion
-  converts the 4 source pixels of every interior output pixel: 8192 per region. This is the main reason Fern is faster
-  on one thread.
-- **Has fixed shapes.** The intermediates' shapes and the pipeline's constants are known when the black boxes are
-  compiled. The `letterbox` and `normalize` loops are auto-vectorized by clang; the conversion and resize loops stay
-  scalar, as FKL's loop does.
+  converts the 4 source pixels of every interior output pixel: 8192 per region. This is a likely reason Fern is faster
+  on one thread (not measured separately here).
+- **Has some fixed shapes.** The resized image (32 x 64), the band height (16) and the pipeline's constants are known
+  when the black boxes are compiled; the crop's size and the bands' width come from the region and the output plane
+  at run time.
 - **Has a schedule chosen by hand.** The tile and the black boxes were written for this pipeline. FKL's pipeline is
   its generic operations.
 
@@ -134,7 +136,7 @@ records a submodule (`gernels/mm/SGEMM_CUDA`) that it does not declare in a `.gi
 every `git submodule foreach --recursive` and recursive update in this repository fails on it; `git submodule deinit
 gern` ends that.
 
-gern at d05bc66 calls `std::find` in `src/codegen/codegen.cpp` without including `<algorithm>`, which libstdc++ 15 no
-longer includes indirectly. `regenerate.cmake` forces the header on every gern source (`-include algorithm`) instead of
+gern at d05bc66 calls `std::set_difference` and `std::transform` in `src/codegen/codegen.cpp` without including
+`<algorithm>`, which libstdc++ 15 no longer includes indirectly. `regenerate.cmake` forces the header on every gern source (`-include algorithm`) instead of
 patching gern. The generated text is the same with g++ 15 and clang 23, except for the numbers in the names of Fern's
 temporaries, which the comparison renames.

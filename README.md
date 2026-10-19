@@ -198,7 +198,9 @@ FKL vs OpenCV on the CPU shares one harness with the other CPU benchmarks (FKL v
 `rocm/`'s RPP program, see [the GPU benchmarks](#the-gpu-benchmarks)), [`common/bench_cpu.h`](common/bench_cpu.h). FKL's side is [`common/bench_fkl_cpu.cpp`](common/bench_fkl_cpu.cpp):
 one `executeOperations` call (BVF) on FKL's CPU backend (one thread) and on its `CPU_MULTITHREAD` backend (FKL's
 thread pool, one worker per hardware thread). Each program compares its library on one thread with FKL on one thread,
-and on as many threads as FKL's pool has workers with FKL's pool.
+and on as many threads as FKL's pool has workers with FKL's pool. Fern generates serial code and has no threads of its
+own: its multithreaded comparison runs Fern's code on FKL's thread pool ("Fern code, FKL thread pool", see
+[its README](fkl-vs-fern-cpu/README.md)).
 
 The two libraries of a comparison never run at the same time:
 

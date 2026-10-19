@@ -542,11 +542,13 @@ if(BENCHMARKS STREQUAL "cpu")
         check_csv("${OUT_DIR}/fkl-vs-fern-cpu/cpu_validation.csv" "${column}" 1e-3)
     endforeach()
     check_csv("${OUT_DIR}/fkl-vs-fern-cpu/cpu_validation.csv" "Fern code FKL thread pool vs Fern MaxAbsDifference" 0)
-    # The checked-in Fern code must be what gern, at the commit of the pinned submodule, generates: on Linux, where gern
-    # builds (its runner uses dlfcn.h). gern is cloned at that commit in DEPS_DIR, not checked out in the workspace: gern
+    # The checked-in Fern code must be what gern, at the commit of the pinned submodule, generates: on Linux with CMake
+    # 3.30 or newer, where gern builds (its runner uses dlfcn.h, and its CMakeLists.txt needs CMake 3.30). gern is cloned at that commit in DEPS_DIR, not checked out in the workspace: gern
     # records a submodule its tree does not declare, which breaks `git submodule foreach --recursive` in a checkout
     # that includes it, such as the one actions/checkout runs in a runner's workspace before every job
-    if(NOT CMAKE_HOST_WIN32)
+    if(NOT CMAKE_HOST_WIN32 AND CMAKE_VERSION VERSION_LESS 3.30)
+        message(STATUS "Fern code not regenerated: CMake ${CMAKE_VERSION}, gern needs 3.30")
+    elseif(NOT CMAKE_HOST_WIN32)
         execute_process(COMMAND git -C "${REPO}" ls-tree HEAD gern OUTPUT_VARIABLE gernEntry
                         OUTPUT_STRIP_TRAILING_WHITESPACE)
         string(REGEX MATCH "[0-9a-f]+[\t ]+gern$" gernCommit "${gernEntry}")

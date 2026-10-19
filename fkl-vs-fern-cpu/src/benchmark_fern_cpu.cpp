@@ -16,7 +16,8 @@
 //   fern          one call of the generated function per region, on the calling thread (Fern generates serial code)
 //   fern on pool  the same calls, one per region, as the chunks of one execution on FKL's thread pool
 //                 (runOnFklPool): Fern has no parallel CPU code generation, so the benchmark parallelizes its calls,
-//                 over regions (at most N workers busy)
+//                 over regions (at most N workers run Fern's code; every run wakes all of the pool's sleeping workers,
+//                 which spin as after FKL's runs)
 //   fkl           one executeOperations<TransformDPP<ParArch::CPU>> call with the whole chain (BVF), one thread
 //   fkl mt        the same call with ParArch::CPU_MULTITHREAD, on FKL's thread pool, in chunks of one output row
 //
@@ -110,6 +111,12 @@ private:
 struct Check {
     size_t batch, iteration;
     float fklVsReference, fernVsReference, fernVsFkl, fernPoolVsFern, fklMultithreadVsFkl;
+    // What the program requires (withinTolerance): FKL and Fern against the reference with FKL's conventions (Fern's
+    // too), FKL's pool against FKL, and Fern's code on the pool against Fern on one thread
+    bool passed() const {
+        return withinTolerance(fklVsReference) && withinTolerance(fernVsReference) &&
+               withinTolerance(fernPoolVsFern) && withinTolerance(fklMultithreadVsFkl);
+    }
 };
 
 template <size_t N>
@@ -135,10 +142,11 @@ void runBatch(const Workload& w, std::vector<Row>& singleThread, std::vector<Row
                       maxAbsError(fern.output(), fklOut), maxAbsError(fernPool.output(), fern.output()),
                       maxAbsError(fklMT->output(), fklOut)};
         checks.push_back(c);
-        worst = Check{N, t, std::max(worst.fklVsReference, c.fklVsReference),
-                      std::max(worst.fernVsReference, c.fernVsReference), std::max(worst.fernVsFkl, c.fernVsFkl),
-                      std::max(worst.fernPoolVsFern, c.fernPoolVsFern),
-                      std::max(worst.fklMultithreadVsFkl, c.fklMultithreadVsFkl)};
+        // std::max keeps a NaN only as its first argument: the error goes first
+        worst = Check{N, t, std::max(c.fklVsReference, worst.fklVsReference),
+                      std::max(c.fernVsReference, worst.fernVsReference), std::max(c.fernVsFkl, worst.fernVsFkl),
+                      std::max(c.fernPoolVsFern, worst.fernPoolVsFern),
+                      std::max(c.fklMultithreadVsFkl, worst.fklMultithreadVsFkl)};
     }
     const Check& c = worst;
 
@@ -183,10 +191,13 @@ int main(int argc, char** argv) {
         std::ofstream v(outDir / "cpu_validation.csv");
         v << "Batch size, Iteration, FKL MaxAbsError vs FKL-convention reference, Fern MaxAbsError vs FKL-convention "
              "reference, Fern vs FKL MaxAbsDifference, Fern code FKL thread pool vs Fern MaxAbsDifference, FKL "
-             "CPU_MULTITHREAD vs FKL CPU MaxAbsDifference" << std::endl;
+             "CPU_MULTITHREAD vs FKL CPU MaxAbsDifference, Within tolerance" << std::endl;
+        bool passed = true;
         for (const auto& c : checks) {
             v << c.batch << ", " << c.iteration << ", " << c.fklVsReference << ", " << c.fernVsReference << ", "
-              << c.fernVsFkl << ", " << c.fernPoolVsFern << ", " << c.fklMultithreadVsFkl << std::endl;
+              << c.fernVsFkl << ", " << c.fernPoolVsFern << ", " << c.fklMultithreadVsFkl << ", "
+              << (c.passed() ? "yes" : "no") << std::endl;
+            passed &= c.passed();
         }
         writeRegionStats((outDir / "regions.csv").string(), *w.regions, WARMUP_ITERS, ITERS);
         std::ofstream p(outDir / "cpu_platform.txt");
@@ -201,13 +212,20 @@ int main(int argc, char** argv) {
              "a per-thread stack arena; one call of the generated function per region (hook_fern_band16)\n"
           << "Multithreaded comparison, \"Fern code, FKL thread pool\": Fern generates serial CPU code and has no "
              "parallel code of its own, so the benchmark runs Fern's per-region calls as the chunks of one execution on "
-             "FKL's thread pool (one chunk per region, at most N workers busy), against FKL's CPU_MULTITHREAD backend on "
-             "the same pool (one chunk per output row of each region)\n"
+             "FKL's thread pool (one chunk per region: at most N workers run Fern's code, and every run wakes all of the "
+             "pool's sleeping workers, which spin as after FKL's runs), against FKL's CPU_MULTITHREAD backend on the "
+             "same pool (one chunk per output row of each region). Fern has no threads of its own: both sides of the "
+             "multithreaded comparison use FKL's pool\n"
           << "Thread pool, measured before the benchmark: each of FKL's workers stays busy " << fklBusyUs << " us per "
           << "FKL CPU_MULTITHREAD run on 1 region (spin and wake-up), which the "
           << std::chrono::milliseconds(IDLE_GAP).count() << " ms idle gap must outlast\n";
         writeCpuPlatform(p, threads);
         std::cout << "Results written to " << std::filesystem::absolute(outDir) << std::endl;
+        if (!passed) {
+            throw std::runtime_error("validation failed (FKL or Fern against the reference, FKL's pool against FKL, or "
+                                     "Fern's code on the pool against Fern, beyond the tolerance): see "
+                                     "cpu_validation.csv");
+        }
     } catch (const std::exception& e) {
         std::cerr << "ERROR: " << e.what() << std::endl;
         return 1;
