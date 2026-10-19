@@ -203,7 +203,8 @@ were excluded.
   - fkl_inline for the Gaussian is `GaussianBVF<21>` (common/bench_neighborhood_ops.h, commit bb0c245).
 - **Protocol:** the paper's, as Experiments 1 and 3.
   - 100 warm-up and 1000 timed iterations in every mode (latency, GPU only, GPU only with the L2 flushed), the
-    implementations interleaved in every iteration, default clocks.
+    implementations interleaved in every iteration, default clocks. The harness (common/bench_gpu.h) now runs each
+    implementation's complete loop before the next one's instead (the baselines first, the FKL forms last).
   - Per-iteration mean speedups in both directions: nppdx over each FKL form, and each FKL form over nppdx.
   - Medians and p10-p90, CUPTI kernel counts, validation on 21 iterations (the first, every 50th and the last timed one).
 - **Run and data:**
