@@ -248,24 +248,26 @@ inline void writeControlCSV(const std::filesystem::path& path, const std::vector
 }
 
 // How long the workers of a thread pool stay on their cores after a parallel run before they sleep, in us: `rounds`
-// times, a parallel run on `threads` threads, then 20 ms of sleep of the calling thread; the CPU time of the process's
-// other threads over the rounds (Linux: /proc/self/task/<tid>/schedstat) divided by rounds * (threads - 1) is the time
-// each worker stays busy per run, its share of the work plus its spin. With little work it is the pool's spin and
-// wake-up, which the idle gap must exceed for the pool to be asleep when a run starts. NAN where schedstat does not
-// exist.
-inline double workerBusyUs(const std::function<void()>& parallelRun, int threads, int rounds = 50) {
+// times, a parallel run, then 20 ms of sleep of the calling thread; the CPU time of the process's other threads over
+// the rounds (Linux: /proc/self/task/<tid>/schedstat) divided by rounds * workers is the time each worker stays busy per
+// run, its share of the work plus its spin. workers: the pool's threads other than the caller (FKL's pool: all of them,
+// the caller waits; OpenMP, OpenCV and Halide: their thread count minus one, the caller takes part). With little work
+// it is the pool's spin and wake-up, which the idle gap must exceed for the pool to be asleep when a run starts. NAN
+// where the threads' counters cannot be read.
+inline double workerBusyUs(const std::function<void()>& parallelRun, int workers, int rounds = 50) {
 #ifdef _WIN32
-    (void)parallelRun, (void)threads, (void)rounds;
+    (void)parallelRun, (void)workers, (void)rounds;
     return NAN;
 #else
     const std::filesystem::path tasks = "/proc/self/task";
-    if (!std::filesystem::exists(tasks)) {
+    std::error_code error;
+    if (!std::filesystem::exists(tasks, error) || workers < 1) {
         return NAN;
     }
     const std::string self = std::to_string(getpid());
     const auto threadCpuNs = [&]() {
         std::map<std::string, long long> ns;
-        for (const auto& task : std::filesystem::directory_iterator(tasks)) {
+        for (const auto& task : std::filesystem::directory_iterator(tasks, error)) {
             const std::string tid = task.path().filename().string();
             std::ifstream f(task.path() / "schedstat");
             long long runNs = 0;
@@ -282,12 +284,16 @@ inline double workerBusyUs(const std::function<void()>& parallelRun, int threads
         parallelRun();
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+    const auto after = threadCpuNs();
+    if (before.empty() || after.empty()) {
+        return NAN;
+    }
     long long busy = 0;
-    for (const auto& [tid, ns] : threadCpuNs()) {
+    for (const auto& [tid, ns] : after) {
         const auto b = before.find(tid);
         busy += ns - (b == before.end() ? 0 : b->second);
     }
-    return busy / 1e3 / rounds / std::max(1, threads - 1);
+    return busy / 1e3 / rounds / workers;
 #endif
 }
 

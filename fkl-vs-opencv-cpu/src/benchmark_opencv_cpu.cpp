@@ -156,7 +156,7 @@ int main(int argc, char** argv) {
     cv::setNumThreads(threads);
     const double opencvBusyUs = workerBusyUs([&]() {
         cv::parallel_for_(cv::Range(0, threads), [](const cv::Range&) {}, threads);
-    }, threads);
+    }, threads - 1);
     cv::setNumThreads(1);
     const auto spinProbe = makeFklCpu(BATCHES.front(), true, w);
     const double fklBusyUs = workerBusyUs([&]() { spinProbe->run(WARMUP_ITERS); }, threads);

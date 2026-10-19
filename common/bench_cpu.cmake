@@ -67,14 +67,21 @@ function(bench_cpu_options TARGET_NAME)
         BENCH_CXX_FLAGS="${CMAKE_CXX_FLAGS_RELEASE} ${BENCH_CPU_STD_FLAG} ${CPU_ARCH_FLAGS} ${BENCH_CPU_EXTRA_FLAGS_STR}")
 endfunction()
 
-# A CPU benchmark executable from its sources. FKL's side (common/bench_fkl_cpu.cpp, FKL's pipelines on the CPU and
-# CPU_MULTITHREAD backends) is an object library of its own, compiled with these options only (none of the compared
-# library's, which target_link_libraries adds to the executable) and linked first: the same FKL code, placed the same
-# way, in every CPU benchmark.
+# A CPU benchmark executable: add_cpu_bench_target(<name> <sources>... [LIBRARIES <libraries>...]). FKL's side
+# (common/bench_fkl_cpu.cpp, FKL's pipelines on the CPU and CPU_MULTITHREAD backends) is the object library <name>_fkl,
+# compiled with these options only, and the program's sources are the object library <name>_code, compiled with these
+# options and the usage requirements of LIBRARIES (the compared library; add the program's own include folders and
+# definitions to <name>_code). The executable links FKL's objects first, then the program's, so that FKL's code is the
+# same, and placed the same way, in every CPU benchmark (Makefile and Ninja generators put an executable's own sources
+# before the objects of object libraries, so the executable has none).
 function(add_cpu_bench_target TARGET_NAME)
+    cmake_parse_arguments(PARSE_ARGV 1 BENCH "" "" "LIBRARIES")
     add_library(${TARGET_NAME}_fkl OBJECT ${BENCH_COMMON_DIR}/bench_fkl_cpu.cpp)
     bench_cpu_options(${TARGET_NAME}_fkl)
-    add_executable(${TARGET_NAME} $<TARGET_OBJECTS:${TARGET_NAME}_fkl> ${ARGN})
-    bench_cpu_options(${TARGET_NAME})
-    target_link_libraries(${TARGET_NAME} PRIVATE Threads::Threads)
+    add_library(${TARGET_NAME}_code OBJECT ${BENCH_UNPARSED_ARGUMENTS})
+    bench_cpu_options(${TARGET_NAME}_code)
+    target_link_libraries(${TARGET_NAME}_code PRIVATE ${BENCH_LIBRARIES})
+    add_executable(${TARGET_NAME} $<TARGET_OBJECTS:${TARGET_NAME}_fkl> $<TARGET_OBJECTS:${TARGET_NAME}_code>)
+    set_target_properties(${TARGET_NAME} PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_libraries(${TARGET_NAME} PRIVATE Threads::Threads ${BENCH_LIBRARIES})
 endfunction()

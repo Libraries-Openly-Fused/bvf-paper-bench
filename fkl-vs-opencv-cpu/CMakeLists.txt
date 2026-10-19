@@ -10,5 +10,4 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/../common/bench_cpu.cmake)
 cmake_policy(SET CMP0146 OLD)
 find_package(OpenCV 4.14 REQUIRED COMPONENTS core imgproc)
 
-add_cpu_bench_target(benchmark_opencv_cpu src/benchmark_opencv_cpu.cpp)
-target_link_libraries(benchmark_opencv_cpu PRIVATE opencv_core opencv_imgproc)
+add_cpu_bench_target(benchmark_opencv_cpu src/benchmark_opencv_cpu.cpp LIBRARIES opencv_core opencv_imgproc)
