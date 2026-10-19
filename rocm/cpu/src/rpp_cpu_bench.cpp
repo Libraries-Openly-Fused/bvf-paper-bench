@@ -362,9 +362,9 @@ constexpr uint8_t RGB_SENTINEL = 0x5A;
 
 // The NV12 -> RGB conversion of an RPP HOST pipeline: of the full frame, or of only the N crops of the iteration
 enum class Conversion { Frame, Crop };
-// The form the selection pass times the RPP variants with: the per-crop one, in which the RPP calls (the variant) make
-// most of the pipeline's time; with the full-frame conversion, which takes most of it, the ranking would be set by the
-// conversion's noise
+// The form the selection pass times the RPP variants with: the per-crop one, in which the RPP calls (the variant) are a
+// large share of the pipeline's time; with the full-frame conversion they are a few percent of it, and the ranking would
+// be set by the conversion's noise
 constexpr Conversion SELECTION_CONVERSION = Conversion::Crop;
 
 // FKL's per-crop conversion (FklRgb8::runCrops) against its full-frame one (FklRgb8::run), on the MAX_BATCH regions of
@@ -573,6 +573,9 @@ struct RppHost {
     template <size_t... Is>
     void bindCropConversion(std::index_sequence<Is...>) {
         rgb8.prepareCrops(w.sets, n);
+        // Every page of the RGB frame touched now, outside the timing: the per-crop conversion writes only the crops, so
+        // without this its first runs would pay page faults (the full-frame conversion writes every page in its first run)
+        rgb8.fill(RGB_SENTINEL);
         (void)((n == BATCHES[Is] ? (convertCrops = [this]() { rgb8.template runCrops<BATCHES[Is]>(*w.frame, iteration); },
                                     true)
                                  : false) ||
@@ -1274,7 +1277,7 @@ void selectionConfig(const Workload& w, unsigned threads, bool timing, const Ref
     constexpr size_t A = STABILITY_SEQUENCE.front();
     static_assert(STABILITY_SEQUENCE.back() == A, "The stability sequence runs the regions of A first and last");
     std::vector<std::unique_ptr<RppHost<PA>>> pipelines;
-    // The tail is selected with the per-crop conversion, the form in which the tail dominates the pipeline's time
+    // The tail is selected with the per-crop conversion, the form in which the tail is a large share of the time
     for (const Variant v : VARIANTS) {
         pipelines.push_back(std::make_unique<RppHost<PA>>(w, N, v, threads, SELECTION_CONVERSION));
     }
@@ -1297,9 +1300,11 @@ void selectionConfig(const Workload& w, unsigned threads, bool timing, const Ref
         }
         // vs own reference (rppt_resize's or rppt_resize_mirror_normalize's convention), vs the RPP-convention reference
         // of rppt_resize (the column of cpu_validation.csv), vs FKL's float and 8 bit references
-        checks.push_back(makeCheck(w, N, A, "selection", variantName(VARIANTS[k]), threads, out, refOwn, refA));
+        checks.push_back(makeCheck(w, N, A, "selection", pipelines[k]->name(), threads, out, refOwn, refA));
         const Check& c = checks.back();
-        SelectionRow r{threads, N, c.implementation, c.vsOwnReference, maxAbsError(out, perOp), sameOutput, false, {}};
+        // The row names the variant (the check names the pipeline, with its conversion form)
+        SelectionRow r{threads, N, variantName(VARIANTS[k]), c.vsOwnReference, maxAbsError(out, perOp), sameOutput, false,
+                       {}};
         r.candidate = r.stable && r.vsOwnReference <= RPP_EQUIVALENCE && r.vsPerOp <= RPP_EQUIVALENCE;
         std::printf("N %3zu | %-20s %2u thread(s), regions of iteration %zu: max err vs its RPP-convention reference "
                     "%.2e (%s; first run %.2e, same output after iterations 1 and 2: %s), vs rpp_per_op %.2e, vs "
@@ -1815,9 +1820,9 @@ int main(int argc, char** argv) {
              << hardwareThreads << " threads runs. RPP pipeline: " << variantName(oneThread) << " with 1 thread, "
              << variantName(allThreads) << " with " << hardwareThreads << " threads, the fastest RPP variant numerically "
              << "equivalent (within " << RPP_EQUIVALENCE << ") to rpp_per_op and to its RPP-convention reference, chosen "
-             << "by a selection pass with the per-crop conversion, the form in which the RPP calls make most of the "
-             << "pipeline's time (with the full-frame conversion, which takes most of it, the conversion's noise would "
-             << "set the ranking) (each variant run on the regions of iterations 0, 1, 2 and 0 again, so that every "
+             << "by a selection pass with the per-crop conversion, the form in which the RPP calls are a large share of "
+             << "the pipeline's time (cpu_rpp_breakdown.csv; with the full-frame conversion they are a few percent of it, "
+             << "and the conversion's noise would set the ranking) (each variant run on the regions of iterations 0, 1, 2 and 0 again, so that every "
              << "slot of the crop buffer has held a region of every size: the two outputs of iteration 0 identical value "
              << "by value, the second within " << RPP_EQUIVALENCE << " of its reference and of rpp_per_op's; then every "
              << "candidate timed one after the other, each one's complete loop of " << SELECTION_WARMUP << " warm-up + "
@@ -1911,7 +1916,8 @@ int main(int argc, char** argv) {
                 "calls. Outside: the generation of the "
                 "regions of "
                 "every iteration and their conversion to FKL rectangles and RPP ROIs (once per pipeline, when it is "
-                "created, before its first run), the idle gaps, the thread pool spin settings and the validation.\n"
+                "created, before its first run), the idle gaps, the thread pool spin settings before every run (rpp_crop's "
+                "settings between its size batches are inside its timed conversion) and the validation.\n"
              << "Validation: before the timing of every N, the six timed pipelines (RPP 1 thread and RPP "
              << hardwareThreads << " threads, each in both conversion forms, FKL CPU, FKL CPU_MULTITHREAD) run the regions of the timed iterations k = " << sampledText()
              << " (" << validated << (validated == 1 ? " iteration" : " iterations") << ": the first, every "

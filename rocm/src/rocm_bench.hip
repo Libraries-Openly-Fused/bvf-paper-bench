@@ -1580,7 +1580,8 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
 // Selection of the RPP pipeline: every RPP variant is validated against the RPP-convention reference on the validated
 // iterations of the selection pass and timed (CPU + GPU, one variant's complete loop after the other, SELECTION_WARMUP +
 // SELECTION_ITERS iterations per N, iteration i on the regions of iteration i); the numerically equivalent variant with
-// the lowest geometric mean of its medians over all N is the benchmark's RPP pipeline, the only one in the measurements
+// the lowest geometric mean of its medians over all N is the benchmark's RPP variant, measured afterwards in its two
+// conversion forms (rpp_frame, rpp_crop)
 // ------------------------------------------------------------------------------------------------
 
 struct SelectionRow {
@@ -2223,9 +2224,12 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << "before every call). The calls after the conversion are the same in both forms: they read the crops of the "
        << "RGB frame through their ROIs. Per N and per metric (CPU + GPU, GPU only, GPU only flushed), the form with "
        << "the lower median in that metric is the reported RPP pipeline, rpp_frame on a tie (rpp_conversion_form.csv, "
-       << "with both forms' medians and counts). Exact: the regions' origins and sizes are even, so "
+       << "with both forms' medians and counts; the GPU time only medians leave out the HIP runtime's blit kernels, "
+       << "among them the 8 hipMemcpyToSymbol uploads of every rppt_yuv_to_rgb call, 8 per execution for rpp_frame and "
+       << "8N for rpp_crop, whose time and dispatches are next to them). Exact: the regions' origins and sizes are "
+       << "even, so "
        << "every crop starts on a chroma sample of the frame, and RPP's chroma is nearest-neighbour (the per-crop "
-       << "conversion check above). Before rpp_crop is validated, its RGB frame is filled with the byte "
+       << "conversion check at the end of this file). Before rpp_crop is validated, its RGB frame is filled with the byte "
        << static_cast<int>(RGB_SENTINEL) << ", and its output must be exactly rpp_frame's in every validated "
        << "iteration (otherwise the run stops), so that a call reading a pixel no crop converted cannot go "
        << "unnoticed.\n"
@@ -2262,10 +2266,13 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << "rppt_crop and rppt_crop_mirror_normalize, LTRB for rppt_resize and rppt_resize_mirror_normalize, the formats "
        << "those calls work in: given the other one, RPP converts the caller's ROI tensor in place with an extra "
        << "kernel), the destination sizes, normalization and scalar parameter tensors (pinned host memory) and the rows "
-       << "of per channel constants (device memory); FKL's rectangles and views of every iteration. Inside the timed "
-       << "region: what each library needs to receive the regions of its iteration (RPP: one hipMemcpyAsync of the "
-       << "iteration's ROIs from the pinned buffer to the device ROI tensors, which RPP's kernels read; FKL: build() of "
-       << "the operations with the iteration's rectangles and the fusion, in every executeOperations call), and, because "
+       << "of per channel constants (device memory); for rpp_crop, the arguments of every iteration's per-crop "
+       << "rppt_yuv_to_rgb calls (the Y, UV and RGB pointers at each crop, its width and height); FKL's rectangles and "
+       << "views of every iteration. Inside the timed region: what each library needs to receive the regions of its "
+       << "iteration (RPP: one hipMemcpyAsync of the iteration's ROIs from the pinned buffer to the device ROI tensors, "
+       << "which RPP's kernels read, and rpp_crop's N rppt_yuv_to_rgb calls with the precomputed arguments of the "
+       << "iteration; FKL: build() of the operations with the iteration's rectangles and the fusion, in every "
+       << "executeOperations call), and, because "
        << "a user cannot hoist them, RPP's own copies inside its calls (the 8 hipMemcpyToSymbol of every rppt_yuv_to_rgb "
        << "and the 6 host-to-device hipMemcpyAsync of every rppt_tensor_subtract_tensor / rppt_tensor_divide_tensor, the "
        << "zeroing memset and the stream synchronization inside rppt_resize_mirror_normalize) and the hipMemsetAsync of "
@@ -2758,8 +2765,12 @@ int main(int argc, char** argv) {
         // that metric (CPU + GPU, GPU only, GPU only flushed), rpp_frame on a tie, with both forms' medians and counts;
         // the GPU only metrics only where they were measured
         std::ofstream form(outDir / "rpp_conversion_form.csv");
-        form << "N,implementation,conversion,median_us,gpu_median_us,gpu_flushed_median_us,kernels,memsets,memcpys,"
-                "reported_cpu_gpu,reported_gpu_only,reported_gpu_flushed\n";
+        // The GPU time only medians leave out the HIP runtime's blit kernels, as everywhere (gpu_time*.csv): among them
+        // the 8 hipMemcpyToSymbol uploads of every rppt_yuv_to_rgb, so 8 per execution for rpp_frame and 8N for
+        // rpp_crop; their median time and dispatches per execution are next to the medians
+        form << "N,implementation,conversion,median_us,gpu_median_us,gpu_flushed_median_us,gpu_blit_median_us,"
+                "gpu_blit_dispatches_per_execution,gpu_flushed_blit_median_us,gpu_flushed_blit_dispatches_per_execution,"
+                "kernels,memsets,memcpys,reported_cpu_gpu,reported_gpu_only,reported_gpu_flushed\n";
         for (const size_t batch : BATCHES) {
             const auto find = [&](const std::string& name) {
                 const auto r = std::find_if(results.begin(), results.end(), [&](const Result& x) {
@@ -2780,9 +2791,12 @@ int main(int argc, char** argv) {
                 form << batch << "," << r->name << "," << conversion << "," << std::fixed << std::setprecision(2)
                      << r->timing.median << ",";
                 if (tracing) {
-                    form << r->gpuTiming.median << "," << r->gpuFlushedTiming.median;
+                    form << r->gpuTiming.median << "," << r->gpuFlushedTiming.median << "," << r->gpuBlitTiming.median
+                         << "," << std::setprecision(1) << r->gpuBlitDispatches << "," << std::setprecision(2)
+                         << r->gpuFlushedBlitTiming.median << "," << std::setprecision(1)
+                         << r->gpuFlushedBlitDispatches << std::setprecision(2);
                 } else {
-                    form << ",";
+                    form << ",,,,,";
                 }
                 form << "," << r->launches.kernels << "," << r->launches.memsets << "," << r->launches.memcpys << ","
                      << flag(cropCpuGpu) << ",";
