@@ -51,8 +51,9 @@ machine, the CUDA runtime library both libraries load is the system's (CUDA 13.3
 - **parameters:** per region, the index of its window's first value in the luma and in the chroma plane and its grid
   coordinates, computed on the host and, on the GPU, uploaded in one copy from pinned memory;
 - **gather:** the 48 x 24 window at every region's origin (the largest region size: the geometry draws every position
-  for that box, so it is inside the frame) with one `take` from the NV12 frame, at the windows' byte indices (each
-  window's first byte + the window's offsets): N x 24 x 48 luma and N x 12 x 24 x 2 chroma;
+  for that box, so it is inside the frame) with one `take` from the NV12 frame, at three first bytes per region (the
+  two halves of its luma window and its chroma window) + the offsets of 12 rows of 48 bytes: N x 24 x 48 luma and
+  N x 12 x 24 x 2 chroma;
 - **conversion:** the chroma terms (`addmm` or two `addcmul`) and the broadcast `add` on the whole batch;
 - **resize:** one `grid_sample` (bilinear, `align_corners=false`) on the N windows, with each region's pixel-center
   coordinates, `(dst + 0.5) * (in / out) - 0.5` clamped to the region's own first and last pixel, so that the
@@ -82,14 +83,14 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
 
 ## What PyTorch is forced to do that FKL does not
 
-- **A host loop over the regions, or windows of the largest size.** The regions have different sizes, and
-  `interpolate` takes one input size per call. In the per-region variants every region is its own sequence of operator
-  calls: 5 or 6 device operations per region on the GPU (by variant: 4 to 6 kernels, plus a device to device memcpy in
-  the channels-last variants), and about as many operator calls on the CPU. The batched variants avoid the loop with
-  one shape for all regions: they gather and convert the 48 x 24 window of every region (1152 pixels, against 200,
-  512 or 1152 for the 20x10, 32x16 and 48x24 regions), resample it with a grid of N x 32 x 64 coordinate pairs, and
-  upload the regions' parameters every iteration. FKL processes the N regions, each with its own size, in one call and
-  one kernel.
+- **A host loop over the regions, or windows of the largest size.** The regions have different sizes, and `interpolate`
+  takes one input size per call. In the per-region variants every region is its own sequence of operator calls: 5 or 6
+  device operations per region on the GPU (by variant: 4 to 6 kernels, plus a device to device memcpy in the
+  channels-last variants), and about as many operator calls on the CPU. The batched variants avoid the loop with one
+  shape for all regions: they gather and convert the 48 x 24 window of every region (1152 pixels, against 200, 512 or
+  1152 for the 20x10, 32x16 and 48x24 regions), resample it with a grid of N x 32 x 64 coordinate pairs, and write the
+  regions' parameters every iteration (on the GPU, uploaded in one copy). FKL processes the N regions, each with its own
+  size, in one call and one kernel.
 - **No code for this GPU's operators in the wheel.** The cu132 wheel's build flags (`pytorch_build_information.txt`)
   give SASS for sm_75, sm_80, sm_86, sm_90, sm_100 and sm_120; its only sm_89 code is a set of CUTLASS FP8 GEMM kernels
   (`cuobjdump -arch sm_89` of `libtorch_cuda.so`). So PyTorch's own kernels in this pipeline run as sm_86 code on the
@@ -97,7 +98,7 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
   on.
 - **Intermediates in memory.** Per region: the chroma terms, the h x w x 3 float RGB crop (in the batched variants the
   48 x 24 window, after the gathered 8-bit windows) and the resized 3 x 32 x 64 image; in the batched variants also the
-  int64 byte indices of the windows (2 x 1152 per region, 18432 bytes), the grid (32 x 64 coordinate pairs) and, on the
+  int64 byte indices of the windows (3 x 576 per region, 13824 bytes), the grid (32 x 64 coordinate pairs) and, on the
   GPU, the device copy of the parameters; with `addmm` also the float chroma (on both devices), and on the CPU the float
   copies TensorIterator makes of the 8-bit inputs (the luma, and with `addcmul` the U and V views). The output is
   written, then rewritten three times by `mul_`, `sub_` and `div_`, plus the two border fills. FKL keeps everything in
@@ -108,13 +109,15 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
 - **Kernel launches, one stream, no overlap (GPU).** Each iteration is about 5 N to 6 N dependent kernels and memcpys on
   one stream in the per-region variants, and about 13 kernels and a memcpy in the batched ones (`kernels.csv`). The GPU
   time (`gpu_time.csv`) is a fraction of the iteration's time (`latency.csv`); the rest is host work and launch gaps.
-- **Thread count is per operator (CPU).** PyTorch splits an operator of more than its grain size (32768 elements) into
-  ceil(elements / 32768) equal chunks, at most one per thread; smaller operators run on one thread. On 32 threads, in
-  the per-region variants, its per-region operators are one chunk each and run on one thread; only the border fills
-  (from N = 16) and the last three operators (from N = 4) are split: at N = 50 into 5 chunks per fill and 19 per
-  operator, at N = 100 into 10 and 32. The batched variants' operators work on all regions at once. With `addmm`, MKL's
-  GEMM decides its own threading (`at::set_num_threads` sets MKL's thread count too). FKL's thread pool splits the fused
-  loop into one chunk per output row of each region.
+- **Thread count is per operator (CPU).** PyTorch's element-wise operators (TensorIterator's) split an operator of more
+  than 32768 elements into ceil(elements / 32768) equal chunks, at most one per thread; smaller ones run on one thread.
+  On 32 threads, in the per-region variants, its per-region operators are one chunk each and run on one thread; only the
+  border fills (from N = 16) and the last three operators (from N = 4) are split: at N = 50 into 5 chunks per fill and
+  19 per operator, at N = 100 into 10 and 32. In the batched variants every operator works on all regions at once, and
+  the gather and the resize have grains of their own (in the wheel's `libtorch_cpu.so`): `take` splits every 3000
+  indices (1728 per region: 3, 10, 29 and 32 chunks at N = 4, 16, 50 and 100) and `grid_sample` every 4 regions (1, 4,
+  13 and 25 chunks). With `addmm`, MKL's GEMM decides its own threading (`at::set_num_threads` sets MKL's thread count
+  too). FKL's thread pool splits the fused loop into one chunk per output row of each region.
 
 ## What PyTorch gets that FKL does not
 
