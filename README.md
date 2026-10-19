@@ -43,7 +43,8 @@ Next to them:
   CI (`ci/run_benchmarks.cmake`);
 - the submodules `fkl` (FusedKernelLibrary main, with its `thread-pool` submodule for the `CPU_MULTITHREAD` backend),
   `nppdx` (NVIDIA NPPDx v0.1.2) and `gern` (Fern, d05bc66: the code generator of `fkl-vs-fern-cpu`, whose generated
-  code is checked in).
+  code is checked in; `update = none`, so recursive clones skip it, see
+  [regenerating the Fern code](fkl-vs-fern-cpu/README.md#build-and-run)).
 
 `rocm/` has its own scripts (`rocm/scripts/run_all.sh` runs both of its benchmarks and the hardware counters).
 
@@ -277,7 +278,8 @@ Every job runs [`scripts/ci/run_benchmarks.cmake`](scripts/ci/run_benchmarks.cma
 `~/bvf-paper-bench-deps` (so the first run on a runner takes much longer), builds the benchmarks (FKL vs NPPDx for
 every region size, `NPPDX_SIZES`, and the NPPDx neighborhood programs) with one timed iteration and no warm-up (`ITERATIONS` and `WARMUP_ITERATIONS` of the
 script), runs every mode except those for Nsight Compute (`--ncu-target` and the profiling scripts), regenerates the Fern code
-from the `gern` submodule on Linux and compares it with the checked-in copy, and fails if a
+on Linux from gern at the submodule's commit (cloned in `~/bvf-paper-bench-deps`) and compares it with the checked-in
+copy, and fails if a
 benchmark fails or if FKL's or NPPDx's outputs do not match their references (OpenCV's and NPP's are in
 `validation.csv` but not required: they come from the OpenCV build and the CUDA toolkit of each runner). The results
 and logs of every job are uploaded as artifacts. Times measured on shared CI runners are not the paper's numbers.

@@ -182,7 +182,7 @@ int main(int argc, char** argv) {
                  "Fern code FKL thread pool " + std::to_string(threads) + " threads", multiThread, "FKL CPU_MULTITHREAD");
         std::ofstream v(outDir / "cpu_validation.csv");
         v << "Batch size, Iteration, FKL MaxAbsError vs FKL-convention reference, Fern MaxAbsError vs FKL-convention "
-             "reference, Fern vs FKL MaxAbsDifference, Fern on FKL's pool vs Fern MaxAbsDifference, FKL "
+             "reference, Fern vs FKL MaxAbsDifference, Fern code FKL thread pool vs Fern MaxAbsDifference, FKL "
              "CPU_MULTITHREAD vs FKL CPU MaxAbsDifference" << std::endl;
         for (const auto& c : checks) {
             v << c.batch << ", " << c.iteration << ", " << c.fklVsReference << ", " << c.fernVsReference << ", "

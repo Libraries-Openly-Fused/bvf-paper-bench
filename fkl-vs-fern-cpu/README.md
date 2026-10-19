@@ -121,11 +121,18 @@ clang, `-march=native` by default (`CPU_ARCH_FLAGS`):
     cmake --build build-fern-cpu -j
     ./build-fern-cpu/benchmark_fern_cpu ../results/fkl-vs-fern-cpu
 
-To regenerate the Fern code from the `gern` submodule (`git submodule update --init gern`), on Linux or macOS with
-CMake 3.30 or newer:
+To regenerate the Fern code from the `gern` submodule, on Linux or macOS with CMake 3.30 or newer:
 
+    git submodule update --init --checkout gern
     cmake -DCXX=clang++ -P fkl-vs-fern-cpu/fern/regenerate.cmake            # checks generated/ against it
     cmake -DCXX=clang++ -DWRITE=ON -P fkl-vs-fern-cpu/fern/regenerate.cmake # replaces generated/
+    git submodule deinit gern
+
+`-DGERN=<path>` takes another checkout of gern, which must be at the pinned commit (the CI clones one). The submodule
+is `update = none`, so `git clone --recursive` and `git submodule update --init --recursive` skip it: gern at d05bc66
+records a submodule (`gernels/mm/SGEMM_CUDA`) that it does not declare in a `.gitmodules`. While gern is checked out,
+every `git submodule foreach --recursive` and recursive update in this repository fails on it; `git submodule deinit
+gern` ends that.
 
 gern at d05bc66 calls `std::find` in `src/codegen/codegen.cpp` without including `<algorithm>`, which libstdc++ 15 no
 longer includes indirectly. `regenerate.cmake` forces the header on every gern source (`-include algorithm`) instead of

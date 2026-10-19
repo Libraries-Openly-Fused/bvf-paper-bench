@@ -1,7 +1,11 @@
 # Regenerates the Fern code of the benchmark (fern/generated/) from the gern submodule, at its pinned commit, and checks
 # that it is the checked-in copy, or replaces the copy with WRITE=ON:
 #
-#   cmake [-DCXX=<C++ compiler>] [-DWORK=<build folder>] [-DWRITE=ON] -P fkl-vs-fern-cpu/fern/regenerate.cmake
+#   cmake [-DCXX=<C++ compiler>] [-DWORK=<build folder>] [-DGERN=<gern checkout>] [-DWRITE=ON]
+#         -P fkl-vs-fern-cpu/fern/regenerate.cmake
+#
+# GERN is the gern submodule by default (`git submodule update --init --checkout gern`: it is `update = none`, so a
+# recursive clone or update skips it). Another checkout of gern must be at the submodule's pinned commit.
 #
 # It builds gern (CMake 3.30 or newer, a C++20 compiler; Linux or macOS: gern's runner, which the library includes,
 # uses dlfcn.h) without its tests, then fern_pipeline_gen.cpp against it, and runs it. gern at d05bc66 calls std::find
@@ -15,22 +19,28 @@ cmake_minimum_required(VERSION 3.30)
 
 get_filename_component(HERE "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)
 get_filename_component(REPO "${HERE}/../.." ABSOLUTE)
-set(GERN "${REPO}/gern")
+if(NOT GERN)
+    set(GERN "${REPO}/gern")
+endif()
+get_filename_component(GERN "${GERN}" ABSOLUTE)
 if(NOT CXX)
     set(CXX c++)
 endif()
 if(NOT WORK)
     set(WORK "${REPO}/build-fern-regenerate")
 endif()
-if(NOT EXISTS "${GERN}/CMakeLists.txt")
-    message(FATAL_ERROR "The gern submodule is not checked out: git submodule update --init gern")
+# gern's own commit (a checkout has a .git; in an empty submodule folder, git would report the parent's), which must be
+# the commit the repository pins
+if(NOT EXISTS "${GERN}/CMakeLists.txt" OR NOT EXISTS "${GERN}/.git")
+    message(FATAL_ERROR "${GERN} is not a checkout of gern: git submodule update --init --checkout gern")
 endif()
-# The submodule's own commit (a checked-out submodule has a .git file; without it, git would report the parent's)
-if(NOT EXISTS "${GERN}/.git")
-    message(FATAL_ERROR "${GERN} is not a git checkout of gern: git submodule update --init gern")
-endif()
-execute_process(COMMAND git -C "${GERN}" rev-parse --short HEAD OUTPUT_VARIABLE gernCommit
+execute_process(COMMAND git -C "${GERN}" rev-parse HEAD OUTPUT_VARIABLE gernFullCommit
                 OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(COMMAND git -C "${REPO}" ls-tree HEAD gern OUTPUT_VARIABLE gernEntry OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(NOT gernFullCommit OR NOT gernEntry MATCHES "${gernFullCommit}")
+    message(FATAL_ERROR "gern in ${GERN} is at ${gernFullCommit}; the repository pins ${gernEntry}")
+endif()
+string(SUBSTRING "${gernFullCommit}" 0 7 gernCommit)
 message(STATUS "gern ${gernCommit}, compiler ${CXX}, build in ${WORK}")
 
 function(run)

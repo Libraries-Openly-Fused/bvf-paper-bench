@@ -8,3 +8,4 @@
 [submodule "gern"]
 	path = gern
 	url = https://github.com/manya-bansal/gern
+	update = none

@@ -541,12 +541,31 @@ if(BENCHMARKS STREQUAL "cpu")
                             "FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference")
         check_csv("${OUT_DIR}/fkl-vs-fern-cpu/cpu_validation.csv" "${column}" 1e-3)
     endforeach()
-    check_csv("${OUT_DIR}/fkl-vs-fern-cpu/cpu_validation.csv" "Fern on FKL's pool vs Fern MaxAbsDifference" 0)
-    # The checked-in Fern code must be what gern (the pinned submodule) generates: on Linux, where gern builds (its
-    # runner uses dlfcn.h)
+    check_csv("${OUT_DIR}/fkl-vs-fern-cpu/cpu_validation.csv" "Fern code FKL thread pool vs Fern MaxAbsDifference" 0)
+    # The checked-in Fern code must be what gern, at the commit of the pinned submodule, generates: on Linux, where gern
+    # builds (its runner uses dlfcn.h). gern is cloned at that commit in DEPS_DIR, not checked out in the workspace: gern
+    # records a submodule its tree does not declare, which breaks `git submodule foreach --recursive` in a checkout
+    # that includes it, such as the one actions/checkout runs in a runner's workspace before every job
     if(NOT CMAKE_HOST_WIN32)
-        run(fern_regenerate COMMAND "${CMAKE_COMMAND}" "-DCXX=${CXX_COMPILER}" "-DWORK=${BUILD_DIR}/fern-regenerate"
-            -P "${REPO}/fkl-vs-fern-cpu/fern/regenerate.cmake")
+        execute_process(COMMAND git -C "${REPO}" ls-tree HEAD gern OUTPUT_VARIABLE gernEntry
+                        OUTPUT_STRIP_TRAILING_WHITESPACE)
+        string(REGEX MATCH "[0-9a-f]+[\t ]+gern$" gernCommit "${gernEntry}")
+        string(REGEX REPLACE "[\t ]+gern$" "" gernCommit "${gernCommit}")
+        execute_process(COMMAND git -C "${REPO}" config -f .gitmodules submodule.gern.url OUTPUT_VARIABLE gernUrl
+                        OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(NOT gernCommit MATCHES "^[0-9a-f]+$" OR NOT gernUrl)
+            message(FATAL_ERROR "No gern submodule in ${REPO} (${gernEntry}, ${gernUrl})")
+        endif()
+        set(gernDir "${DEPS_DIR}/gern-${gernCommit}")
+        if(NOT EXISTS "${gernDir}/.git")
+            # Cloned beside it and renamed once complete, so that a later job never reuses an interrupted clone
+            file(REMOVE_RECURSE "${gernDir}" "${gernDir}-partial")
+            run(gern_clone FATAL COMMAND git clone --no-checkout "${gernUrl}" "${gernDir}-partial")
+            file(RENAME "${gernDir}-partial" "${gernDir}")
+        endif()
+        run(gern_checkout FATAL COMMAND git -C "${gernDir}" checkout --detach --force "${gernCommit}")
+        run(fern_regenerate COMMAND "${CMAKE_COMMAND}" "-DCXX=${CXX_COMPILER}" "-DGERN=${gernDir}"
+            "-DWORK=${BUILD_DIR}/fern-regenerate" -P "${REPO}/fkl-vs-fern-cpu/fern/regenerate.cmake")
     endif()
 else()
     # The benchmarks on common/bench_gpu.h: <build name>:<folder>:<program>
