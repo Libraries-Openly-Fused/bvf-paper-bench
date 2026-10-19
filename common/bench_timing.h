@@ -13,8 +13,9 @@
    limitations under the License. */
 
 // Timing statistics and FKL's two-execution CSV format, shared by the benchmarks of this repository: the GPU harness
-// (common/bench_gpu.h), the CPU harness (common/bench_cpu.h) and fkl-vs-pytorch's GPU program, which builds against
-// LibTorch for CUDA or ROCm and so cannot include the CUDA-only common/bench_gpu.h. Plain C++, no GPU API.
+// (common/bench_gpu.h), the CPU harness (common/bench_cpu.h) and fkl-vs-pytorch's GPU program (added by pull request
+// #18), which builds against LibTorch for CUDA or ROCm and so cannot include the CUDA-only common/bench_gpu.h. Plain C++,
+// no GPU API.
 
 #ifndef BVF_BENCH_TIMING_H
 #define BVF_BENCH_TIMING_H

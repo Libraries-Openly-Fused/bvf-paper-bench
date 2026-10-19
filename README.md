@@ -194,8 +194,9 @@ and max), `compile_time_kernels.csv` and `compile_time_phases.csv`, and prints a
 
 ## The CPU benchmarks
 
-FKL vs OpenCV on the CPU shares one harness with the other CPU benchmarks (FKL vs PyTorch, Halide and Fern; not
-`rocm/`'s RPP program, see [the GPU benchmarks](#the-gpu-benchmarks)), [`common/bench_cpu.h`](common/bench_cpu.h). FKL's side is [`common/bench_fkl_cpu.cpp`](common/bench_fkl_cpu.cpp):
+FKL vs OpenCV on the CPU shares one harness with the other CPU benchmarks (FKL vs PyTorch, Halide and Fern, added by
+pull requests #18, #16 and #17; not `rocm/`'s RPP program, see [the GPU benchmarks](#the-gpu-benchmarks)),
+[`common/bench_cpu.h`](common/bench_cpu.h). FKL's side is [`common/bench_fkl_cpu.cpp`](common/bench_fkl_cpu.cpp):
 one `executeOperations` call (BVF) on FKL's CPU backend (one thread) and on its `CPU_MULTITHREAD` backend (FKL's
 thread pool, one worker per hardware thread). Each program compares its library on one thread with FKL on one thread,
 and on as many threads as FKL's pool has workers with FKL's pool.
@@ -208,8 +209,9 @@ The two libraries of a comparison never run at the same time:
   iteration, which pairs runs on identical inputs. Every comparison CSV has a `_per_iteration.csv` sibling with the
   pairs.
 - **Idle gap.** Every run follows a 1 ms idle gap, which the timing thread busy-waits, so that its core stays out of a
-  deep C-state. A pool whose workers spin for less than that after a run (FKL's, OpenCV's, Halide's) is asleep when
-  the next run starts; one that spins longer (PyTorch's libgomp, by default) is still spinning. Each library keeps its
+  deep C-state. A pool whose workers spin for less than that after a run (FKL's and OpenCV's, as the platform file's
+  busy times show) is asleep when the next run starts; one that spins longer (libgomp's, by default: PyTorch's, #18)
+  is still spinning. Each library keeps its
   own threads, if it has any, and its own idle behaviour.
 - **Worker busy time.** Each program measures how long the workers of every pool it uses (FKL's, and the library's if
   it has one) stay busy after a run with little
@@ -232,9 +234,13 @@ with each library's imported symbols) take. Not aligned: the constants, strings 
 with the other objects', the read-only data the object places after its strings (the type names of its type
 information), and its per-function read-only data (switch tables, not in the timed loops). FKL's timed code reads some
 of those merged 8-, 16- and 32-byte constants, whose addresses modulo 4096 differ by a few cache lines between programs;
-whether that changes FKL's times is not measured separately: the cross-program FKL times of the paper's runs show it. The platform file records three of those addresses; `nm` on two programs compares all of
-them. The [protocol change](fkl-vs-opencv-cpu/README.md#protocol-change)
-section of FKL vs OpenCV on the CPU explains the busy-waited gap and the separate translation unit.
+whether that changes FKL's times is not measured separately: the cross-program FKL times of the paper's runs show it.
+The platform file records the addresses modulo 4096 of two aligned symbols (`benchFklCodeStart` and `benchFklBssStart`,
+0 by construction) and of one function in FKL's aligned code section (`fklFrame`), and `nm` on two programs compares
+every FKL symbol; the merged constants have no symbols
+(`objdump -d` shows the addresses FKL's code loads them from). The
+[protocol change](fkl-vs-opencv-cpu/README.md#protocol-change) section of FKL vs OpenCV on the CPU explains the
+busy-waited gap and the separate translation unit.
 
 ## Requirements
 

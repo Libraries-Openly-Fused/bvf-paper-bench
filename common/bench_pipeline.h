@@ -15,7 +15,7 @@
 // The constants of the Figure 1 pipeline and the conventions of its references, in plain C++ (no FKL), for the code
 // that compares a library with FKL without including FKL: the CPU benchmarks on common/bench_cpu.h (FKL's headers are
 // included by one translation unit only, common/bench_fkl_cpu.cpp) and the PyTorch side of fkl-vs-pytorch's GPU
-// program.
+// program (added by pull request #18).
 
 #ifndef BVF_BENCH_PIPELINE_H
 #define BVF_BENCH_PIPELINE_H
