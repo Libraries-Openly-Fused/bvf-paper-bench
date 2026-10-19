@@ -7,8 +7,10 @@
 // and FKL BVF last; never two implementations at the same time, never interleaved per iteration. Iteration t of every
 // loop runs on the regions of iteration t, so FKL BVF's speedup pairs the runs of the same iteration.
 //
-// Implementations: rpp (the fastest of the RPP variants below, chosen by a selection pass; the only RPP pipeline in the
-// measurements), fkl_vf_hf and fkl_bvf. RPP variants (ROCm Performance Primitives, HIP backend):
+// Implementations: rpp_frame and rpp_crop (the fastest of the RPP variants below, chosen by a selection pass, with its
+// NV12 -> RGB conversion of the full frame or of only the N crops of the iteration: one rppt_yuv_to_rgb per crop, the
+// planes' pointers offset to the crop origin, written at the crop's position in the RGB frame; per N the faster of the
+// two is the reported RPP pipeline), fkl_vf_hf and fkl_bvf. RPP variants (ROCm Performance Primitives, HIP backend):
 //   rpp_per_op         one RPP call per operation, batched where RPP can:
 //                      rppt_yuv_to_rgb on the full frame (8 bit RGB), one rppt_crop_mirror_normalize for all the
 //                      crops (8u -> 32f, every batch image aliasing the frame), hipMemsetAsync of the output tensor
@@ -68,6 +70,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -231,7 +234,7 @@ struct Implementation {
     // The GPU operations (library calls, kernels, memsets, copies) of the pipeline, in order, for the per operation
     // breakdown
     std::vector<std::pair<std::string, Stage>> stages;
-    std::string variant; // for "rpp": the RPP variant it is
+    std::string variant; // for rpp_frame and rpp_crop: the RPP variant they are
 };
 
 // NaN poisoning and readback of the outputs are ordered on the pipeline stream, like the pipelines themselves
@@ -652,6 +655,39 @@ RppStage yuvToRgbStage(Context& ctx, RppStatePtr st) {
     return {"rppt_yuv_to_rgb_full_frame", [&ctx, st](size_t) { rppYuvToRgb(ctx, *st); }};
 }
 
+// rppt_yuv_to_rgb on one crop only. The function takes no ROI tensor (unlike rppt_crop_mirror_normalize or
+// rppt_box_filter), so the crop is an ROI in NPP's sense: the planes' pointers offset to the crop's origin, the frame's
+// pitches and the crop's width and height, writing the crop at its own position in the 8 bit RGB frame rgbFrame (rows of
+// FRAME_W * 3 bytes). Exact: the regions' origins and sizes are even (common/bench_geometry.h), so a crop starts on a
+// chroma sample of the frame, and RPP's chroma is nearest-neighbour, so every crop pixel gets the value of the full-frame
+// conversion (checked by perCropConversionCheck, which also checks that nothing outside the crops is written)
+void rppYuvToRgbCrop(const Context& ctx, RpptDesc& nv12Desc, RpptDesc& rgbDesc, uint8_t* rgbFrame, rppHandle_t handle,
+                     const Region& r) {
+    RPP_CHECK(rppt_yuv_to_rgb(ctx.y + static_cast<size_t>(r.y) * ctx.pitch + r.x,
+                              ctx.uv + static_cast<size_t>(r.y / 2) * ctx.pitch + r.x, &nv12Desc,
+                              rgbFrame + (static_cast<size_t>(r.y) * FRAME_W + r.x) * 3, &rgbDesc, ctx.pitch, ctx.pitch,
+                              FRAME_W * 3, r.width, r.height, RpptColorStandard_BT601, RpptColorRange_STUDIO, handle,
+                              RppBackend::RPP_HIP_BACKEND));
+}
+
+// The conversion of an RPP pipeline: the full frame (one call) or only the N crops of the iteration (one call per crop,
+// each one a GPU operation of its own for the cache flush, as every RPP call is). Both write the same 8 bit RGB frame,
+// which the rest of the pipeline reads through the crops' ROIs, so the calls after the conversion do not change.
+enum class RppConversion { Frame, Crop };
+
+RppStage yuvToRgbCropsStage(Context& ctx, RppStatePtr st) {
+    return {"rppt_yuv_to_rgb_per_crop", [&ctx, st](size_t t) {
+                for (size_t i = 0; i < st->n; ++i) {
+                    beforeKernel();
+                    rppYuvToRgbCrop(ctx, st->nv12Desc, st->rgbDesc, st->rgb8, st->handle, ctx.regions->at(t, i));
+                }
+            }};
+}
+
+RppStage conversionStage(Context& ctx, RppStatePtr st, RppConversion conversion) {
+    return conversion == RppConversion::Frame ? yuvToRgbStage(ctx, st) : yuvToRgbCropsStage(ctx, st);
+}
+
 // Crop + 8u -> 32f of all the crops, every batch image aliasing the RGB frame
 RppStage cropConvertStage(RppStatePtr st) {
     return {"rppt_crop_mirror_normalize_8u32f_batch", [st](size_t) {
@@ -763,8 +799,13 @@ RppStage normalizeStage(RppStatePtr st) {
             }};
 }
 
-Implementation makeRppImplementation(const std::string& name, Context& ctx, RppStatePtr st, std::vector<RppStage> stages) {
-    Implementation impl{name, "rpp_sampling_8bit"};
+// The 8 bit RGB frame's bytes before validating a per-crop pipeline: a value outside the crops then stays this one, so a
+// later call that read a pixel no crop converted would give an output off the reference (fillNaN, never timed)
+constexpr uint8_t RGB_SENTINEL = 0x5A;
+
+Implementation makeRppImplementation(const std::string& name, Context& ctx, RppStatePtr st, std::vector<RppStage> stages,
+                                     RppConversion conversion) {
+    Implementation impl{conversion == RppConversion::Frame ? name : name + "_crop", "rpp_sampling_8bit"};
     // First the upload of the iteration's ROIs
     stages.insert(stages.begin(), uploadRoisStage(ctx, st));
     for (size_t i = 0; i < stages.size(); ++i) {
@@ -777,54 +818,66 @@ Implementation makeRppImplementation(const std::string& name, Context& ctx, RppS
         }
     };
     impl.download = [&ctx, st]() { return downloadDevice(ctx.stream, st->tensor, st->n * OUT_FLOATS); };
-    impl.fillNaN = [&ctx, st]() { poisonDevice(ctx.stream, st->tensor, st->n * OUT_FLOATS); };
+    impl.fillNaN = [&ctx, st, conversion]() {
+        poisonDevice(ctx.stream, st->tensor, st->n * OUT_FLOATS);
+        if (conversion == RppConversion::Crop) {
+            gpuErrchk(hipMemsetAsync(st->rgb8, RGB_SENTINEL, static_cast<size_t>(FRAME_W) * FRAME_H * 3, ctx.stream));
+        }
+    };
     return impl;
 }
 
 // One RPP call per operation of Figure 1
 template <size_t N>
-Implementation makeRpp(Context& ctx) {
+Implementation makeRpp(Context& ctx, RppConversion conversion) {
     auto st = makeRppState(ctx, N, false, RppRois::CropAndResize);
-    return makeRppImplementation("rpp_per_op", ctx, st, {yuvToRgbStage(ctx, st), cropConvertStage(st), zeroTensorStage(ctx, st),
-                                             resizeIntoOutputStage(st), multiplyStage(st), subtractStage(st),
-                                             divideStage(st)});
+    return makeRppImplementation("rpp_per_op", ctx, st, {conversionStage(ctx, st, conversion), cropConvertStage(st),
+                                                    zeroTensorStage(ctx, st), resizeIntoOutputStage(st),
+                                                    multiplyStage(st), subtractStage(st), divideStage(st)},
+                                 conversion);
 }
 
 // The same calls, with exactly the intermediates of the paper's NPP pipeline (8 bit frame, float3 crops, float3
 // resized crops, output): the resize writes its own buffer, and one batched rppt_crop F32 -> F32 is the strided copy
 // into the output rows, after the memset of the tensor
 template <size_t N>
-Implementation makeRppNppLike(Context& ctx) {
+Implementation makeRppNppLike(Context& ctx, RppConversion conversion) {
     auto st = makeRppState(ctx, N, true, RppRois::CropAndResize);
-    return makeRppImplementation("rpp_npp_like", ctx, st, {yuvToRgbStage(ctx, st), cropConvertStage(st), resizeStage(st),
-                                                      zeroTensorStage(ctx, st), copyIntoOutputStage(st),
-                                                      multiplyStage(st), subtractStage(st), divideStage(st)});
+    return makeRppImplementation("rpp_npp_like", ctx, st, {conversionStage(ctx, st, conversion), cropConvertStage(st),
+                                                      resizeStage(st), zeroTensorStage(ctx, st),
+                                                      copyIntoOutputStage(st), multiplyStage(st), subtractStage(st),
+                                                      divideStage(st)},
+                                 conversion);
 }
 
 // RPP's fused primitive: rppt_resize_mirror_normalize does crop + 8u -> 32f + resize + Mul, then Sub and Div
 template <size_t N>
-Implementation makeRppFused(Context& ctx) {
+Implementation makeRppFused(Context& ctx, RppConversion conversion) {
     auto st = makeRppState(ctx, N, false, RppRois::ResizeMirrorNormalize);
-    return makeRppImplementation("rpp_fused", ctx, st, {yuvToRgbStage(ctx, st), zeroFirstBorderStage(ctx, st),
-                                                   resizeMirrorNormalizeStage(st, true), subtractStage(st),
-                                                   divideStage(st)});
+    return makeRppImplementation("rpp_fused", ctx, st, {conversionStage(ctx, st, conversion),
+                                                   zeroFirstBorderStage(ctx, st), resizeMirrorNormalizeStage(st, true),
+                                                   subtractStage(st), divideStage(st)},
+                                 conversion);
 }
 
 // One RPP call per operation up to the resize, then Mul + Sub + Div in one rppt_normalize
 template <size_t N>
-Implementation makeRppNormalize(Context& ctx) {
+Implementation makeRppNormalize(Context& ctx, RppConversion conversion) {
     auto st = makeRppState(ctx, N, false, RppRois::CropAndResize);
-    return makeRppImplementation("rpp_normalize", ctx, st, {yuvToRgbStage(ctx, st), cropConvertStage(st),
+    return makeRppImplementation("rpp_normalize", ctx, st, {conversionStage(ctx, st, conversion), cropConvertStage(st),
                                                        zeroTensorStage(ctx, st), resizeIntoOutputStage(st),
-                                                       normalizeStage(st)});
+                                                       normalizeStage(st)},
+                                 conversion);
 }
 
 // The fewest RPP calls: rppt_resize_mirror_normalize (crop + 8u -> 32f + resize) and rppt_normalize (Mul + Sub + Div)
 template <size_t N>
-Implementation makeRppFusedNormalize(Context& ctx) {
+Implementation makeRppFusedNormalize(Context& ctx, RppConversion conversion) {
     auto st = makeRppState(ctx, N, false, RppRois::ResizeMirrorNormalize);
-    return makeRppImplementation("rpp_fused_normalize", ctx, st, {yuvToRgbStage(ctx, st), zeroFirstBorderStage(ctx, st),
-                                                             resizeMirrorNormalizeStage(st, false), normalizeStage(st)});
+    return makeRppImplementation("rpp_fused_normalize", ctx, st, {conversionStage(ctx, st, conversion),
+                                                             zeroFirstBorderStage(ctx, st),
+                                                             resizeMirrorNormalizeStage(st, false), normalizeStage(st)},
+                                 conversion);
 }
 
 // References on FKL's CPU backend, for the regions of iteration t. The float reference is the Figure 1 chain itself.
@@ -1255,51 +1308,59 @@ bool fklOutsideTolerance(const std::vector<Result>& results) {
                        [](const Result& r) { return r.name.rfind("fkl_", 0) == 0 && !r.withinTolerance(); });
 }
 
-// The RPP variants, all numerically equivalent on the HIP backend. The benchmark's RPP pipeline ("rpp") is the fastest
-// of them, chosen by the selection pass (selectRpp) or given with BENCH_RPP_VARIANT (profiling child, counter targets);
-// with allRppVariants (--validate) every variant is validated
+// The RPP variants, all numerically equivalent on the HIP backend. The benchmark's RPP pipeline is the fastest of them
+// with the full-frame conversion, chosen by the selection pass (chooseRpp) or given with BENCH_RPP_VARIANT (profiling
+// child, counter targets). It is measured in both conversion forms, rpp_frame and rpp_crop, each with its own loops and
+// speedups; per N the one with the lower CPU + GPU median is the reported RPP pipeline (rpp_conversion_form.csv). With
+// allRppVariants (--validate) every variant is validated in both forms.
 const std::array<std::string, 5> RPP_VARIANTS{"rpp_per_op", "rpp_npp_like", "rpp_fused", "rpp_normalize",
                                               "rpp_fused_normalize"};
 std::string selectedRpp;
 bool allRppVariants = false;
 
 template <size_t N>
-Implementation makeRppVariant(Context& ctx, const std::string& variant) {
-    if (variant == "rpp_per_op") return makeRpp<N>(ctx);
-    if (variant == "rpp_npp_like") return makeRppNppLike<N>(ctx);
-    if (variant == "rpp_fused") return makeRppFused<N>(ctx);
-    if (variant == "rpp_normalize") return makeRppNormalize<N>(ctx);
-    if (variant == "rpp_fused_normalize") return makeRppFusedNormalize<N>(ctx);
+Implementation makeRppVariant(Context& ctx, const std::string& variant, RppConversion conversion) {
+    if (variant == "rpp_per_op") return makeRpp<N>(ctx, conversion);
+    if (variant == "rpp_npp_like") return makeRppNppLike<N>(ctx, conversion);
+    if (variant == "rpp_fused") return makeRppFused<N>(ctx, conversion);
+    if (variant == "rpp_normalize") return makeRppNormalize<N>(ctx, conversion);
+    if (variant == "rpp_fused_normalize") return makeRppFusedNormalize<N>(ctx, conversion);
     throw std::runtime_error("Unknown RPP variant " + variant);
 }
 
+// The five variants with the full-frame conversion (the selection pass), or in both forms (--validate)
 template <size_t N>
-std::vector<Implementation> makeRppVariants(Context& ctx) {
+std::vector<Implementation> makeRppVariants(Context& ctx, bool bothConversions = false) {
     std::vector<Implementation> impls;
     for (const auto& v : RPP_VARIANTS) {
-        impls.push_back(makeRppVariant<N>(ctx, v));
+        impls.push_back(makeRppVariant<N>(ctx, v, RppConversion::Frame));
+        if (bothConversions) {
+            impls.push_back(makeRppVariant<N>(ctx, v, RppConversion::Crop));
+        }
     }
     return impls;
 }
 
+// The benchmark's RPP pipeline in one conversion form: rpp_frame or rpp_crop
 template <size_t N>
-Implementation makeSelectedRpp(Context& ctx) {
+Implementation makeSelectedRpp(Context& ctx, RppConversion conversion) {
     if (selectedRpp.empty()) {
         throw std::runtime_error("No RPP variant selected (selection pass or BENCH_RPP_VARIANT)");
     }
-    Implementation impl = makeRppVariant<N>(ctx, selectedRpp);
+    Implementation impl = makeRppVariant<N>(ctx, selectedRpp, conversion);
     impl.variant = selectedRpp;
-    impl.name = "rpp";
+    impl.name = conversion == RppConversion::Frame ? "rpp_frame" : "rpp_crop";
     return impl;
 }
 
-// The implementations in the comparison, and FKL BVF last, which has no intermediates in memory and keeps float3 from
-// the color conversion to the write
+// The implementations in the comparison: the RPP pipeline in its two conversion forms, FKL VF+HF, and FKL BVF last,
+// which has no intermediates in memory and keeps float3 from the color conversion to the write
 template <size_t N>
 std::vector<Implementation> makeImplementations(Context& ctx) {
-    std::vector<Implementation> impls = allRppVariants ? makeRppVariants<N>(ctx) : std::vector<Implementation>{};
+    std::vector<Implementation> impls = allRppVariants ? makeRppVariants<N>(ctx, true) : std::vector<Implementation>{};
     if (!allRppVariants) {
-        impls.push_back(makeSelectedRpp<N>(ctx));
+        impls.push_back(makeSelectedRpp<N>(ctx, RppConversion::Frame));
+        impls.push_back(makeSelectedRpp<N>(ctx, RppConversion::Crop));
     }
     impls.push_back(makeFklVfHf<N, true>(ctx));
     impls.push_back(makeFklBvf<N>(ctx));
@@ -1853,6 +1914,54 @@ void computeRppRgb8(Context& ctx) {
     gpuErrchk(hipStreamSynchronize(ctx.stream));
 }
 
+// The per-crop conversion (rppYuvToRgbCrop) against the full-frame one (ctx.rppRgb8), on the MAX_BATCH regions of every
+// validated timed iteration, each iteration into a frame of RGB_SENTINEL bytes: every byte of the crops must be the
+// full-frame conversion's, and every byte outside them must still be the sentinel. Throws otherwise; the summary goes
+// into platform.txt.
+void perCropConversionCheck(Context& ctx, std::ostream& os) {
+    auto st = makeRppState(ctx, 1);
+    const size_t pixels = static_cast<size_t>(FRAME_W) * FRAME_H;
+    std::vector<uint8_t> host(pixels * 3);
+    std::vector<uint8_t> inCrop(pixels);
+    size_t crops = 0, cropBytes = 0, differ = 0, outsideBytes = 0, outsideWritten = 0;
+    const auto validated = validation::validatedIterations(TIMED_ITERS);
+    for (const size_t v : validated) {
+        const size_t t = static_cast<size_t>(WARMUP_ITERS) + v;
+        gpuErrchk(hipMemsetAsync(st->rgb8, RGB_SENTINEL, pixels * 3, ctx.stream));
+        std::fill(inCrop.begin(), inCrop.end(), uint8_t{0});
+        for (size_t i = 0; i < MAX_BATCH; ++i) {
+            const Region& r = ctx.regions->at(t, i);
+            rppYuvToRgbCrop(ctx, st->nv12Desc, st->rgbDesc, st->rgb8, st->handle, r);
+            for (int y = r.y; y < r.y + r.height; ++y) {
+                std::fill_n(inCrop.begin() + static_cast<size_t>(y) * FRAME_W + r.x, r.width, uint8_t{1});
+            }
+            ++crops;
+        }
+        gpuErrchk(hipMemcpyAsync(host.data(), st->rgb8, host.size(), hipMemcpyDeviceToHost, ctx.stream));
+        gpuErrchk(hipStreamSynchronize(ctx.stream));
+        for (size_t px = 0; px < pixels; ++px) {
+            for (size_t c = 0; c < 3; ++c) {
+                const size_t i = px * 3 + c;
+                if (inCrop[px]) {
+                    ++cropBytes;
+                    differ += host[i] != ctx.rppRgb8[i];
+                } else {
+                    ++outsideBytes;
+                    outsideWritten += host[i] != RGB_SENTINEL;
+                }
+            }
+        }
+    }
+    os << "Per-crop conversion (rpp_crop: one rppt_yuv_to_rgb per crop, the planes' pointers offset to the crop origin, "
+          "the frame's pitches, the crop's width and height) against the full-frame conversion, on the "
+       << MAX_BATCH << " regions of each of the " << validated.size() << " validated timed iterations (" << crops
+       << " crops): " << differ << " of " << cropBytes << " crop bytes differ, " << outsideWritten << " of "
+       << outsideBytes << " bytes outside the crops written\n";
+    if (differ != 0 || outsideWritten != 0) {
+        throw std::runtime_error("the per-crop conversion is not the full-frame conversion restricted to the crops");
+    }
+}
+
 void conversionDiagnostic(const Context& ctx, std::ostream& os) {
     const std::vector<uint8_t>& host = ctx.rppRgb8;
     size_t diffRound = 0, diffTrunc = 0, total = 0;
@@ -2037,13 +2146,24 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << "one row per implementation, N and iteration; latency.csv's max_abs_err is the largest over them); an FKL "
        << "output outside its tolerance in any of them fails the program. After the timed iterations, the first "
        << "validated iteration is run again and must give the same output (every value within 1e-6).\n"
-       << "RPP pipeline: rpp = " << selectedRpp << ", the fastest of the five RPP variants below, which are "
+       << "RPP pipeline: " << selectedRpp << ", the fastest of the five RPP variants below, which are "
        << "numerically equivalent (within " << RPP_EQUIVALENCE << " of the RPP-convention reference, on the validated "
-       << "iterations of the selection pass): a selection pass validates and times every variant (CPU + GPU, one "
-       << "variant's complete loop after the other, " << SELECTION_WARMUP << " warm-up + " << SELECTION_ITERS
-       << " timed iterations per N, iteration i on the regions of iteration i) and picks the one with the lowest "
-       << "geometric mean "
-       << "of its medians (rpp_selection.csv); only that one is measured afterwards.\n"
+       << "iterations of the selection pass): a selection pass validates and times every variant with the full-frame "
+       << "conversion (CPU + GPU, one variant's complete loop after the other, " << SELECTION_WARMUP << " warm-up + "
+       << SELECTION_ITERS << " timed iterations per N, iteration i on the regions of iteration i) and picks the one "
+       << "with the lowest geometric mean of its medians (rpp_selection.csv). That variant is measured in two forms of "
+       << "its NV12->RGB conversion, each with its own loops and FKL BVF speedups: rpp_frame converts the full frame "
+       << "(one rppt_yuv_to_rgb), rpp_crop only the N crops of the iteration (one rppt_yuv_to_rgb per crop: "
+       << "rppt_yuv_to_rgb takes no ROI tensor, so each crop is an ROI in NPP's sense, the Y and UV pointers offset to "
+       << "the crop origin (Y + y * pitch + x, UV + (y / 2) * pitch + x), the frame's pitches, the crop's width and "
+       << "height, written at the crop's own position in the 8 bit RGB frame; the cache flush, where there is one, "
+       << "before every call). The calls after the conversion are the same in both forms: they read the crops of the "
+       << "RGB frame through their ROIs. Per N, the form with the lower CPU + GPU median is the reported RPP pipeline "
+       << "(rpp_conversion_form.csv, with both forms' counts). Exact: the regions' origins and sizes are even, so "
+       << "every crop starts on a chroma sample of the frame, and RPP's chroma is nearest-neighbour (the per-crop "
+       << "conversion check above). Before rpp_crop is validated, its RGB frame is filled with the byte "
+       << static_cast<int>(RGB_SENTINEL) << ", so that a call reading a pixel no crop converted would fail the "
+       << "validation.\n"
        << "RPP variants (HIP backend), each one starting with the hipMemcpyAsync of the ROIs of its iteration (below): "
        << "rpp_per_op = rppt_yuv_to_rgb (RpptColorStandard_BT601, RpptColorRange_STUDIO; 1 kernel plus 8 hipMemcpyToSymbol per "
        << "call: its matrix and luma bias, and 6 integer constants used only by its cubic_v variant, uploaded on every "
@@ -2212,7 +2332,7 @@ void writePerIterationRows(std::ostream& p, long long key, const std::vector<flo
     }
 }
 
-const std::array<std::string, 2> BASELINES{"rpp", "fkl_vf_hf"};
+const std::array<std::string, 3> BASELINES{"rpp_frame", "rpp_crop", "fkl_vf_hf"};
 
 template <size_t... Is>
 void runAllBatches(Context& ctx, std::vector<Result>& results, std::index_sequence<Is...>) {
@@ -2402,9 +2522,11 @@ template <size_t N>
 void rocprofTarget(Context& ctx, const std::string& name) {
     std::vector<Implementation> impls;
     if (std::find(RPP_VARIANTS.begin(), RPP_VARIANTS.end(), name) != RPP_VARIANTS.end()) {
-        impls.push_back(makeRppVariant<N>(ctx, name));
-    } else if (name == "rpp") {
-        impls.push_back(makeSelectedRpp<N>(ctx));
+        impls.push_back(makeRppVariant<N>(ctx, name, RppConversion::Frame));
+    } else if (name == "rpp_frame") {
+        impls.push_back(makeSelectedRpp<N>(ctx, RppConversion::Frame));
+    } else if (name == "rpp_crop") {
+        impls.push_back(makeSelectedRpp<N>(ctx, RppConversion::Crop));
     } else {
         impls.push_back(makeFklVfHf<N, true>(ctx));
         impls.push_back(makeFklVfHf<N, false>(ctx));
@@ -2499,6 +2621,7 @@ int main(int argc, char** argv) {
         computeRppRgb8(ctx);
         std::ostringstream diagnostic;
         conversionDiagnostic(ctx, diagnostic);
+        perCropConversionCheck(ctx, diagnostic);
         std::cout << diagnostic.str();
 
         std::vector<Result> results;
@@ -2564,6 +2687,32 @@ int main(int argc, char** argv) {
             writeValidationRows(validation, r);
             kernels << r.name << "," << r.batch << "," << r.launches.kernels << "," << r.launches.memsets << ","
                     << r.launches.memcpys << "\n";
+        }
+        // The reported RPP pipeline per N: the conversion form (rpp_frame, rpp_crop) with the lower CPU + GPU median,
+        // rpp_frame on a tie, with both forms' medians and counts
+        std::ofstream form(outDir / "rpp_conversion_form.csv");
+        form << "N,implementation,conversion,median_us,kernels,memsets,memcpys,reported\n";
+        for (const size_t batch : BATCHES) {
+            const auto find = [&](const std::string& name) {
+                const auto r = std::find_if(results.begin(), results.end(), [&](const Result& x) {
+                    return x.name == name && x.batch == static_cast<int>(batch);
+                });
+                if (r == results.end()) {
+                    throw std::runtime_error("No " + name + " result for N = " + std::to_string(batch));
+                }
+                return r;
+            };
+            const auto frame = find("rpp_frame"), crop = find("rpp_crop");
+            const bool cropReported = crop->timing.median < frame->timing.median;
+            for (const auto& [r, conversion, reported] :
+                 {std::tuple{frame, "full_frame", !cropReported}, std::tuple{crop, "per_crop", cropReported}}) {
+                form << batch << "," << r->name << "," << conversion << "," << std::fixed << std::setprecision(2)
+                     << r->timing.median << "," << r->launches.kernels << "," << r->launches.memsets << ","
+                     << r->launches.memcpys << "," << (reported ? "yes" : "no") << "\n";
+            }
+            std::cout << "RPP conversion form N = " << batch << ": rpp_frame " << std::fixed << std::setprecision(1)
+                      << frame->timing.median << " us, rpp_crop " << crop->timing.median << " us: reported "
+                      << (cropReported ? "rpp_crop" : "rpp_frame") << std::defaultfloat << std::endl;
         }
         // One CSV per baseline in FKL's two-execution format (times in ms):
         // <baseline>_vs_fkl_bvf_GPU_AMD.csv (CPU + GPU) and, where measured, <baseline>_vs_fkl_bvf_gpu_only_GPU_AMD.csv
