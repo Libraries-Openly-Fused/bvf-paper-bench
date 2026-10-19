@@ -237,9 +237,10 @@ measured execution exceeds the smallest of its three warm-up executions (the sam
 flushed) by more than 2 % and 256 KiB of traffic, up to `MAX_REPEATS` (3) rounds; the rejected profiles stay in
 `raw_rejected/` and `traffic_repeats.csv`, and `traffic.csv` has their count per row and whether a leak is still
 suspected. Duration on the paper's machine (bare metal, Ubuntu 26.04, Ryzen 7 5800X3D, RX 9060, performance level
-`STABLE_STD`), the paper run with `SKIP_COUNTERS=1`: 436 s, of which the builds 32 s, the GPU benchmark with
-its GPU time only passes 103 s and the CPU benchmark 299 s (the counters took 61 s in an earlier run with one region
-size).
+`STABLE_STD`), the paper run with `SKIP_COUNTERS=1`: 466 s, of which the builds 57 s (the GPU build also builds
+`rocm_neighborhood`), the GPU benchmark with its GPU time only passes 102 s and the CPU benchmark 306 s (the counters
+took 61 s in an earlier run with one region size); Experiment 3's paper run (`EXPERIMENT=3`): 378 s, of which the
+build 47 s and `rocm_neighborhood` 331 s.
 
 The workload is the one of `common/bench_geometry.h`, with the three region sizes by turns (`BENCH_REGIONS=mixed`,
 the paper's); one size for every region, as the NPPDx builds use, is another CMake option in `BENCH_CMAKE_ARGS`, for
