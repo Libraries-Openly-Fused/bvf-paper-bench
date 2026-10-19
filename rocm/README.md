@@ -198,8 +198,8 @@ thread pool, so that the idle gap before every timed run puts both pools to slee
 
 ## Build and run
 
-Everything, in one command (it writes a platform snapshot first, builds, checks that FKL is at the commit recorded for
-the fkl submodule and unmodified and that kernel dispatch tracing and the hardware counters are available and count,
+Everything, in one command (it checks that FKL is at the commit recorded for the fkl submodule and unmodified, writes
+a platform snapshot, builds, checks that kernel dispatch tracing and the hardware counters are available and count,
 then runs the GPU benchmark, the counters and the CPU benchmark; the counters default to `FETCH_SIZE GL2C_EA_WRREQ_sum
 GL2C_EA_WRREQ_64B_sum`, since rocprofiler-sdk 1.4.1 defines no `WRITE_SIZE` for gfx12):
 
@@ -242,8 +242,8 @@ flushed) by more than 2 % and 256 KiB of traffic, up to `MAX_REPEATS` (3) rounds
 suspected. Duration on the paper's machine (bare metal, Ubuntu 26.04, Ryzen 7 5800X3D, RX 9060, performance level
 `STABLE_STD`), from `run_all.sh` started to finished: the paper run of Experiment 1 and the CPU benchmark, with
 `SKIP_COUNTERS=1`, 466 s, of which the builds 57 s (the GPU build also builds `rocm_neighborhood`), the GPU benchmark
-with its GPU time only passes 102 s and the CPU benchmark 306 s (the counters took 61 s in an earlier run with one
-region size); Experiment 3's paper run (`EXPERIMENT=3`) 379 s, of which the build 47 s and `rocm_neighborhood` 331 s.
+with its GPU time only passes 102 s and the CPU benchmark 306 s; Experiment 3's paper run (`EXPERIMENT=3`) 379 s, of
+which the build 47 s and `rocm_neighborhood` 331 s.
 
 The workload is the one of `common/bench_geometry.h`, with the three region sizes by turns (`BENCH_REGIONS=mixed`,
 the paper's); one size for every region, as the NPPDx builds use, is another CMake option in `BENCH_CMAKE_ARGS`, for

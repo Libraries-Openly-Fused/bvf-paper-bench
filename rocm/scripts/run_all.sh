@@ -52,7 +52,6 @@ EXPERIMENT=${EXPERIMENT:-1}
 # submodule, which has MorphologyDPP's executeBoxBlur for Experiment 3
 # (full SHA for the checks below, its first 7 characters for messages)
 FKL_PAPER_SHA=$(git -C "$REPO" ls-tree HEAD fkl | awk '{print $3}')
-[ -n "$FKL_PAPER_SHA" ] || { echo "run_all.sh: STOP: no fkl submodule recorded in $REPO" >&2; exit 1; }
 FKL_PAPER_COMMIT=${FKL_PAPER_SHA:0:7}
 # FKL_GPU_DIR / FKL_CPU_DIR, or by default the repository's fkl submodule (see the FKL checks below)
 FKL_DEFAULT_DIR=$REPO/fkl
@@ -96,6 +95,7 @@ command -v rocminfo > /dev/null || die "rocminfo not found"
 [ "$EXPERIMENT" = 3 ] || allowed SKIP_COUNTERS || command -v rocprofv3 > /dev/null ||
     die "rocprofv3 not found (install amdrocm-profiler-base10.1)"
 allowed SKIP_CPU || command -v "$CXX_CPU" > /dev/null || die "C++ compiler $CXX_CPU not found (set CXX_CPU)"
+[ -n "$FKL_PAPER_SHA" ] || allowed ALLOW_OTHER_FKL || die "no fkl submodule recorded in $REPO"
 FKL_GPU_SHA=$(git -C "$FKL_GPU_DIR" rev-parse HEAD 2>/dev/null) && [ -f "$FKL_GPU_DIR/CMakeLists.txt" ] ||
     die "no FKL checkout in $FKL_GPU_DIR (git -C $REPO submodule update --init --recursive fkl)"
 FKL_DIRS=("$FKL_GPU_DIR")
