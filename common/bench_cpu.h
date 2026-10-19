@@ -119,6 +119,11 @@ Conversion fklConversion();
 // The workers of FKL's thread pool (one per hardware thread): the thread count of the multithreaded comparisons
 int poolThreads();
 
+// Runs function(0) ... function(chunks - 1) on FKL's thread pool, the way FKL's CPU_MULTITHREAD executions run their
+// chunks (an execution of a CPU_MULTITHREAD stream that enqueues them in the pool), and returns when all of them have
+// finished: for a library whose generated code is serial, parallelized by the benchmark (fkl-vs-fern-cpu)
+void runOnFklPool(size_t chunks, const std::function<void(size_t)>& function);
+
 // ------------------------------------------------------------------------------------------------
 // Two-execution timing in FKL's format: in every iteration the library and then FKL on the regions of that iteration,
 // each timed with steady_clock after the idle gap
