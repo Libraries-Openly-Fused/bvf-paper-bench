@@ -18,7 +18,8 @@
 #
 # Environment variables:
 #   STEPS        the benchmarks to build and run, among opencv-cuda, npp, ablation, nppdx, neighborhood and opencv-cpu
-#                (default all)
+#                (default all), and halide (FKL vs Halide on the CPU, not in the default: it needs HALIDE_DIR)
+#   HALIDE_DIR   for the halide step: the folder of the Halide 21.0.0 release (fkl-vs-halide-cpu/README.md)
 #   NPPDX_SIZES  the region sizes of FKL vs NPPDx (default "20x10 32x16 48x24")
 #   COMPILE_TIME 1 to also run scripts/compile_time.sh after the runs (long: 10 rounds of every unit): FKL's ablation,
 #                the OpenCV and NPP units, and in the NPPDx builds the headers and FKL BVF (first size) and the NPPDx
@@ -26,7 +27,7 @@
 #   PROFILE      1 to run the Nsight Compute scripts (needs the opencv-cuda, npp and ablation steps and the GPU
 #                performance counters open to every user); without it, their commands are printed at the end
 #   BUILD_ROOT   where the build folders go (default this repository): build-<step>, and build-nppdx-<size>
-#   CPU_CXX      C++ compiler of the CPU benchmark (default clang++; the README recommends a recent clang)
+#   CPU_CXX      C++ compiler of the CPU benchmarks (default clang++; the README recommends a recent clang)
 #   CMAKE_ARGS   more options for every CMake project (for example -DBENCH_ITERATIONS=1 for a quick check). They
 #                come before the options this script sets for each project (BENCH_REGIONS, OpenCV_DIR, and CPU_CXX for
 #                the CPU benchmark), which win. Setting or unsetting BENCH_REGIONS in them is an error: this script sets
@@ -82,6 +83,10 @@ has_step() { [[ " $STEPS " == *" $1 "* ]]; }
 # (BENCH_OPENCV, which CMAKE_ARGS can turn off): its CMake project enforces that, and gets OpenCV_DIR when it is set.
 if { has_step opencv-cuda || has_step opencv-cpu; } && [ -z "${OpenCV_DIR:-}" ]; then
     echo "Set OpenCV_DIR to the OpenCV build or install folder (the OpenCV benchmarks need it)" >&2
+    exit 1
+fi
+if has_step halide && [ ! -f "${HALIDE_DIR:-}/lib/cmake/Halide/HalideConfig.cmake" ]; then
+    echo "Set HALIDE_DIR to the folder of the Halide 21.0.0 release (the halide step needs it)" >&2
     exit 1
 fi
 # Every size has its own build, results and log paths, so a size listed twice would overwrite its first measurements
@@ -160,6 +165,16 @@ for step in opencv-cuda npp ablation opencv-cpu; do
         run "$LOGS/bvf_types.log" "$build/bvf_types"
     fi
 done
+if has_step halide; then
+    # One process per Halide thread count: Halide's JIT runtime cannot take threads away from a started pool
+    build=$BUILD_ROOT/build-halide
+    out=$RESULTS/fkl-vs-halide-cpu
+    echo "  fkl-vs-halide-cpu ($build)"
+    configure "$REPO/fkl-vs-halide-cpu" "$build" -DBENCH_REGIONS=mixed -DCMAKE_CXX_COMPILER="$CPU_CXX" \
+              -DHalide_DIR="$HALIDE_DIR/lib/cmake/Halide"
+    run "$LOGS/benchmark_halide_cpu_1thread.log" "$build/benchmark_halide_cpu" "$out" 1
+    run "$LOGS/benchmark_halide_cpu_pool.log" "$build/benchmark_halide_cpu" "$out" pool
+fi
 if has_step nppdx; then
     for size in $NPPDX_SIZES; do
         build=$BUILD_ROOT/build-nppdx-$size

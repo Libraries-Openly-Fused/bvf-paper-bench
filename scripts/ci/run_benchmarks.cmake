@@ -8,14 +8,17 @@
 #
 # On Windows, run it from a Visual Studio developer shell (cl, link and ninja in the PATH).
 #
-#   BENCHMARKS           cpu: FKL vs OpenCV on the CPU (fkl-vs-opencv-cpu/); gpu: the GPU benchmarks (fkl-vs-opencv-cuda/,
+#   BENCHMARKS           cpu: the CPU benchmarks (fkl-vs-opencv-cpu/, fkl-vs-halide-cpu/); gpu: the GPU benchmarks (fkl-vs-opencv-cuda/,
 #                        fkl-vs-npp/, fkl-ablation/, fkl-vs-nppdx/ and fkl-neighborhood/)
 #   CXX_COMPILER         C++ compiler of the benchmarks; for gpu also the host compiler of nvcc (except with cl, which
 #                        nvcc finds in the PATH)
 #   CUDA_COMPILER        nvcc, for gpu
 #   OPENCV_CXX_COMPILER  C++ compiler for OpenCV (default CXX_COMPILER); OPENCV_C_COMPILER is derived from it
 #   NPPDX                ON, OFF or AUTO (default): AUTO builds FKL vs NPPDx on x86_64 only, the only CPU NPPDx supports
-#   DEPS_DIR             where OpenCV is built once and reused by later runs (default <home>/bvf-paper-bench-deps)
+#   HALIDE               ON, OFF or AUTO (default), for cpu: AUTO builds FKL vs Halide on the platforms with a Halide 21.0.0
+#                        release (Linux x86_64 and ARM64, Windows x64), downloaded once into DEPS_DIR
+#   DEPS_DIR             where OpenCV is built and Halide downloaded once, reused by later runs (default
+#                        <home>/bvf-paper-bench-deps)
 #   BUILD_DIR            build folders of the benchmarks (default <repo>/build-ci)
 #   OUT_DIR              results and logs (default <repo>/ci-results)
 #   NPPDX_SIZES          the region sizes FKL vs NPPDx is built and run for, separated by spaces (default
@@ -38,7 +41,8 @@ else()
     set(HOME_DIR "$ENV{HOME}")
     set(EXE "")
 endif()
-foreach(default IN ITEMS "GENERATOR=Ninja" "OPENCV_VERSION=4.14.0" "NPPDX=AUTO" "ITERATIONS=1" "WARMUP_ITERATIONS=0"
+foreach(default IN ITEMS "GENERATOR=Ninja" "OPENCV_VERSION=4.14.0" "NPPDX=AUTO" "HALIDE=AUTO" "ITERATIONS=1"
+                         "WARMUP_ITERATIONS=0"
                          "NPPDX_SIZES=20x10 32x16 48x24"
                          "DEPS_DIR=${HOME_DIR}/bvf-paper-bench-deps"
                          "BUILD_DIR=${REPO}/build-ci" "OUT_DIR=${REPO}/ci-results")
@@ -102,6 +106,14 @@ else()
 endif()
 if(NPPDX STREQUAL "AUTO")
     set(NPPDX ${HOST_X64})
+endif()
+# Halide 21.0.0's releases: Linux x86_64 and ARM64, Windows x64
+if(HALIDE STREQUAL "AUTO")
+    if(CMAKE_HOST_WIN32 AND NOT HOST_X64)
+        set(HALIDE OFF)
+    else()
+        set(HALIDE ON)
+    endif()
 endif()
 # nvcc can need a few GB per compilation: at most one job per 3 GB of memory
 math(EXPR JOBS "${MEMORY_MIB} / 3072")
@@ -302,6 +314,64 @@ function(build_opencv RESULT)
 endfunction()
 
 build_opencv(OPENCV_PREFIX)
+
+# Halide 21.0.0, the release of FKL vs Halide on the CPU (fkl-vs-halide-cpu/README.md), downloaded once per platform into
+# DEPS_DIR and checked against the SHA-256 GitHub publishes for it; RESULT is the folder of the release
+function(get_halide RESULT)
+    set(release "https://github.com/halide/Halide/releases/download/v21.0.0")
+    set(commit b629c80de18f1534ec71fddd8b567aa7027a0876)
+    if(CMAKE_HOST_WIN32)
+        set(platform x86-64-windows)
+        set(archive "Halide-21.0.0-${platform}-${commit}.zip")
+        set(sha256 4efec94b7c8958b1ae0125a73245a148e4c98dbb54f2678bc34c6abe36ee899a)
+    elseif(HOST_X64)
+        set(platform x86-64-linux)
+        set(archive "Halide-21.0.0-${platform}-${commit}.tar.gz")
+        set(sha256 b56139ddc5d863486b9b339e1c9b7cc3f6aadd4dd8a2eff2202e79ca68706091)
+    else()
+        set(platform arm-64-linux)
+        set(archive "Halide-21.0.0-${platform}-${commit}.tar.gz")
+        set(sha256 6fa8be9a556ddf3e899a0db59af84d69d0bebbf91ead90c03f90f731ab314d95)
+    endif()
+    set(prefix "${DEPS_DIR}/halide-21.0.0-${platform}")
+    set(root "${prefix}/Halide-21.0.0-${platform}")
+    set(${RESULT} "${root}" PARENT_SCOPE)
+    if(EXISTS "${prefix}/bvf-complete.txt")
+        message(STATUS "Halide 21.0.0 ${platform}: already in ${prefix}")
+        return()
+    endif()
+    file(LOCK "${prefix}.lock" GUARD FUNCTION TIMEOUT 3600)
+    if(EXISTS "${prefix}/bvf-complete.txt")
+        return()
+    endif()
+    file(REMOVE_RECURSE "${prefix}")
+    message(STATUS "Downloading ${release}/${archive}")
+    file(DOWNLOAD "${release}/${archive}" "${prefix}/${archive}" STATUS status INACTIVITY_TIMEOUT 300 TLS_VERIFY ON
+         EXPECTED_HASH SHA256=${sha256})
+    list(GET status 0 code)
+    if(NOT code EQUAL 0)
+        message(FATAL_ERROR "Download of ${release}/${archive} failed: ${status}")
+    endif()
+    file(ARCHIVE_EXTRACT INPUT "${prefix}/${archive}" DESTINATION "${prefix}")
+    file(REMOVE "${prefix}/${archive}")
+    if(NOT EXISTS "${root}/lib/cmake/Halide/HalideConfig.cmake")
+        message(FATAL_ERROR "The Halide release has no ${root}/lib/cmake/Halide/HalideConfig.cmake")
+    endif()
+    file(WRITE "${prefix}/bvf-complete.txt" "Halide 21.0.0 ${platform} (${archive}, SHA-256 ${sha256})\n")
+endfunction()
+
+if(BENCHMARKS STREQUAL "cpu" AND HALIDE)
+    get_halide(HALIDE_ROOT)
+    if(CMAKE_HOST_WIN32)
+        # Halide.dll, for the benchmark (Windows has no RPATH)
+        file(GLOB_RECURSE halideDlls "${HALIDE_ROOT}/*Halide.dll")
+        foreach(dll IN LISTS halideDlls)
+            get_filename_component(dir "${dll}" DIRECTORY)
+            file(TO_NATIVE_PATH "${dir}" dir)
+            set(ENV{PATH} "${dir};$ENV{PATH}")
+        endforeach()
+    endif()
+endif()
 
 # Shared libraries found at run time: Linux executables have RPATHs, Windows needs the folders in the PATH
 if(CMAKE_HOST_WIN32)
@@ -531,6 +601,34 @@ if(BENCHMARKS STREQUAL "cpu")
     run(benchmark_opencv_cpu COMMAND "${bench}" "${OUT_DIR}/fkl-vs-opencv-cpu")
     check_csv("${OUT_DIR}/fkl-vs-opencv-cpu/cpu_validation.csv" "FKL MaxAbsError vs FKL-convention reference" 1e-3)
     check_csv("${OUT_DIR}/fkl-vs-opencv-cpu/cpu_validation.csv" "FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference" 1e-3)
+    if(HALIDE)
+        # FKL vs Halide: one process per Halide thread count (1, then FKL's thread pool size); FKL and both Halide
+        # schedules must match the reference with FKL's conventions
+        build_benchmark(halide-cpu "${REPO}/fkl-vs-halide-cpu" -DBENCH_REGIONS=mixed
+                        "-DHalide_DIR=${HALIDE_ROOT}/lib/cmake/Halide")
+        set(bench "${BUILD_DIR}/halide-cpu/benchmark_halide_cpu${EXE}")
+        find_dlls("${bench}")
+        set(out "${OUT_DIR}/fkl-vs-halide-cpu")
+        file(REMOVE_RECURSE "${out}")
+        foreach(threads IN ITEMS 1 pool)
+            run(benchmark_halide_cpu_${threads} COMMAND "${bench}" "${out}" ${threads})
+        endforeach()
+        file(GLOB validations "${out}/cpu_validation_*.csv")
+        list(LENGTH validations count)
+        if(NOT count EQUAL 2)
+            list(APPEND FAILURES "fkl-vs-halide-cpu: ${count} validation files instead of 2")
+        endif()
+        foreach(validation IN LISTS validations)
+            foreach(column IN ITEMS "FKL MaxAbsError vs FKL-convention reference"
+                                    "Halide default MaxAbsError vs FKL-convention reference"
+                                    "Halide parallel MaxAbsError vs FKL-convention reference"
+                                    "FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference")
+                check_csv("${validation}" "${column}" 1e-3)
+            endforeach()
+        endforeach()
+    else()
+        message(STATUS "FKL vs Halide not built: no Halide 21.0.0 release for this platform (set HALIDE=ON to try)")
+    endif()
 else()
     # The benchmarks on common/bench_gpu.h: <build name>:<folder>:<program>
     foreach(entry IN ITEMS "opencv-cuda:fkl-vs-opencv-cuda:benchmark_opencv_cuda" "npp:fkl-vs-npp:benchmark_npp"
