@@ -126,7 +126,7 @@ int poolThreads();
 
 // Runs function(0) ... function(chunks - 1) on FKL's thread pool, the way FKL's CPU_MULTITHREAD executions run their
 // chunks (an execution of a CPU_MULTITHREAD stream that enqueues them in the pool), and returns when all of them have
-// finished: for a library whose generated code is serial, parallelized by the benchmark (fkl-vs-fern-cpu)
+// finished: for a library whose generated code is serial, parallelized by the benchmark (fkl-vs-fern-cpu, #17)
 void runOnFklPool(size_t chunks, const std::function<void(size_t)>& function);
 
 // ------------------------------------------------------------------------------------------------
@@ -283,6 +283,8 @@ struct CpuPlatformText {
     std::string libraryValidation;
     // What the library does with the regions of an iteration, and whether it is timed
     std::string libraryRegions;
+    // The rows of the validation CSV
+    std::string validationRows = "one row per iteration";
 };
 
 // The lines of the platform file that every CPU benchmark shares: the CPU, FKL, the OS, the workload, the regions, the
@@ -326,7 +328,7 @@ inline void writeCpuPlatform(std::ostream& p, int threads, const CpuPlatformText
          "the timed iterations of (library time / FKL time) of the same iteration (the *_per_iteration.csv files, times "
          "in ms, as in the comparison CSVs).\n"
       << "Validation: before the timing, on the regions of the first, every " << validation::VALIDATION_STRIDE
-      << "th and the last timed iteration (" << text.validationFile << ", one row per iteration): FKL against the "
+      << "th and the last timed iteration (" << text.validationFile << ", " << text.validationRows << "): FKL against the "
       << "reference with its conventions, FKL's pool against FKL on one thread, and " << text.libraryValidation
       << " must agree within " << validation::TOLERANCE << " (maximum absolute difference); the program exits with an "
       << "error otherwise.\n";
