@@ -2006,6 +2006,7 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << "rocprofiler-sdk: " << BENCH_ROCPROFILER_LIB << "\n"
        << "FKL: " << BENCH_FKL_COMMIT
        << (std::string(BENCH_FKL_BRANCH) == "HEAD" ? std::string() : std::string(", branch ") + BENCH_FKL_BRANCH) << "\n"
+       << "bvf-paper-bench: " << BENCH_REPO_COMMIT << "\n"
        << "CPU: " << cpuName() << "\n"
        << "OS: " << osDescription << ", kernel " << kernelVersion() << "\n"
        << "GPU clocks: not changed by the benchmark. Performance level: "

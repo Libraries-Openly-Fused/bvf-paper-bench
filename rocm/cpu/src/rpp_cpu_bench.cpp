@@ -1449,6 +1449,7 @@ int main(int argc, char** argv) {
              << "pool of " << fk::cpuThreadPool().size() << " workers, thread-pool " << BENCH_THREAD_POOL_COMMIT
              << ", one chunk per output row of each region), compiled with " << BENCH_COMPILER << ", flags "
              << BENCH_CXX_FLAGS << "\n"
+             << "bvf-paper-bench: " << BENCH_REPO_COMMIT << "\n"
              << "RPP: " << RPP_VERSION_MAJOR << "." << RPP_VERSION_MINOR << "." << RPP_VERSION_PATCH
              << " HOST backend, as packaged (" << BENCH_RPP_LIB << "; ROCm 10.1 package amdrocm-rpp10.1, prebuilt by "
              << "AMD, OpenMP over the batch images), numThreads 1 and " << hardwareThreads << " (rppCreate; RPP's "

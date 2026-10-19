@@ -42,6 +42,15 @@ if(NOT EXISTS "${FKL_DIR}/thread-pool/include")
     message(FATAL_ERROR "${FKL_DIR}/thread-pool is empty: the CPU_MULTITHREAD backend needs FKL's thread-pool submodule "
                         "(git submodule update --init --recursive)")
 endif()
+# The commit of this repository, and whether its checkout has changes, as in rocm/CMakeLists.txt: both show up in
+# cpu_platform.txt
+execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR}/../.. rev-parse --short HEAD OUTPUT_VARIABLE BENCH_REPO_COMMIT
+                OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR}/../.. status --porcelain --untracked-files=no
+                OUTPUT_VARIABLE BENCH_REPO_CHANGES OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(BENCH_REPO_CHANGES)
+    string(APPEND BENCH_REPO_COMMIT " (with uncommitted changes)")
+endif()
 find_package(Threads REQUIRED)
 
 add_executable(rpp_cpu_bench src/rpp_cpu_bench.cpp)
@@ -55,6 +64,7 @@ target_compile_options(rpp_cpu_bench PRIVATE ${CPU_ARCH_FLAGS_LIST} -ftemplate-d
 target_compile_definitions(rpp_cpu_bench PRIVATE ${BENCH_GEOMETRY_DEFINITIONS} FK_CPU_MULTITHREAD_ENABLED __HIP_PLATFORM_AMD__
                            BENCH_ITERATIONS=${BENCH_ITERATIONS} BENCH_WARMUP_ITERATIONS=${BENCH_WARMUP_ITERATIONS}
                            BENCH_FKL_COMMIT="${FKL_COMMIT}" BENCH_THREAD_POOL_COMMIT="${THREAD_POOL_COMMIT}"
+                           BENCH_REPO_COMMIT="${BENCH_REPO_COMMIT}"
                            BENCH_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
                            BENCH_CXX_FLAGS="${CMAKE_CXX_FLAGS_RELEASE} -std=c++20 ${CPU_ARCH_FLAGS} -ftemplate-depth=1000"
                            BENCH_RPP_LIB="${RPP_LIBRARY}")
