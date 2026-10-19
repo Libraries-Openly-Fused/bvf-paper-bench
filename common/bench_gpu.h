@@ -42,9 +42,6 @@
 //   setup(outDir, mode)                   called before any run, with the mode argument (empty for the main run)
 //   regionSize                            every region of this size (RegionSets' fixed-size constructor) instead of
 //                                         the sizes of BENCH_REGIONS
-//   perIterationTimes                     also write every timed iteration's time of every implementation
-//                                         (per_iteration_<mode>.csv), for per-iteration speedups between any two
-//                                         implementations (nppdx-wins/)
 
 #ifndef BVF_BENCH_GPU_H
 #define BVF_BENCH_GPU_H
@@ -759,8 +756,9 @@ inline PipelineProfile profilePipeline(const Context& ctx, const Implementation&
 inline std::vector<PipelineProfile> profiles;
 
 // Every timed iteration's time of every implementation, one file per mode (per_iteration_latency.csv,
-// per_iteration_gpu_only.csv, per_iteration_gpu_only_l2_flushed.csv), when the Program has perIterationTimes: the
-// directory is set by gpuBenchMain; each file is truncated by the first batch of a process and appended by the others
+// per_iteration_gpu_only.csv, per_iteration_gpu_only_l2_flushed.csv), for every program: the pairs the mean speedups
+// average, and per-iteration speedups between any two implementations. The directory is set by gpuBenchMain; each file
+// is truncated by the first batch of a process and appended by the others
 inline std::filesystem::path perIterationDir;
 inline void writePerIteration(const std::string& mode, const size_t batch, const std::vector<Implementation>& impls,
                               const std::vector<std::vector<float>>& ms) {
@@ -1227,9 +1225,7 @@ int gpuBenchMain(int argc, char** argv) {
         }
         std::filesystem::path outDir = argc > 1 ? argv[1] : "results";
         std::filesystem::create_directories(outDir);
-        if constexpr (requires { P::perIterationTimes; }) {
-            perIterationDir = outDir;
-        }
+        perIterationDir = outDir;
         if constexpr (requires { P::setup(outDir, std::string()); }) {
             P::setup(outDir, argc > 2 ? std::string(argv[2]) : std::string());
         }
