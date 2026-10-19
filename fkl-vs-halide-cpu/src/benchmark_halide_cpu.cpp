@@ -255,7 +255,8 @@ int main(int argc, char** argv) {
             throw std::runtime_error("The comparisons run on 1 thread or on " + std::to_string(poolSize) +
                                      " threads (FKL's thread pool), not " + std::to_string(threads));
         }
-        const bool multithreaded = threads > 1;
+        // pool is the multithreaded comparison whatever the pool's size (on a one-worker pool too)
+        const bool multithreaded = std::string(argv[2]) == "pool" || threads > 1;
         const std::string threadLabel = multithreaded ? std::to_string(threads) + "threads" : "1thread";
         Workload w;
         initWorkload(w);
