@@ -142,11 +142,10 @@ void runBatch(const Workload& w, std::vector<Row>& singleThread, std::vector<Row
                       maxAbsError(fern.output(), fklOut), maxAbsError(fernPool.output(), fern.output()),
                       maxAbsError(fklMT->output(), fklOut)};
         checks.push_back(c);
-        // std::max keeps a NaN only as its first argument: the error goes first
-        worst = Check{N, t, std::max(c.fklVsReference, worst.fklVsReference),
-                      std::max(c.fernVsReference, worst.fernVsReference), std::max(c.fernVsFkl, worst.fernVsFkl),
-                      std::max(c.fernPoolVsFern, worst.fernPoolVsFern),
-                      std::max(c.fklMultithreadVsFkl, worst.fklMultithreadVsFkl)};
+        worst = Check{N, t, worstError(c.fklVsReference, worst.fklVsReference),
+                      worstError(c.fernVsReference, worst.fernVsReference), worstError(c.fernVsFkl, worst.fernVsFkl),
+                      worstError(c.fernPoolVsFern, worst.fernPoolVsFern),
+                      worstError(c.fklMultithreadVsFkl, worst.fklMultithreadVsFkl)};
     }
     const Check& c = worst;
 
