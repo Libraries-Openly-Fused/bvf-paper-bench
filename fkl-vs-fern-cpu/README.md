@@ -76,19 +76,22 @@ mapping is to CUDA blocks and threads. So:
 | Comparison | Fern | FKL | File |
 |---|---|---|---|
 | 1 thread | one call per region, on the calling thread | CPU backend (`ParArch::CPU`) | `benchmark_cpu_fern_1thread_vs_fkl_bvf_CPU.csv` |
-| FKL's pool size (32 on the paper's machine) | **Fern's generated serial code, parallelized by the benchmark**: the per-region calls as the chunks of one execution on FKL's own thread pool (`runOnFklPool`), one chunk per region, so at most N workers are busy | `CPU_MULTITHREAD` backend on the same pool, one chunk per output row of each region | `benchmark_cpu_fern_on_fkl_pool_32threads_vs_fkl_bvf_CPU_MULTITHREAD.csv` |
+| FKL's pool size (32 on the paper's machine) | **"Fern code, FKL thread pool"**: Fern's generated serial code, parallelized by the benchmark. The per-region calls run as the chunks of one execution on FKL's own thread pool (`runOnFklPool`), one chunk per region, so at most N workers are busy | `CPU_MULTITHREAD` backend on the same pool, one chunk per output row of each region | `benchmark_cpu_fern_code_fkl_thread_pool_32threads_vs_fkl_bvf_CPU_MULTITHREAD.csv` |
 
-The multithreaded row is not Fern parallelizing anything. It is what a user of Fern's serial code can do, on the same
-pool, workers, spin and wake-up as FKL. The protocol is the one of every CPU benchmark:
+Fern has no parallel code of its own, so the multithreaded row is not Fern parallelizing anything. It is what a user of
+Fern's serial code can do, on the same pool, workers, spin and wake-up as FKL. The protocol is the one of every CPU
+benchmark:
 
-- **Interleaved runs.** Each iteration runs Fern and then FKL on the regions of that iteration.
+- **Sequential loops.** For every batch size, Fern's complete loop (100 warm-up and 1000 timed iterations) runs first,
+  then FKL's on the same regions. The two libraries never run at the same time.
 - **Idle gap.** Every run follows a 1 ms idle gap, busy-waited by the timing thread.
-- **Speedups.** Speedups are computed per iteration and averaged.
+- **Paired speedups.** The speedup is the mean of the per-iteration ratios, pairing the runs of the same iteration.
+  Every comparison CSV has its `_per_iteration.csv` with the pairs.
 
-The program also writes the FKL-only control (`fkl_control.csv`) and the validation (`cpu_validation.csv`): before
-the timing, on the regions of the first, every 50th and the last timed iteration, Fern and FKL against the plain C++
-reference with FKL's conventions ([`common/bench_reference.h`](../common/bench_reference.h)), Fern against FKL's output,
-and Fern on the pool against Fern.
+The program also writes the validation (`cpu_validation.csv`): before the timing, on the regions of the first, every
+50th and the last timed iteration, Fern and FKL against the plain C++ reference with FKL's conventions
+([`common/bench_reference.h`](../common/bench_reference.h)), Fern against FKL's output, and Fern on the pool against
+Fern.
 
 ## What each side does that the other does not
 

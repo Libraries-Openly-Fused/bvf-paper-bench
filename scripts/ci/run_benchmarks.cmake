@@ -532,7 +532,7 @@ if(BENCHMARKS STREQUAL "cpu")
     check_csv("${OUT_DIR}/fkl-vs-opencv-cpu/cpu_validation.csv" "FKL MaxAbsError vs FKL-convention reference" 1e-3)
     check_csv("${OUT_DIR}/fkl-vs-opencv-cpu/cpu_validation.csv" "FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference" 1e-3)
     # FKL vs Fern: the checked-in Fern code, built and run on every platform; FKL and Fern must match the reference
-    # with FKL's conventions, and Fern on FKL's pool must give Fern's output
+    # with FKL's conventions, and Fern's code on FKL's thread pool must give Fern's output
     build_benchmark(fern-cpu "${REPO}/fkl-vs-fern-cpu" -DBENCH_REGIONS=mixed)
     set(bench "${BUILD_DIR}/fern-cpu/benchmark_fern_cpu${EXE}")
     find_dlls("${bench}")

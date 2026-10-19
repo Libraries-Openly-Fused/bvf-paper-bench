@@ -20,8 +20,9 @@
 //   fkl           one executeOperations<TransformDPP<ParArch::CPU>> call with the whole chain (BVF), one thread
 //   fkl mt        the same call with ParArch::CPU_MULTITHREAD, on FKL's thread pool, in chunks of one output row
 //
-// Two comparisons, each with the same number of threads on both sides: fern against fkl, and fern on pool against
-// fkl mt.
+// Two comparisons, each with the same number of threads on both sides: fern against fkl, and fern on pool ("Fern code,
+// FKL thread pool": Fern has no parallel code of its own) against fkl mt. In each, Fern's complete loop runs first and
+// FKL's after it, on the same regions (common/bench_cpu.h).
 
 #include "bench_cpu.h"
 #include "fern_impl.h"
@@ -113,7 +114,7 @@ struct Check {
 
 template <size_t N>
 void runBatch(const Workload& w, std::vector<Row>& singleThread, std::vector<Row>& multiThread,
-              std::vector<Control>& controls, std::vector<Check>& checks, int threads) {
+              std::vector<Check>& checks, int threads) {
     FernPipeline fern(w, N);
     FernPipeline fernPool(w, N);
     const auto fkl = makeFklCpu(N, false, w);
@@ -143,15 +144,14 @@ void runBatch(const Workload& w, std::vector<Row>& singleThread, std::vector<Row
 
     singleThread.push_back(timeTwo(N, [&](size_t t) { fern.run(t); }, [&](size_t t) { fkl->run(t); }));
     multiThread.push_back(timeTwo(N, [&](size_t t) { fernPool.runOnPool(t); }, [&](size_t t) { fklMT->run(t); }));
-    controls.push_back(timeFklControl(N, *fkl, *fklMT));
     const Row& s = singleThread.back();
     const Row& m = multiThread.back();
-    std::printf("N %3zu | fern %8.1f us, FKL CPU %8.1f us, mean speedup %6.2fx | fern on FKL's pool (%d threads) %8.1f us, "
-                "FKL CPU_MULTITHREAD %8.1f us, mean speedup %6.2fx | FKL alone %8.1f us, %8.1f us | max err: FKL vs "
+    std::printf("N %3zu | fern %8.1f us, FKL CPU %8.1f us, mean speedup %6.2fx | Fern code, FKL thread pool (%d threads) "
+                "%8.1f us, FKL CPU_MULTITHREAD %8.1f us, mean speedup %6.2fx | max err: FKL vs "
                 "reference %.2e, fern vs reference %.2e, fern vs FKL %.2e, fern on pool vs fern %.2e, FKL "
                 "CPU_MULTITHREAD vs FKL CPU %.2e\n",
                 N, s.baseline.median, s.fkl.median, s.meanSpeedup, threads, m.baseline.median, m.fkl.median,
-                m.meanSpeedup, controls.back().single.median, controls.back().multi.median, c.fklVsReference,
+                m.meanSpeedup, c.fklVsReference,
                 c.fernVsReference, c.fernVsFkl, c.fernPoolVsFern, c.fklMultithreadVsFkl);
 }
 
@@ -173,15 +173,13 @@ int main(int argc, char** argv) {
         const double fklBusyUs = workerBusyUs([&]() { spinProbe->run(WARMUP_ITERS); }, threads);
 
         std::vector<Row> singleThread, multiThread;
-        std::vector<Control> controls;
         std::vector<Check> checks;
-        forEachBatch([&]<size_t N>() { runBatch<N>(w, singleThread, multiThread, controls, checks, threads); });
+        forEachBatch([&]<size_t N>() { runBatch<N>(w, singleThread, multiThread, checks, threads); });
 
         writeCSV(outDir / "benchmark_cpu_fern_1thread_vs_fkl_bvf_CPU.csv", "Fern 1 thread", singleThread, "FKL CPU");
-        writeCSV(outDir / ("benchmark_cpu_fern_on_fkl_pool_" + std::to_string(threads) +
+        writeCSV(outDir / ("benchmark_cpu_fern_code_fkl_thread_pool_" + std::to_string(threads) +
                            "threads_vs_fkl_bvf_CPU_MULTITHREAD.csv"),
-                 "Fern on FKL's pool " + std::to_string(threads) + " threads", multiThread, "FKL CPU_MULTITHREAD");
-        writeControlCSV(outDir / "fkl_control.csv", controls);
+                 "Fern code FKL thread pool " + std::to_string(threads) + " threads", multiThread, "FKL CPU_MULTITHREAD");
         std::ofstream v(outDir / "cpu_validation.csv");
         v << "Batch size, Iteration, FKL MaxAbsError vs FKL-convention reference, Fern MaxAbsError vs FKL-convention "
              "reference, Fern vs FKL MaxAbsDifference, Fern on FKL's pool vs Fern MaxAbsDifference, FKL "
@@ -201,9 +199,10 @@ int main(int argc, char** argv) {
              "Tile over bands of 16 output rows: per region, the crop (h x w) and the resized image (32 x 64) once, "
              "then per band a 16 x 64 padded band, letterboxed and normalized into the output plane; intermediates from "
              "a per-thread stack arena; one call of the generated function per region (hook_fern_band16)\n"
-          << "Multithreaded comparison: Fern generates serial CPU code, so the benchmark runs its per-region calls as "
-             "the chunks of one execution on FKL's thread pool (one chunk per region, at most N workers busy), against "
-             "FKL's CPU_MULTITHREAD backend on the same pool (one chunk per output row of each region)\n"
+          << "Multithreaded comparison, \"Fern code, FKL thread pool\": Fern generates serial CPU code and has no "
+             "parallel code of its own, so the benchmark runs Fern's per-region calls as the chunks of one execution on "
+             "FKL's thread pool (one chunk per region, at most N workers busy), against FKL's CPU_MULTITHREAD backend on "
+             "the same pool (one chunk per output row of each region)\n"
           << "Thread pool, measured before the benchmark: each of FKL's workers stays busy " << fklBusyUs << " us per "
           << "FKL CPU_MULTITHREAD run on 1 region (spin and wake-up), which the "
           << std::chrono::milliseconds(IDLE_GAP).count() << " ms idle gap must outlast\n";
