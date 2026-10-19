@@ -45,6 +45,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace bench::pytorch {
@@ -58,9 +59,28 @@ using namespace pipeline;
 // programs time PyTorch's complete loop with each before every comparison and compare FKL with the faster one, as FKL
 // vs NPPDx chooses NPPDx's configuration.
 enum class ChromaTerms { Addmm, Addcmul };
-inline constexpr std::array<ChromaTerms, 2> CHROMA_TERMS{ChromaTerms::Addmm, ChromaTerms::Addcmul};
+// The view interpolate gets of the h x w x 3 RGB crop: permute then unsqueeze, which PyTorch's layout check
+// (suggest_memory_format) treats as NCHW, so interpolate writes NCHW and the copy into the output plane transposes it;
+// or unsqueeze then permute, which it treats as channels-last, so interpolate writes channels-last and the copy is a
+// straight one. Neither was faster on both devices in development runs.
+enum class ResizeInput { Nchw, ChannelsLast };
+// One way of writing PyTorch's pipeline: the sweep times every one before each comparison
+struct Variant {
+    ChromaTerms chromaTerms;
+    ResizeInput resizeInput;
+};
+inline constexpr std::array<Variant, 4> VARIANTS{Variant{ChromaTerms::Addmm, ResizeInput::Nchw},
+                                                 Variant{ChromaTerms::Addmm, ResizeInput::ChannelsLast},
+                                                 Variant{ChromaTerms::Addcmul, ResizeInput::Nchw},
+                                                 Variant{ChromaTerms::Addcmul, ResizeInput::ChannelsLast}};
 inline const char* chromaTermsName(ChromaTerms f) {
     return f == ChromaTerms::Addmm ? "addmm" : "addcmul";
+}
+inline const char* resizeInputName(ResizeInput r) {
+    return r == ResizeInput::Nchw ? "nchw" : "channels_last";
+}
+inline std::string variantName(Variant v) {
+    return std::string(chromaTermsName(v.chromaTerms)) + " " + resizeInputName(v.resizeInput);
 }
 
 class Pipeline {
@@ -106,8 +126,8 @@ public:
         m_chromaV = m_chromaMatrix.select(0, 1);
     }
 
-    // The formulation of the chroma terms of the next runs
-    void setChromaTerms(ChromaTerms f) { m_chromaTerms = f; }
+    // The variant of the next runs
+    void setVariant(Variant v) { m_variant = v; }
 
     // The pipeline on the first n regions of an iteration, enqueued on the device's current stream
     void run(const Region* regions) {
@@ -127,7 +147,7 @@ public:
             // M_U U + M_V V + bias per chroma sample, (h / 2) x (w / 2) x 3 (ChromaTerms: addcmul is 2 kernels on the
             // GPU, addmm a conversion and cuBLASLt's split-K GEMM, 3 kernels)
             const torch::Tensor chromaTerms =
-                m_chromaTerms == ChromaTerms::Addcmul
+                m_variant.chromaTerms == ChromaTerms::Addcmul
                     ? torch::addcmul(m_bias, chroma.narrow(2, 0, 1), m_chromaU).addcmul_(chroma.narrow(2, 1, 1), m_chromaV)
                     : torch::addmm(m_bias, chroma.to(torch::kFloat32).reshape({-1, 2}), m_chromaMatrix);
             // + M_Y Y, each chroma sample broadcast to its 2x2 luma pixels: h x w x 3 float RGB. The 8-bit luma view goes
@@ -136,8 +156,12 @@ public:
             const torch::Tensor rgb = torch::add(chromaTerms.view({h / 2, 1, w / 2, 1, 3}),
                                                  luma.reshape({h / 2, 2, w / 2, 2, 1}), m_lumaScale)
                                           .view({h, w, 3});
-            // 1 x 3 x h x w (a view of the h x w x 3 values) -> 1 x 3 x 32 x 64 (NCHW), transposed by the copy
-            const torch::Tensor resized = F::interpolate(rgb.permute({2, 0, 1}).unsqueeze(0), resizeOptions);
+            // 1 x 3 x h x w, a view of the h x w x 3 values (ResizeInput) -> 1 x 3 x 32 x 64, NCHW (transposed by the
+            // copy) or channels-last (copied straight)
+            const torch::Tensor input = m_variant.resizeInput == ResizeInput::ChannelsLast
+                                            ? rgb.unsqueeze(0).permute({0, 3, 1, 2})
+                                            : rgb.permute({2, 0, 1}).unsqueeze(0);
+            const torch::Tensor resized = F::interpolate(input, resizeOptions);
             m_out.select(0, static_cast<int64_t>(i)).narrow(0, BORDER_TOP, RES_H).copy_(resized[0].permute({1, 2, 0}));
         }
         m_out.mul_(m_mul).sub_(m_sub).div_(m_div);
@@ -158,7 +182,7 @@ private:
     torch::Device m_device;
     torch::Tensor m_luma, m_chroma, m_chromaMatrix, m_bias, m_mul, m_sub, m_div, m_out;
     torch::Tensor m_chromaU, m_chromaV;
-    ChromaTerms m_chromaTerms{ChromaTerms::Addmm};
+    Variant m_variant{VARIANTS[0]};
     float m_lumaScale{0.f};
 };
 

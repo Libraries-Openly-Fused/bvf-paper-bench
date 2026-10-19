@@ -180,7 +180,9 @@ if has_step pytorch; then
     # Torch_DIR at every configure: a build folder configured with another environment follows TORCH_PYTHON
     configure "$REPO/fkl-vs-pytorch" "$build" -DBENCH_REGIONS=mixed -DCMAKE_CXX_COMPILER="$CPU_CXX" \
               -DCMAKE_PREFIX_PATH="$TORCH_PREFIX" -DTorch_DIR="$TORCH_PREFIX/Torch"
-    run "$LOGS/benchmark_pytorch_cpu.log" env -u GOMP_SPINCOUNT "$build/benchmark_pytorch_cpu" "$out/cpu"
+    # libgomp's default spin: neither GOMP_SPINCOUNT nor OMP_WAIT_POLICY (passive: no spin; active: no limit)
+    run "$LOGS/benchmark_pytorch_cpu.log" env -u GOMP_SPINCOUNT -u OMP_WAIT_POLICY "$build/benchmark_pytorch_cpu" \
+        "$out/cpu"
     # CMake removes the GPU program of an earlier configuration that does not build it (BENCH_PYTORCH_GPU=OFF, or a
     # LibTorch without a GPU backend), so it exists exactly when this one built it; a LibTorch with a GPU backend must
     # have built it

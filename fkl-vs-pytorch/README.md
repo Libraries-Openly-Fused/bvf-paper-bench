@@ -34,22 +34,28 @@ machine, the CUDA runtime library both libraries load is the system's (CUDA 13.3
    - **chroma:** multiplied by FKL's chroma coefficients, once per chroma sample, with every offset of the conversion
      folded into the bias, in one of two formulations: `addmm` on the chroma converted to float (MKL on the CPU, a
      conversion and cuBLASLt's split-K GEMM on the GPU: three kernels), or two `addcmul` on the 8-bit U and V views
-     (two kernels on the GPU). Which is faster depends on the device, the thread count and the batch size (in
-     development runs, `addcmul` on the GPU, and on 32 CPU threads except at N = 100, where it was several times slower;
-     `addmm` on one CPU thread from N = 4). So before every comparison the program runs PyTorch's complete loop with each
-     (on that thread count) and compares FKL with the faster one by median, as FKL vs NPPDx chooses NPPDx's
-     configuration: `pytorch_chroma_sweep.csv` has the sweep and the choice, and the validation checks both;
+     (two kernels on the GPU);
    - **luma:** the 8-bit luma view added with its coefficient, each chroma sample broadcast to its 2x2 luma pixels
      (`add`, which converts the luma to float: in its kernel on the GPU, through a float copy that TensorIterator
      makes first on the CPU). Together this is float RGB, with FKL's BT.601 limited range matrix (taken from FKL), no
      clamping;
-   - **resize:** bilinear resize to 64x32 (`torch::nn::functional::interpolate`, `align_corners=false`);
-   - **copy:** into the 32 rows of its output plane between the borders;
+   - **resize:** bilinear resize to 64x32 (`torch::nn::functional::interpolate`, `align_corners=false`), on one of two
+     views of the h x w x 3 crop: permuted then unsqueezed, which PyTorch's layout check treats as NCHW (the output is
+     NCHW), or unsqueezed then permuted, which it treats as channels-last (the output is channels-last);
+   - **copy:** into the 32 rows of its output plane between the borders: a transposing copy from NCHW, a straight one
+     from channels-last;
 3. `mul_`, `sub_` and `div_` in place on the whole N x 64 x 64 x 3 output tensor, FKL's layout.
+
+**Variants, chosen by a sweep.** The two formulations of the chroma terms and the two views for the resize make four
+variants of PyTorch's pipeline. Which is fastest depends on the device, the thread count and the batch size (in
+development runs, `addcmul` on the GPU, and on 32 CPU threads except at N = 100; the channels-last view on the CPU).
+So before every comparison the program runs PyTorch's complete loop with each variant (on that thread count) and
+compares FKL with the fastest by median, as FKL vs NPPDx chooses NPPDx's configuration: `pytorch_variant_sweep.csv`
+has the sweep and the choice, and the validation checks every variant.
 
 On the GPU, with `addcmul` a region launches 5 kernels (the two `addcmul`, the add, the upsample and the copy), and with
 `addmm` 6. Each iteration adds 2 fills and the 3 element-wise kernels: 5 N + 5 or 6 N + 5 kernels per iteration
-(`kernels.csv` has the counts and the formulation of the comparison).
+(`kernels.csv` has the counts and the variant of the comparison).
 
 **Sampling convention.** `interpolate` samples at pixel centers, `src = (dst + 0.5) * (in / out) - 0.5` clamped at 0.
 FKL samples at `src = dst * (in / out)` (fused_kernel's `resize.h`), and `align_corners=true` is a third convention.
@@ -60,8 +66,8 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
 ## What PyTorch is forced to do that FKL does not
 
 - **A host loop over the regions.** The regions have different sizes, and `interpolate` takes one input size per call,
-  so every region is its own sequence of operator calls: 5 kernel launches per region on the GPU, and about as many
-  operator calls on the CPU. FKL processes the N regions in one call and one kernel. Grouping regions by size would batch them here,
+  so every region is its own sequence of operator calls: 5 or 6 kernel launches per region on the GPU (by variant), and
+  about as many operator calls on the CPU. FKL processes the N regions in one call and one kernel. Grouping regions by size would batch them here,
   only because this workload has three sizes; detections in general have any size.
 - **No code for this GPU in the wheel.** The cu132 wheel has SASS for sm_75, sm_80, sm_86, sm_90, sm_100 and sm_120
   (`pytorch_build_information.txt`), none for the RTX 4090's sm_89: PyTorch's kernels run as sm_86 code there. FKL's
@@ -72,12 +78,10 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
 - **Allocation and dispatch.** Every operator allocates its output (PyTorch's caching allocator on the GPU, its CPU
   allocator on the CPU), and goes through the dispatcher and TensorIterator's setup. FKL's `build()` calls and fusion
   are compile-time types plus a few parameters.
-- **Kernel launches, one stream, no overlap (GPU).** Each iteration is 5 N + 5 dependent launches on one stream. The
+- **Kernel launches, one stream, no overlap (GPU).** Each iteration is 5 N + 5 or 6 N + 5 dependent launches on one
+  stream. The
   GPU time (`gpu_time.csv`) is a fraction of the iteration's time (`latency.csv`); the rest is host work and launch
   gaps.
-- **NCHW.** `interpolate` writes its 1 x 3 x 32 x 64 output in NCHW on both devices (the input, a view of the h x w x 3
-  crop, has channels-last strides), so the copy into the output plane transposes it. Checked with this wheel, in eager
-  mode: output strides (6144, 2048, 64, 1) on the CPU and on the GPU.
 - **Thread count is per operator (CPU).** PyTorch parallelizes an operator only above its grain size (32768 elements).
   On 32 threads, the per-region operators still run on one thread; only the border fills and the last three operators
   run on all threads at large N. FKL's thread pool splits the fused loop into one chunk per output row of each region.
@@ -87,10 +91,10 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
 - **Each source pixel converted once, and chroma once per chroma sample.** PyTorch converts each source pixel of the
   crop once, and computes the chroma terms once per chroma sample (a quarter of the pixels). FKL's backwards fusion
   converts the 4 source pixels of every output pixel: about 8192 conversions per region against at most 1152.
-- **Vendor and vectorized kernels.** MKL for the conversion's GEMM on the CPU; PyTorch's vectorized CPU kernels (AVX2
-  on the paper's CPU, runtime dispatch); its tuned CUDA kernels.
-- **The arithmetic folded, and the faster formulation per comparison.** The offsets of the conversion are folded into
-  the bias, and the luma term into one broadcast add; the chroma terms take the formulation that was faster in the
+- **Vendor and vectorized kernels.** MKL for the conversion's GEMM on the CPU when `addmm` is chosen; PyTorch's
+  vectorized CPU kernels (AVX2 on the paper's CPU, runtime dispatch); its tuned CUDA kernels.
+- **The arithmetic folded, and the fastest variant per comparison.** The offsets of the conversion are folded into
+  the bias, and the luma term into one broadcast add; PyTorch's pipeline takes the variant that was fastest in the
   sweep before each comparison (FKL's pipeline is its generic operations).
 - **Few operators for an eager pipeline.** Region views without copies, two fills per iteration for every border
   instead of a pad per region, and in-place tail operators.
@@ -109,15 +113,15 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
   the same time.
 - **Paired speedups.** The speedup is the mean over the timed iterations of (PyTorch time / FKL time) of the same
   iteration.
-- **Chroma terms.** Before each comparison, PyTorch's complete loop with each formulation on that thread count; the
-  comparison uses the faster (`pytorch_chroma_sweep.csv`).
+- **Variants.** Before each comparison, PyTorch's complete loop with each variant on that thread count; the comparison
+  uses the fastest (`pytorch_variant_sweep.csv`).
 
 | Comparison | Files |
 |---|---|
 | PyTorch on 1 thread (`at::set_num_threads(1)`) against FKL on one thread | `benchmark_cpu_pytorch_1thread_vs_fkl_bvf_CPU.csv` and its `_per_iteration.csv` |
 | PyTorch on 32 threads (FKL's pool size) against FKL's thread pool | `benchmark_cpu_pytorch_32threads_vs_fkl_bvf_CPU_MULTITHREAD.csv` and its `_per_iteration.csv` |
 
-It also writes `pytorch_chroma_sweep.csv`, `cpu_validation.csv` (one row per validated iteration and formulation),
+It also writes `pytorch_variant_sweep.csv`, `cpu_validation.csv` (one row per validated iteration and variant),
 `regions.csv`, `pytorch_build_information.txt` and `cpu_platform.txt`.
 `cpu_platform.txt` records how long libgomp's and FKL's workers stay busy after a parallel run, measured at the start;
 `benchmark_pytorch_cpu --omp-spin` prints only that. The validation checks:
@@ -175,8 +179,8 @@ OpenCV on the CPU explains the change.
 - **Validation.** Before the timing, on the regions of the first, every 50th and the last timed iteration (1e-3):
   PyTorch against its pixel-center reference, FKL BVF against FKL's chain on its CPU backend. The program fails if
   either is out of tolerance.
-- **Chroma terms.** For every batch size, PyTorch's latency loop with each formulation first; the comparison, and the
-  GPU time pass, use the faster (`pytorch_chroma_sweep.csv`; `kernels.csv` names the one used).
+- **Variants.** For every batch size, PyTorch's latency loop with each variant first; the comparison, and the GPU time
+  pass, use the fastest (`pytorch_variant_sweep.csv`; `kernels.csv` names the one used).
 - **Latency.** For every batch size, PyTorch's complete loop (100 warm-up and 1000 timed iterations) runs first, then
   FKL BVF's on the same regions, so the two never run at the same time. Every run is between two device events
   (`c10::Event`, all host enqueue work included) and followed by a synchronization. FKL's speedup is computed per
