@@ -13,9 +13,9 @@
 // Two comparisons, each with the same number of threads on both sides: PyTorch with at::set_num_threads(1) against
 // fkl, and PyTorch with as many threads as FKL's thread pool has workers against fkl mt. In each, PyTorch's complete
 // loop runs first and FKL's after it, on the same regions (common/bench_cpu.h). PyTorch keeps libgomp's default spin
-// (its workers spin for GOMP_SPINCOUNT iterations after a parallel region before they sleep: about 5.4 ms with the
-// default 300000 on the paper's machine); the program measures how long the workers of both pools stay busy after a
-// run (--omp-spin alone prints it) and records it in cpu_platform.txt.
+// (its workers spin for GOMP_SPINCOUNT iterations after a parallel region before they sleep: several ms with the
+// default 300000); the program measures how long the workers of both pools stay busy after a run (--omp-spin alone
+// prints it) and records it in cpu_platform.txt.
 //
 //     benchmark_pytorch_cpu <results folder>
 //     benchmark_pytorch_cpu --omp-spin      how long libgomp's and FKL's workers stay busy after a parallel run, us
@@ -183,13 +183,17 @@ int main(int argc, char** argv) {
           << "stays busy " << spin.ompBusyUs << " us per parallel run of PyTorch (an add with 32768 floats per thread) "
           << "and each of FKL's CPU_MULTITHREAD workers " << spin.fklBusyUs << " us per run (1 region): work plus spin "
           << "before sleeping (libgomp's default spin is kept)\n"
-          << "PyTorch pipeline: per region, views of the region's luma and chroma planes, chroma to float and addmm "
-             "with FKL's chroma coefficients and every offset folded into the bias, a broadcast add of the 8-bit luma "
-             "with its coefficient (chroma replicated to 2x2 pixels; the add converts the luma), interpolate "
-             "(bilinear, align_corners=false: "
+          << "PyTorch pipeline: per region, views of the region's luma and chroma planes, the chroma terms ("
+          << bench::pytorch::Pipeline::chromaTerms(false) << ", FKL's chroma coefficients and every offset folded into the "
+             "bias), a broadcast add of the 8-bit luma with its coefficient (chroma replicated to 2x2 pixels; the add "
+             "makes a float copy of the luma first), interpolate (bilinear, align_corners=false: "
              "pixel-center sampling) and a copy into its output plane; per iteration the border rows set to 0 and "
              "mul_, sub_, div_ on the whole N x 64 x 64 x 3 tensor\n";
-        writeCpuPlatform(p, threads);
+        writeCpuPlatform(p, threads,
+                         {"cpu_validation.csv",
+                          "PyTorch against the reference with its pixel-center sampling, and PyTorch on its thread "
+                          "count against PyTorch on one thread",
+                          "PyTorch's per-region views and operator calls are timed"});
         std::cout << "Results written to " << std::filesystem::absolute(outDir) << std::endl;
         if (!passed) {
             throw std::runtime_error("validation failed (FKL or PyTorch against its reference, FKL's pool against FKL, "

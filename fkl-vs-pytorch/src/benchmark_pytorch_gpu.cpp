@@ -4,8 +4,8 @@
 // source builds against LibTorch for CUDA and for ROCm (USE_ROCM, defined by LibTorch's CMake for ROCm), where PyTorch's
 // device is still torch::kCUDA and FKL's side (src/fkl_gpu.cu) is compiled as HIP.
 //
-//   pytorch  src/pytorch_pipeline.h on the GPU: per region, views of the region's planes, two conversions to float, an
-//            addmm, a broadcast add, interpolate and a device to device copy into its output plane; per iteration two
+//   pytorch  src/pytorch_pipeline.h on the GPU: per region, views of the region's planes, two addcmul on the 8-bit
+//            chroma, a broadcast add with the 8-bit luma, interpolate and a copy into its output plane; per iteration two
 //            zero fills for the border rows and mul_, sub_, div_ on the whole tensor. PyTorch's caching allocator
 //            serves the temporaries of every region.
 //   fkl_bvf  one FKL kernel for the whole chain (BVF), src/fkl_gpu.cu.
@@ -246,6 +246,15 @@ std::vector<Activities> traceExecutions(const Context& ctx, const Implementation
                                  " has " + std::to_string(executions.size()) + " markers and " +
                                  std::to_string(records.size()) + " device activities");
     }
+    // Every execution of a pipeline launches the same work: a different count means a lost or extra record
+    for (const Activities& e : executions) {
+        if (e.kernels != executions.front().kernels || e.memcpys != executions.front().memcpys ||
+            e.memsets != executions.front().memsets) {
+            throw std::runtime_error("GPU time: the executions of " + impl.name + " in the trace have different " +
+                                     "kernel, memcpy or memset counts (" + std::to_string(e.kernels) + " and " +
+                                     std::to_string(executions.front().kernels) + " kernels)");
+        }
+    }
     return executions;
 }
 
@@ -379,7 +388,8 @@ void writePlatform(const std::filesystem::path& outDir, const Context& ctx) {
     os << "NVIDIA driver: " << shell("nvidia-smi --id=" + busId + " --query-gpu=driver_version --format=csv,noheader")
        << "; this GPU in nvidia-smi: "
        << shell("nvidia-smi --id=" + busId + " --query-gpu=index,pci.bus_id,uuid --format=csv,noheader") << "\n"
-       << "GPU clocks: not locked (locking needs root); application clocks as reported by nvidia-smi: "
+       << "GPU clocks: the benchmark does not lock them (locking needs root); maximum SM and memory clocks "
+          "(nvidia-smi clocks.max.sm, clocks.max.mem): "
        << shell("nvidia-smi --id=" + busId + " --query-gpu=clocks.max.sm,clocks.max.mem --format=csv,noheader")
        << "\n";
 #endif
@@ -395,10 +405,10 @@ void writePlatform(const std::filesystem::path& outDir, const Context& ctx) {
        << "OS: " << osName() << ", kernel " << kernelVersion() << "\n\n"
        << "Workload: " << describe() << ". AddBorder (black), then Mul (1/255), Sub (0.485, 0.456, 0.406), Div (0.229, "
        << "0.224, 0.225), float3 tensor of N planes " << OUT_W << "x" << OUT_H << "\n"
-       << "PyTorch pipeline: per region, views of the region's luma and chroma planes, chroma to float and addmm with "
-          "FKL's chroma coefficients and every offset folded into the bias, a broadcast add of the 8-bit luma with "
-          "its coefficient (chroma replicated to 2x2 pixels; the add converts the luma), interpolate (bilinear, "
-          "align_corners=false: "
+       << "PyTorch pipeline: per region, views of the region's luma and chroma planes, the chroma terms ("
+       << Pipeline::chromaTerms(true) << ", FKL's chroma coefficients and every offset folded into the bias), a "
+          "broadcast add of the 8-bit luma with its coefficient (chroma replicated to 2x2 pixels; the add converts the "
+          "luma), interpolate (bilinear, align_corners=false: "
           "pixel-center sampling) and a device to device copy into its output plane; per iteration the border rows "
           "set to 0 and mul_, sub_, div_ on the whole N x 64 x 64 x 3 tensor. Temporaries from PyTorch's caching "
           "allocator.\n"
@@ -422,7 +432,9 @@ void writePlatform(const std::filesystem::path& outDir, const Context& ctx) {
        << "PyTorch's profiler (Kineto) in chunks of " << PROFILE_CHUNK << " iterations, an empty marker kernel after "
        << "every execution splitting the trace; the GPU time of one execution is the "
        << "sum of the execution times of its device activities: kernels, and memcpys and memsets when there are any "
-       << "(PyTorch's copies and fills here are kernels; kernels.csv has the counts), span = first start to last end; "
+       << "(PyTorch's copies and fills here are kernels; kernels.csv has the counts), span = first start to last end "
+       << "of its activities in the trace (measured under the profiler, so it includes the profiler's cost per launch "
+       << "and can exceed the latency); "
        << "speedups per execution, averaged.\n"
        << "Validation: before the timing, both pipelines on the regions of the first, every "
        << validation::VALIDATION_STRIDE << "th and the last timed iteration (validation.csv, one row per iteration): "
@@ -510,7 +522,7 @@ int run(int argc, char** argv) {
         // Every timed iteration's pair of times (ms) and their ratio, which the mean speedup averages
         std::ofstream pairs(outDir / (std::string(PYTORCH) + "_vs_" + FKL_BVF + "_" + (gpuOnly ? "gpu_only_" : "") +
                                       parArchName() + "_per_iteration.csv"));
-        pairs << "Batch size, Iteration, " << PYTORCH << " Time, " << FKL_BVF << " Time, Speedup" << std::endl;
+        pairs << "Batch size, Iteration, " << PYTORCH << " Time (ms), " << FKL_BVF << " Time (ms), Speedup" << std::endl;
         for (const auto& b : results) {
             if (b.name != PYTORCH) {
                 continue;

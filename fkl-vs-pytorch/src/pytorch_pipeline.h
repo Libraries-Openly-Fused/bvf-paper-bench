@@ -17,10 +17,11 @@
 //   ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
 // Per iteration, with the regions of the iteration (host integers, so nothing waits for the device):
 //   - the border rows of the output tensor are set to 0 (two zero_ on strided views of all the planes);
-//   - per region: views of the luma and chroma planes of the region (slices, no copy); the chroma converted to float
-//     and multiplied by FKL's chroma coefficients, with every offset of the conversion folded into the bias, once per
-//     chroma sample (addmm); the luma converted to float and added with its coefficient, the chroma replicated to its
-//     2x2 luma pixels by broadcasting (add): float RGB, no clamping, FKL's BT.601 limited range formula; bilinear
+//   - per region: views of the luma and chroma planes of the region (slices, no copy); the chroma multiplied by FKL's
+//     chroma coefficients, with every offset of the conversion folded into the bias, once per chroma sample (on the
+//     GPU two addcmul on the 8-bit U and V views, on the CPU addmm on the chroma converted to float); the 8-bit luma
+//     added with its coefficient, the chroma replicated to its 2x2 luma pixels by broadcasting (add): float RGB, no
+//     clamping, FKL's BT.601 limited range formula; bilinear
 //     resize to 64x32 (torch::nn::functional::interpolate, align_corners=false); copy into the rows of its output
 //     plane between the borders;
 //   - multiply, subtract and divide in place on the whole N x 64 x 64 x 3 output tensor.
@@ -89,6 +90,15 @@ public:
             m_sub = m_sub.clone();
             m_div = m_div.clone();
         }
+        m_chromaU = m_chromaMatrix.select(0, 0);
+        m_chromaV = m_chromaMatrix.select(0, 1);
+        m_addcmul = !device.is_cpu();
+    }
+
+    // The formulation of the chroma terms on this device (chromaTermsOnGpu, chromaTermsOnCpu)
+    static const char* chromaTerms(bool gpu) {
+        return gpu ? "two addcmul on the 8-bit U and V views (bias + U M_U, then + V M_V)"
+                   : "addmm of the bias with the chroma converted to float and the 2 x 3 chroma matrix";
     }
 
     // The pipeline on the first n regions of an iteration, enqueued on the device's current stream
@@ -106,11 +116,17 @@ public:
             const int64_t h = r.height, w = r.width;
             const torch::Tensor luma = m_luma.slice(0, r.y, r.y + h).slice(1, r.x, r.x + w);
             const torch::Tensor chroma = m_chroma.slice(0, r.y / 2, (r.y + h) / 2).slice(1, r.x / 2, (r.x + w) / 2);
-            // M_U U + M_V V + bias per chroma sample: (h / 2) * (w / 2) x 3
+            // M_U U + M_V V + bias per chroma sample, (h / 2) x (w / 2) x 3, in the formulation that was faster on each
+            // device in development runs: on the GPU two addcmul on the 8-bit U and V views (2 kernels; the addmm
+            // form takes a conversion and cuBLASLt's split-K GEMM, 3 kernels), on the CPU addmm (MKL) on the chroma
+            // converted to float (addcmul was slower on one thread, and much slower on 32 threads at N = 100)
             const torch::Tensor chromaTerms =
-                torch::addmm(m_bias, chroma.to(torch::kFloat32).reshape({-1, 2}), m_chromaMatrix);
+                m_addcmul ? torch::addcmul(m_bias, chroma.narrow(2, 0, 1), m_chromaU)
+                                .addcmul_(chroma.narrow(2, 1, 1), m_chromaV)
+                          : torch::addmm(m_bias, chroma.to(torch::kFloat32).reshape({-1, 2}), m_chromaMatrix);
             // + M_Y Y, each chroma sample broadcast to its 2x2 luma pixels: h x w x 3 float RGB. The 8-bit luma view goes
-            // in as it is: the add promotes it to float in its own kernel (no separate conversion)
+            // in as it is: the add promotes it to float (on the GPU in its own kernel; on the CPU TensorIterator makes a
+            // float copy of it first)
             const torch::Tensor rgb = torch::add(chromaTerms.view({h / 2, 1, w / 2, 1, 3}),
                                                  luma.reshape({h / 2, 2, w / 2, 2, 1}), m_lumaScale)
                                           .view({h, w, 3});
@@ -135,6 +151,8 @@ private:
     size_t m_n;
     torch::Device m_device;
     torch::Tensor m_luma, m_chroma, m_chromaMatrix, m_bias, m_mul, m_sub, m_div, m_out;
+    torch::Tensor m_chromaU, m_chromaV;
+    bool m_addcmul{false};
     float m_lumaScale{0.f};
 };
 

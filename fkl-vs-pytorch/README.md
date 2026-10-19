@@ -31,18 +31,21 @@ machine, the CUDA runtime library both libraries load is the system's (CUDA 13.3
 1. the 16 border rows on top and bottom of every plane of the output tensor are set to 0 (two `zero_` on strided views
    of all the planes);
 2. for each region, with views of the region's luma and chroma planes (slices, no copy):
-   - **chroma:** converted to float and multiplied by FKL's chroma coefficients, once per chroma sample, with every
-     offset of the conversion folded into the bias (`addmm`);
+   - **chroma:** multiplied by FKL's chroma coefficients, once per chroma sample, with every offset of the conversion
+     folded into the bias. Each device gets the formulation that was faster there in development runs: on the GPU two
+     `addcmul` on the 8-bit U and V views (two kernels, against three for `addmm`'s conversion and cuBLASLt's split-K
+     GEMM), on the CPU `addmm` (MKL) on the chroma converted to float (`addcmul` was slower on one thread, and much
+     slower on 32 threads at N = 100). The platform files name the one used;
    - **luma:** the 8-bit luma view added with its coefficient, each chroma sample broadcast to its 2x2 luma pixels
-     (`add`, which converts the luma to float itself). Together this is float RGB, with FKL's BT.601 limited range
-     matrix (taken from FKL), no clamping;
+     (`add`, which converts the luma to float: in its kernel on the GPU, through a float copy that TensorIterator
+     makes first on the CPU). Together this is float RGB, with FKL's BT.601 limited range matrix (taken from FKL), no
+     clamping;
    - **resize:** bilinear resize to 64x32 (`torch::nn::functional::interpolate`, `align_corners=false`);
    - **copy:** into the 32 rows of its output plane between the borders;
 3. `mul_`, `sub_` and `div_` in place on the whole N x 64 x 64 x 3 output tensor, FKL's layout.
 
-On the GPU, a region launches 6 kernels: the chroma's conversion to float, cuBLASLt's split-K GEMM (two kernels), the
-add, the upsample and the copy. Each iteration adds 2 fills and the 3 element-wise kernels: 6 N + 5 kernels per
-iteration (`kernels.csv` has the counts).
+On the GPU, a region launches 5 kernels: the two `addcmul`, the add, the upsample and the copy. Each iteration adds 2
+fills and the 3 element-wise kernels: 5 N + 5 kernels per iteration (`kernels.csv` has the counts).
 
 **Sampling convention.** `interpolate` samples at pixel centers, `src = (dst + 0.5) * (in / out) - 0.5` clamped at 0.
 FKL samples at `src = dst * (in / out)` (fused_kernel's `resize.h`), and `align_corners=true` is a third convention.
@@ -53,23 +56,21 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
 ## What PyTorch is forced to do that FKL does not
 
 - **A host loop over the regions.** The regions have different sizes, and `interpolate` takes one input size per call,
-  so every region is its own sequence of operator calls: about 6 dispatches per region on the CPU, 6 kernel launches
-  on the GPU. FKL processes the N regions in one call and one kernel. Grouping regions by size would batch them here,
+  so every region is its own sequence of operator calls: 5 kernel launches per region on the GPU, and about as many
+  operator calls on the CPU. FKL processes the N regions in one call and one kernel. Grouping regions by size would batch them here,
   only because this workload has three sizes; detections in general have any size.
-- **A GEMM for a 2-term product.** The conversion's chroma terms are a product with K = 2, which `addmm` hands to
-  cuBLASLt on the GPU: two kernels per region (split-K). An element-wise formulation would take more operator calls.
 - **No code for this GPU in the wheel.** The cu132 wheel has SASS for sm_75, sm_80, sm_86, sm_90, sm_100 and sm_120
   (`pytorch_build_information.txt`), none for the RTX 4090's sm_89: PyTorch's kernels run as sm_86 code there. FKL's
   kernel is compiled for the GPU it runs on.
-- **Intermediates in memory.** Per region: the float chroma, the chroma terms, the h x w x 3 float RGB crop and
-  the resized 3 x 32 x 64 image. The output is written, then rewritten three times by `mul_`, `sub_` and `div_`, plus
+- **Intermediates in memory.** Per region: the chroma terms, the h x w x 3 float RGB crop and the resized
+  3 x 32 x 64 image, and on the CPU also the float chroma and the float copy of the luma. The output is written, then rewritten three times by `mul_`, `sub_` and `div_`, plus
   the two border fills. FKL keeps everything in registers and writes each output value once.
 - **Allocation and dispatch.** Every operator allocates its output (PyTorch's caching allocator on the GPU, its CPU
   allocator on the CPU), and goes through the dispatcher and TensorIterator's setup. FKL's `build()` calls and fusion
   are compile-time types plus a few parameters.
-- **Kernel launches, one stream, no overlap (GPU).** Each iteration is about 705 dependent launches on one stream at
-  N = 100. The GPU time is a quarter of the iteration's time (`gpu_time.csv` against `latency.csv`); the rest is host
-  work and launch gaps.
+- **Kernel launches, one stream, no overlap (GPU).** Each iteration is 5 N + 5 dependent launches on one stream. The
+  GPU time (`gpu_time.csv`) is a fraction of the iteration's time (`latency.csv`); the rest is host work and launch
+  gaps.
 - **NCHW.** `interpolate` writes its 1 x 3 x 32 x 64 output in NCHW on both devices (the input, a view of the h x w x 3
   crop, has channels-last strides), so the copy into the output plane transposes it.
 - **Thread count is per operator (CPU).** PyTorch parallelizes an operator only above its grain size (32768 elements).
@@ -83,8 +84,9 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
   converts the 4 source pixels of every output pixel: about 8192 conversions per region against at most 1152.
 - **Vendor and vectorized kernels.** MKL for the conversion's GEMM on the CPU; PyTorch's vectorized CPU kernels (AVX2
   on the paper's CPU, runtime dispatch); its tuned CUDA kernels.
-- **The arithmetic folded.** The offsets of the conversion are folded into the GEMM's bias, and the luma term into one
-  broadcast add.
+- **The arithmetic folded, and the faster formulation per device.** The offsets of the conversion are folded into the
+  bias, and the luma term into one broadcast add; the chroma terms take the formulation that was faster on each
+  device.
 - **Few operators for an eager pipeline.** Region views without copies, two fills per iteration for every border
   instead of a pad per region, and in-place tail operators.
 - **Fast paths.** `InferenceMode` (no autograd bookkeeping) and the caching allocator, which serves the temporaries
@@ -178,7 +180,8 @@ FKL code of every CPU benchmark (common/bench_fkl_cpu.cpp):
   with PyTorch's profiler (Kineto: CUPTI on CUDA, the ROCm tracer on ROCm), in chunks of 100 iterations, with an empty
   marker kernel after every execution to split the trace. The GPU time of an execution is the sum of its device
   activities: kernels, and memcpys and memsets when there are any (PyTorch's copies and fills are kernels here). The
-  span runs from the first start to the last end.
+  span runs from the first start to the last end in the trace: it is measured under the profiler, so it includes
+  the profiler's cost per launch and can exceed the latency.
 - **Counts.** Kernels, memcpys and memsets of one execution, and the device memory segments PyTorch's caching
   allocator allocated during each implementation's timed latency iterations.
 - **The GPU.** `platform.txt` describes the device the program ran on (CUDA device 0, the first of
