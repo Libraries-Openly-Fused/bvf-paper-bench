@@ -7,10 +7,14 @@ project(fkl_vs_fern_cpu LANGUAGES CXX)
 # FKL, CPU_ARCH_FLAGS, the iterations, the workload and add_cpu_bench_target, shared by every CPU benchmark
 include(${CMAKE_CURRENT_SOURCE_DIR}/../common/bench_cpu.cmake)
 
-# The gern commit the code was generated with: the repository's gern submodule
+# The gern commit the code was generated with: the repository's gern submodule. Only a checked-out submodule (with its
+# .git) is asked: in an empty submodule folder, git would answer with the parent repository's commit
 set(GERN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../gern" CACHE PATH "gern checkout the generated code comes from")
-execute_process(COMMAND git -C ${GERN_DIR} rev-parse --short HEAD OUTPUT_VARIABLE GERN_COMMIT
-                OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+set(GERN_COMMIT "")
+if(EXISTS "${GERN_DIR}/.git")
+    execute_process(COMMAND git -C ${GERN_DIR} rev-parse --short HEAD OUTPUT_VARIABLE GERN_COMMIT
+                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+endif()
 if(NOT GERN_COMMIT)
     # Without the submodule checked out, the commit the repository records for it
     execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR}/.. ls-tree HEAD gern OUTPUT_VARIABLE GERN_ENTRY
