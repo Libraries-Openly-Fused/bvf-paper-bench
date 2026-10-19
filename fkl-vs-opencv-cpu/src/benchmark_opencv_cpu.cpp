@@ -153,13 +153,17 @@ int main(int argc, char** argv) {
     initWorkload(w);
     // How long each pool's workers stay busy after a parallel run with little work (their spin and wake-up), which the
     // idle gap must outlast
+    // workerBusyUs divides by the pool's workers other than the caller: OpenCV's calling thread takes part in its
+    // parallel_for_ (threads - 1 workers), FKL's waits while every one of its pool's threads works
+    const int opencvWorkers = threads - 1;
+    const int fklWorkers = poolThreads();
     cv::setNumThreads(threads);
     const double opencvBusyUs = workerBusyUs([&]() {
         cv::parallel_for_(cv::Range(0, threads), [](const cv::Range&) {}, threads);
-    }, threads - 1);
+    }, opencvWorkers);
     cv::setNumThreads(1);
     const auto spinProbe = makeFklCpu(BATCHES.front(), true, w);
-    const double fklBusyUs = workerBusyUs([&]() { spinProbe->run(WARMUP_ITERS); }, threads);
+    const double fklBusyUs = workerBusyUs([&]() { spinProbe->run(WARMUP_ITERS); }, fklWorkers);
     std::printf("Workers busy after a parallel run: OpenCV %.1f us, FKL %.1f us\n", opencvBusyUs, fklBusyUs);
 
     std::vector<Row> singleThread, multiThread;

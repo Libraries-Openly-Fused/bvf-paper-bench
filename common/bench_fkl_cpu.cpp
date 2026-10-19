@@ -32,6 +32,8 @@
 #include "bench_reference.h"
 
 #include <array>
+#include <exception>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -127,6 +129,16 @@ Conversion fklConversion() {
 
 int poolThreads() {
     return static_cast<int>(fk::cpuThreadPool().size());
+}
+
+void runOnFklPool(size_t chunks, const std::function<void(size_t)>& function) {
+    static fk::Stream_<fk::ParArch::CPU_MULTITHREAD> stream;
+    const std::function<void(size_t)>* f = &function;
+    stream.enqueue([chunks, f](const fk::cpu_multithread::Completion& done) {
+        fk::cpu_multithread::enqueueChunks(chunks, [f](const std::size_t chunk) { (*f)(chunk); },
+                                           [done](const std::exception_ptr error) { done(error); });
+    });
+    stream.sync();
 }
 
 } // namespace bench::cpu
