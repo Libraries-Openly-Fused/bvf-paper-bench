@@ -17,8 +17,8 @@
 # iteration).
 #
 # Environment variables:
-#   STEPS        the benchmarks to build and run, among opencv-cuda, npp, ablation, nppdx, neighborhood and opencv-cpu
-#                (default all)
+#   STEPS        the benchmarks to build and run, among opencv-cuda, npp, ablation, nppdx, neighborhood, opencv-cpu and
+#                fern (default all)
 #   NPPDX_SIZES  the region sizes of FKL vs NPPDx (default "20x10 32x16 48x24")
 #   COMPILE_TIME 1 to also run scripts/compile_time.sh after the runs (long: 10 rounds of every unit): FKL's ablation,
 #                the OpenCV and NPP units, and in the NPPDx builds the headers and FKL BVF (first size) and the NPPDx
@@ -26,7 +26,7 @@
 #   PROFILE      1 to run the Nsight Compute scripts (needs the opencv-cuda, npp and ablation steps and the GPU
 #                performance counters open to every user); without it, their commands are printed at the end
 #   BUILD_ROOT   where the build folders go (default this repository): build-<step>, and build-nppdx-<size>
-#   CPU_CXX      C++ compiler of the CPU benchmark (default clang++; the README recommends a recent clang)
+#   CPU_CXX      C++ compiler of the CPU benchmarks (default clang++; the README recommends a recent clang)
 #   CMAKE_ARGS   more options for every CMake project (for example -DBENCH_ITERATIONS=1 for a quick check). They
 #                come before the options this script sets for each project (BENCH_REGIONS, OpenCV_DIR, and CPU_CXX for
 #                the CPU benchmark), which win. Setting or unsetting BENCH_REGIONS in them is an error: this script sets
@@ -37,7 +37,7 @@ set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 RESULTS=$(realpath -m "${1:-$(dirname "$REPO")/results}")
-STEPS=${STEPS:-"opencv-cuda npp ablation nppdx neighborhood opencv-cpu"}
+STEPS=${STEPS:-"opencv-cuda npp ablation nppdx neighborhood opencv-cpu fern"}
 NPPDX_SIZES=${NPPDX_SIZES:-"20x10 32x16 48x24"}
 COMPILE_TIME=${COMPILE_TIME:-0}
 if grep -q "RmProfilingAdminOnly: 0" /proc/driver/nvidia/params 2>/dev/null; then
@@ -160,6 +160,14 @@ for step in opencv-cuda npp ablation opencv-cpu; do
         run "$LOGS/bvf_types.log" "$build/bvf_types"
     fi
 done
+if has_step fern; then
+    # The Fern code is checked in (fkl-vs-fern-cpu/fern/generated): the build needs neither gern nor its dependencies
+    build=$BUILD_ROOT/build-fern
+    out=$RESULTS/fkl-vs-fern-cpu
+    echo "  fkl-vs-fern-cpu ($build)"
+    configure "$REPO/fkl-vs-fern-cpu" "$build" -DBENCH_REGIONS=mixed -DCMAKE_CXX_COMPILER="$CPU_CXX"
+    run "$LOGS/benchmark_fern_cpu.log" "$build/benchmark_fern_cpu" "$out"
+fi
 if has_step nppdx; then
     for size in $NPPDX_SIZES; do
         build=$BUILD_ROOT/build-nppdx-$size

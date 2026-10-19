@@ -22,6 +22,7 @@ One folder per library compared with FKL, each its own CMake project with its ow
 | [`fkl-vs-npp/`](fkl-vs-npp/README.md) | FKL BVF with NVIDIA NPP | `benchmark_npp` |
 | [`fkl-vs-nppdx/`](fkl-vs-nppdx/README.md) | FKL BVF with NVIDIA NPPDx, as one kernel with hand written CUDA code and combined with NPP without hand written pixel processing code | `benchmark_nppdx`, `benchmark_nppdx_npp` |
 | [`fkl-vs-opencv-cpu/`](fkl-vs-opencv-cpu/README.md) | FKL's CPU backends with OpenCV on the CPU | `benchmark_opencv_cpu` |
+| [`fkl-vs-fern-cpu/`](fkl-vs-fern-cpu/README.md) | FKL's CPU backends with the code Fern (gern, PLDI 2025) generates for the pipeline from black-box subroutines | `benchmark_fern_cpu` |
 | [`fkl-ablation/`](fkl-ablation/README.md) | FKL with BVF against FKL without it (vertical and horizontal fusion only), FKL's host overhead, the type FKL builds | `benchmark_fkl_ablation`, `bvf_types` |
 | [`fkl-neighborhood/`](fkl-neighborhood/README.md) | The neighborhood experiment: 64x32 crops, a box blur and the normalization; FKL's BVF box operation against its MorphologyDPP, and the DPP against NPP, OpenCV CUDA and NPPDx | `benchmark_fkl_neighborhood_k<K>_p<passes>[_resize]`, `benchmark_{npp,opencv_cuda,nppdx}_neighborhood`, `test_neighborhood_ops` |
 | [`rocm/`](rocm/README.md) | FKL's HIP backend with AMD RPP on an AMD GPU, and FKL's CPU backends with RPP's HOST backend, on ROCm | `rocm_bench`, `rpp_cpu_bench` |
@@ -40,8 +41,9 @@ Next to them:
   (`ncu_dram.sh`, `ncu_l2.sh`, `ncu_common.sh`, `ncu_summarize.py`, `ncu_traffic_model.py`), the compile time
   (`compile_time.sh`, `compile_time_summarize.py`), the runner-up NPPDx configurations (`nppdx_runner_up.py`) and the
   CI (`ci/run_benchmarks.cmake`);
-- the submodules `fkl` (FusedKernelLibrary main, with its `thread-pool` submodule for the `CPU_MULTITHREAD` backend)
-  and `nppdx` (NVIDIA NPPDx v0.1.2).
+- the submodules `fkl` (FusedKernelLibrary main, with its `thread-pool` submodule for the `CPU_MULTITHREAD` backend),
+  `nppdx` (NVIDIA NPPDx v0.1.2) and `gern` (Fern, d05bc66: the code generator of `fkl-vs-fern-cpu`, whose generated
+  code is checked in).
 
 `rocm/` has its own scripts (`rocm/scripts/run_all.sh` runs both of its benchmarks and the hardware counters).
 
@@ -179,7 +181,7 @@ and max), `compile_time_kernels.csv` and `compile_time_phases.csv`, and prints a
 
 ## The CPU benchmarks
 
-FKL vs OpenCV on the CPU shares one harness with the other CPU benchmarks,
+FKL vs OpenCV on the CPU and FKL vs Fern share one harness,
 [`common/bench_cpu.h`](common/bench_cpu.h). FKL's side is [`common/bench_fkl_cpu.cpp`](common/bench_fkl_cpu.cpp):
 one `executeOperations` call (BVF) on FKL's CPU backend (one thread) and on its `CPU_MULTITHREAD` backend (FKL's
 thread pool, one worker per hardware thread). Each program compares its library on one thread with FKL on one thread,
@@ -214,6 +216,7 @@ Each benchmark has its own requirements, besides a C++20 compiler:
 | `fkl-vs-nppdx` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.30, a Linux x86_64 or Windows x64 machine (NPPDx's platforms); no OpenCV |
 | `fkl-neighborhood` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.28, FusedKernelLibrary with the batched `MorphologyDPP` and `executeBoxBlur` (PR #393, the `fkl` submodule), OpenCV 4.14 built with CUDA and the opencv_contrib modules `cudaarithm`, `cudafilters` and `cudaimgproc` for its OpenCV program, and for its NPPDx programs what `fkl-vs-nppdx` needs (or `-DBENCH_NPPDX=OFF`) |
 | `fkl-vs-opencv-cpu` | CMake 3.28 and OpenCV 4.14 with `core` and `imgproc`; no GPU or CUDA |
+| `fkl-vs-fern-cpu` | CMake 3.28; nothing else (the Fern code is checked in; regenerating it needs the `gern` submodule, CMake 3.30 and Linux or macOS) |
 | `rocm` | Linux, an AMD GPU (gfx1200 by default, another one with `-DCMAKE_HIP_ARCHITECTURES`), ROCm 10.1 with RPP 3.2.0 and rocprofiler-sdk, CMake 3.28, Ninja (see [its README](rocm/README.md)); no CUDA or OpenCV |
 
 The paper's results were measured on Linux; the CI also builds and runs every benchmark but `rocm/` on Windows, and
@@ -239,7 +242,7 @@ The README of every folder has its commands. `scripts/run_all.sh` builds and run
 its own `rocm/scripts/run_all.sh`): the main run and the GPU only run with the L2 flushed of every GPU benchmark, FKL's
 host overhead and per-kernel times, `bvf_types`, FKL vs NPPDx for every region size (`NPPDX_SIZES`) with the runner-up
 NPPDx configuration of every N re-timed against FKL (`nppdx_runner_up.py`, then `--configs`, into `runner-up/`), every
-program of the neighborhood experiment, and the CPU benchmark; `COMPILE_TIME=1` adds the compile-time units and `PROFILE=1` the Nsight Compute scripts, their summaries
+program of the neighborhood experiment, and the CPU benchmarks of OpenCV and Fern; `COMPILE_TIME=1` adds the compile-time units and `PROFILE=1` the Nsight Compute scripts, their summaries
 and the traffic model, when the driver lets every user read the GPU performance counters (`RmProfilingAdminOnly: 0`);
 otherwise it prints their commands, which then need sudo:
 
@@ -254,8 +257,8 @@ default, except for FKL vs NPPDx, which takes one size, `32x16` by default).
 
 [`.github/workflows/benchmarks.yml`](.github/workflows/benchmarks.yml) runs on pull requests to `main` from branches
 of this repository and by hand, on the self-hosted runners of FKL's CI with the toolchains of FKL's workflows (except
-CUDA 13.0 on Windows: the benchmarks need 13.3 or newer): Linux x86_64 and ARM64 for the CPU benchmark (g++-13 and
-clang++-23), Linux CUDA x86_64 and ARM64 for the GPU benchmarks (g++-13, CUDA 13.4), Windows x64 for the CPU benchmark
+CUDA 13.0 on Windows: the benchmarks need 13.3 or newer): Linux x86_64 and ARM64 for the CPU benchmarks (g++-13 and
+clang++-23), Linux CUDA x86_64 and ARM64 for the GPU benchmarks (g++-13, CUDA 13.4), Windows x64 for the CPU benchmarks
 (cl and clang-cl) and Windows CUDA for the GPU benchmarks (cl, CUDA 13.4). The Linux ROCm runner has no NVIDIA GPU
 and runs every Linux x86_64 CPU job; no job runs on the Windows ROCm runner, and no job builds or runs `rocm/`. FKL vs NPPDx runs on the x86_64 CUDA runners
 only, the CPUs NPPDx supports.
@@ -264,7 +267,8 @@ Every job runs [`scripts/ci/run_benchmarks.cmake`](scripts/ci/run_benchmarks.cma
 (see its header). It builds OpenCV 4.14.0 with the modules the benchmarks use once per runner and configuration, in
 `~/bvf-paper-bench-deps` (so the first run on a runner takes much longer), builds the benchmarks (FKL vs NPPDx for
 every region size, `NPPDX_SIZES`, and the NPPDx neighborhood programs) with one timed iteration and no warm-up (`ITERATIONS` and `WARMUP_ITERATIONS` of the
-script), runs every mode except those for Nsight Compute (`--ncu-target` and the profiling scripts), and fails if a
+script), runs every mode except those for Nsight Compute (`--ncu-target` and the profiling scripts), regenerates the Fern code
+from the `gern` submodule on Linux and compares it with the checked-in copy, and fails if a
 benchmark fails or if FKL's or NPPDx's outputs do not match their references (OpenCV's and NPP's are in
 `validation.csv` but not required: they come from the OpenCV build and the CUDA toolkit of each runner). The results
 and logs of every job are uploaded as artifacts. Times measured on shared CI runners are not the paper's numbers.

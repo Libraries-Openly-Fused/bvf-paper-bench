@@ -8,7 +8,7 @@
 #
 # On Windows, run it from a Visual Studio developer shell (cl, link and ninja in the PATH).
 #
-#   BENCHMARKS           cpu: FKL vs OpenCV on the CPU (fkl-vs-opencv-cpu/); gpu: the GPU benchmarks (fkl-vs-opencv-cuda/,
+#   BENCHMARKS           cpu: the CPU benchmarks (fkl-vs-opencv-cpu/, fkl-vs-fern-cpu/); gpu: the GPU benchmarks (fkl-vs-opencv-cuda/,
 #                        fkl-vs-npp/, fkl-ablation/, fkl-vs-nppdx/ and fkl-neighborhood/)
 #   CXX_COMPILER         C++ compiler of the benchmarks; for gpu also the host compiler of nvcc (except with cl, which
 #                        nvcc finds in the PATH)
@@ -531,6 +531,23 @@ if(BENCHMARKS STREQUAL "cpu")
     run(benchmark_opencv_cpu COMMAND "${bench}" "${OUT_DIR}/fkl-vs-opencv-cpu")
     check_csv("${OUT_DIR}/fkl-vs-opencv-cpu/cpu_validation.csv" "FKL MaxAbsError vs FKL-convention reference" 1e-3)
     check_csv("${OUT_DIR}/fkl-vs-opencv-cpu/cpu_validation.csv" "FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference" 1e-3)
+    # FKL vs Fern: the checked-in Fern code, built and run on every platform; FKL and Fern must match the reference
+    # with FKL's conventions, and Fern on FKL's pool must give Fern's output
+    build_benchmark(fern-cpu "${REPO}/fkl-vs-fern-cpu" -DBENCH_REGIONS=mixed)
+    set(bench "${BUILD_DIR}/fern-cpu/benchmark_fern_cpu${EXE}")
+    find_dlls("${bench}")
+    run(benchmark_fern_cpu COMMAND "${bench}" "${OUT_DIR}/fkl-vs-fern-cpu")
+    foreach(column IN ITEMS "FKL MaxAbsError vs FKL-convention reference" "Fern MaxAbsError vs FKL-convention reference"
+                            "FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference")
+        check_csv("${OUT_DIR}/fkl-vs-fern-cpu/cpu_validation.csv" "${column}" 1e-3)
+    endforeach()
+    check_csv("${OUT_DIR}/fkl-vs-fern-cpu/cpu_validation.csv" "Fern on FKL's pool vs Fern MaxAbsDifference" 0)
+    # The checked-in Fern code must be what gern (the pinned submodule) generates: on Linux, where gern builds (its
+    # runner uses dlfcn.h)
+    if(NOT CMAKE_HOST_WIN32)
+        run(fern_regenerate COMMAND "${CMAKE_COMMAND}" "-DCXX=${CXX_COMPILER}" "-DWORK=${BUILD_DIR}/fern-regenerate"
+            -P "${REPO}/fkl-vs-fern-cpu/fern/regenerate.cmake")
+    endif()
 else()
     # The benchmarks on common/bench_gpu.h: <build name>:<folder>:<program>
     foreach(entry IN ITEMS "opencv-cuda:fkl-vs-opencv-cuda:benchmark_opencv_cuda" "npp:fkl-vs-npp:benchmark_npp"
