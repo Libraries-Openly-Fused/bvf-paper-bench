@@ -94,7 +94,9 @@ The implementations never run at the same time:
   iterations) runs before the next one's, on the same regions, in a fixed order: the baselines first, FKL BVF last.
   Each loop therefore starts with the L2 state its own previous iteration left.
 - **Paired speedups.** FKL BVF's speedup over a baseline is computed per iteration (baseline time / FKL BVF time of the
-  same iteration, identical inputs) and averaged, as in FKL's two-execution benchmarks.
+  same iteration, identical inputs) and averaged, as in FKL's two-execution benchmarks. Every timed iteration's time of
+  every implementation is in `per_iteration_<mode>.csv` (latency, GPU only, GPU only with the L2 flushed), and FKL vs
+  NPPDx writes the pairs of each comparison CSV in its `_per_iteration.csv`.
 - **Earlier results.** The paper's first results (`results-v3`) alternated the implementations within every
   iteration instead.
 - **`rocm/`.** The programs of `rocm/` (AMD GPU and RPP on the CPU) have their own harness, which pull request #19
@@ -207,7 +209,7 @@ The two libraries of a comparison never run at the same time:
 - **Idle gap.** Every run follows a 1 ms idle gap, which the timing thread busy-waits, so that its core stays out of a
   deep C-state. A pool whose workers spin for less than that after a run (FKL's, OpenCV's, Halide's) is asleep when
   the next run starts; one that spins longer (PyTorch's libgomp, by default) is still spinning. Each library keeps its
-  own threads and idle behaviour.
+  own threads, if it has any, and its own idle behaviour.
 - **Worker busy time.** Each program measures how long the workers of every pool it uses (FKL's, and the library's if
   it has one) stay busy after a run with little
   work: their spin and wake-up, from `/proc/self/task/*/schedstat` on Linux. It records them in its platform file
@@ -226,8 +228,10 @@ aligned to 4096 bytes, which aligns its code, read-only data, vtables, data and 
 functions (its template instantiations, in sections of their own, follow in the same order), vtables and static
 objects then have the same addresses modulo 4096 in every CPU benchmark, whatever the sections before them (which grow
 with each library's imported symbols) take. Not aligned: the constants, strings and exception tables the linker merges
-with the other objects', and the read-only data the object places after its strings (the type names of its type
-information), none of them used by the timed loops. The platform file records three of those addresses; `nm` on two programs compares all of
+with the other objects', the read-only data the object places after its strings (the type names of its type
+information), and its per-function read-only data (switch tables, not in the timed loops). FKL's timed code reads some
+of those merged 8-, 16- and 32-byte constants, whose addresses modulo 4096 differ by a few cache lines between programs;
+whether that changes FKL's times is not measured separately: the cross-program FKL times of the paper's runs show it. The platform file records three of those addresses; `nm` on two programs compares all of
 them. The [protocol change](fkl-vs-opencv-cpu/README.md#protocol-change)
 section of FKL vs OpenCV on the CPU explains the busy-waited gap and the separate translation unit.
 
