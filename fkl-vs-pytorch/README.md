@@ -83,60 +83,58 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
   instead of a pad per region, and in-place tail operators.
 - **Fast paths.** `InferenceMode` (no autograd bookkeeping) and the caching allocator: no `cudaMalloc` in the timed
   loop after the warm-up.
-- **Default spin on 32 threads.** On 32 threads PyTorch keeps libgomp's default spin. Its workers stay warm between its
-  own runs, an advantage the interleaved protocol denies every other library (below).
+- **Its own idle behaviour.** Each library runs its loop alone. On 32 threads PyTorch keeps libgomp's default spin:
+  its workers, still spinning from its previous run, start every run warm.
 
 ## CPU program
 
-`benchmark_pytorch_cpu`:
+`benchmark_pytorch_cpu`, on the harness of every CPU benchmark:
+
+- **Sequential loops.** For every batch size, PyTorch's complete loop (100 warm-up and 1000 timed iterations, a 1 ms
+  busy-waited idle gap before every run) runs first, then FKL's on the same regions. The two libraries never run at
+  the same time.
+- **Paired speedups.** The speedup is the mean over the timed iterations of (PyTorch time / FKL time) of the same
+  iteration.
 
 | Comparison | Files |
 |---|---|
-| PyTorch on 1 thread (`at::set_num_threads(1)`) against FKL on one thread, interleaved | `benchmark_cpu_pytorch_1thread_vs_fkl_bvf_CPU.csv` |
-| PyTorch on 32 threads (FKL's pool size) against FKL's thread pool, each library in a loop of its own, paired by iteration (below) | `benchmark_cpu_pytorch_32threads_vs_fkl_bvf_CPU_MULTITHREAD.csv`, `..._per_iteration.csv` |
-| The same comparison interleaved, with the `GOMP_SPINCOUNT` of the environment | `..._CPU_MULTITHREAD_interleaved.csv` |
+| PyTorch on 1 thread (`at::set_num_threads(1)`) against FKL on one thread | `benchmark_cpu_pytorch_1thread_vs_fkl_bvf_CPU.csv` and its `_per_iteration.csv` |
+| PyTorch on 32 threads (FKL's pool size) against FKL's thread pool | `benchmark_cpu_pytorch_32threads_vs_fkl_bvf_CPU_MULTITHREAD.csv` and its `_per_iteration.csv` |
 
-It also writes `fkl_control.csv` (FKL alone with the same protocol), `cpu_validation.csv`, `regions.csv`,
-`pytorch_build_information.txt` and `cpu_platform.txt`. `cpu_platform.txt` records how long libgomp's and FKL's
-workers stay busy after a parallel run, measured at the start; `benchmark_pytorch_cpu --omp-spin` prints only that.
-The validation checks:
+It also writes `cpu_validation.csv`, `regions.csv`, `pytorch_build_information.txt` and `cpu_platform.txt`.
+`cpu_platform.txt` records how long libgomp's and FKL's workers stay busy after a parallel run, measured at the start;
+`benchmark_pytorch_cpu --omp-spin` prints only that. The validation checks:
 
 - PyTorch on 1 thread against its pixel-center reference;
 - PyTorch on 32 threads against PyTorch on 1 thread;
 - FKL against its reference;
 - PyTorch against FKL (the convention difference).
 
-### Protocol deviation on 32 threads
+### Why the libraries are not interleaved
 
-The official wheels run PyTorch's intra-op parallelism on OpenMP (libgomp). libgomp's workers spin for
-`GOMP_SPINCOUNT` iterations after a parallel region before they sleep. On the paper's Ryzen 9 5950X that is about
-5.4 ms with the default 300000, far longer than the 1 ms idle gap.
+The first version of the harness alternated the two libraries within every iteration. With PyTorch on 32 threads that
+cannot be fair to both. The official wheels run PyTorch's intra-op parallelism on OpenMP (libgomp), whose workers spin
+for `GOMP_SPINCOUNT` iterations after a parallel region before they sleep. On the paper's Ryzen 9 5950X that is about
+5.4 ms with the default 300000: far longer than the 1 ms idle gap, and than FKL's 100 us. `GOMP_SPINCOUNT=4000`
+matches FKL's spin.
 
-FKL's workers spin 100 us. `GOMP_SPINCOUNT=4000` matches that: libgomp's workers then stay busy about 100 us longer
-than with a spin count of 0.
+Measured interleaved on that machine (400 iterations, medians, us, N = 1 / 4 / 16 / 50 / 100):
 
-Measured on that machine (400 iterations, medians, us, N = 1 / 4 / 16 / 50 / 100):
-
-| Row | PyTorch on 32 threads | FKL CPU_MULTITHREAD in the same loop | FKL-only control |
+| Interleaved | PyTorch on 32 threads | FKL CPU_MULTITHREAD in the same loop | FKL alone |
 |---|---|---|---|
-| A: interleaved, `GOMP_SPINCOUNT=4000` (matched spin) | 196 / 907 / 1430 / 4073 / 9405 | 39 / 48 / 79 / 178 / 315 | 41 / 51 / 87 / 197 / 345 |
-| B: interleaved, default spin | 118 / 343 / 1143 / 3175 / 6182 | 54 / 166 / 256 / 884 / 1236 | 41 / 51 / 88 / 198 / 347 |
-| C: interleaved, default spin, 11 ms gap (twice libgomp's spin) | 145 / 949 / 1786 / 3298 / 15736 | — | 39 / 85 / 238 / 492 / 596 |
+| A: `GOMP_SPINCOUNT=4000` (matched spin) | 196 / 907 / 1430 / 4073 / 9405 | 39 / 48 / 79 / 178 / 315 | 41 / 51 / 87 / 197 / 345 |
+| B: default spin | 118 / 343 / 1143 / 3175 / 6182 | 54 / 166 / 256 / 884 / 1236 | 41 / 51 / 88 / 198 / 347 |
+| C: default spin, 11 ms gap (twice libgomp's spin) | 145 / 949 / 1786 / 3298 / 15736 | — | 39 / 85 / 238 / 492 / 596 |
 
-- **Row B: PyTorch's workers disturb FKL.** In an interleaved loop, PyTorch's spinning workers are still on the cores
-  when FKL runs: FKL is up to 3.6x slower than alone.
-- **Row A: matching the spin costs PyTorch.** One PyTorch run has long serial stretches (the per-region operators,
-  below the grain size) between its parallel regions. With a 100 us spin, the workers fall asleep between them and are
-  woken again inside the run, so PyTorch is 1.2 to 2.6x slower than with its default.
-- **Row C: a longer gap slows both.** With every run starting from sleeping workers, both libraries are slower.
+- **B: PyTorch's workers disturb FKL.** PyTorch's spinning workers are still on the cores when FKL runs: FKL is up to
+  3.6x slower than alone.
+- **A: matching the spin costs PyTorch.** With FKL's spin, PyTorch is 1.2 to 2.6x slower than with its default. One
+  PyTorch run has long serial stretches (the per-region operators, below the grain size) between its parallel
+  regions, and its workers fall asleep between them.
+- **C: a longer gap slows both.**
 
-So on 32 threads the program times each library in a loop of its own (`timeSeparately` in `common/bench_cpu.h`). Both
-loops cover the same warm-up and timed iterations on the same regions, each run after the 1 ms busy-waited gap, with
-PyTorch's default spin. The speedup is still the mean over the timed iterations of (PyTorch time / FKL time) in the
-same iteration, which pairs runs on identical inputs (`..._per_iteration.csv` has every pair). The interleaved loop is
-also run, as the evidence: row B from the run with the default spin, and row A from a second run of the program with
-`GOMP_SPINCOUNT=4000` (`scripts/run_all.sh` does both). The 1-thread comparison is interleaved, as in every CPU
-benchmark.
+Running each library's loop alone, with its own defaults, avoids all three. That is now the protocol of every CPU and
+GPU benchmark of this repository, a rule of the paper's author.
 
 ### An observation on FKL's CPU backend
 
@@ -161,15 +159,18 @@ FKL code of every CPU benchmark (common/bench_fkl_cpu.cpp):
 - **Validation.** Before the timing, on the regions of the first, every 50th and the last timed iteration (1e-3):
   PyTorch against its pixel-center reference, FKL BVF against FKL's chain on its CPU backend. The program fails if
   either is out of tolerance.
-- **Latency.** In every iteration PyTorch and then FKL BVF run, each between two device events (`c10::Event`, all host
-  enqueue work included) and followed by a synchronization. FKL's speedup is computed per iteration and averaged.
-- **GPU time only.** A second pass of the same interleaved iterations is traced with PyTorch's profiler (Kineto: CUPTI
-  on CUDA, the ROCm tracer on ROCm), in chunks of 100 iterations. The GPU time of an execution is the sum of its device
+- **Latency.** For every batch size, PyTorch's complete loop (100 warm-up and 1000 timed iterations) runs first, then
+  FKL BVF's on the same regions, so the two never run at the same time. Every run is between two device events
+  (`c10::Event`, all host enqueue work included) and followed by a synchronization. FKL's speedup is computed per
+  iteration (identical inputs) and averaged.
+- **GPU time only.** A second pass with the same loops, PyTorch's then FKL BVF's. The timed iterations are traced with
+  PyTorch's profiler (Kineto: CUPTI on CUDA, the ROCm tracer on ROCm), in chunks of 100 iterations, with an empty
+  marker kernel after every execution to split the trace. The GPU time of an execution is the sum of its device
   activities: kernels, and PyTorch's memcpys and memsets. The span runs from the first start to the last end.
 - **Counts.** Kernels, memcpys and memsets of one execution.
 
 Output files: `latency.csv`, `gpu_time.csv`, `pytorch_vs_fkl_bvf_<GPU_NVIDIA|GPU_AMD>.csv` and
-`pytorch_vs_fkl_bvf_gpu_only_<...>.csv` (FKL's two-execution format), `validation.csv`, `kernels.csv`, `regions.csv`,
+`pytorch_vs_fkl_bvf_gpu_only_<...>.csv` (FKL's two-execution format) with their `_per_iteration.csv`, `validation.csv`, `kernels.csv`, `regions.csv`,
 `platform.txt` and `pytorch_build_information.txt`.
 
 **Two compilations.** FKL's side ([`src/fkl_gpu.cu`](src/fkl_gpu.cu)) is compiled separately from PyTorch's, as
@@ -187,7 +188,6 @@ project enables CUDA first, with nvcc's default host compiler or `CMAKE_CUDA_HOS
           -DCMAKE_PREFIX_PATH=$(venv-torch/bin/python -c 'import torch; print(torch.utils.cmake_prefix_path)')
     cmake --build build-pytorch -j
     ./build-pytorch/benchmark_pytorch_cpu ../results/fkl-vs-pytorch/cpu
-    GOMP_SPINCOUNT=4000 ./build-pytorch/benchmark_pytorch_cpu ../results/fkl-vs-pytorch/cpu-matched-spin   # row A
     ./build-pytorch/benchmark_pytorch_gpu ../results/fkl-vs-pytorch/gpu
 
 `BENCH_PYTORCH_GPU=OFF` builds the CPU program only. `CUDA_ARCH` (default `native`) is the CUDA architecture of FKL's

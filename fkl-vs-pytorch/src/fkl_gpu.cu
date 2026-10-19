@@ -130,6 +130,8 @@ private:
     fk::Tensor<fk::float3> m_out{OUT_W, OUT_H, N, 1, fk::MemType::Device};
 };
 
+__global__ void benchExecutionMarker() {}
+
 // Calls f.template operator()<N>() for the batch size N == n, or throws
 template <typename F>
 void withBatch(size_t n, F&& f) {
@@ -189,6 +191,15 @@ std::vector<float> pixelCenterReference(size_t n, const RegionSets& regions, siz
 
 pipeline::Conversion fklConversion() {
     return reference::conversion();
+}
+
+void launchExecutionMarker(void* stream) {
+    benchExecutionMarker<<<1, 1, 0, static_cast<GpuStream>(stream)>>>();
+#if defined(__HIPCC__)
+    gpuErrchk(hipGetLastError());
+#else
+    gpuErrchk(cudaGetLastError());
+#endif
 }
 
 std::string parArchName() {

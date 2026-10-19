@@ -14,11 +14,15 @@
 // The protocol of the GPU benchmarks of common/bench_gpu.h, with PyTorch's device-generic APIs instead of CUDA's:
 // - validation before the timing, on the regions of the first, every 50th and the last timed iteration: PyTorch
 //   against a reference with its pixel-center sampling, FKL against FKL's chain on its CPU backend, both 1e-3;
-// - latency: in every iteration PyTorch and then FKL, each between two device events on the stream (c10::Event, all
-//   host enqueue work included) and followed by a synchronization; FKL's speedup computed per iteration and averaged;
-// - GPU time only: a second pass with the same interleaved iterations, traced with PyTorch's profiler (Kineto: CUPTI on
-//   CUDA, the ROCm tracer on ROCm), in chunks of PROFILE_CHUNK iterations; the GPU time of one execution is the sum of
-//   the execution times of its device activities (kernels, and PyTorch's device to device copies and fills);
+// - the two libraries never run at the same time: PyTorch's complete loop (warm-up and timed iterations) runs first,
+//   then FKL's, on the same regions; FKL's speedup is computed per iteration (the executions of the same iteration,
+//   identical inputs) and averaged, and every pair is written next to the summary (*_per_iteration.csv);
+// - latency: every run between two device events on the stream (c10::Event, all host enqueue work included) and
+//   followed by a synchronization;
+// - GPU time only: a second pass with the same loops, PyTorch's then FKL's, the timed iterations traced with PyTorch's
+//   profiler (Kineto: CUPTI on CUDA, the ROCm tracer on ROCm) in chunks of PROFILE_CHUNK iterations, an empty marker
+//   kernel after every execution splitting the trace; the GPU time of one execution is the sum of the execution times
+//   of its device activities (kernels, and PyTorch's device to device copies and fills);
 // - kernel, memset and memcpy counts of one execution of each, from the same trace.
 
 #include <torch/torch.h>
@@ -100,6 +104,8 @@ struct Result {
     double meanSpeedupOfBvf{NAN};
     TimingStats gpuTiming, gpuSpan;
     double meanGpuSpeedupOfBvf{NAN};
+    // Every timed iteration's latency and GPU time (ms), in iteration order
+    std::vector<float> latencyMs, gpuMs;
     Activities counts;
     // Over the validated iterations together, and per validated iteration (iteration, against its own reference,
     // against FKL's float reference)
@@ -139,15 +145,16 @@ std::vector<Implementation> implementations(Context& ctx) {
     return impls;
 }
 
-// Latency of each complete pipeline, as common/bench_gpu.h measures it: in every iteration the implementations one
-// after the other on the regions of that iteration, each between two events on the stream and followed by a
-// synchronization. Returns the TIMED_ITERS execution times of each implementation, in ms, in iteration order.
-std::vector<std::vector<float>> measureInterleaved(const Context& ctx, const std::vector<Implementation>& impls) {
+// Latency of each complete pipeline, as common/bench_gpu.h measures it, with the two libraries never running at the
+// same time: each implementation's complete loop (warm-up and timed iterations, on the regions of each iteration)
+// runs before the next one's, PyTorch first and FKL BVF last, each run between two events on the stream and followed
+// by a synchronization. Returns the TIMED_ITERS execution times of each implementation, in ms, in iteration order.
+std::vector<std::vector<float>> measureSequential(const Context& ctx, const std::vector<Implementation>& impls) {
     c10::Event start(c10::DeviceType::CUDA, c10::EventFlag::BACKEND_DEFAULT);
     c10::Event stop(c10::DeviceType::CUDA, c10::EventFlag::BACKEND_DEFAULT);
     std::vector<std::vector<float>> ms(impls.size(), std::vector<float>(TIMED_ITERS));
-    for (int i = 0; i < WARMUP_ITERS + TIMED_ITERS; ++i) {
-        for (size_t k = 0; k < impls.size(); ++k) {
+    for (size_t k = 0; k < impls.size(); ++k) {
+        for (int i = 0; i < WARMUP_ITERS + TIMED_ITERS; ++i) {
             start.record(ctx.stream);
             impls[k].run(static_cast<size_t>(i));
             stop.record(ctx.stream);
@@ -160,29 +167,26 @@ std::vector<std::vector<float>> measureInterleaved(const Context& ctx, const std
     return ms;
 }
 
-// The device activities of iterations [first, first + count): every iteration runs PyTorch and then FKL, each followed
-// by a synchronization, under PyTorch's profiler. In start time order, each FKL kernel (the only kernel whose name has
-// "fk::") ends one iteration, and the activities before it since the previous one are PyTorch's execution of that
-// iteration.
-std::vector<std::pair<Activities, Activities>> traceIterations(const Context& ctx,
-                                                               const std::vector<Implementation>& impls,
-                                                               int first, int count) {
+// The device activities of every execution of one implementation on iterations [first, first + count), each followed
+// by a synchronization and the marker kernel (launchExecutionMarker), under PyTorch's profiler: in start time order,
+// every marker ends one execution, and the activities before it since the previous one are that execution's
+std::vector<Activities> traceExecutions(const Context& ctx, const Implementation& impl, int first, int count) {
     namespace prof = torch::profiler::impl;
     const prof::ProfilerConfig config(prof::ProfilerState::KINETO);
     const std::set<prof::ActivityType> activities{prof::ActivityType::CUDA};
     torch::autograd::profiler::prepareProfiler(config, activities);
     torch::autograd::profiler::enableProfiler(config, activities);
     for (int i = first; i < first + count; ++i) {
-        for (const auto& impl : impls) {
-            impl.run(static_cast<size_t>(i));
-            ctx.stream.synchronize();
-        }
+        impl.run(static_cast<size_t>(i));
+        ctx.stream.synchronize();
+        launchExecutionMarker(ctx.handle);
+        ctx.stream.synchronize();
     }
     const auto result = torch::autograd::profiler::disableProfiler();
     struct Record {
         uint64_t start, end;
-        uint8_t type;
-        bool fkl;
+        libkineto::ActivityType type;
+        bool marker;
     };
     std::vector<Record> records;
     for (const auto& e : result->events()) {
@@ -194,42 +198,38 @@ std::vector<std::pair<Activities, Activities>> traceIterations(const Context& ct
             type != libkineto::ActivityType::GPU_MEMSET) {
             continue;
         }
-        records.push_back({e.startNs(), e.startNs() + e.durationNs(), e.activityType(),
+        records.push_back({e.startNs(), e.startNs() + e.durationNs(), type,
                            type == libkineto::ActivityType::CONCURRENT_KERNEL &&
-                               e.name().find("fk::") != std::string::npos});
+                               e.name().find(EXECUTION_MARKER) != std::string::npos});
     }
     std::sort(records.begin(), records.end(), [](const Record& a, const Record& b) { return a.start < b.start; });
-    std::vector<std::pair<Activities, Activities>> iterations;
-    Activities torchExecution;
-    const auto add = [](Activities& a, const Record& r) {
-        const auto type = static_cast<libkineto::ActivityType>(r.type);
-        a.kernels += type == libkineto::ActivityType::CONCURRENT_KERNEL;
-        a.memcpys += type == libkineto::ActivityType::GPU_MEMCPY;
-        a.memsets += type == libkineto::ActivityType::GPU_MEMSET;
-        a.busyNs += r.end - r.start;
-        a.firstStartNs = a.kernels + a.memcpys + a.memsets == 1 ? r.start : std::min(a.firstStartNs, r.start);
-        a.lastEndNs = std::max(a.lastEndNs, r.end);
-    };
+    std::vector<Activities> executions;
+    Activities execution;
+    size_t activitiesSeen = 0;
     for (const Record& r : records) {
-        if (r.fkl) {
-            Activities fklExecution;
-            add(fklExecution, r);
-            if (torchExecution.kernels == 0) {
-                throw std::runtime_error("GPU time: an FKL kernel without PyTorch kernels before it");
+        if (r.marker) {
+            if (activitiesSeen == 0) {
+                throw std::runtime_error("GPU time: an execution of " + impl.name + " with no device activity");
             }
-            iterations.emplace_back(torchExecution, fklExecution);
-            torchExecution = Activities{};
-        } else {
-            add(torchExecution, r);
+            executions.push_back(execution);
+            execution = Activities{};
+            activitiesSeen = 0;
+            continue;
         }
+        execution.kernels += r.type == libkineto::ActivityType::CONCURRENT_KERNEL;
+        execution.memcpys += r.type == libkineto::ActivityType::GPU_MEMCPY;
+        execution.memsets += r.type == libkineto::ActivityType::GPU_MEMSET;
+        execution.busyNs += r.end - r.start;
+        execution.firstStartNs = activitiesSeen == 0 ? r.start : std::min(execution.firstStartNs, r.start);
+        execution.lastEndNs = std::max(execution.lastEndNs, r.end);
+        ++activitiesSeen;
     }
-    if (iterations.size() != static_cast<size_t>(count) || torchExecution.kernels + torchExecution.memcpys +
-                                                                   torchExecution.memsets != 0) {
-        throw std::runtime_error("GPU time: the trace of " + std::to_string(count) + " iterations has " +
-                                 std::to_string(iterations.size()) + " FKL kernels and " +
+    if (executions.size() != static_cast<size_t>(count) || activitiesSeen != 0) {
+        throw std::runtime_error("GPU time: the trace of " + std::to_string(count) + " executions of " + impl.name +
+                                 " has " + std::to_string(executions.size()) + " markers and " +
                                  std::to_string(records.size()) + " device activities");
     }
-    return iterations;
+    return executions;
 }
 
 // Validation, latency and GPU time of batch N
@@ -263,7 +263,7 @@ void runBatch(Context& ctx, std::vector<Result>& results) {
                 r.errorsPerIteration.size() == 1 ? vsFkl : validation::combine(r.errorVsFklReference, vsFkl);
         }
     }
-    const auto ms = measureInterleaved(ctx, impls);
+    const auto ms = measureSequential(ctx, impls);
     for (size_t k = 0; k < impls.size(); ++k) {
         Result& r = batchResults[k];
         r.timing = computeStats(ms[k]);
@@ -275,30 +275,29 @@ void runBatch(Context& ctx, std::vector<Result>& results) {
             r.meanSpeedupOfBvf = sum / TIMED_ITERS;
         }
     }
-    // GPU time only: warm-up as in the latency pass, then the timed iterations traced in chunks
-    for (int i = 0; i < WARMUP_ITERS; ++i) {
-        for (const auto& impl : impls) {
-            impl.run(static_cast<size_t>(i));
+    // GPU time only: each implementation's warm-up, then its timed iterations traced in chunks, PyTorch first
+    std::vector<std::vector<float>> gpuMs(impls.size()), spanMs(impls.size());
+    for (size_t k = 0; k < impls.size(); ++k) {
+        for (int i = 0; i < WARMUP_ITERS; ++i) {
+            impls[k].run(static_cast<size_t>(i));
             ctx.stream.synchronize();
         }
-    }
-    std::vector<std::vector<float>> gpuMs(impls.size()), spanMs(impls.size());
-    for (int first = 0; first < TIMED_ITERS; first += PROFILE_CHUNK) {
-        const int count = std::min(PROFILE_CHUNK, TIMED_ITERS - first);
-        const auto iterations = traceIterations(ctx, impls, WARMUP_ITERS + first, count);
-        for (const auto& [torchExecution, fklExecution] : iterations) {
-            size_t k = 0;
-            for (const Activities* a : {&torchExecution, &fklExecution}) {
-                gpuMs[k].push_back(static_cast<float>(a->busyNs * 1e-6));
-                spanMs[k].push_back(static_cast<float>((a->lastEndNs - a->firstStartNs) * 1e-6));
-                ++k;
+        for (int first = 0; first < TIMED_ITERS; first += PROFILE_CHUNK) {
+            const int count = std::min(PROFILE_CHUNK, TIMED_ITERS - first);
+            const auto executions = traceExecutions(ctx, impls[k], WARMUP_ITERS + first, count);
+            for (const Activities& a : executions) {
+                gpuMs[k].push_back(static_cast<float>(a.busyNs * 1e-6));
+                spanMs[k].push_back(static_cast<float>((a.lastEndNs - a.firstStartNs) * 1e-6));
+            }
+            if (first == 0) {
+                batchResults[k].counts = executions.front();
             }
         }
-        if (first == 0) {
-            batchResults[0].counts = iterations.front().first;
-            batchResults[1].counts = iterations.front().second;
-        }
     }
+    batchResults[0].latencyMs = ms[0];
+    batchResults[1].latencyMs = ms[1];
+    batchResults[0].gpuMs = gpuMs[0];
+    batchResults[1].gpuMs = gpuMs[1];
     for (size_t k = 0; k < impls.size(); ++k) {
         Result& r = batchResults[k];
         r.gpuTiming = computeStats(gpuMs[k]);
@@ -363,12 +362,15 @@ void writePlatform(const std::filesystem::path& outDir, const Context& ctx) {
        << WARMUP_ITERS + TIMED_ITERS << ")) runs both pipelines on the regions of iteration t, generated before the "
        << "loops (statistics of the timed ones in regions.csv); FKL's build() calls and fusion and PyTorch's "
           "per-region calls are timed.\n"
-       << "Timing: " << WARMUP_ITERS << " warm-up then " << TIMED_ITERS << " timed iterations. In every iteration "
-       << "pytorch then FKL BVF, each timed with device events (c10::Event) on one stream around the complete pipeline "
+       << "Timing: the two libraries never run at the same time: for every batch size, pytorch's complete loop ("
+       << WARMUP_ITERS << " warm-up then " << TIMED_ITERS << " timed iterations) runs first, then FKL BVF's on the same "
+       << "regions, every run timed with device events (c10::Event) on one stream around the complete pipeline "
        << "(all host enqueue work included) and followed by a synchronization. FKL BVF's speedup is computed per "
-       << "iteration (pytorch time / BVF time) and averaged. Median, p10, p90 with linear interpolation.\n"
-       << "GPU time only: a second pass with the same interleaved iterations and regions, traced with PyTorch's "
-       << "profiler (Kineto) in chunks of " << PROFILE_CHUNK << " iterations; the GPU time of one execution is the "
+       << "iteration (pytorch time / BVF time of the same iteration) and averaged (*_per_iteration.csv have every "
+       << "pair). Median, p10, p90 with linear interpolation.\n"
+       << "GPU time only: a second pass with the same loops, pytorch's then FKL BVF's, the timed iterations traced with "
+       << "PyTorch's profiler (Kineto) in chunks of " << PROFILE_CHUNK << " iterations, an empty marker kernel after "
+       << "every execution splitting the trace; the GPU time of one execution is the "
        << "sum of the execution times of its device activities (kernels, memcpys and memsets: PyTorch's device to "
        << "device copies are memcpys), span = first start to last end; speedups per execution, averaged.\n"
        << "Validation: before the timing, both pipelines on the regions of the first, every "
@@ -451,6 +453,23 @@ int run(int argc, char** argv) {
             writeTwoExecutionRow(two, static_cast<long long>(b.batch), gpuOnly ? b.gpuTiming : b.timing,
                                  gpuOnly ? f->gpuTiming : f->timing,
                                  gpuOnly ? b.meanGpuSpeedupOfBvf : b.meanSpeedupOfBvf);
+        }
+        // Every timed iteration's pair of times (ms) and their ratio, which the mean speedup averages
+        std::ofstream pairs(outDir / (std::string(PYTORCH) + "_vs_" + FKL_BVF + "_" + (gpuOnly ? "gpu_only_" : "") +
+                                      parArchName() + "_per_iteration.csv"));
+        pairs << "Batch size, Iteration, " << PYTORCH << " Time, " << FKL_BVF << " Time, Speedup" << std::endl;
+        for (const auto& b : results) {
+            if (b.name != PYTORCH) {
+                continue;
+            }
+            const auto f = std::find_if(results.begin(), results.end(),
+                                        [&](const Result& r) { return r.name == FKL_BVF && r.batch == b.batch; });
+            const std::vector<float>& pt = gpuOnly ? b.gpuMs : b.latencyMs;
+            const std::vector<float>& fk = gpuOnly ? f->gpuMs : f->latencyMs;
+            for (size_t i = 0; i < pt.size(); ++i) {
+                pairs << b.batch << ", " << WARMUP_ITERS + i << ", " << pt[i] << ", " << fk[i] << ", "
+                      << static_cast<double>(pt[i]) / fk[i] << std::endl;
+            }
         }
     }
     std::ofstream(outDir / "pytorch_build_information.txt") << at::show_config();

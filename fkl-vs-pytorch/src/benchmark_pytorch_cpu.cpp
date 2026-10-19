@@ -11,16 +11,11 @@
 //   fkl mt:  the same call with ParArch::CPU_MULTITHREAD, on FKL's thread pool (one worker per hardware thread).
 //
 // Two comparisons, each with the same number of threads on both sides: PyTorch with at::set_num_threads(1) against
-// fkl, interleaved as in every CPU benchmark, and PyTorch with as many threads as FKL's thread pool has workers against
-// fkl mt. libgomp's workers spin for GOMP_SPINCOUNT iterations after a parallel region before they sleep (300000 by
-// default: about 5.4 ms on the paper's machine, longer than the 1 ms idle gap), so in an interleaved loop they would
-// still be spinning when FKL runs, and with a spin as short as FKL's PyTorch itself is slower (README.md). The
-// multithreaded comparison therefore times each library in a loop of its own, on the same regions, with PyTorch's
-// default spin, and pairs the runs by iteration for the speedup (timeSeparately, a protocol deviation for this one
-// comparison); the interleaved multithreaded loop is also run, as the evidence of the interference, with the
-// GOMP_SPINCOUNT of the environment (the default, and in a second run of the program the spin matched to FKL's,
-// scripts/run_all.sh). The program measures the spin it runs with (--omp-spin alone prints it) and records it in
-// cpu_platform.txt.
+// fkl, and PyTorch with as many threads as FKL's thread pool has workers against fkl mt. In each, PyTorch's complete
+// loop runs first and FKL's after it, on the same regions (common/bench_cpu.h). PyTorch keeps libgomp's default spin
+// (its workers spin for GOMP_SPINCOUNT iterations after a parallel region before they sleep: about 5.4 ms with the
+// default 300000 on the paper's machine); the program measures how long the workers of both pools stay busy after a
+// run (--omp-spin alone prints it) and records it in cpu_platform.txt.
 //
 //     benchmark_pytorch_cpu <results folder>
 //     benchmark_pytorch_cpu --omp-spin      how long libgomp's and FKL's workers stay busy after a parallel run, us
@@ -51,8 +46,7 @@ struct Check {
 };
 
 template <size_t N>
-void runBatch(Workload& w, std::vector<Row>& singleThread, std::vector<Row>& multiThread, std::vector<Control>& controls,
-              std::vector<Row>& interleaved, std::vector<PerIteration>& perIteration, std::vector<Check>& checks,
+void runBatch(Workload& w, std::vector<Row>& singleThread, std::vector<Row>& multiThread, std::vector<Check>& checks,
               int threads) {
     pytorch::Pipeline torchPipeline(w.frame, w.pitch, torch::kCPU, N, fklConversion());
     const auto fkl = makeFklCpu(N, false, w);
@@ -90,21 +84,16 @@ void runBatch(Workload& w, std::vector<Row>& singleThread, std::vector<Row>& mul
     at::set_num_threads(1);
     singleThread.push_back(timeTwo(N, runPytorch, [&](size_t t) { fkl->run(t); }));
     at::set_num_threads(threads);
-    perIteration.emplace_back();
-    multiThread.push_back(timeSeparately(N, runPytorch, [&](size_t t) { fklMT->run(t); }, perIteration.back()));
-    interleaved.push_back(timeTwo(N, runPytorch, [&](size_t t) { fklMT->run(t); }));
+    multiThread.push_back(timeTwo(N, runPytorch, [&](size_t t) { fklMT->run(t); }));
     at::set_num_threads(1);
-    controls.push_back(timeFklControl(N, *fkl, *fklMT));
     const Row& s = singleThread.back();
     const Row& m = multiThread.back();
-    const Row& x = interleaved.back();
     std::printf("N %3zu | PyTorch 1 thread %8.1f us, FKL CPU %8.1f us, mean speedup %6.2fx | PyTorch %d threads %8.1f us, "
-                "FKL CPU_MULTITHREAD %8.1f us, mean speedup %6.2fx (interleaved: %8.1f us, %8.1f us) | FKL alone %8.1f us, "
-                "%8.1f us | max err: FKL vs "
+                "FKL CPU_MULTITHREAD %8.1f us, mean speedup %6.2fx | max err: FKL vs "
                 "reference %.2e, PyTorch vs pixel-center reference %.2e, PyTorch vs FKL %.2e, FKL CPU_MULTITHREAD vs "
                 "FKL CPU %.2e, PyTorch %d threads vs 1 thread %.2e\n",
                 N, s.baseline.median, s.fkl.median, s.meanSpeedup, threads, m.baseline.median, m.fkl.median,
-                m.meanSpeedup, x.baseline.median, x.fkl.median, controls.back().single.median, controls.back().multi.median, c.fklVsReference,
+                m.meanSpeedup, c.fklVsReference,
                 c.pytorchVsReference, c.pytorchVsFkl, c.fklMultithreadVsFkl, threads, c.pytorchThreadsVsOneThread);
 }
 
@@ -155,22 +144,14 @@ int main(int argc, char** argv) {
         std::printf("Workers busy after a parallel run: libgomp %.1f us, FKL %.1f us\n", spin.ompBusyUs,
                     spin.fklBusyUs);
 
-        std::vector<Row> singleThread, multiThread, interleaved;
-        std::vector<PerIteration> perIteration;
-        std::vector<Control> controls;
+        std::vector<Row> singleThread, multiThread;
         std::vector<Check> checks;
-        forEachBatch([&]<size_t N>() { runBatch<N>(w, singleThread, multiThread, controls, interleaved, perIteration, checks, threads);
-        });
+        forEachBatch([&]<size_t N>() { runBatch<N>(w, singleThread, multiThread, checks, threads); });
 
         writeCSV(outDir / "benchmark_cpu_pytorch_1thread_vs_fkl_bvf_CPU.csv", "PyTorch 1 thread", singleThread,
                  "FKL CPU");
-        const std::string multi = "benchmark_cpu_pytorch_" + std::to_string(threads) + "threads_vs_fkl_bvf_CPU_MULTITHREAD";
-        const std::string pytorchLabel = "PyTorch " + std::to_string(threads) + " threads";
-        // Each library in its own loop, paired by iteration (timeSeparately): the comparison; and interleaved
-        writeCSV(outDir / (multi + ".csv"), pytorchLabel, multiThread, "FKL CPU_MULTITHREAD");
-        writePerIterationCSV(outDir / (multi + "_per_iteration.csv"), pytorchLabel, perIteration, "FKL CPU_MULTITHREAD");
-        writeCSV(outDir / (multi + "_interleaved.csv"), pytorchLabel, interleaved, "FKL CPU_MULTITHREAD");
-        writeControlCSV(outDir / "fkl_control.csv", controls);
+        writeCSV(outDir / ("benchmark_cpu_pytorch_" + std::to_string(threads) + "threads_vs_fkl_bvf_CPU_MULTITHREAD.csv"),
+                 "PyTorch " + std::to_string(threads) + " threads", multiThread, "FKL CPU_MULTITHREAD");
         std::ofstream v(outDir / "cpu_validation.csv");
         v << "Batch size, Iteration, FKL MaxAbsError vs FKL-convention reference, PyTorch MaxAbsError vs "
              "pixel-center reference, PyTorch vs FKL MaxAbsDifference, FKL CPU_MULTITHREAD vs FKL CPU "
@@ -191,11 +172,7 @@ int main(int argc, char** argv) {
           << ", OMP_WAIT_POLICY=" << envOr("OMP_WAIT_POLICY", "unset") << "; measured before the benchmark, each worker "
           << "stays busy " << spin.ompBusyUs << " us per parallel run of PyTorch (an add with 32768 floats per thread) "
           << "and each of FKL's CPU_MULTITHREAD workers " << spin.fklBusyUs << " us per run (1 region): work plus spin "
-          << "before sleeping\n"
-          << "Multithreaded comparison (" << multi << ".csv): each library in a loop of its own, the same warm-up and "
-          << "timed iterations on the same regions, each run after the idle gap; mean speedup over the timed iterations "
-          << "of (PyTorch time / FKL time) in the same iteration (" << multi << "_per_iteration.csv). The same "
-          << "comparison interleaved as the others, with this GOMP_SPINCOUNT: " << multi << "_interleaved.csv\n"
+          << "before sleeping (libgomp's default spin is kept)\n"
           << "PyTorch pipeline: per region, views of the region's luma and chroma planes, chroma to float and addmm "
              "with FKL's chroma coefficients and every offset folded into the bias, luma to float and a broadcast "
              "add with its coefficient (chroma replicated to 2x2 pixels), interpolate (bilinear, align_corners=false: "

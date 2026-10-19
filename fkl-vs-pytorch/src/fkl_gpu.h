@@ -60,6 +60,12 @@ std::vector<float> pixelCenterReference(size_t n, const geometry::RegionSets& re
 // FKL's NV12 -> RGB conversion as a matrix and offsets, for PyTorch's pipeline
 pipeline::Conversion fklConversion();
 
+// Launches an empty kernel, benchExecutionMarker, on the stream: in a trace of one library's loop, the GPU time pass
+// launches it after every execution, and splits the trace there
+void launchExecutionMarker(void* stream);
+// The name of that kernel, as traces show it (a substring)
+constexpr const char* EXECUTION_MARKER = "benchExecutionMarker";
+
 // "GPU_NVIDIA" or "GPU_AMD": FKL's name of the GPU backend, for the file names
 std::string parArchName();
 // The GPU, the GPU runtime and the compiler and flags of FKL's code, for the platform file
