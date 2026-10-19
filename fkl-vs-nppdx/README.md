@@ -57,9 +57,10 @@ platform files), before the workload described above and before the NPPDx+NPP be
 under its earlier name, `benchmark_figure1_bvf` (the prefix of their files). Their configuration files do not match the
 current workload, so the scripts that check the workload refuse them.
 
-Three benchmarks, with the same iterations: 1000 timed after 100 warm-up ones, NPPDx and FKL one after the other in
-each, and FKL's mean speedup computed per iteration (NPPDx time / FKL time) and averaged, as in FKL's and
-cvGPUSpeedup's benchmarks. NPPDx runs in the configuration chosen for every N (see
+Three benchmarks, with the same iterations: 1000 timed after 100 warm-up ones. The two implementations never run at
+the same time: NPPDx's complete loop runs first, then FKL's, on the same regions. FKL's mean speedup is computed per
+iteration (NPPDx time / FKL time of the same iteration) and averaged, as in FKL's and cvGPUSpeedup's benchmarks. The
+paper's first results (`results-v3`) alternated the two implementations within every iteration instead. NPPDx runs in the configuration chosen for every N (see
 [NPPDx configuration](#nppdx-configuration)).
 
 **CPU + GPU**: CUDA events around everything the host does to enqueue the kernel plus its execution. Median
@@ -202,8 +203,8 @@ with `SET=nppdx scripts/compile_time.sh` after a run of `benchmark_nppdx` with t
 Following FKL's benchmark convention, each benchmark writes `<benchmark>_<ParArch>.csv` with one row per batch
 size: `Batch size`, then `MeanTime`, `TimeVariance`, `MaxTime` and `MinTime` of the first (baseline, NPPDx or NPPDx+NPP) and
 second (FKL) implementation in milliseconds, `Mean Speedup`, and the `MedianTime`, `P10Time` and `P90Time` of
-each. In every iteration both implementations are timed one after the other with CUDA events on one stream,
-synchronizing after each. `<benchmark>_gpu_only_<ParArch>.csv` has the same columns for the GPU only benchmark.
+each. Each implementation's complete loop runs before the other's, every execution timed with CUDA events on one
+stream and followed by a synchronization. `<benchmark>_gpu_only_<ParArch>.csv` has the same columns for the GPU only benchmark.
 Next to them are `_validation_` (errors, tolerances and whether each output is within its tolerance, per N and
 validated iteration), `_nppdx_block_sweep_` (every NPPDx configuration tried: tile, block, blocks per crop, shared
 memory, time alone, error, whether it is within its tolerance and whether it was chosen), `_nppdx_config_` (the chosen
