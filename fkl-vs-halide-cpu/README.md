@@ -97,12 +97,13 @@ The protocol is the one of every CPU benchmark:
 - **Paired speedups.** The speedup is the mean of the per-iteration ratios, pairing the runs of the same iteration.
   Every comparison CSV has its `_per_iteration.csv` with the pairs.
 
-Each process records in `cpu_platform_<threads>.txt` how long Halide's and FKL's workers stay busy after a parallel run
-(the idle gap must outlast both), and writes the validation (`cpu_validation_<threads>.csv`): before the timing, on the
-regions of the first, every 50th and the last timed iteration, the schedules it times and FKL against the plain C++
-reference with FKL's conventions ([`common/bench_reference.h`](../common/bench_reference.h)), FKL's pool against FKL,
-and Halide against FKL's output. The schedules and FKL must be within 1e-3 of the reference, and FKL's pool of FKL, or
-the process exits with an error after writing its files.
+Each process records in `cpu_platform_<threads>.txt` how long FKL's workers stay busy after a parallel run, and the
+pool process also Halide's (the 1-thread process has no Halide workers: NaN); the idle gap must outlast them. It also
+writes the validation (`cpu_validation_<threads>.csv`): before the timing, on the regions of the first, every 50th and
+the last timed iteration, the schedules it times and FKL against the plain C++ reference with FKL's conventions
+([`common/bench_reference.h`](../common/bench_reference.h)), FKL's pool against FKL, and `halide_parallel` against
+FKL's output (reported, not required). The schedules and FKL must be within 1e-3 of the reference, and FKL's pool of
+FKL, or the process exits with an error after writing its files.
 
 ## What each side does that the other does not
 
