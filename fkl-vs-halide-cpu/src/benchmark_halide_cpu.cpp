@@ -21,7 +21,8 @@
 //   fkl              one executeOperations<TransformDPP<ParArch::CPU>> call with the whole chain (BVF), one thread
 //   fkl mt           the same call with ParArch::CPU_MULTITHREAD, on FKL's thread pool
 //
-// Three comparisons, each with the same number of threads on both sides: halide_default and halide_parallel with
+// The comparisons run each library's complete loop on its own, Halide's first and FKL's after it, on the same regions
+// (common/bench_cpu.h). Four comparisons, each with the same number of threads on both sides: halide_default and halide_parallel with
 // Halide's thread pool set to 1 thread against fkl, and halide_parallel with as many threads as FKL's thread pool has
 // workers against fkl mt. halide_default has no parallel loop, so on more threads it would run the same code. Halide's
 // threads are set once per process, before any run, with Halide::Internal::JITSharedRuntime::set_num_threads (the JIT
@@ -184,7 +185,6 @@ struct Results {
     // Both schedules against FKL CPU on one thread, against FKL CPU_MULTITHREAD on more (halide_default, which has no
     // parallel loop, then still runs on one)
     std::vector<Row> defaultRows, parallelRows;
-    std::vector<Control> controls;
     std::vector<Check> checks;
 };
 
@@ -222,17 +222,15 @@ void runBatch(const Workload& w, Halide::Callable& defaultCallable, Halide::Call
     FklCpu& fklSide = multithreaded ? *fklMT : *fkl;
     res.defaultRows.push_back(timeTwo(N, [&](size_t t) { halideDefault.run(t); }, [&](size_t t) { fklSide.run(t); }));
     res.parallelRows.push_back(timeTwo(N, [&](size_t t) { halideParallel.run(t); }, [&](size_t t) { fklSide.run(t); }));
-    res.controls.push_back(timeFklControl(N, *fkl, *fklMT));
     const Row& p = res.parallelRows.back();
     const Row& d = res.defaultRows.back();
     const char* fklName = multithreaded ? "CPU_MULTITHREAD" : "CPU";
     std::printf("N %3zu | halide_default %8.1f us, FKL %s %8.1f us, mean speedup %6.2fx |", N, d.baseline.median,
                 fklName, d.fkl.median, d.meanSpeedup);
-    std::printf(" halide_parallel %8.1f us, FKL %s %8.1f us, mean speedup %6.2fx | FKL alone %8.1f us, %8.1f us | max "
+    std::printf(" halide_parallel %8.1f us, FKL %s %8.1f us, mean speedup %6.2fx | max "
                 "err vs reference: FKL %.2e, halide_default %.2e, halide_parallel %.2e; halide_parallel vs FKL %.2e, FKL "
                 "CPU_MULTITHREAD vs FKL CPU %.2e\n",
-                p.baseline.median, fklName, p.fkl.median, p.meanSpeedup,
-                res.controls.back().single.median, res.controls.back().multi.median, c.fklVsReference,
+                p.baseline.median, fklName, p.fkl.median, p.meanSpeedup, c.fklVsReference,
                 c.defaultVsReference, c.parallelVsReference, c.parallelVsFkl, c.fklMultithreadVsFkl);
 }
 
@@ -302,7 +300,6 @@ int main(int argc, char** argv) {
                  "Halide default " + label, res.defaultRows, "FKL " + fklSuffix);
         writeCSV(outDir / ("benchmark_cpu_halide_parallel_" + threadLabel + "_vs_fkl_bvf_" + fklSuffix + ".csv"),
                  "Halide parallel " + label, res.parallelRows, "FKL " + fklSuffix);
-        writeControlCSV(outDir / ("fkl_control_" + threadLabel + ".csv"), res.controls);
         std::ofstream v(outDir / ("cpu_validation_" + threadLabel + ".csv"));
         v << "Batch size, Iteration, FKL MaxAbsError vs FKL-convention reference, Halide default MaxAbsError vs "
              "FKL-convention reference, Halide parallel MaxAbsError vs FKL-convention reference, Halide parallel vs FKL "

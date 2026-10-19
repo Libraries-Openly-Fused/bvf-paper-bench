@@ -66,8 +66,8 @@ at the same thread count on both sides:
 
 | Halide threads | Compared with | Files |
 |---|---|---|
-| 1 | FKL CPU | `benchmark_cpu_halide_default_1thread_vs_fkl_bvf_CPU.csv`, `benchmark_cpu_halide_parallel_1thread_vs_fkl_bvf_CPU.csv` |
-| FKL's pool size (32 on the paper's machine) | FKL CPU_MULTITHREAD | `benchmark_cpu_halide_default_32threads_vs_fkl_bvf_CPU_MULTITHREAD.csv`, `benchmark_cpu_halide_parallel_32threads_vs_fkl_bvf_CPU_MULTITHREAD.csv` |
+| 1 | FKL CPU | `benchmark_cpu_halide_default_1thread_vs_fkl_bvf_CPU.csv`, `benchmark_cpu_halide_parallel_1thread_vs_fkl_bvf_CPU.csv`, and their `_per_iteration.csv` |
+| FKL's pool size (32 on the paper's machine) | FKL CPU_MULTITHREAD | `benchmark_cpu_halide_default_32threads_vs_fkl_bvf_CPU_MULTITHREAD.csv`, `benchmark_cpu_halide_parallel_32threads_vs_fkl_bvf_CPU_MULTITHREAD.csv`, and their `_per_iteration.csv` |
 
 `halide_default` has no parallel loop, so on 32 threads it runs the same serial code.
 
@@ -85,15 +85,17 @@ The 1-thread run checks this. It measures the CPU time of the process's other th
 
 The protocol is the one of every CPU benchmark:
 
-- **Interleaved runs.** Each iteration runs Halide and then FKL on the regions of that iteration.
+- **Sequential loops.** For every batch size and schedule, Halide's complete loop (100 warm-up and 1000 timed
+  iterations) runs first, then FKL's on the same regions. The two libraries never run at the same time.
 - **Idle gap.** Every run follows a 1 ms idle gap, busy-waited by the timing thread.
-- **Speedups.** Speedups are computed per iteration and averaged.
+- **Paired speedups.** The speedup is the mean of the per-iteration ratios, pairing the runs of the same iteration.
+  Every comparison CSV has its `_per_iteration.csv` with the pairs.
 
-Halide's workers stay busy 62 to 74 us after a parallel run, about as long as FKL's, so both pools are asleep when a run
-starts. Each process records both busy times in `cpu_platform_<threads>.txt`. Both processes also write the FKL-only
-control (`fkl_control_<threads>.csv`) and the validation (`cpu_validation_<threads>.csv`): before the timing, on the
-regions of the first, every 50th and the last timed iteration, both schedules and FKL against the plain C++ reference
-with FKL's conventions ([`common/bench_reference.h`](../common/bench_reference.h)), and Halide against FKL's output.
+Halide's workers stay busy 62 to 74 us after a parallel run, about as long as FKL's, so the pool is asleep when a run
+starts. Each process records both busy times in `cpu_platform_<threads>.txt`, and writes the validation
+(`cpu_validation_<threads>.csv`): before the timing, on the regions of the first, every 50th and the last timed
+iteration, both schedules and FKL against the plain C++ reference with FKL's conventions
+([`common/bench_reference.h`](../common/bench_reference.h)), and Halide against FKL's output.
 
 ## What each side does that the other does not
 
