@@ -13,7 +13,7 @@
    limitations under the License. */
 
 // The harness of the CPU benchmarks that compare a library with FKL's CPU backends (BVF) on the Figure 1 pipeline
-// (fkl-vs-opencv-cpu, fkl-vs-pytorch, fkl-vs-halide-cpu, fkl-vs-fern-cpu):
+// (fkl-vs-opencv-cpu; fkl-vs-pytorch, fkl-vs-halide-cpu and fkl-vs-fern-cpu are added by pull requests #18, #16, #17):
 //   ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
 // One 3840x2160 NV12 frame in host memory and N regions, new every iteration, with the sizes and positions of
 // common/bench_geometry.h, bilinear resize to 64x32, black rows on top and bottom up to a square, then
@@ -32,9 +32,9 @@
 // are timed; each program says what its library does with them inside its timed run (CpuPlatformText). FKL's speedup is
 // the mean over the timed iterations of (library time / FKL time) of the same iteration, which pairs runs on identical
 // inputs. Every timed run is preceded by a 1 ms idle gap, as when a pipeline runs once per video frame: a pool whose
-// workers spin for less than that after a run (FKL's, OpenCV's, Halide's) is asleep when the run starts, one that spins
-// longer (PyTorch's libgomp) is still spinning; each library keeps its own threads, if it has any (Fern runs on FKL's
-// pool), and its own idle behaviour. The timing thread busy-waits the gap instead of sleeping: a sleeping
+// workers spin for less than that after a run (FKL's, OpenCV's) is asleep when the run starts, one that spins longer
+// (libgomp's by default, PyTorch's in #18) is still spinning; each library keeps its own threads, if it has any (a
+// library without threads runs on FKL's pool through runOnFklPool, Fern in #17), and its own idle behaviour. The timing thread busy-waits the gap instead of sleeping: a sleeping
 // core enters its deepest C-state, and the run right after it then pays a wake-up whose cost depends on each binary's
 // code (fkl-vs-opencv-cpu/README.md).
 

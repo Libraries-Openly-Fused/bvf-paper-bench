@@ -1,5 +1,5 @@
-# The common part of the CPU benchmark projects built on common/bench_cpu.h (fkl-vs-pytorch, fkl-vs-halide-cpu,
-# fkl-vs-fern-cpu), with the options of fkl-vs-opencv-cpu: FKL with its CPU backends, the CPU code generation flags,
+# The common part of the CPU benchmark projects built on common/bench_cpu.h (fkl-vs-opencv-cpu; fkl-vs-pytorch,
+# fkl-vs-halide-cpu and fkl-vs-fern-cpu, added by pull requests #18, #16 and #17): FKL with its CPU backends, the CPU code generation flags,
 # the iterations, the workload, and add_cpu_bench_target(), which builds one benchmark with them. Include it right
 # after project(). Meant to be built with the latest stable clang and the best SIMD the CPU has (CPU_ARCH_FLAGS).
 
