@@ -60,8 +60,9 @@ the binary rather than on FKL. Two effects:
 The busy-waited gap removes the first. For the second, FKL's code is compiled apart, linked first and page-aligned
 (see [the CPU benchmarks](../README.md#the-cpu-benchmarks)): every CPU benchmark runs the same FKL object file, with
 every FKL function at the same address modulo 4096 (with GCC and Clang). Whether FKL's times then agree
-between the CPU benchmarks is checked on the paper's runs, where every program measures FKL on the same regions. OpenCV
-also gains from the busy-waited gap, since its runs no longer start from a sleeping core.
+between the CPU benchmarks is checked on the paper's runs, where every program measures FKL on the same regions. The
+busy-waited gap keeps the timing thread's core awake for OpenCV's runs too (its other threads' cores still sleep
+through the gap); how that changes OpenCV's times is not measured separately.
 
 ## Build and run
 

@@ -201,7 +201,8 @@ were excluded.
   two passes, the 9x9 box, the 21-tap Gaussian).
 - **Implementations:** nppdx; fkl_inline; fkl_staged; and, for the Gaussian, fkl_staged_separable as a labelled extra.
   - fkl_inline for the Gaussian is `GaussianBVF<21>` (common/bench_neighborhood_ops.h, commit bb0c245).
-- **Protocol:** the paper's, as Experiments 1 and 3.
+- **Protocol:** the one of Experiments 1 and 3 at 57f08bc, which interleaved the implementations in every iteration; not
+  the paper's current protocol. Rerun before citing next to results of the sequential protocol.
   - 100 warm-up and 1000 timed iterations in every mode (latency, GPU only, GPU only with the L2 flushed), the
     implementations interleaved in every iteration, default clocks. The harness (common/bench_gpu.h) now runs each
     implementation's complete loop before the next one's instead (the baselines first, the FKL forms last).

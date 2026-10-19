@@ -231,9 +231,12 @@ with each library's imported symbols) take. Not aligned: the constants, strings 
 with the other objects', the read-only data the object places after its strings (the type names of its type
 information), and its per-function read-only data (switch tables, not in the timed loops). FKL's timed code reads some
 of those merged 8-, 16- and 32-byte constants, whose addresses modulo 4096 differ by a few cache lines between programs;
-whether that changes FKL's times is not measured separately: the cross-program FKL times of the paper's runs show it. The platform file records three of those addresses; `nm` on two programs compares all of
-them. The [protocol change](fkl-vs-opencv-cpu/README.md#protocol-change)
-section of FKL vs OpenCV on the CPU explains the busy-waited gap and the separate translation unit.
+whether that changes FKL's times is not measured separately: the cross-program FKL times of the paper's runs show it.
+The platform file records the addresses modulo 4096 of three aligned symbols (`benchFklCodeStart`, `fklFrame`,
+`benchFklBssStart`), and `nm` on two programs compares every FKL symbol; the merged constants have no symbols
+(`objdump -d` shows the addresses FKL's code loads them from). The
+[protocol change](fkl-vs-opencv-cpu/README.md#protocol-change) section of FKL vs OpenCV on the CPU explains the
+busy-waited gap and the separate translation unit.
 
 ## Requirements
 
