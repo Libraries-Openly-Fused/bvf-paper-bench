@@ -18,7 +18,11 @@
 #
 # Environment variables:
 #   STEPS        the benchmarks to build and run, among opencv-cuda, npp, ablation, nppdx, neighborhood and opencv-cpu
-#                (default all)
+#                (default all), and pytorch (FKL vs PyTorch, not in the default: it needs TORCH_PYTHON)
+#   TORCH_PYTHON for the pytorch step: the Python of the environment with PyTorch (fkl-vs-pytorch/README.md), whose
+#                LibTorch the programs are built against
+#   PYTORCH_GOMP_SPINCOUNT  the GOMP_SPINCOUNT of the pytorch step's matched-spin run (default 4000: libgomp's workers
+#                then spin about as long as FKL's, 100 us, on the paper's Ryzen 9 5950X)
 #   NPPDX_SIZES  the region sizes of FKL vs NPPDx (default "20x10 32x16 48x24")
 #   COMPILE_TIME 1 to also run scripts/compile_time.sh after the runs (long: 10 rounds of every unit): FKL's ablation,
 #                the OpenCV and NPP units, and in the NPPDx builds the headers and FKL BVF (first size) and the NPPDx
@@ -26,7 +30,7 @@
 #   PROFILE      1 to run the Nsight Compute scripts (needs the opencv-cuda, npp and ablation steps and the GPU
 #                performance counters open to every user); without it, their commands are printed at the end
 #   BUILD_ROOT   where the build folders go (default this repository): build-<step>, and build-nppdx-<size>
-#   CPU_CXX      C++ compiler of the CPU benchmark (default clang++; the README recommends a recent clang)
+#   CPU_CXX      C++ compiler of the CPU benchmarks (default clang++; the README recommends a recent clang)
 #   CMAKE_ARGS   more options for every CMake project (for example -DBENCH_ITERATIONS=1 for a quick check). They
 #                come before the options this script sets for each project (BENCH_REGIONS, OpenCV_DIR, and CPU_CXX for
 #                the CPU benchmark), which win. Setting or unsetting BENCH_REGIONS in them is an error: this script sets
@@ -83,6 +87,13 @@ has_step() { [[ " $STEPS " == *" $1 "* ]]; }
 if { has_step opencv-cuda || has_step opencv-cpu; } && [ -z "${OpenCV_DIR:-}" ]; then
     echo "Set OpenCV_DIR to the OpenCV build or install folder (the OpenCV benchmarks need it)" >&2
     exit 1
+fi
+TORCH_PREFIX=""
+if has_step pytorch; then
+    TORCH_PREFIX=$("${TORCH_PYTHON:-}" -c 'import torch; print(torch.utils.cmake_prefix_path)' 2>/dev/null) || {
+        echo "Set TORCH_PYTHON to the Python of the environment with PyTorch (the pytorch step needs it)" >&2
+        exit 1
+    }
 fi
 # Every size has its own build, results and log paths, so a size listed twice would overwrite its first measurements
 seen=" "
@@ -160,6 +171,22 @@ for step in opencv-cuda npp ablation opencv-cpu; do
         run "$LOGS/bvf_types.log" "$build/bvf_types"
     fi
 done
+if has_step pytorch; then
+    # The CPU program with libgomp's default spin (the paper's comparisons, and the interleaved multithreaded loop as
+    # the evidence of the interference), then with the spin matched to FKL's (the interleaved loop of that row); the
+    # GPU program when LibTorch has a GPU backend
+    build=$BUILD_ROOT/build-pytorch
+    out=$RESULTS/fkl-vs-pytorch
+    echo "  fkl-vs-pytorch ($build)"
+    configure "$REPO/fkl-vs-pytorch" "$build" -DBENCH_REGIONS=mixed -DCMAKE_CXX_COMPILER="$CPU_CXX" \
+              -DCMAKE_PREFIX_PATH="$TORCH_PREFIX"
+    run "$LOGS/benchmark_pytorch_cpu.log" env -u GOMP_SPINCOUNT "$build/benchmark_pytorch_cpu" "$out/cpu"
+    run "$LOGS/benchmark_pytorch_cpu_matched_spin.log" env GOMP_SPINCOUNT="${PYTORCH_GOMP_SPINCOUNT:-4000}" \
+        "$build/benchmark_pytorch_cpu" "$out/cpu-matched-spin"
+    if [ -x "$build/benchmark_pytorch_gpu" ]; then
+        run "$LOGS/benchmark_pytorch_gpu.log" "$build/benchmark_pytorch_gpu" "$out/gpu"
+    fi
+fi
 if has_step nppdx; then
     for size in $NPPDX_SIZES; do
         build=$BUILD_ROOT/build-nppdx-$size

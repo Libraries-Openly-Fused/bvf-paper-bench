@@ -22,6 +22,7 @@ One folder per library compared with FKL, each its own CMake project with its ow
 | [`fkl-vs-npp/`](fkl-vs-npp/README.md) | FKL BVF with NVIDIA NPP | `benchmark_npp` |
 | [`fkl-vs-nppdx/`](fkl-vs-nppdx/README.md) | FKL BVF with NVIDIA NPPDx, as one kernel with hand written CUDA code and combined with NPP without hand written pixel processing code | `benchmark_nppdx`, `benchmark_nppdx_npp` |
 | [`fkl-vs-opencv-cpu/`](fkl-vs-opencv-cpu/README.md) | FKL's CPU backends with OpenCV on the CPU | `benchmark_opencv_cpu` |
+| [`fkl-vs-pytorch/`](fkl-vs-pytorch/README.md) | FKL with eager PyTorch (LibTorch's C++ API, torch 2.14.1): its CPU backends with PyTorch's CPU kernels, and FKL BVF with PyTorch on the GPU (CUDA or ROCm) | `benchmark_pytorch_cpu`, `benchmark_pytorch_gpu` |
 | [`fkl-ablation/`](fkl-ablation/README.md) | FKL with BVF against FKL without it (vertical and horizontal fusion only), FKL's host overhead, the type FKL builds | `benchmark_fkl_ablation`, `bvf_types` |
 | [`fkl-neighborhood/`](fkl-neighborhood/README.md) | The neighborhood experiment: 64x32 crops, a box blur and the normalization; FKL's BVF box operation against its MorphologyDPP, and the DPP against NPP, OpenCV CUDA and NPPDx | `benchmark_fkl_neighborhood_k<K>_p<passes>[_resize]`, `benchmark_{npp,opencv_cuda,nppdx}_neighborhood`, `test_neighborhood_ops` |
 | [`rocm/`](rocm/README.md) | FKL's HIP backend with AMD RPP on an AMD GPU, and FKL's CPU backends with RPP's HOST backend, on ROCm | `rocm_bench`, `rpp_cpu_bench` |
@@ -179,7 +180,7 @@ and max), `compile_time_kernels.csv` and `compile_time_phases.csv`, and prints a
 
 ## The CPU benchmarks
 
-FKL vs OpenCV on the CPU shares one harness with the other CPU benchmarks,
+FKL vs OpenCV on the CPU and FKL vs PyTorch's CPU program share one harness,
 [`common/bench_cpu.h`](common/bench_cpu.h). FKL's side is [`common/bench_fkl_cpu.cpp`](common/bench_fkl_cpu.cpp):
 one `executeOperations` call (BVF) on FKL's CPU backend (one thread) and on its `CPU_MULTITHREAD` backend (FKL's
 thread pool, one worker per hardware thread). Each program compares its library on one thread with FKL on one thread,
@@ -214,6 +215,7 @@ Each benchmark has its own requirements, besides a C++20 compiler:
 | `fkl-vs-nppdx` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.30, a Linux x86_64 or Windows x64 machine (NPPDx's platforms); no OpenCV |
 | `fkl-neighborhood` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.28, FusedKernelLibrary with the batched `MorphologyDPP` and `executeBoxBlur` (PR #393, the `fkl` submodule), OpenCV 4.14 built with CUDA and the opencv_contrib modules `cudaarithm`, `cudafilters` and `cudaimgproc` for its OpenCV program, and for its NPPDx programs what `fkl-vs-nppdx` needs (or `-DBENCH_NPPDX=OFF`) |
 | `fkl-vs-opencv-cpu` | CMake 3.28 and OpenCV 4.14 with `core` and `imgproc`; no GPU or CUDA |
+| `fkl-vs-pytorch` | CMake 3.28 and a PyTorch 2.14.1 wheel (its LibTorch; see [its README](fkl-vs-pytorch/README.md)); for the GPU program, a CUDA wheel and the CUDA toolkit (nvcc), or a ROCm wheel and ROCm |
 | `rocm` | Linux, an AMD GPU (gfx1200 by default, another one with `-DCMAKE_HIP_ARCHITECTURES`), ROCm 10.1 with RPP 3.2.0 and rocprofiler-sdk, CMake 3.28, Ninja (see [its README](rocm/README.md)); no CUDA or OpenCV |
 
 The paper's results were measured on Linux; the CI also builds and runs every benchmark but `rocm/` on Windows, and
@@ -239,7 +241,8 @@ The README of every folder has its commands. `scripts/run_all.sh` builds and run
 its own `rocm/scripts/run_all.sh`): the main run and the GPU only run with the L2 flushed of every GPU benchmark, FKL's
 host overhead and per-kernel times, `bvf_types`, FKL vs NPPDx for every region size (`NPPDX_SIZES`) with the runner-up
 NPPDx configuration of every N re-timed against FKL (`nppdx_runner_up.py`, then `--configs`, into `runner-up/`), every
-program of the neighborhood experiment, and the CPU benchmark; `COMPILE_TIME=1` adds the compile-time units and `PROFILE=1` the Nsight Compute scripts, their summaries
+program of the neighborhood experiment, and FKL vs OpenCV on the CPU; with `STEPS` naming `pytorch` and `TORCH_PYTHON`
+the Python of a PyTorch environment, FKL vs PyTorch; `COMPILE_TIME=1` adds the compile-time units and `PROFILE=1` the Nsight Compute scripts, their summaries
 and the traffic model, when the driver lets every user read the GPU performance counters (`RmProfilingAdminOnly: 0`);
 otherwise it prints their commands, which then need sudo:
 
