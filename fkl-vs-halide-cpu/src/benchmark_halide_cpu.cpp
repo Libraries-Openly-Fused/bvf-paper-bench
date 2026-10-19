@@ -225,12 +225,11 @@ void runBatch(const Workload& w, Halide::Callable& defaultCallable, Halide::Call
                       maxAbsError(halideParallel.output(), reference),
                       maxAbsError(halideParallel.output(), fklOut), maxAbsError(fklMT->output(), fklOut)};
         res.checks.push_back(c);
-        // std::max keeps a NaN only as its first argument: the error goes first
-        worst = Check{N, t, std::max(c.fklVsReference, worst.fklVsReference),
-                      std::max(c.defaultVsReference, worst.defaultVsReference),
-                      std::max(c.parallelVsReference, worst.parallelVsReference),
-                      std::max(c.parallelVsFkl, worst.parallelVsFkl),
-                      std::max(c.fklMultithreadVsFkl, worst.fklMultithreadVsFkl)};
+        worst = Check{N, t, worstError(c.fklVsReference, worst.fklVsReference),
+                      worstError(c.defaultVsReference, worst.defaultVsReference),
+                      worstError(c.parallelVsReference, worst.parallelVsReference),
+                      worstError(c.parallelVsFkl, worst.parallelVsFkl),
+                      worstError(c.fklMultithreadVsFkl, worst.fklMultithreadVsFkl)};
     }
     const Check& c = worst;
 
