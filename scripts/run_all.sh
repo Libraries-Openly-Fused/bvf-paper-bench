@@ -29,7 +29,7 @@
 #   CPU_CXX      C++ compiler of the CPU benchmark (default clang++; the README recommends a recent clang)
 #   CMAKE_ARGS   more options for every CMake project (for example -DBENCH_ITERATIONS=1 for a quick check). They
 #                come before the options this script sets for each project (BENCH_REGIONS, OpenCV_DIR, and CPU_CXX for
-#                the CPU benchmark), which win. Setting or unsetting BENCH_REGIONS in them is an error: this script sets
+#                the CPU benchmarks), which win. Setting or unsetting BENCH_REGIONS in them is an error: this script sets
 #                it for every project (mixed, or the NPPDx sizes of NPPDX_SIZES)
 # Results: <results>/<benchmark folder>, FKL vs NPPDx in <results>/fkl-vs-nppdx/<size> (the runner-up configurations in
 # its runner-up/), the neighborhood experiment in <results>/fkl-neighborhood/<program>, logs in <results>/logs. The GPU benchmarks run one at a time; leave the GPU otherwise idle.

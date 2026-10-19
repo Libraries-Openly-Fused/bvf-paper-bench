@@ -27,9 +27,9 @@
 //                                  before each of its kernels but the first (the L2 flush of the GPU only benchmark
 //                                  with the L2 flushed)
 //   runKernel<N, C>(w, origins, b) its NPPDx kernel alone, timed to choose the configuration
-// Every loop runs both libraries on the regions of its iteration (common/bench_geometry.h), whose positions change every
-// iteration: NPPDx gets the origins of the iteration's regions (a kernel parameter) and FKL their rectangles (its
-// build() calls), both converted from the regions before the loops.
+// Iteration t of each library's loop runs on the regions of iteration t (common/bench_geometry.h), whose positions
+// change every iteration: NPPDx gets the origins of the iteration's regions (a kernel parameter) and FKL their
+// rectangles (its build() calls), both converted from the regions before the loops.
 //   kernel<N, C>                   the NPPDx kernel type of configuration C (block, grid, smem, init())
 //   analyze(w)                     its --analyze mode
 
@@ -685,9 +685,14 @@ int figure1Main(int argc, char** argv) {
         int runtime = 0;
         gpuErrchk(cudaRuntimeGetVersion(&runtime));
         std::ofstream platform(outDir / (name + "_platform.txt"));
+        char busId[64] = {};
+        gpuErrchk(cudaDeviceGetPCIBusId(busId, sizeof(busId), device));
         platform << "GPU: " << prop.name << " (sm_" << prop.major << prop.minor << ", " << prop.multiProcessorCount
-                 << " SMs)\n"
-                 << "NVIDIA driver: " << bench::shell("nvidia-smi --query-gpu=driver_version --format=csv,noheader") << "\n"
+                 << " SMs), CUDA device " << device << "; in nvidia-smi: " << bench::nvidiaSmi(busId, "index,pci.bus_id,uuid")
+                 << "\n"
+                 << "NVIDIA driver: " << bench::nvidiaSmi(busId, "driver_version") << "\n"
+                 << "GPU clocks: not locked (locking needs root); application clocks as reported by nvidia-smi: "
+                 << bench::nvidiaSmi(busId, "clocks.max.sm,clocks.max.mem") << "\n"
                  << "CUDA runtime: " << runtime / 1000 << "." << (runtime % 1000) / 10 << "\n"
                  << "Host compiler: " << bench::hostCompiler() << "\n"
                  << "FKL: " << FKL_VERSION << "\n"
