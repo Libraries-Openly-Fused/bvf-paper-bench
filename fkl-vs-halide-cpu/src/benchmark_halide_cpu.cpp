@@ -355,7 +355,13 @@ int main(int argc, char** argv) {
                             : "single-thread comparisons")
           << ")\n"
           << "Thread pools, measured before the benchmark: each worker stays busy " << halideBusyUs << " us per "
-          << "halide_parallel run on 1 region (NAN: one thread, no workers), and " << fklBusyUs << " us per FKL "
+          << "halide_parallel run on 1 region ("
+#ifdef _WIN32
+          << "NAN: not measured on Windows"
+#else
+          << (multithreaded ? "Halide's workers" : "NAN: one thread, no workers")
+#endif
+          << "), and " << fklBusyUs << " us per FKL "
           << "CPU_MULTITHREAD run on 1 region (spin and wake-up), which the "
           << std::chrono::milliseconds(IDLE_GAP).count() << " ms idle gap must outlast\n";
         // A Halide worker taking tasks would use hundreds of us per run on 100 regions

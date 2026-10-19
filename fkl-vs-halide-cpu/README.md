@@ -110,11 +110,12 @@ Halide, compared with FKL:
 
 - **Vectorizes.** `halide_parallel` computes 8 output pixels per AVX2 instruction (the four samples' loads are
   gathered). FKL's CPU backend runs its fused loop one output pixel at a time, without SIMD across pixels.
-- **Simplifies the arithmetic (`halide_parallel`).** With the channel loop bounded to 3 and unrolled, Halide's
-  simplifier folds each channel's constants, and `(x * MUL - SUB) / DIV` becomes one multiply-add
-  (`halide_parallel.stmt`). `halide_default` keeps the channel a loop variable: its `.stmt` selects the constants per
-  channel (`mux`), divides, and samples the frame inside the channel loop. FKL computes each operation of the chain as
-  written. All must stay within 1e-3 of the reference; the validation files have their errors.
+- **Simplifies the arithmetic.** In both schedules Halide's simplifier folds the conversion's offsets into one
+  constant per channel (`+ -222.921555f` for R in both `.stmt` files), where FKL subtracts them from the samples. With
+  the channel loop bounded to 3 and unrolled, `halide_parallel` also folds `(x * MUL - SUB) / DIV` into one
+  multiply-add; `halide_default` keeps the channel a loop variable, so its `.stmt` selects the normalization constants
+  per channel (`mux`), divides, and samples the frame inside the channel loop. FKL computes each operation of the
+  chain as written. All must stay within 1e-3 of the reference; the validation files have their errors.
 - **Compiles for the exact CPU.** The JIT compiles for the host CPU (`tune_znver3`), at run time and once. FKL's code
   is compiled ahead of time with `-march=native`, the same CPU.
 - **Has the regions in a table.** Halide reads the regions from a table in memory, which every run fills from the
