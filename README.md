@@ -88,9 +88,17 @@ program runs its library's pipeline (the baseline) and FKL BVF, one `executeOper
 whole chain (the paper's Listing 2). FKL vs NPPDx has its own harness, described in its README, with the same three
 timings.
 
-In each of the 1000 timed iterations (after 100 warm-up ones) the baseline and FKL BVF run one after the other on the
-regions of that iteration, and FKL BVF's speedup over the baseline is computed per iteration and then averaged, as in
-FKL's two-execution benchmarks. Every run produces two benchmarks:
+The implementations never run at the same time:
+
+- **Sequential loops.** For every batch size, each implementation's complete loop (100 warm-up and 1000 timed
+  iterations) runs before the next one's, on the same regions, in a fixed order: the baselines first, FKL BVF last.
+  Each loop therefore starts with the L2 state its own previous iteration left.
+- **Paired speedups.** FKL BVF's speedup over a baseline is computed per iteration (baseline time / FKL BVF time of the
+  same iteration, identical inputs) and averaged, as in FKL's two-execution benchmarks.
+- **Earlier results.** The paper's first results (`results-v3`) alternated the implementations within every
+  iteration instead.
+
+Every run produces two benchmarks:
 
 - CPU + GPU: CUDA events around everything the host does to enqueue a pipeline, plus its GPU execution.
 - GPU only: a second pass with CUPTI kernel tracing, where the time of an execution is the sum of its kernels'
