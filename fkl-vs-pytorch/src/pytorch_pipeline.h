@@ -26,10 +26,10 @@
 //     plane between the borders;
 //   - multiply, subtract and divide in place on the whole N x 64 x 64 x 3 output tensor.
 // Or, with the batched variants (ResizeInput::Batched), without a host loop over the regions: the region parameters
-// uploaded in one copy, the 48 x 24 window at every region's origin (the largest region size; the geometry draws every
-// position for that box) gathered with one take from the NV12 frame, converted in one pass, and resized with one
-// grid_sample whose grid holds each region's pixel-center coordinates, clamped to the region, so that the window's
-// pixels outside the region get no weight: interpolate's sampling, to float rounding.
+// written into one buffer (on the GPU uploaded in one copy), the 48 x 24 window at every region's origin (the largest
+// region size; the geometry draws every position for that box) gathered with one take from the NV12 frame, converted
+// in one pass, and resized with one grid_sample whose grid holds each region's pixel-center coordinates, clamped to the
+// region, so that the window's pixels outside the region get no weight: interpolate's sampling, to float rounding.
 // The conversion matrix and offsets are FKL's (common/bench_pipeline.h's Conversion, filled by FKL's side):
 // (R, G, B) = M (Y - 16, U - 128, V - 128) = M_Y Y + (M_U U + M_V V + bias), with bias = -16 M_Y - 128 (M_U + M_V).
 //
@@ -200,11 +200,11 @@ public:
         constexpr int64_t WH = MAX_REGION_H, WW = MAX_REGION_W;
         m_out.narrow(1, 0, BORDER_TOP).zero_();
         m_out.narrow(1, BORDER_TOP + RES_H, BORDER_BOTTOM).zero_();
-        // The parameters of the iteration's regions, written on the host and uploaded in one copy: per region the
-        // indices in the NV12 frame of the first byte of its luma window's two halves and of its chroma window
-        // (int64), then its grid
-        // coordinates, RES_W x and RES_H y, normalized to the window (float). On the GPU the host buffer is pinned
-        // memory from PyTorch's caching host allocator, which keeps it until the copy is done.
+        // The parameters of the iteration's regions, written on the host into one buffer (on the GPU uploaded in one
+        // copy): per region the indices in the NV12 frame of the first byte of its luma window's two halves and of its
+        // chroma window (int64), then its grid coordinates, RES_W x and RES_H y, normalized to the window (float). On
+        // the GPU the host buffer is pinned memory from PyTorch's caching host allocator, which keeps it until the copy
+        // is done.
         const torch::Tensor host =
             m_device.is_cpu()
                 ? m_cpuParameters

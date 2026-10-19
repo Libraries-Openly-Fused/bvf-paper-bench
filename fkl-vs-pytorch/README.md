@@ -48,8 +48,9 @@ machine, the CUDA runtime library both libraries load is the system's (CUDA 13.3
 
 **Batched, without a loop over the regions.** Step 2 can also run on all regions at once (`ResizeInput::Batched`,
 `Pipeline::runBatched`):
-- **parameters:** per region, the index of its window's first value in the luma and in the chroma plane and its grid
-  coordinates, computed on the host and, on the GPU, uploaded in one copy from pinned memory;
+- **parameters:** per region, the indices in the NV12 frame of the first bytes of its luma window's two halves and of
+  its chroma window (three int64) and its grid coordinates (64 x and 32 y, float), computed on the host into one
+  buffer and, on the GPU, uploaded in one copy from pinned memory;
 - **gather:** the 48 x 24 window at every region's origin (the largest region size: the geometry draws every position
   for that box, so it is inside the frame) with one `take` from the NV12 frame, at three first bytes per region (the
   two halves of its luma window and its chroma window) + the offsets of 12 rows of 48 bytes: N x 24 x 48 luma and
