@@ -691,7 +691,7 @@ int figure1Main(int argc, char** argv) {
                  << " SMs), CUDA device " << device << "; in nvidia-smi: " << bench::nvidiaSmi(busId, "index,pci.bus_id,uuid")
                  << "\n"
                  << "NVIDIA driver: " << bench::nvidiaSmi(busId, "driver_version") << "\n"
-                 << "GPU clocks: not locked (locking needs root); application clocks as reported by nvidia-smi: "
+                 << "GPU clocks: not locked by the benchmark (locking needs root); maximum SM and memory clocks (nvidia-smi clocks.max.sm, clocks.max.mem): "
                  << bench::nvidiaSmi(busId, "clocks.max.sm,clocks.max.mem") << "\n"
                  << "CUDA runtime: " << runtime / 1000 << "." << (runtime % 1000) / 10 << "\n"
                  << "Host compiler: " << bench::hostCompiler() << "\n"

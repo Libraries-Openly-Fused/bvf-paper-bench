@@ -209,7 +209,8 @@ The two libraries of a comparison never run at the same time:
   deep C-state. A pool whose workers spin for less than that after a run (FKL's, OpenCV's, Halide's) is asleep when
   the next run starts; one that spins longer (PyTorch's libgomp, by default) is still spinning. Each library keeps its
   own threads and idle behaviour.
-- **Worker busy time.** Each program measures how long the workers of both pools stay busy after a run with little
+- **Worker busy time.** Each program measures how long the workers of every pool it uses (FKL's, and the library's if
+  it has one) stay busy after a run with little
   work: their spin and wake-up, from `/proc/self/task/*/schedstat` on Linux. It records them in its platform file
   (`cpu_platform*.txt`).
 - **Validation.** Before the timing, on the regions of the first, every 50th and the last timed iteration, FKL against
@@ -225,8 +226,9 @@ the same compiler and flags. It is linked first, and with GCC and Clang a functi
 aligned to 4096 bytes, which aligns its code, read-only data, vtables, data and zero-initialized data sections: FKL's
 functions (its template instantiations, in sections of their own, follow in the same order), vtables and static
 objects then have the same addresses modulo 4096 in every CPU benchmark, whatever the sections before them (which grow
-with each library's imported symbols) take. Only the constants and exception tables the linker merges with the other
-objects' are not aligned. The platform file records three of those addresses; `nm` on two programs compares all of
+with each library's imported symbols) take. Not aligned: the constants, strings and exception tables the linker merges
+with the other objects', and the read-only data the object places after its strings (the type names of its type
+information), none of them used by the timed loops. The platform file records three of those addresses; `nm` on two programs compares all of
 them. The [protocol change](fkl-vs-opencv-cpu/README.md#protocol-change)
 section of FKL vs OpenCV on the CPU explains the busy-waited gap and the separate translation unit.
 
@@ -295,10 +297,9 @@ Every job runs [`scripts/ci/run_benchmarks.cmake`](scripts/ci/run_benchmarks.cma
 its platform there once (checked against its SHA-256), builds the benchmarks (FKL vs NPPDx for
 every region size, `NPPDX_SIZES`, and the NPPDx neighborhood programs) with one timed iteration and no warm-up (`ITERATIONS` and `WARMUP_ITERATIONS` of the
 script), runs every mode except those for Nsight Compute (`--ncu-target` and the profiling scripts), and fails if a
-benchmark fails (a CPU benchmark fails its own validation) or if FKL's outputs, or those of a library the benchmark
-requires (NPPDx's, and the CPU baselines' against their own references, as each folder's README says), do not match
-their references (OpenCV's and NPP's are in the validation files but not required: they come from the OpenCV build and
-the CUDA toolkit of each runner). The results
+benchmark fails (a CPU benchmark fails when its own validation fails: FKL's checks and what it checks of its library,
+as its README says) or if FKL's or NPPDx's outputs do not match their references (on the GPU, OpenCV's and NPP's are
+in the validation files but not required: they come from the OpenCV build and the CUDA toolkit of each runner). The results
 and logs of every job are uploaded as artifacts. Times measured on shared CI runners are not the paper's numbers.
 
 The runners are persistent machines and this repository is public, so the workflow only runs trusted code: pull

@@ -1151,7 +1151,7 @@ void writePlatform(const std::filesystem::path& outDir, const std::vector<std::s
     P::describe(os, outDir);
     os << "CPU: " << bench::cpuName() << "\n"
        << "OS: " << bench::osName() << ", kernel " << bench::kernelVersion() << "\n"
-       << "GPU clocks: not locked (locking needs root); application clocks as reported by nvidia-smi: "
+       << "GPU clocks: not locked by the benchmark (locking needs root); maximum SM and memory clocks (nvidia-smi clocks.max.sm, clocks.max.mem): "
        << bench::nvidiaSmi(busId, "clocks.max.sm,clocks.max.mem") << "\n"
        << "\n";
     if constexpr (requires { P::workload(os); }) {
