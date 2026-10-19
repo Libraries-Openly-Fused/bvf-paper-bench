@@ -1134,11 +1134,14 @@ void writePlatform(const std::filesystem::path& outDir, const std::vector<std::s
     for (const auto& b : baselines) {
         names += b + ", ";
     }
+    char busId[64] = {};
+    gpuErrchk(cudaDeviceGetPCIBusId(busId, sizeof(busId), device));
     std::ofstream os(outDir / "platform.txt");
     os << "Benchmark: " << P::title << "\n"
        << "GPU: " << prop.name << " (sm_" << prop.major << prop.minor << ", " << prop.multiProcessorCount << " SMs, "
-       << (prop.totalGlobalMem >> 20) << " MiB)\n"
-       << "NVIDIA driver: " << bench::shell("nvidia-smi --query-gpu=driver_version --format=csv,noheader") << "\n"
+       << (prop.totalGlobalMem >> 20) << " MiB), CUDA device " << device << "; in nvidia-smi: "
+       << bench::nvidiaSmi(busId, "index,pci.bus_id,uuid") << "\n"
+       << "NVIDIA driver: " << bench::nvidiaSmi(busId, "driver_version") << "\n"
        << "CUDA runtime: " << runtime / 1000 << "." << (runtime % 1000) / 10 << ", CUDA driver API: " << driver / 1000
        << "." << (driver % 1000) / 10 << "\n"
        << "nvcc: " << BENCH_NVCC_VERSION << "\n"
@@ -1149,7 +1152,7 @@ void writePlatform(const std::filesystem::path& outDir, const std::vector<std::s
     os << "CPU: " << bench::cpuName() << "\n"
        << "OS: " << bench::osName() << ", kernel " << bench::kernelVersion() << "\n"
        << "GPU clocks: not locked (locking needs root); application clocks as reported by nvidia-smi: "
-       << bench::shell("nvidia-smi --query-gpu=clocks.max.sm,clocks.max.mem --format=csv,noheader") << "\n"
+       << bench::nvidiaSmi(busId, "clocks.max.sm,clocks.max.mem") << "\n"
        << "\n";
     if constexpr (requires { P::workload(os); }) {
         P::workload(os);
