@@ -79,12 +79,11 @@ void runBatch(Workload& w, std::vector<Row>& singleThread, std::vector<Row>& mul
                       maxAbsError(torchOut, fklOut), maxAbsError(fklMT->output(), fklOut),
                       maxAbsError(torchThreadsOut, torchOut)};
         checks.push_back(c);
-        // std::max keeps a NaN only as its first argument: the error goes first
-        worst = Check{N, t, std::max(c.fklVsReference, worst.fklVsReference),
-                      std::max(c.pytorchVsReference, worst.pytorchVsReference),
-                      std::max(c.pytorchVsFkl, worst.pytorchVsFkl),
-                      std::max(c.fklMultithreadVsFkl, worst.fklMultithreadVsFkl),
-                      std::max(c.pytorchThreadsVsOneThread, worst.pytorchThreadsVsOneThread)};
+        worst = Check{N, t, worstError(c.fklVsReference, worst.fklVsReference),
+                      worstError(c.pytorchVsReference, worst.pytorchVsReference),
+                      worstError(c.pytorchVsFkl, worst.pytorchVsFkl),
+                      worstError(c.fklMultithreadVsFkl, worst.fklMultithreadVsFkl),
+                      worstError(c.pytorchThreadsVsOneThread, worst.pytorchThreadsVsOneThread)};
     }
     const Check& c = worst;
 
