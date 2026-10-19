@@ -6,7 +6,10 @@
 set(CUDA_ARCH "native" CACHE STRING "CUDA architectures to build, passed verbatim to CUDA_ARCHITECTURES")
 set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH})
 if(CUDA_ARCH STREQUAL "native")
-    set(CUDA_ARCH_DESCRIPTION "native (${CMAKE_CUDA_ARCHITECTURES_NATIVE})")
+    # One entry per GPU of the machine (89-real;120-real with two GPUs): joined with spaces, since the description
+    # becomes a string literal in a compile definition, where a semicolon would split it
+    string(REPLACE ";" " " CUDA_ARCH_NATIVE_LIST "${CMAKE_CUDA_ARCHITECTURES_NATIVE}")
+    set(CUDA_ARCH_DESCRIPTION "native (${CUDA_ARCH_NATIVE_LIST})")
 else()
     set(CUDA_ARCH_DESCRIPTION "${CUDA_ARCH}")
 endif()

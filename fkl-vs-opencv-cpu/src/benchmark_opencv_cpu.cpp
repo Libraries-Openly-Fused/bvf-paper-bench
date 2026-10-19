@@ -18,7 +18,8 @@
 //           thread pool (one worker per hardware thread), in chunks of one output row of one crop, and sync() waits.
 //
 // Two comparisons, each with the same number of threads on both sides: OpenCV with 1 thread against fkl, and OpenCV
-// with as many threads as FKL's thread pool has workers (one per hardware thread) against fkl mt.
+// with as many threads as FKL's thread pool has workers (one per hardware thread) against fkl mt. In each, OpenCV's
+// complete loop runs first and FKL's after it, on the same regions (common/bench_cpu.h).
 
 #include "bench_cpu.h"
 
@@ -99,7 +100,7 @@ struct Check {
 
 template <size_t N>
 void runBatch(const Workload& w, std::vector<Row>& singleThread, std::vector<Row>& multiThread,
-              std::vector<Control>& controls, std::vector<Check>& checks, int threads) {
+              std::vector<Check>& checks, int threads) {
     OpenCVCpu opencv(w, N);
     const auto fkl = makeFklCpu(N, false, w);
     const auto fklMT = makeFklCpu(N, true, w);
@@ -127,15 +128,14 @@ void runBatch(const Workload& w, std::vector<Row>& singleThread, std::vector<Row
     cv::setNumThreads(threads);
     multiThread.push_back(timeTwo(N, [&](size_t t) { opencv.run(t); }, [&](size_t t) { fklMT->run(t); }));
     cv::setNumThreads(1);
-    controls.push_back(timeFklControl(N, *fkl, *fklMT));
     const Row& s = singleThread.back();
     const Row& m = multiThread.back();
     std::printf("N %3zu | OpenCV 1 thread %8.1f us, FKL CPU %8.1f us, mean speedup %6.2fx | OpenCV %d threads %8.1f us, "
-                "FKL CPU_MULTITHREAD %8.1f us, mean speedup %6.2fx | FKL alone %8.1f us, %8.1f us | max err: FKL vs "
+                "FKL CPU_MULTITHREAD %8.1f us, mean speedup %6.2fx | max err: FKL vs "
                 "reference %.2e, OpenCV vs OpenCV-convention reference %.2e, OpenCV vs FKL %.2e, FKL CPU_MULTITHREAD "
                 "vs FKL CPU %.2e\n",
                 N, s.baseline.median, s.fkl.median, s.meanSpeedup, threads, m.baseline.median, m.fkl.median,
-                m.meanSpeedup, controls.back().single.median, controls.back().multi.median, c.fklVsReference,
+                m.meanSpeedup, c.fklVsReference,
                 c.opencvVsReference, c.opencvVsFkl, c.fklMultithreadVsFkl);
 }
 
@@ -167,15 +167,13 @@ int main(int argc, char** argv) {
     std::printf("Workers busy after a parallel run: OpenCV %.1f us, FKL %.1f us\n", opencvBusyUs, fklBusyUs);
 
     std::vector<Row> singleThread, multiThread;
-    std::vector<Control> controls;
     std::vector<Check> checks;
-    forEachBatch([&]<size_t N>() { runBatch<N>(w, singleThread, multiThread, controls, checks, threads); });
+    forEachBatch([&]<size_t N>() { runBatch<N>(w, singleThread, multiThread, checks, threads); });
 
     writeCSV(outDir / "benchmark_cpu_opencv_1thread_vs_fkl_bvf_CPU.csv", "OpenCV 1 thread", singleThread, "FKL CPU");
     writeCSV(outDir / ("benchmark_cpu_opencv_" + std::to_string(threads) +
                        "threads_vs_fkl_bvf_CPU_MULTITHREAD.csv"),
              "OpenCV " + std::to_string(threads) + " threads", multiThread, "FKL CPU_MULTITHREAD");
-    writeControlCSV(outDir / "fkl_control.csv", controls);
     std::ofstream v(outDir / "cpu_validation.csv");
     v << "Batch size, Iteration, FKL MaxAbsError vs FKL-convention reference, OpenCV MaxAbsError vs OpenCV-convention "
          "reference, OpenCV vs FKL MaxAbsDifference, FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference" << std::endl;
