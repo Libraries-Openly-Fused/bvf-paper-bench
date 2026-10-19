@@ -611,8 +611,9 @@ if(BENCHMARKS STREQUAL "cpu")
     check_csv("${OUT_DIR}/fkl-vs-opencv-cpu/cpu_validation.csv" "FKL MaxAbsError vs FKL-convention reference" 1e-3)
     check_csv("${OUT_DIR}/fkl-vs-opencv-cpu/cpu_validation.csv" "FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference" 1e-3)
     if(HALIDE)
-        # FKL vs Halide: one process per Halide thread count (1, then FKL's thread pool size); FKL and both Halide
-        # schedules must match the reference with FKL's conventions
+        # FKL vs Halide: one process per Halide thread count (1, then FKL's thread pool size); FKL and the timed Halide
+        # schedules (both on one thread, halide_parallel on the pool size) must match the reference with FKL's
+        # conventions, as the program itself requires
         build_benchmark(halide-cpu "${REPO}/fkl-vs-halide-cpu" -DBENCH_REGIONS=mixed
                         "-DHalide_DIR=${HALIDE_ROOT}/lib/cmake/Halide")
         set(bench "${BUILD_DIR}/halide-cpu/benchmark_halide_cpu${EXE}")
@@ -628,10 +629,13 @@ if(BENCHMARKS STREQUAL "cpu")
             list(APPEND FAILURES "fkl-vs-halide-cpu: ${count} validation files instead of 2")
         endif()
         foreach(validation IN LISTS validations)
-            foreach(column IN ITEMS "FKL MaxAbsError vs FKL-convention reference"
-                                    "Halide default MaxAbsError vs FKL-convention reference"
-                                    "Halide parallel MaxAbsError vs FKL-convention reference"
-                                    "FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference")
+            set(columns "FKL MaxAbsError vs FKL-convention reference"
+                        "Halide parallel MaxAbsError vs FKL-convention reference"
+                        "FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference")
+            if(validation MATCHES "_1thread\\.csv$")
+                list(APPEND columns "Halide default MaxAbsError vs FKL-convention reference")
+            endif()
+            foreach(column IN LISTS columns)
                 check_csv("${validation}" "${column}" 1e-3)
             endforeach()
         endforeach()

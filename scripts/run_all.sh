@@ -4,7 +4,8 @@
 # per-kernel GPU times and bvf_types, the type of the fused operation), FKL vs NPPDx for every region size (both
 # programs: main run, L2 flushed, and the runner-up NPPDx configuration re-timed against FKL), the neighborhood
 # experiment (fkl-neighborhood: every program, main run and L2 flushed, on its fixed-size 64x32 crops),
-# FKL vs OpenCV on the CPU, with COMPILE_TIME=1 the compile-time units, and with PROFILE=1 the memory traffic with
+# FKL vs OpenCV on the CPU, with the halide step FKL vs Halide on the CPU (one process per Halide thread count), with
+# COMPILE_TIME=1 the compile-time units, and with PROFILE=1 the memory traffic with
 # Nsight Compute
 # (scripts/ncu_dram.sh and ncu_l2.sh, their summaries and the traffic model), which needs the driver to let every user
 # read the GPU performance counters (RmProfilingAdminOnly=0); otherwise, since those scripts then need root, their

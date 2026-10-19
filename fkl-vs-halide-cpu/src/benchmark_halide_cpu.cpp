@@ -22,15 +22,16 @@
 //   fkl mt           the same call with ParArch::CPU_MULTITHREAD, on FKL's thread pool
 //
 // The comparisons run each library's complete loop on its own, Halide's first and FKL's after it, on the same regions
-// (common/bench_cpu.h). Four comparisons, each with the same number of threads on both sides: halide_default and halide_parallel with
-// Halide's thread pool set to 1 thread against fkl, and halide_parallel with as many threads as FKL's thread pool has
-// workers against fkl mt. halide_default has no parallel loop, so on more threads it would run the same code. Halide's
+// (common/bench_cpu.h). Three comparisons, each with the same number of threads on both sides: halide_default and
+// halide_parallel with Halide's thread pool set to 1 thread against fkl, and halide_parallel with as many threads as
+// FKL's thread pool has workers against fkl mt. halide_default has no parallel loop, so on more threads it would still
+// run on one: the multithreaded process does not time it. Halide's
 // threads are set once per process, before any run, with Halide::Internal::JITSharedRuntime::set_num_threads (the JIT
 // runtime's halide_set_num_threads), which does not take workers away once they have started: one process runs the
 // single-thread comparisons and another the multithreaded one.
 //
 //     benchmark_halide_cpu <results folder> 1      both schedules against FKL on one thread
-//     benchmark_halide_cpu <results folder> pool   both schedules against FKL's thread pool, on as many Halide threads
+//     benchmark_halide_cpu <results folder> pool   halide_parallel against FKL's thread pool, on as many Halide threads
 //                                                  (or the pool size as a number)
 
 #include "bench_cpu.h"
@@ -119,33 +120,30 @@ Halide::Callable compilePipeline(Schedule schedule, const Halide::Target& target
     return out.compile_to_callable({frame, regions}, target);
 }
 
-// One schedule on n regions per iteration: the region tables of every iteration, built before the loops, and the
-// output, as FKL's pipelines
+// One schedule on n regions per iteration: the region table (4 x n int32: x, y, width, height), filled in every run
+// from the regions of the iteration, as FKL's build() calls take the iteration's rectangles, and the output, as FKL's
+// pipelines
 class HalidePipeline {
 public:
     HalidePipeline(Halide::Callable& callable, const Workload& w, size_t n)
-        : m_callable(callable), m_n(n),
+        : m_callable(callable), m_n(n), m_regions(*w.regions),
           m_frame(const_cast<uint8_t*>(w.frame),
                   {halide_dimension_t{0, FRAME_W, 1}, halide_dimension_t{0, FRAME_H * 3 / 2, static_cast<int32_t>(w.pitch)}}),
-          m_tables(4, static_cast<int>(n), static_cast<int>(w.regions->iterations())),
+          m_table(4, static_cast<int>(n)),
           // Dense c x x x y x n: FKL's N x 64 x 64 x float3 layout
-          m_out(3, OUT_W, OUT_H, static_cast<int>(n)) {
-        for (size_t t = 0; t < w.regions->iterations(); ++t) {
-            for (size_t i = 0; i < n; ++i) {
-                const Region& r = w.regions->at(t, i);
-                const int ti = static_cast<int>(t), ii = static_cast<int>(i);
-                m_tables(0, ii, ti) = r.x;
-                m_tables(1, ii, ti) = r.y;
-                m_tables(2, ii, ti) = r.width;
-                m_tables(3, ii, ti) = r.height;
-            }
-        }
-    }
+          m_out(3, OUT_W, OUT_H, static_cast<int>(n)) {}
 
     // On the regions of iteration t
     void run(size_t t) {
-        Halide::Runtime::Buffer<int32_t, 2> table = m_tables.sliced(2, static_cast<int>(t));
-        const int error = m_callable(m_frame, table, m_out);
+        for (size_t i = 0; i < m_n; ++i) {
+            const Region& r = m_regions.at(t, i);
+            const int ii = static_cast<int>(i);
+            m_table(0, ii) = r.x;
+            m_table(1, ii) = r.y;
+            m_table(2, ii) = r.width;
+            m_table(3, ii) = r.height;
+        }
+        const int error = m_callable(m_frame, m_table, m_out);
         if (error != 0) {
             throw std::runtime_error("Halide pipeline failed with error " + std::to_string(error));
         }
@@ -160,8 +158,9 @@ public:
 private:
     Halide::Callable& m_callable;
     size_t m_n;
+    const RegionSets& m_regions;
     Halide::Runtime::Buffer<uint8_t, 2> m_frame;
-    Halide::Runtime::Buffer<int32_t, 3> m_tables;
+    Halide::Runtime::Buffer<int32_t, 2> m_table;
     Halide::Runtime::Buffer<float, 4> m_out;
 };
 
@@ -175,15 +174,21 @@ void setHalideThreads(int threads) {
     }
 }
 
-// The errors on the regions of one validated iteration
+// The errors on the regions of one validated iteration (defaultVsReference: NAN in the multithreaded process, which
+// does not run halide_default)
 struct Check {
     size_t batch, iteration;
     float fklVsReference, defaultVsReference, parallelVsReference, parallelVsFkl, fklMultithreadVsFkl;
+    // What the program requires (withinTolerance): FKL and the timed schedules against the reference with FKL's
+    // conventions (Halide's too), and FKL's pool against FKL
+    bool passed() const {
+        return withinTolerance(fklVsReference) && withinTolerance(parallelVsReference) &&
+               withinTolerance(fklMultithreadVsFkl) && (std::isnan(defaultVsReference) || withinTolerance(defaultVsReference));
+    }
 };
 
 struct Results {
-    // Both schedules against FKL CPU on one thread, against FKL CPU_MULTITHREAD on more (halide_default, which has no
-    // parallel loop, then still runs on one)
+    // On one thread, both schedules against FKL CPU; on FKL's pool size, halide_parallel against FKL CPU_MULTITHREAD
     std::vector<Row> defaultRows, parallelRows;
     std::vector<Check> checks;
 };
@@ -196,7 +201,7 @@ void runBatch(const Workload& w, Halide::Callable& defaultCallable, Halide::Call
     const auto fkl = makeFklCpu(N, false, w);
     const auto fklMT = makeFklCpu(N, true, w);
     // Before the timing, on the regions of the first, every 50th and the last timed iteration
-    Check worst{N, 0, 0.f, 0.f, 0.f, 0.f, 0.f};
+    Check worst{N, 0, 0.f, multithreaded ? NAN : 0.f, 0.f, 0.f, 0.f};
     for (const size_t k : validatedIterations(ITERS)) {
         const size_t t = WARMUP_ITERS + k;
         halideParallel.fillNaN();
@@ -205,28 +210,38 @@ void runBatch(const Workload& w, Halide::Callable& defaultCallable, Halide::Call
         fklMT->run(t);
         const auto fklOut = fkl->output();
         const auto reference = referenceOutput(w, N, t, Conventions::Fkl);
-        halideDefault.fillNaN();
-        halideDefault.run(t);
-        const Check c{N, t, maxAbsError(fklOut, reference), maxAbsError(halideDefault.output(), reference),
+        float defaultVsReference = NAN;
+        if (!multithreaded) {
+            halideDefault.fillNaN();
+            halideDefault.run(t);
+            defaultVsReference = maxAbsError(halideDefault.output(), reference);
+        }
+        const Check c{N, t, maxAbsError(fklOut, reference), defaultVsReference,
                       maxAbsError(halideParallel.output(), reference),
                       maxAbsError(halideParallel.output(), fklOut), maxAbsError(fklMT->output(), fklOut)};
         res.checks.push_back(c);
-        worst = Check{N, t, std::max(worst.fklVsReference, c.fklVsReference),
-                      std::max(worst.defaultVsReference, c.defaultVsReference),
-                      std::max(worst.parallelVsReference, c.parallelVsReference),
-                      std::max(worst.parallelVsFkl, c.parallelVsFkl),
-                      std::max(worst.fklMultithreadVsFkl, c.fklMultithreadVsFkl)};
+        // std::max keeps a NaN only as its first argument: the error goes first
+        worst = Check{N, t, std::max(c.fklVsReference, worst.fklVsReference),
+                      std::max(c.defaultVsReference, worst.defaultVsReference),
+                      std::max(c.parallelVsReference, worst.parallelVsReference),
+                      std::max(c.parallelVsFkl, worst.parallelVsFkl),
+                      std::max(c.fklMultithreadVsFkl, worst.fklMultithreadVsFkl)};
     }
     const Check& c = worst;
 
     FklCpu& fklSide = multithreaded ? *fklMT : *fkl;
-    res.defaultRows.push_back(timeTwo(N, [&](size_t t) { halideDefault.run(t); }, [&](size_t t) { fklSide.run(t); }));
+    const char* fklName = multithreaded ? "CPU_MULTITHREAD" : "CPU";
+    if (!multithreaded) {
+        res.defaultRows.push_back(
+            timeTwo(N, [&](size_t t) { halideDefault.run(t); }, [&](size_t t) { fklSide.run(t); }));
+        const Row& d = res.defaultRows.back();
+        std::printf("N %3zu | halide_default %8.1f us, FKL %s %8.1f us, mean speedup %6.2fx |", N, d.baseline.median,
+                    fklName, d.fkl.median, d.meanSpeedup);
+    } else {
+        std::printf("N %3zu |", N);
+    }
     res.parallelRows.push_back(timeTwo(N, [&](size_t t) { halideParallel.run(t); }, [&](size_t t) { fklSide.run(t); }));
     const Row& p = res.parallelRows.back();
-    const Row& d = res.defaultRows.back();
-    const char* fklName = multithreaded ? "CPU_MULTITHREAD" : "CPU";
-    std::printf("N %3zu | halide_default %8.1f us, FKL %s %8.1f us, mean speedup %6.2fx |", N, d.baseline.median,
-                fklName, d.fkl.median, d.meanSpeedup);
     std::printf(" halide_parallel %8.1f us, FKL %s %8.1f us, mean speedup %6.2fx | max "
                 "err vs reference: FKL %.2e, halide_default %.2e, halide_parallel %.2e; halide_parallel vs FKL %.2e, FKL "
                 "CPU_MULTITHREAD vs FKL CPU %.2e\n",
@@ -246,7 +261,8 @@ int main(int argc, char** argv) {
         const std::filesystem::path outDir = argv[1];
         std::filesystem::create_directories(outDir);
         // One thread: halide_default and halide_parallel against FKL on one thread. As many threads as FKL's thread
-        // pool has workers (std::thread::hardware_concurrency()): halide_parallel against FKL's thread pool.
+        // pool has workers (std::thread::hardware_concurrency()): halide_parallel against FKL's thread pool
+        // (halide_default has no parallel loop: it is not timed there).
         const int poolSize = poolThreads();
         const int threads = std::string(argv[2]) == "pool" ? poolSize : std::stoi(argv[2]);
         if (threads != 1 && threads != poolSize) {
@@ -296,48 +312,67 @@ int main(int argc, char** argv) {
 
         const std::string fklSuffix = multithreaded ? "CPU_MULTITHREAD" : "CPU";
         const std::string label = multithreaded ? std::to_string(threads) + " threads" : "1 thread";
-        writeCSV(outDir / ("benchmark_cpu_halide_default_" + threadLabel + "_vs_fkl_bvf_" + fklSuffix + ".csv"),
-                 "Halide default " + label, res.defaultRows, "FKL " + fklSuffix);
+        if (!multithreaded) {
+            writeCSV(outDir / ("benchmark_cpu_halide_default_" + threadLabel + "_vs_fkl_bvf_" + fklSuffix + ".csv"),
+                     "Halide default " + label, res.defaultRows, "FKL " + fklSuffix);
+        }
         writeCSV(outDir / ("benchmark_cpu_halide_parallel_" + threadLabel + "_vs_fkl_bvf_" + fklSuffix + ".csv"),
                  "Halide parallel " + label, res.parallelRows, "FKL " + fklSuffix);
         std::ofstream v(outDir / ("cpu_validation_" + threadLabel + ".csv"));
         v << "Batch size, Iteration, FKL MaxAbsError vs FKL-convention reference, Halide default MaxAbsError vs "
              "FKL-convention reference, Halide parallel MaxAbsError vs FKL-convention reference, Halide parallel vs FKL "
-             "MaxAbsDifference, FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference" << std::endl;
+             "MaxAbsDifference, FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference, Within tolerance" << std::endl;
+        bool passed = true;
         for (const auto& c : res.checks) {
             v << c.batch << ", " << c.iteration << ", " << c.fklVsReference << ", ";
             if (!std::isnan(c.defaultVsReference)) {
                 v << c.defaultVsReference;
             }
-            v << ", " << c.parallelVsReference << ", " << c.parallelVsFkl << ", " << c.fklMultithreadVsFkl << std::endl;
+            v << ", " << c.parallelVsReference << ", " << c.parallelVsFkl << ", " << c.fklMultithreadVsFkl << ", "
+              << (c.passed() ? "yes" : "no") << std::endl;
+            passed &= c.passed();
         }
         writeRegionStats((outDir / "regions.csv").string(), *w.regions, WARMUP_ITERS, ITERS);
         std::ofstream p(outDir / ("cpu_platform_" + threadLabel + ".txt"));
         p << "Halide: " << HALIDE_VERSION_MAJOR << "." << HALIDE_VERSION_MINOR << "." << HALIDE_VERSION_PATCH
-          << " (release binary " << BENCH_HALIDE_RELEASE << "), JIT target " << target.to_string()
+          << " (release binary " << BENCH_HALIDE_RELEASE << ", libHalide " << BENCH_HALIDE_LIBRARY << " SHA-256 "
+          << BENCH_HALIDE_LIBRARY_SHA256 << "), JIT target " << target.to_string()
           << ", both schedules compiled once before the loops in " << compileMs << " ms (Halide::Callable); lowered "
           << "statements in halide_default.stmt and halide_parallel.stmt\n"
           << "Halide pipeline: one Func out(c, x, y, n), every producer inlined; region table (4 x N int32) as an input "
-             "buffer, one per iteration built before the loops; FKL's bilinear sampling and BT.601 limited range "
+             "buffer, filled from the regions of the iteration in every run (timed); FKL's bilinear sampling and BT.601 "
+             "limited range "
              "matrix; frame coordinates in unsafe_promise_clamped; the border rows a select with the resized value "
              "marked likely (loop partitioning). Schedules: halide_default (none) and halide_parallel (out.bound(c, 0, "
              "3).reorder(c, x, n, y).unroll(c).vectorize(x, 8).parallel(y))\n"
           << "Halide's threads: " << threads << ", set once before any run with "
           << "Halide::Internal::JITSharedRuntime::set_num_threads (this process runs the "
-          << (multithreaded ? "multithreaded comparison" : "single-thread comparisons") << ")\n"
+          << (multithreaded ? "multithreaded comparison: halide_parallel only, halide_default has no parallel loop"
+                            : "single-thread comparisons")
+          << ")\n"
           << "Thread pools, measured before the benchmark: each worker stays busy " << halideBusyUs << " us per "
           << "halide_parallel run on 1 region (NAN: one thread, no workers), and " << fklBusyUs << " us per FKL "
           << "CPU_MULTITHREAD run on 1 region (spin and wake-up), which the "
           << std::chrono::milliseconds(IDLE_GAP).count() << " ms idle gap must outlast\n";
+        // A Halide worker taking tasks would use hundreds of us per run on 100 regions
+        constexpr double SINGLE_THREAD_LIMIT_US = 5.;
         if (!multithreaded) {
             p << "Validation of the thread count: CPU time of the process's other threads per halide_parallel run on "
               << BATCHES.back() << " regions, on one Halide thread: " << singleThreadCheckUs << " us (0: Halide ran on "
-              << "the calling thread only)\n";
+              << "the calling thread only; the program fails above " << SINGLE_THREAD_LIMIT_US << " us)\n";
             std::printf("Other threads' CPU time per halide_parallel run on one Halide thread: %.1f us\n",
                         singleThreadCheckUs);
         }
-        writeCpuPlatform(p, poolSize);
+        writeCpuPlatform(p, poolSize, "cpu_validation_" + threadLabel + ".csv");
         std::cout << "Results written to " << std::filesystem::absolute(outDir) << std::endl;
+        if (!passed) {
+            throw std::runtime_error("validation failed (FKL or Halide against the reference, or FKL's pool against "
+                                     "FKL, beyond the tolerance): see cpu_validation_" + threadLabel + ".csv");
+        }
+        if (!multithreaded && std::isfinite(singleThreadCheckUs) && singleThreadCheckUs > SINGLE_THREAD_LIMIT_US) {
+            throw std::runtime_error("Halide used other threads on one thread: " + std::to_string(singleThreadCheckUs) +
+                                     " us of their CPU time per run");
+        }
     } catch (const std::exception& e) {
         std::cerr << "ERROR: " << e.what() << std::endl;
         return 1;

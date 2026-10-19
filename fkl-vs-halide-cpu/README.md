@@ -15,7 +15,9 @@ Halide is the binary release of **Halide 21.0.0**, the latest release (2025-09-1
 | Windows x64 | `Halide-21.0.0-x86-64-windows-b629c80de18f1534ec71fddd8b567aa7027a0876.zip` | `4efec94b7c8958b1ae0125a73245a148e4c98dbb54f2678bc34c6abe36ee899a` |
 
 The archives come from the [v21.0.0 release](https://github.com/halide/Halide/releases/tag/v21.0.0). The SHA-256 are
-the ones GitHub publishes for them, and the CI checks them.
+the ones GitHub publishes for them, and the CI checks them. The program records in its platform files the SHA-256 of the
+`libHalide` it links (computed at configure time): in the Linux x86_64 archive, `libHalide.so.21.0.0` has SHA-256
+`4bd7f53061c70d3217a2878d8f37cb052c57208a5c59e447eee81a018e112f4e`.
 
 ## The Halide pipeline
 
@@ -34,7 +36,8 @@ interleaved float3 layout. Every producer is inlined into it. For each output va
 Choices in how the pipeline is written:
 
 - **Regions are run-time data.** They change every iteration without recompiling, as FKL's `Crop` parameters do. The
-  tables of every iteration are built before the loops, as FKL's rectangles are.
+  table (4 x N int32: x, y, width, height) is filled from the regions of the iteration in every run, which is timed, as
+  FKL's `build()` calls take the iteration's rectangles in every run.
 - **Nothing is computed over the frame.** The frame coordinates are wrapped in `unsafe_promise_clamped(..., 0, size - 1)`,
   which is valid because every region lies inside the frame ([workload](../README.md#workload)). Bounds inference then
   bounds the frame reads by the frame itself. No producer is scheduled outside the output's loops, so Halide converts
@@ -64,24 +67,26 @@ FKL runs one `executeOperations` call with the whole chain on its CPU backend (o
 `CPU_MULTITHREAD` backend (FKL's thread pool, one worker per hardware thread). Both schedules are compared with each,
 at the same thread count on both sides:
 
-| Halide threads | Compared with | Files |
-|---|---|---|
-| 1 | FKL CPU | `benchmark_cpu_halide_default_1thread_vs_fkl_bvf_CPU.csv`, `benchmark_cpu_halide_parallel_1thread_vs_fkl_bvf_CPU.csv`, and their `_per_iteration.csv` |
-| FKL's pool size (32 on the paper's machine) | FKL CPU_MULTITHREAD | `benchmark_cpu_halide_default_32threads_vs_fkl_bvf_CPU_MULTITHREAD.csv`, `benchmark_cpu_halide_parallel_32threads_vs_fkl_bvf_CPU_MULTITHREAD.csv`, and their `_per_iteration.csv` |
+| Halide threads | Schedules | Compared with | Files |
+|---|---|---|---|
+| 1 | both | FKL CPU | `benchmark_cpu_halide_default_1thread_vs_fkl_bvf_CPU.csv`, `benchmark_cpu_halide_parallel_1thread_vs_fkl_bvf_CPU.csv`, and their `_per_iteration.csv` |
+| FKL's pool size (32 on the paper's machine) | `halide_parallel` | FKL CPU_MULTITHREAD | `benchmark_cpu_halide_parallel_32threads_vs_fkl_bvf_CPU_MULTITHREAD.csv` and its `_per_iteration.csv` |
 
-`halide_default` has no parallel loop, so on 32 threads it runs the same serial code.
+`halide_default` has no parallel loop: on 32 threads it would still run on one, against FKL on 32, so the
+multithreaded process does not time it.
 
 **One process per thread count.** Halide's threads are set with `Halide::Internal::JITSharedRuntime::set_num_threads`,
 the JIT runtime's `halide_set_num_threads`. That call cannot take threads away from a pool whose workers have started.
-After a run on 32 threads, `set_num_threads(1)` reports 1 thread, but the workers keep taking the tasks of
-`halide_parallel`: about 200 us of CPU on the other threads per run on 100 regions. So the program sets the thread
-count once, before any run, and runs once per thread count:
+After a run on 32 threads, `set_num_threads(1)` reports 1 thread, but the started workers keep taking the tasks of
+`halide_parallel` (seen in development, where the other threads then used CPU time in every run). So the program sets
+the thread count once, before any run, and runs once per thread count:
 
     benchmark_halide_cpu <results folder> 1          # both schedules against FKL on one thread
-    benchmark_halide_cpu <results folder> pool       # both schedules against FKL's thread pool, on as many threads
+    benchmark_halide_cpu <results folder> pool       # halide_parallel against FKL's thread pool, on as many threads
 
 The 1-thread run checks this. It measures the CPU time of the process's other threads per `halide_parallel` run on
-100 regions on one Halide thread, and records it in `cpu_platform_1thread.txt` (it is 0 us on the paper's machine).
+100 regions on one Halide thread, records it in `cpu_platform_1thread.txt`, and fails above 5 us (a Halide worker
+taking tasks uses hundreds).
 
 The protocol is the one of every CPU benchmark:
 
@@ -91,11 +96,12 @@ The protocol is the one of every CPU benchmark:
 - **Paired speedups.** The speedup is the mean of the per-iteration ratios, pairing the runs of the same iteration.
   Every comparison CSV has its `_per_iteration.csv` with the pairs.
 
-Halide's workers stay busy 62 to 74 us after a parallel run, about as long as FKL's, so the pool is asleep when a run
-starts. Each process records both busy times in `cpu_platform_<threads>.txt`, and writes the validation
-(`cpu_validation_<threads>.csv`): before the timing, on the regions of the first, every 50th and the last timed
-iteration, both schedules and FKL against the plain C++ reference with FKL's conventions
-([`common/bench_reference.h`](../common/bench_reference.h)), and Halide against FKL's output.
+Each process records in `cpu_platform_<threads>.txt` how long Halide's and FKL's workers stay busy after a parallel run
+(the idle gap must outlast both), and writes the validation (`cpu_validation_<threads>.csv`): before the timing, on the
+regions of the first, every 50th and the last timed iteration, the schedules it times and FKL against the plain C++
+reference with FKL's conventions ([`common/bench_reference.h`](../common/bench_reference.h)), FKL's pool against FKL,
+and Halide against FKL's output. The schedules and FKL must be within 1e-3 of the reference, and FKL's pool of FKL, or
+the process exits with an error after writing its files.
 
 ## What each side does that the other does not
 
@@ -105,11 +111,12 @@ Halide, compared with FKL:
   gathered). FKL's CPU backend runs its fused loop one output pixel at a time, without SIMD across pixels.
 - **Simplifies the arithmetic.** Halide's simplifier folds the conversion's offsets into one constant per channel, and
   `(x * MUL - SUB) / DIV` into one multiply-add (in the `.stmt` files). FKL computes each operation of the chain as
-  written. Both stay within 2.4e-6 of the reference.
+  written. Both must stay within 1e-3 of the reference; the validation files have their errors.
 - **Compiles for the exact CPU.** The JIT compiles for the host CPU (`tune_znver3`), at run time and once. FKL's code
   is compiled ahead of time with `-march=native`, the same CPU.
-- **Has the regions in a table.** Halide reads the regions from a table in memory; FKL's are kernel parameters built in
-  the iteration (`build()` calls, timed).
+- **Has the regions in a table.** Halide reads the regions from a table in memory, which every run fills from the
+  regions of its iteration; FKL's are parameters of its operations, which every run builds (`build()` calls). Both are
+  timed.
 - **Calls through the JIT.** Every run is a call through the JIT `Callable`, which validates the buffers' shapes; the
   bounds queries are part of the compiled pipeline.
 
