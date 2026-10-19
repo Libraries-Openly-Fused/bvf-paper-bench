@@ -52,14 +52,14 @@ The last two changes are there because, in development runs on the paper's Ryzen
 the binary rather than on FKL. Two effects:
 
 - **Waking from a sleep.** A run that follows a sleep pays the core's wake-up from its deepest C-state, and how much
-  depended on the binary: from nothing in this benchmark's binary to several tens of microseconds at N = 1 in others.
-- **Code placement.** In some binaries, N = 4 and N = 100 were about twice as slow even without sleeping. FKL's CPU
-  loop calls the out-of-line `InterpolateComplete::exec` for every pixel, and its speed depends on where that code lands
-  (an observation; this machine gives no access to the performance counters that would confirm it).
+  depended on the binary.
+- **Code placement.** In some binaries, some batch sizes were much slower even without sleeping. FKL's CPU loop calls
+  the out-of-line `InterpolateComplete::exec` for every pixel, and its speed depends on where that code lands (an
+  observation; this machine gives no access to the performance counters that would confirm it).
 
 The busy-waited gap removes the first. For the second, FKL's code is compiled apart, linked first and page-aligned
 (see [the CPU benchmarks](../README.md#the-cpu-benchmarks)): every CPU benchmark runs the same FKL object file, with
-every FKL function at the same address modulo 4096, which each platform file records. Whether FKL's times then agree
+every FKL function at the same address modulo 4096 (with GCC and Clang). Whether FKL's times then agree
 between the CPU benchmarks is checked on the paper's runs, where every program measures FKL on the same regions. OpenCV
 also gains from the busy-waited gap, since its runs no longer start from a sleeping core.
 

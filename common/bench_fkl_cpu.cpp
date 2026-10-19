@@ -47,6 +47,15 @@
 // functions with it.
 #if defined(__GNUC__) || defined(__clang__)
 extern "C" __attribute__((aligned(4096), used, noinline)) void benchFklCodeStart() {}
+// The same for the file's read-only data, data and zero-initialized data sections, so that FKL's static objects (the
+// thread pool's mutex, condition variable and atomics) are also at the same addresses modulo 4096 in every CPU benchmark
+extern "C" {
+extern const char benchFklRodataStart[1];
+__attribute__((aligned(4096), used)) const char benchFklRodataStart[1] = {1};
+__attribute__((aligned(4096), used)) char benchFklDataStart[1] = {1};
+__attribute__((aligned(4096), used)) char benchFklBssStart[1];
+}
+#define BENCH_FKL_ALIGNED 1
 #else
 extern "C" void benchFklCodeStart() {}
 #endif
@@ -141,9 +150,17 @@ Conversion fklConversion() {
 }
 
 std::string fklCodeAlignment() {
-    const auto page = [](const void* f) { return reinterpret_cast<std::uintptr_t>(f) % 4096; };
-    return "benchFklCodeStart at address mod 4096 = " + std::to_string(page(reinterpret_cast<const void*>(&benchFklCodeStart))) +
-           ", fklFrame at address mod 4096 = " + std::to_string(page(reinterpret_cast<const void*>(&fklFrame)));
+#ifdef BENCH_FKL_ALIGNED
+    const auto page = [](const void* f) { return std::to_string(reinterpret_cast<std::uintptr_t>(f) % 4096); };
+    return "its code, read-only data, data and zero-initialized data sections aligned to 4096 bytes, so that FKL's "
+           "functions and static objects are at the same addresses modulo 4096 in every CPU benchmark built the same "
+           "way (in this program, modulo 4096: benchFklCodeStart " +
+           page(reinterpret_cast<const void*>(&benchFklCodeStart)) + ", fklFrame " +
+           page(reinterpret_cast<const void*>(&fklFrame)) + ", benchFklBssStart " + page(benchFklBssStart) +
+           "; FKL's template instantiations, in sections of their own, follow in the same order, which nm shows)";
+#else
+    return "its sections not aligned (this compiler has no alignment attribute here)";
+#endif
 }
 
 int poolThreads() {

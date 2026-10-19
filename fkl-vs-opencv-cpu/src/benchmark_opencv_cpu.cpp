@@ -210,7 +210,9 @@ int main(int argc, char** argv) {
       << "Thread pools, measured before the benchmark: each worker stays busy " << opencvBusyUs << " us per OpenCV "
       << "parallel_for_ with no work, and " << fklBusyUs << " us per FKL CPU_MULTITHREAD run on 1 region (spin and "
       << "wake-up), which the " << std::chrono::milliseconds(IDLE_GAP).count() << " ms idle gap must outlast\n";
-    writeCpuPlatform(p, threads);
+    writeCpuPlatform(p, threads,
+                     {"cpu_validation.csv", "OpenCV on its thread count against OpenCV on one thread",
+                      "OpenCV's cv::Rects are built before the loops, and its per-region calls are timed"});
     std::cout << "Results written to " << std::filesystem::absolute(outDir) << std::endl;
     if (!passed) {
         std::cerr << "ERROR: validation failed (FKL against its reference, FKL's pool against FKL, or OpenCV on "
