@@ -13,7 +13,9 @@ execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR}/.. ls-tree HEAD gern 
                 OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
 string(REGEX MATCH "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]" GERN_COMMIT "${GERN_ENTRY}")
 if(NOT GERN_COMMIT)
-    message(FATAL_ERROR "No gern submodule in the repository's tree (git ls-tree HEAD gern): ${GERN_ENTRY}")
+    # A source tree without git metadata (an archive) still builds: the generated code is checked in
+    set(GERN_COMMIT "unknown (no git metadata; the repository pins d05bc66)")
+    message(WARNING "No gern entry in the repository's tree (git ls-tree HEAD gern): the platform file says ${GERN_COMMIT}")
 endif()
 
 # The generated code and the black boxes are compiled with the flags of FKL's code (CPU_ARCH_FLAGS), like the harness

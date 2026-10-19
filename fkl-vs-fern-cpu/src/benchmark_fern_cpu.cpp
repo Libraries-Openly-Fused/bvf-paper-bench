@@ -219,7 +219,12 @@ int main(int argc, char** argv) {
           << "Thread pool, measured before the benchmark: each of FKL's workers stays busy " << fklBusyUs << " us per "
           << "FKL CPU_MULTITHREAD run on 1 region (spin and wake-up), which the "
           << std::chrono::milliseconds(IDLE_GAP).count() << " ms idle gap must outlast\n";
-        writeCpuPlatform(p, threads);
+        writeCpuPlatform(p, threads,
+                         {"cpu_validation.csv",
+                          "Fern against the reference with FKL's conventions, and Fern's code on FKL's pool against "
+                          "Fern on one thread",
+                          "Fern's Rects are converted before the loops, as FKL's rectangles, and copying them and "
+                          "building each call's frame view, plane view and arguments is timed"});
         std::cout << "Results written to " << std::filesystem::absolute(outDir) << std::endl;
         if (!passed) {
             throw std::runtime_error("validation failed (FKL or Fern against the reference, FKL's pool against FKL, or "
