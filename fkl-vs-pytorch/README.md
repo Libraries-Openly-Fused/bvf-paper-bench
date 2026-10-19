@@ -53,9 +53,10 @@ So before every comparison the program runs PyTorch's complete loop with each va
 compares FKL with the fastest by median, as FKL vs NPPDx chooses NPPDx's configuration: `pytorch_variant_sweep.csv`
 has the sweep and the choice, and the validation checks every variant.
 
-On the GPU, with `addcmul` a region launches 5 kernels (the two `addcmul`, the add, the upsample and the copy), and with
-`addmm` 6. Each iteration adds 2 fills and the 3 element-wise kernels: 5 N + 5 or 6 N + 5 kernels per iteration
-(`kernels.csv` has the counts and the variant of the comparison).
+On the GPU, a region runs the chroma terms (two `addcmul` kernels, or `addmm`'s conversion and two cuBLASLt kernels),
+the add and the upsample kernels, and the copy: a kernel from the NCHW view, a device to device memcpy from the
+channels-last one (both contiguous). Each iteration adds 2 fills and the 3 element-wise kernels. `kernels.csv` has the
+kernel and memcpy counts of the variant of the comparison (with `addcmul` and NCHW: 5 N + 5 kernels per iteration).
 
 **Sampling convention.** `interpolate` samples at pixel centers, `src = (dst + 0.5) * (in / out) - 0.5` clamped at 0.
 FKL samples at `src = dst * (in / out)` (fused_kernel's `resize.h`), and `align_corners=true` is a third convention.
@@ -78,8 +79,8 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
 - **Allocation and dispatch.** Every operator allocates its output (PyTorch's caching allocator on the GPU, its CPU
   allocator on the CPU), and goes through the dispatcher and TensorIterator's setup. FKL's `build()` calls and fusion
   are compile-time types plus a few parameters.
-- **Kernel launches, one stream, no overlap (GPU).** Each iteration is 5 N + 5 or 6 N + 5 dependent launches on one
-  stream. The
+- **Kernel launches, one stream, no overlap (GPU).** Each iteration is about 5 N to 6 N dependent kernels and memcpys
+  on one stream (`kernels.csv`). The
   GPU time (`gpu_time.csv`) is a fraction of the iteration's time (`latency.csv`); the rest is host work and launch
   gaps.
 - **Thread count is per operator (CPU).** PyTorch parallelizes an operator only above its grain size (32768 elements).
@@ -189,7 +190,8 @@ OpenCV on the CPU explains the change.
   `common/bench_gpu.h`), a second pass with the same loops, PyTorch's then FKL BVF's. The timed iterations are traced
   with PyTorch's profiler (Kineto: CUPTI on CUDA, the ROCm tracer on ROCm), in chunks of 100 iterations, with an empty
   marker kernel after every execution to split the trace. The GPU time of an execution is the sum of its device
-  activities: kernels, and memcpys and memsets when there are any (PyTorch's copies and fills are kernels here). The
+  activities: kernels, and memcpys and memsets when there are any (PyTorch's copy into the output plane is a memcpy
+  in the channels-last variants, a kernel otherwise; its fills are kernels). The
   span runs from the first start to the last end in the trace: it is measured under the profiler, so it includes
   the profiler's cost per launch and can exceed the latency.
 - **Counts.** Kernels, memcpys and memsets of one execution, and the device memory segments PyTorch's caching
@@ -198,8 +200,9 @@ OpenCV on the CPU explains the change.
   `CUDA_VISIBLE_DEVICES`), and asks nvidia-smi about that device only, by its PCI bus ID.
 
 Output files: `latency.csv`, `gpu_time.csv`, `pytorch_vs_fkl_bvf_<GPU_NVIDIA|GPU_AMD>.csv` and
-`pytorch_vs_fkl_bvf_gpu_only_<...>.csv` (FKL's two-execution format) with their `_per_iteration.csv`, `validation.csv`, `kernels.csv`, `regions.csv`,
-`platform.txt` and `pytorch_build_information.txt`.
+`pytorch_vs_fkl_bvf_gpu_only_<...>.csv` (FKL's two-execution format) with their `_per_iteration.csv`,
+`pytorch_variant_sweep.csv`, `validation.csv`, `kernels.csv`, `regions.csv`, `platform.txt` and
+`pytorch_build_information.txt`.
 
 **Two compilations.** FKL's side ([`src/fkl_gpu.cu`](src/fkl_gpu.cu)) is compiled separately from PyTorch's, as
 CUDA by nvcc or as HIP. It gets the nvcc options of every GPU benchmark ([`common/bench_gpu.cmake`](../common/bench_gpu.cmake)),
