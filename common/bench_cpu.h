@@ -19,9 +19,9 @@
 // common/bench_geometry.h, bilinear resize to 64x32, black rows on top and bottom up to a square, then
 // (x * mul - sub) / div written as float3 into an N-plane tensor (N x 64 x 64 x 3 floats).
 //
-// FKL's side is common/bench_fkl_cpu.cpp, the only translation unit of a CPU benchmark that includes FKL, compiled
-// first in every one of them (add_cpu_bench_target, common/bench_cpu.cmake): the same FKL code, placed the same way,
-// in every CPU benchmark, whatever the library adds. This header is plain C++.
+// FKL's side is common/bench_fkl_cpu.cpp, the only translation unit of a CPU benchmark that includes FKL, linked first
+// in every one of them (add_cpu_bench_target, common/bench_cpu.cmake) and page-aligned: the same FKL code, at the same
+// addresses modulo 4096, in every CPU benchmark, whatever the library adds. This header is plain C++.
 //   makeFklCpu(N, false)  one executeOperations call with the whole chain (BVF) on FKL's CPU backend, one thread
 //   makeFklCpu(N, true)   the same call on the CPU_MULTITHREAD backend: FKL's thread pool (one worker per hardware
 //                         thread), in chunks of one output row of one crop; it returns when the output is written
@@ -107,6 +107,9 @@ public:
     virtual std::vector<float> output() const = 0;
 };
 
+// Where FKL's code is, modulo 4096 (bench_fkl_cpu.cpp), for the platform file
+std::string fklCodeAlignment();
+
 // n is one of BATCHES; on FKL's thread pool if multithread
 std::unique_ptr<FklCpu> makeFklCpu(size_t n, bool multithread, const Workload& w);
 
@@ -190,7 +193,7 @@ inline void writeCSV(const std::filesystem::path& path, const std::string& basel
     std::filesystem::path perIteration = path;
     perIteration.replace_filename(path.stem().string() + "_per_iteration" + path.extension().string());
     std::ofstream p(perIteration);
-    p << "Batch size, Iteration, " << baselineLabel << " Time, " << fklLabel << " Time, Speedup" << std::endl;
+    p << "Batch size, Iteration, " << baselineLabel << " Time (ms), " << fklLabel << " Time (ms), Speedup" << std::endl;
     for (const auto& r : rows) {
         for (size_t i = 0; i < r.baselineMs.size(); ++i) {
             p << r.batch << ", " << WARMUP_ITERS + i << ", " << r.baselineMs[i] << ", " << r.fklMs[i] << ", "
@@ -257,11 +260,20 @@ void forEachBatch(F&& f) {
     }(std::make_index_sequence<BATCHES.size()>{});
 }
 
-// The lines of cpu_platform.txt that every CPU benchmark shares: the CPU, FKL, the OS, the workload, the regions, the
-// timing and the validation; the program writes its library's lines before them
-inline void writeCpuPlatform(std::ostream& p, int threads) {
-    p << "CPU: " << cpuName() << ", " << std::thread::hardware_concurrency() << " hardware threads; the multithreaded "
-      << "comparisons use " << threads << " threads on both sides\n"
+// Whether a validation error (a maximum absolute difference) is finite and within the tolerance of FKL's float outputs.
+// Every CPU benchmark requires it of FKL against its reference, of FKL's pool against FKL on one thread, and of the
+// library on its thread count against itself on one thread, and exits with an error after writing its files otherwise
+inline bool withinTolerance(float error) {
+    return std::isfinite(error) && error <= validation::TOLERANCE;
+}
+
+// The lines of the platform file that every CPU benchmark shares: the CPU, FKL, the OS, the workload, the regions, the
+// timing and the validation (validationFile: the program's validation CSV); the program writes its library's lines
+// before them
+inline void writeCpuPlatform(std::ostream& p, int threads, const std::string& validationFile = "cpu_validation.csv") {
+    p << "CPU: " << cpuName() << ", " << std::thread::hardware_concurrency() << " hardware threads; a multithreaded "
+      << "comparison gives each side " << threads << " threads, FKL's pool size (the program's lines say how the "
+      << "library uses them)\n"
 #ifdef _WIN32
       << "SIMD of the CPU: see the CPU model\n"
 #else
@@ -274,7 +286,8 @@ inline void writeCpuPlatform(std::ostream& p, int threads) {
       << poolThreads() << " workers, thread-pool " << BENCH_THREAD_POOL_COMMIT
       << ", workers spin 100 us before sleeping, one chunk per output row of each crop), compiled with "
       << BENCH_COMPILER << ", flags " << BENCH_CXX_FLAGS
-      << ", in its own translation unit (common/bench_fkl_cpu.cpp), the first of the program\n"
+      << ", in its own translation unit (common/bench_fkl_cpu.cpp), the first of the program, its code section aligned to "
+         "4096 bytes (" << fklCodeAlignment() << ")\n"
       << "Benchmark repository: commit " << BENCH_REPO_COMMIT << "\n"
       << "OS: " << osName() << "\n"
       << "Workload: " << describe() << "\n"
@@ -289,10 +302,16 @@ inline void writeCpuPlatform(std::ostream& p, int threads) {
       << "two libraries never run at the same time. Every run is preceded by a "
       << std::chrono::milliseconds(IDLE_GAP).count()
       << " ms idle gap, busy-waited by the timing thread (so that its core does not enter a deep C-state), while the "
-         "library's thread pool falls asleep; each library keeps its own pool and idle behaviour. Speedup: mean over "
-         "the timed iterations of (library time / FKL time) of the same iteration (the *_per_iteration.csv files).\n"
+         "worker threads of the previous run fall asleep; each library keeps its own threads and idle behaviour. "
+         "Speedup: mean over "
+         "the timed iterations of (library time / FKL time) of the same iteration (the *_per_iteration.csv files, times "
+         "in ms, as in the comparison CSVs).\n"
       << "Validation: before the timing, on the regions of the first, every " << validation::VALIDATION_STRIDE
-      << "th and the last timed iteration (cpu_validation.csv, one row per iteration).\n";
+      << "th and the last timed iteration (" << validationFile << ", one row per iteration): FKL against the "
+      << "reference with its conventions, FKL's pool against FKL on one thread, and the library on its thread count "
+      << "against itself on one thread must agree within " << validation::TOLERANCE << " (maximum absolute difference); "
+      << "the program exits with an error otherwise. The library's errors against a reference of its own conventions "
+      << "are written next to them.\n";
 }
 
 } // namespace bench::cpu

@@ -27,9 +27,14 @@ The harness is the one of every CPU benchmark ([`common/bench_cpu.h`](../common/
   ([`common/bench_fkl_cpu.cpp`](../common/bench_fkl_cpu.cpp)).
 
 Each run writes one CSV per comparison in FKL's two-execution format and its `_per_iteration.csv` (every iteration's
-pair of times and their ratio). It also writes `cpu_validation.csv` (before the timing, on the regions of the first,
-every 50th and the last timed iteration, one row per iteration), `regions.csv`, and `cpu_platform.txt` (with how long
-each pool's workers stay busy after a run).
+pair of times, in ms, and their ratio). It also writes `cpu_validation.csv`, `regions.csv`, and `cpu_platform.txt`
+(with how long each pool's workers stay busy after a run). The validation runs before the timing, on the regions of
+the first, every 50th and the last timed iteration, one row per iteration:
+
+- FKL against the reference with its conventions, FKL's pool against FKL on one thread, and OpenCV on as many threads
+  as FKL's pool has workers against OpenCV on one must agree within 1e-3, or the program exits with an error after
+  writing its files;
+- OpenCV against the reference with OpenCV's conventions (8-bit intermediates), and OpenCV against FKL, are reported.
 
 ### Protocol change
 
@@ -42,29 +47,21 @@ The paper's first results of this benchmark (`results-v3`) were measured with a 
 Now each library runs its complete loop on its own, and the two loops follow each other (a rule of the paper's author
 for every CPU comparison). The timing thread busy-waits the gap, and FKL's code is shared and compiled apart.
 
-The last two changes are there because FKL's single-thread time depended on the binary rather than on FKL. Measured on
-the paper's Ryzen 9 5950X with FKL d1fba2f, built with clang 23.1.3 `-O3 -march=native`, with the same FKL code
-everywhere (medians, us, N = 1 / 4 / 16 / 50 / 100):
+The last two changes are there because, in development runs on the paper's Ryzen 9 5950X (FKL d1fba2f, clang 23.1.3
+`-O3 -march=native`; their files are not kept, so this section gives no numbers), FKL's single-thread time depended on
+the binary rather than on FKL. Two effects:
 
-| FKL on one thread, measured in | Gap | Median |
-|---|---|---|
-| this benchmark's binary | sleep | 34.7 / 139.8 / 562 / 1753 / 3556 |
-| FKL vs PyTorch's CPU binary, FKL alone (PyTorch never called) | sleep | 91 / 371 / 785 / 1897 / 6888 |
-| the same binary | busy-wait | 35.3 / 262 / 558 / 1757 / 6642 |
-| a program with FKL only | sleep | 49 / 196 / 781 / 1917 / 3882 |
-| the same program | busy-wait, or none | 35 / 139 / 558 / 1755 / 3508 |
-
-Two effects:
-
-- **Waking from a sleep.** A run that follows a sleep pays the core's wake-up from its deepest C-state. The cost
-  depends on the binary: nothing here, +14 us in the FKL-only program, +56 us in the PyTorch one at N = 1.
-- **Code placement.** In some binaries N = 4 and N = 100 are about twice as slow even without sleeping. FKL's CPU loop
-  calls the out-of-line `InterpolateComplete::exec` for every pixel, and its speed depends on where that code lands
+- **Waking from a sleep.** A run that follows a sleep pays the core's wake-up from its deepest C-state, and how much
+  depended on the binary: from nothing in this benchmark's binary to several tens of microseconds at N = 1 in others.
+- **Code placement.** In some binaries, N = 4 and N = 100 were about twice as slow even without sleeping. FKL's CPU
+  loop calls the out-of-line `InterpolateComplete::exec` for every pixel, and its speed depends on where that code lands
   (an observation; this machine gives no access to the performance counters that would confirm it).
 
-The busy-waited gap and the shared, separately compiled FKL code remove both effects: every CPU benchmark runs the
-same FKL object file, and FKL's times agree between them. OpenCV also gains, since its runs no longer start from a
-sleeping core.
+The busy-waited gap removes the first. For the second, FKL's code is compiled apart, linked first and page-aligned
+(see [the CPU benchmarks](../README.md#the-cpu-benchmarks)): every CPU benchmark runs the same FKL object file, with
+every FKL function at the same address modulo 4096, which each platform file records. Whether FKL's times then agree
+between the CPU benchmarks is checked on the paper's runs, where every program measures FKL on the same regions. OpenCV
+also gains from the busy-waited gap, since its runs no longer start from a sleeping core.
 
 ## Build and run
 
