@@ -29,8 +29,10 @@ One folder per library compared with FKL, each its own CMake project with its ow
 Next to them:
 
 - [`common/`](common): the workload of every benchmark (`bench_geometry.h`, `bench_geometry.cmake`), the harness of the
-  GPU benchmarks of OpenCV CUDA, NPP and FKL's ablation (`bench_gpu.h`, `bench_gpu.cmake`), the validation rules
-  shared by every GPU benchmark (`bench_validation.h`), NPP's error check and NV12 conversion (`bench_npp.h`), the
+  GPU benchmarks of OpenCV CUDA, NPP and FKL's ablation (`bench_gpu.h`, `bench_gpu.cmake`), the harness of the CPU
+  benchmarks (`bench_cpu.h`, `bench_cpu.cmake`, FKL's side in `bench_fkl_cpu.cpp`), the pipeline's constants and its
+  plain C++ reference (`bench_pipeline.h`, `bench_reference.h`), the timing statistics and FKL's two-execution CSV
+  format (`bench_timing.h`), the validation rules shared by every GPU benchmark (`bench_validation.h`), NPP's error check and NV12 conversion (`bench_npp.h`), the
   platform description (`bench_platform.h`), the common part of the compile-time units (`compile_time_unit.h`), and the
   workload and BVF box operation of the neighborhood experiment (`bench_neighborhood.h`,
   `bench_neighborhood_ops.h`, shared with `rocm/`);
@@ -174,6 +176,32 @@ and max), `compile_time_kernels.csv` and `compile_time_phases.csv`, and prints a
 
     SET=ablation BUILD=build-ablation scripts/compile_time.sh ../results/compile_time/fkl-ablation
     SET=nppdx BUILD=build-nppdx-32x16 scripts/compile_time.sh ../results/compile_time/fkl-vs-nppdx-32x16   # after benchmark_nppdx
+
+## The CPU benchmarks
+
+FKL vs OpenCV on the CPU shares one harness with the other CPU benchmarks,
+[`common/bench_cpu.h`](common/bench_cpu.h). FKL's side is [`common/bench_fkl_cpu.cpp`](common/bench_fkl_cpu.cpp):
+one `executeOperations` call (BVF) on FKL's CPU backend (one thread) and on its `CPU_MULTITHREAD` backend (FKL's
+thread pool, one worker per hardware thread). Each program compares its library on one thread with FKL on one thread,
+and on as many threads as FKL's pool has workers with FKL's pool.
+
+In each of the 1000 timed iterations (after 100 warm-up ones), the library and FKL run one after the other on the
+regions of that iteration, and FKL's speedup is computed per iteration and averaged.
+
+- **Idle gap.** Every run follows a 1 ms idle gap. The timing thread busy-waits it, so the thread pools, whose workers
+  spin for a while after a run and then sleep, are asleep when a run starts, while the timing thread's core stays out
+  of a deep C-state.
+- **Worker busy time.** Each program measures how long the workers of both pools stay busy after a run with little
+  work: their spin and wake-up, from `/proc/self/task/*/schedstat` on Linux. It records them in `cpu_platform.txt`;
+  the gap must outlast them.
+- **FKL-only control.** FKL is also timed alone with the same protocol (`fkl_control.csv`), so that FKL's times can be
+  compared between programs.
+
+FKL's side is the only translation unit of a program that includes FKL: FKL's headers define variable template
+specializations that are not `inline`, so a program can include them in one translation unit only. It is compiled with
+FKL's options only (none of the compared library's) and linked first, so its object file, and FKL's code layout, are
+the same in every CPU benchmark built with the same compiler and flags. The [protocol change](fkl-vs-opencv-cpu/README.md#protocol-change)
+section of FKL vs OpenCV on the CPU has the measurements behind the busy-waited gap and the separate translation unit.
 
 ## Requirements
 
