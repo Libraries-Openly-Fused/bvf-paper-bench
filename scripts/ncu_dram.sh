@@ -10,7 +10,8 @@
 #     sudo NCU=/usr/local/cuda-13.3/bin/ncu scripts/ncu_dram.sh
 # scripts/run_all.sh runs it with the paths of its build and results folders.
 #
-# For every pipeline (OpenCV CUDA, NPP, FKL VF+HF, FKL BVF), profiles one execution on the regions of iteration 0 (the
+# For every pipeline of PIPELINES (scripts/ncu_common.sh; default OpenCV CUDA, NPP in both forms, FKL VF+HF, FKL BVF),
+# profiles one execution on the regions of iteration 0 (the
 # NVTX range "measure" of the --ncu-target mode of the benchmarks) with the caches flushed before every kernel
 # (--cache-control all, cold) at every batch size N, and without flushing (--cache-control none, warm: L2 keeps what
 # the executions before it, on the regions of iterations 1 to 3, left there, as in the timed loop) at the batch sizes

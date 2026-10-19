@@ -11,7 +11,8 @@
 #     sudo NCU=/usr/local/cuda-13.3/bin/ncu scripts/ncu_l2.sh
 # scripts/run_all.sh runs it with the paths of its build and results folders.
 #
-# For every pipeline (OpenCV CUDA, NPP, FKL VF+HF, FKL BVF) and the batch sizes of WARM_BATCHES (default 1 and 100),
+# For every pipeline of PIPELINES (scripts/ncu_common.sh; default OpenCV CUDA, NPP in both forms, FKL VF+HF, FKL BVF)
+# and the batch sizes of WARM_BATCHES (default 1 and 100),
 # profiles one execution on the regions of iteration 0 (the NVTX range "measure" of the --ncu-target mode of the
 # benchmarks) with the caches flushed before every kernel. Reports go to results/ncu_l2 and are given back to
 # the user who ran sudo. Nothing on the system is changed. Summarize afterwards, without sudo, with

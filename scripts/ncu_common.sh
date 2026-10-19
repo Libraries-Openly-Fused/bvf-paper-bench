@@ -2,8 +2,8 @@
 # checks that the benchmarks are of one workload, sets BATCHES (the batch sizes of the benchmarks) and the batch sizes
 # of the warm and SM-L2 profiles, writes the regions of the profiled iteration to ncu_regions.csv in the results folder
 # (for the traffic model), and defines profile_pipelines <N>, which calls the script's profile function for every
-# pipeline: OpenCV CUDA and NPP, each in both forms of its NV12 conversion (opencv_cuda and opencv_cuda_crop_nv12, npp
-# and npp_crop_nv12), FKL VF+HF and FKL BVF, with report names <benchmark folder>__<implementation>_N<N>.
+# pipeline of PIPELINES: OpenCV CUDA, NPP in both forms of its NV12 conversion (npp and npp_crop_nv12), FKL VF+HF and
+# FKL BVF, with report names <benchmark folder>__<implementation>_N<N>.
 #
 # Every profile is one execution on the regions of iteration 0 (the --ncu-target mode of the benchmarks), the same
 # regions for every pipeline.
@@ -11,7 +11,10 @@
 # Paths: NCU, the benchmarks OPENCV_CUDA_BENCH, NPP_BENCH and ABLATION_BENCH (default build-<name>/ of this
 # repository), BVF_RESULTS (the results folder, default ../results). WARM_BATCHES (default "1 100"; at least one, each
 # a batch size of the benchmarks, listed once) are the batch sizes of the warm DRAM profiles and of the SM-L2 profiles;
-# the cold DRAM profiles cover every batch size.
+# the cold DRAM profiles cover every batch size. PIPELINES (default: every one) limits the profiles to the listed
+# implementations among opencv_cuda, npp, npp_crop_nv12, fkl_vf_hf and fkl_bvf, e.g. PIPELINES=opencv_cuda with OUT a
+# new folder to profile one pipeline again after a change of its program (each script deletes the earlier reports of
+# its OUT folder; ncu_summarize.py summarizes one folder).
 # Root is only needed while the driver restricts the GPU performance counters to admin users
 # (RmProfilingAdminOnly=1, the default; the nvidia module option NVreg_RestrictProfilingToAdminUsers=0 opens them)
 if [ "$(id -u)" -ne 0 ] && ! grep -q "RmProfilingAdminOnly: 0" /proc/driver/nvidia/params 2>/dev/null; then
@@ -19,6 +22,14 @@ if [ "$(id -u)" -ne 0 ] && ! grep -q "RmProfilingAdminOnly: 0" /proc/driver/nvid
          "run this script with sudo: sudo $0" >&2
     exit 1
 fi
+ALL_PIPELINES="opencv_cuda npp npp_crop_nv12 fkl_vf_hf fkl_bvf"
+PIPELINES=${PIPELINES:-$ALL_PIPELINES}
+for pipeline in $PIPELINES; do
+    if [[ " $ALL_PIPELINES " != *" $pipeline "* ]]; then
+        echo "PIPELINES: $pipeline is not one of the profiled pipelines ($ALL_PIPELINES)" >&2
+        exit 1
+    fi
+done
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 ROOT=$(dirname "$REPO")
 NCU=${NCU:-/usr/local/cuda/bin/ncu}
@@ -59,12 +70,16 @@ fi
 mkdir -p "$RESULTS"
 "$ABLATION_BENCH" --regions 0 > "$RESULTS/ncu_regions.csv" || exit 1
 chown "$OWNER": "$RESULTS/ncu_regions.csv"
-profile_pipelines() { # <N>: every profiled pipeline at batch size N
+profile_pipeline() { # <benchmark folder> <benchmark binary> <implementation> <N>: profiled if PIPELINES lists it
+    if [[ " $PIPELINES " == *" $3 "* ]]; then
+        profile "$1__$3_N$4" "$2" "$3" "$4"
+    fi
+}
+profile_pipelines() { # <N>: every profiled pipeline of PIPELINES at batch size N
     local n=$1
-    profile "fkl-vs-opencv-cuda__opencv_cuda_N$n" "$OPENCV_CUDA_BENCH" opencv_cuda "$n"
-    profile "fkl-vs-opencv-cuda__opencv_cuda_crop_nv12_N$n" "$OPENCV_CUDA_BENCH" opencv_cuda_crop_nv12 "$n"
-    profile "fkl-vs-npp__npp_N$n" "$NPP_BENCH" npp "$n"
-    profile "fkl-vs-npp__npp_crop_nv12_N$n" "$NPP_BENCH" npp_crop_nv12 "$n"
-    profile "fkl-ablation__fkl_vf_hf_N$n" "$ABLATION_BENCH" fkl_vf_hf "$n"
-    profile "fkl-ablation__fkl_bvf_N$n" "$ABLATION_BENCH" fkl_bvf "$n"
+    profile_pipeline fkl-vs-opencv-cuda "$OPENCV_CUDA_BENCH" opencv_cuda "$n"
+    profile_pipeline fkl-vs-npp "$NPP_BENCH" npp "$n"
+    profile_pipeline fkl-vs-npp "$NPP_BENCH" npp_crop_nv12 "$n"
+    profile_pipeline fkl-ablation "$ABLATION_BENCH" fkl_vf_hf "$n"
+    profile_pipeline fkl-ablation "$ABLATION_BENCH" fkl_bvf "$n"
 }

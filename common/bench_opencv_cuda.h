@@ -20,13 +20,11 @@
 // modules/cudacodec/src/cuda/ColorSpace.cu), so the pipelines are checked against the truncated 8 bit reference
 // (Reference::Fkl8bitTruncated).
 //
-// The surface is one 2-D image of FRAME_H * 3 / 2 rows (the luma rows, then the interleaved chroma rows, with one
-// pitch), and the kernel reads the chroma of luma row y nHeight - y / 2 rows below it, nHeight the surface's luma
-// height. So the rows cannot be restricted: a crop's chroma is not at that distance from the crop's luma (it is at
-// frame row FRAME_H + y / 2). The columns can: a view of the frame's columns [x, x + w) (colRange: the data at column
-// x, the frame's pitch, every row) is a surface of width w whose chroma is where the kernel reads it, x being even. So
-// OpenCV can convert the frame (convert), or per region only the full-height strip of its columns (convertStrip),
-// written at the strip's columns of the RGB frame.
+// It cannot convert a crop: the surface is one 2-D image of FRAME_H * 3 / 2 rows (the luma rows, then the interleaved
+// chroma rows, with one pitch), and the kernel reads the chroma of luma row y nHeight - y / 2 rows below it, nHeight
+// the surface's luma height. A crop's chroma is not at that distance from the crop's luma (it is at frame row
+// FRAME_H + y / 2), so the rows cannot be restricted. (A view of some of the frame's columns, with every row, would be
+// converted correctly, but such a full-height strip is not a crop.) The OpenCV pipelines convert the whole frame.
 
 #ifndef BVF_BENCH_OPENCV_CUDA_H
 #define BVF_BENCH_OPENCV_CUDA_H
@@ -42,10 +40,6 @@
 
 namespace bench::opencv {
 
-// The two forms of OpenCV's NV12 -> RGB in the OpenCV CUDA pipelines: the whole frame, or per region the full-height
-// strip of its columns
-enum class Nv12Form { Frame, CropStrip };
-
 class Nv12Converter {
 public:
     Nv12Converter()
@@ -59,16 +53,6 @@ public:
         beforeKernel();
         m_converter->convert(surface(ctx), dst, cv::cudacodec::SurfaceFormat::SF_NV12, format,
                              cv::cudacodec::BitDepth::EIGHT, false, stream);
-    }
-
-    // The full-height strip of the frame's columns [r.x, r.x + r.width) into the same columns of dst (FRAME_H x
-    // FRAME_W, allocated before the loops): one kernel. The views are made here, in the timed run.
-    void convertStrip(const Context& ctx, cv::cuda::GpuMat& dst, const fk::Rect& r, cv::cudacodec::ColorFormat format,
-                      cv::cuda::Stream& stream) const {
-        cv::cuda::GpuMat strip = dst.colRange(r.x, r.x + r.width);
-        beforeKernel();
-        m_converter->convert(surface(ctx).colRange(r.x, r.x + r.width), strip, cv::cudacodec::SurfaceFormat::SF_NV12,
-                             format, cv::cudacodec::BitDepth::EIGHT, false, stream);
     }
 
     // The device frame of ctx as the converter takes it, without a copy (initContext puts the chroma right after the
