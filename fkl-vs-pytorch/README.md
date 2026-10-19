@@ -87,10 +87,12 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
   on one stream (`kernels.csv`). The
   GPU time (`gpu_time.csv`) is a fraction of the iteration's time (`latency.csv`); the rest is host work and launch
   gaps.
-- **Thread count is per operator (CPU).** PyTorch parallelizes its own operators only above their grain size (32768
-  elements). On 32 threads, its per-region operators still run on one thread; only the border fills and the last three
-  operators run on all threads at large N. With `addmm`, MKL's GEMM decides its own threading (`at::set_num_threads`
-  sets MKL's thread count too). FKL's thread pool splits the fused loop into one chunk per output row of each region.
+- **Thread count is per operator (CPU).** PyTorch splits each of its own operators into chunks of at least its grain
+  size (32768 elements), at most one per thread. On 32 threads, its per-region operators are one chunk each and run on
+  one thread; only the border fills (from N = 16) and the last three operators (from N = 4) are split: at N = 50 into 5
+  chunks per fill and 19 per operator, at N = 100 into 10 and 32. With `addmm`, MKL's GEMM decides its own threading
+  (`at::set_num_threads` sets MKL's thread count too). FKL's thread pool splits the fused loop into one chunk per output
+  row of each region.
 
 ## What PyTorch gets that FKL does not
 
