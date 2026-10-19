@@ -294,7 +294,7 @@ TileSweepRow sweepTile(Context& ctx, const size_t index, const std::vector<float
         impl.run(WARMUP_ITERS);
         gpuErrchk(cudaStreamSynchronize(ctx.stream));
         row.errors = compare(impl.download(), reference);
-        row.timing = computeStats(measureInterleaved(ctx, {impl})[0]);
+        row.timing = computeStats(measureSequential(ctx, {impl})[0]);
     });
     return row;
 }

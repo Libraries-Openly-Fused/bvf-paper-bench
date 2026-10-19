@@ -5,3 +5,7 @@
 [submodule "nppdx"]
 	path = nppdx
 	url = https://github.com/NVIDIA/NPPDx.git
+[submodule "gern"]
+	path = gern
+	url = https://github.com/manya-bansal/gern
+	update = none

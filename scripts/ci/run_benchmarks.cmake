@@ -8,7 +8,7 @@
 #
 # On Windows, run it from a Visual Studio developer shell (cl, link and ninja in the PATH).
 #
-#   BENCHMARKS           cpu: FKL vs OpenCV on the CPU (fkl-vs-opencv-cpu/); gpu: the GPU benchmarks (fkl-vs-opencv-cuda/,
+#   BENCHMARKS           cpu: the CPU benchmarks (fkl-vs-opencv-cpu/, fkl-vs-fern-cpu/); gpu: the GPU benchmarks (fkl-vs-opencv-cuda/,
 #                        fkl-vs-npp/, fkl-ablation/, fkl-vs-nppdx/ and fkl-neighborhood/)
 #   CXX_COMPILER         C++ compiler of the benchmarks; for gpu also the host compiler of nvcc (except with cl, which
 #                        nvcc finds in the PATH)
@@ -531,6 +531,44 @@ if(BENCHMARKS STREQUAL "cpu")
     run(benchmark_opencv_cpu COMMAND "${bench}" "${OUT_DIR}/fkl-vs-opencv-cpu")
     check_csv("${OUT_DIR}/fkl-vs-opencv-cpu/cpu_validation.csv" "FKL MaxAbsError vs FKL-convention reference" 1e-3)
     check_csv("${OUT_DIR}/fkl-vs-opencv-cpu/cpu_validation.csv" "FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference" 1e-3)
+    # FKL vs Fern: the checked-in Fern code, built and run on every platform; FKL and Fern must match the reference
+    # with FKL's conventions, and Fern's code on FKL's thread pool must give Fern's output
+    build_benchmark(fern-cpu "${REPO}/fkl-vs-fern-cpu" -DBENCH_REGIONS=mixed)
+    set(bench "${BUILD_DIR}/fern-cpu/benchmark_fern_cpu${EXE}")
+    find_dlls("${bench}")
+    run(benchmark_fern_cpu COMMAND "${bench}" "${OUT_DIR}/fkl-vs-fern-cpu")
+    foreach(column IN ITEMS "FKL MaxAbsError vs FKL-convention reference" "Fern MaxAbsError vs FKL-convention reference"
+                            "FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference")
+        check_csv("${OUT_DIR}/fkl-vs-fern-cpu/cpu_validation.csv" "${column}" 1e-3)
+    endforeach()
+    check_csv("${OUT_DIR}/fkl-vs-fern-cpu/cpu_validation.csv" "Fern code FKL thread pool vs Fern MaxAbsDifference" 0)
+    # The checked-in Fern code must be what gern, at the commit of the pinned submodule, generates: on Linux with CMake
+    # 3.30 or newer, where gern builds (its runner uses dlfcn.h, and its CMakeLists.txt needs CMake 3.30). gern is cloned at that commit in DEPS_DIR, not checked out in the workspace: gern
+    # records a submodule its tree does not declare, which breaks `git submodule foreach --recursive` in a checkout
+    # that includes it, such as the one actions/checkout runs in a runner's workspace before every job
+    if(NOT CMAKE_HOST_WIN32 AND CMAKE_VERSION VERSION_LESS 3.30)
+        message(STATUS "Fern code not regenerated: CMake ${CMAKE_VERSION}, gern needs 3.30")
+    elseif(NOT CMAKE_HOST_WIN32)
+        execute_process(COMMAND git -C "${REPO}" ls-tree HEAD gern OUTPUT_VARIABLE gernEntry
+                        OUTPUT_STRIP_TRAILING_WHITESPACE)
+        string(REGEX MATCH "[0-9a-f]+[\t ]+gern$" gernCommit "${gernEntry}")
+        string(REGEX REPLACE "[\t ]+gern$" "" gernCommit "${gernCommit}")
+        execute_process(COMMAND git -C "${REPO}" config -f .gitmodules submodule.gern.url OUTPUT_VARIABLE gernUrl
+                        OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(NOT gernCommit MATCHES "^[0-9a-f]+$" OR NOT gernUrl)
+            message(FATAL_ERROR "No gern submodule in ${REPO} (${gernEntry}, ${gernUrl})")
+        endif()
+        set(gernDir "${DEPS_DIR}/gern-${gernCommit}")
+        if(NOT EXISTS "${gernDir}/.git")
+            # Cloned beside it and renamed once complete, so that a later job never reuses an interrupted clone
+            file(REMOVE_RECURSE "${gernDir}" "${gernDir}-partial")
+            run(gern_clone FATAL COMMAND git clone --no-checkout "${gernUrl}" "${gernDir}-partial")
+            file(RENAME "${gernDir}-partial" "${gernDir}")
+        endif()
+        run(gern_checkout FATAL COMMAND git -C "${gernDir}" checkout --detach --force "${gernCommit}")
+        run(fern_regenerate COMMAND "${CMAKE_COMMAND}" "-DCXX=${CXX_COMPILER}" "-DGERN=${gernDir}"
+            "-DWORK=${BUILD_DIR}/fern-regenerate" -P "${REPO}/fkl-vs-fern-cpu/fern/regenerate.cmake")
+    endif()
 else()
     # The benchmarks on common/bench_gpu.h: <build name>:<folder>:<program>
     foreach(entry IN ITEMS "opencv-cuda:fkl-vs-opencv-cuda:benchmark_opencv_cuda" "npp:fkl-vs-npp:benchmark_npp"

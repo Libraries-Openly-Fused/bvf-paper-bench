@@ -16,10 +16,11 @@
 #define FKL_VS_NPPDX_BENCHMARK_COMMON_H
 
 // Two-execution benchmarks in the same format as FKL's benchmarks/twoExecutionsBenchmark.h and
-// cvGPUSpeedup's tests/testsCommon.cuh: in every iteration the first (baseline) and the second
-// implementation are timed one after the other with CUDA events, and one CSV per benchmark is written
-// with the mean, variance, max and min of each (in ms) and the mean of the per-iteration speedups
-// (first / second). Median, p10 and p90 columns are appended for the paper. Every run function takes the
+// cvGPUSpeedup's tests/testsCommon.cuh: the two implementations never run at the same time. The first
+// (baseline) implementation's complete loop (warm-up and timed iterations) runs before the second's, each
+// execution timed with CUDA events, and one CSV per benchmark is written with the mean, variance, max and
+// min of each (in ms) and the mean of the per-iteration speedups (first / second, the executions of the
+// same iteration: identical inputs). Median, p10 and p90 columns are appended for the paper. Every run function takes the
 // iteration: 0 to WARMUP_ITERS - 1 for the warm-up and WARMUP_ITERS to WARMUP_ITERS + ITERS - 1 for the
 // timed iterations, the index of the regions it runs on (common/bench_geometry.h).
 
@@ -58,6 +59,8 @@ struct TwoExecutionsResult {
     int variableDimensionValue{0};
     TimeStats first, second;
     float meanSpeedup{0.f};
+    // Every timed iteration's time of each (ms), in iteration order: the pairs the mean speedup averages
+    std::vector<float> firstTimes, secondTimes;
 };
 
 inline float percentile(const std::vector<float>& sorted, const double p) {
@@ -89,40 +92,9 @@ inline TimeStats computeStats(const std::vector<float>& times) {
     return stats;
 }
 
-// Times first(i) and second(i) back to back in every iteration i, on one stream, synchronizing after each
-inline TwoExecutionsResult runTwoExecutions(cudaStream_t stream, const int variableDimensionValue, const Run& first,
-                                            const Run& second) {
-    cudaEvent_t start, stop;
-    gpuErrchk(cudaEventCreate(&start));
-    gpuErrchk(cudaEventCreate(&stop));
-    const auto timeOne = [&](const Run& run, size_t i) {
-        gpuErrchk(cudaEventRecord(start, stream));
-        run(i);
-        gpuErrchk(cudaEventRecord(stop, stream));
-        gpuErrchk(cudaEventSynchronize(stop));
-        float ms = 0.f;
-        gpuErrchk(cudaEventElapsedTime(&ms, start, stop));
-        return ms;
-    };
-    for (int i = 0; i < WARMUP_ITERS; ++i) {
-        timeOne(first, static_cast<size_t>(i));
-        timeOne(second, static_cast<size_t>(i));
-    }
-    std::vector<float> firstTimes(ITERS), secondTimes(ITERS);
-    double speedupSum = 0.;
-    for (int i = 0; i < ITERS; ++i) {
-        firstTimes[i] = timeOne(first, static_cast<size_t>(WARMUP_ITERS + i));
-        secondTimes[i] = timeOne(second, static_cast<size_t>(WARMUP_ITERS + i));
-        speedupSum += firstTimes[i] / secondTimes[i];
-    }
-    gpuErrchk(cudaEventDestroy(start));
-    gpuErrchk(cudaEventDestroy(stop));
-    return {variableDimensionValue, computeStats(firstTimes), computeStats(secondTimes),
-            static_cast<float>(speedupSum / ITERS)};
-}
-
-// Times one implementation alone, same protocol as runTwoExecutions
-inline TimeStats runOneExecution(cudaStream_t stream, const Run& run) {
+// One implementation's complete loop: the warm-up iterations, then the timed ones, each execution between two CUDA
+// events on one stream and followed by a synchronization; returns the times of the timed ones (ms), in iteration order
+inline std::vector<float> timeLoop(cudaStream_t stream, const Run& run) {
     cudaEvent_t start, stop;
     gpuErrchk(cudaEventCreate(&start));
     gpuErrchk(cudaEventCreate(&stop));
@@ -138,7 +110,25 @@ inline TimeStats runOneExecution(cudaStream_t stream, const Run& run) {
     }
     gpuErrchk(cudaEventDestroy(start));
     gpuErrchk(cudaEventDestroy(stop));
-    return computeStats(times);
+    return times;
+}
+
+// first's complete loop, then second's, on the same iterations; the speedup pairs the executions of the same iteration
+inline TwoExecutionsResult runTwoExecutions(cudaStream_t stream, const int variableDimensionValue, const Run& first,
+                                            const Run& second) {
+    const std::vector<float> firstTimes = timeLoop(stream, first);
+    const std::vector<float> secondTimes = timeLoop(stream, second);
+    double speedupSum = 0.;
+    for (int i = 0; i < ITERS; ++i) {
+        speedupSum += firstTimes[i] / secondTimes[i];
+    }
+    return {variableDimensionValue, computeStats(firstTimes), computeStats(secondTimes),
+            static_cast<float>(speedupSum / ITERS), firstTimes, secondTimes};
+}
+
+// Times one implementation alone, same protocol as runTwoExecutions
+inline TimeStats runOneExecution(cudaStream_t stream, const Run& run) {
+    return computeStats(timeLoop(stream, run));
 }
 
 // GPU time only: CUPTI kernel activity tracing gives the start and end of every kernel on the GPU. The GPU time of
@@ -256,7 +246,8 @@ private:
     int m_blocks{0};
 };
 
-// Same iterations as runTwoExecutions, but each execution is timed by the sum of its kernels' GPU execution times.
+// Same loops as runTwoExecutions (first's, then second's), but each execution is timed by the sum of its kernels' GPU
+// execution times.
 // With a flusher, the L2 is flushed before every execution; a pipeline of several kernels flushes before its other
 // kernels itself (figure1_common.h passes a flush to its run()).
 inline TwoExecutionsResult runTwoExecutionsGpuOnly(cudaStream_t stream, const int variableDimensionValue,
@@ -273,41 +264,39 @@ inline TwoExecutionsResult runTwoExecutionsGpuOnly(cudaStream_t stream, const in
     // The kernels of one execution (on the regions of the first timed iteration; the count does not depend on them)
     const size_t firstKernels = cupti::trace(stream, [&](int) { first(WARMUP_ITERS); }, 1).size();
     const size_t secondKernels = cupti::trace(stream, [&](int) { second(WARMUP_ITERS); }, 1).size();
-    for (int i = 0; i < WARMUP_ITERS; ++i) {
-        first(static_cast<size_t>(i));
-        gpuErrchk(cudaStreamSynchronize(stream));
-        second(static_cast<size_t>(i));
-        gpuErrchk(cudaStreamSynchronize(stream));
-    }
-    const auto records = cupti::trace(stream, [&](int i) {
-        first(static_cast<size_t>(WARMUP_ITERS + i));
-        gpuErrchk(cudaStreamSynchronize(stream));
-        second(static_cast<size_t>(WARMUP_ITERS + i));
-    }, ITERS);
-    if (records.size() != (firstKernels + secondKernels) * ITERS) {
-        throw std::runtime_error("GPU only benchmark: unexpected number of kernel records");
-    }
-    std::vector<float> firstTimes(ITERS), secondTimes(ITERS);
+    // One implementation's warm-up iterations, then its traced timed ones; the executions are sequential, so in start
+    // order the records are iteration by iteration
+    const auto traceLoop = [&](const Run& run, size_t kernelsPerRun) {
+        for (int i = 0; i < WARMUP_ITERS; ++i) {
+            run(static_cast<size_t>(i));
+            gpuErrchk(cudaStreamSynchronize(stream));
+        }
+        const auto records = cupti::trace(stream, [&](int i) { run(static_cast<size_t>(WARMUP_ITERS + i)); }, ITERS);
+        if (records.size() != kernelsPerRun * ITERS) {
+            throw std::runtime_error("GPU only benchmark: unexpected number of kernel records");
+        }
+        std::vector<float> times(ITERS);
+        size_t idx = 0;
+        for (int i = 0; i < ITERS; ++i) {
+            uint64_t ns = 0;
+            for (size_t j = 0; j < kernelsPerRun; ++j, ++idx) {
+                ns += records[idx].end - records[idx].start;
+            }
+            times[i] = static_cast<float>(ns * 1e-6);
+        }
+        return times;
+    };
+    const std::vector<float> firstTimes = traceLoop(first, firstKernels);
+    const std::vector<float> secondTimes = traceLoop(second, secondKernels);
     double speedupSum = 0.;
-    size_t idx = 0;
     for (int i = 0; i < ITERS; ++i) {
-        uint64_t ns = 0;
-        for (size_t j = 0; j < firstKernels; ++j, ++idx) {
-            ns += records[idx].end - records[idx].start;
-        }
-        firstTimes[i] = static_cast<float>(ns * 1e-6);
-        ns = 0;
-        for (size_t j = 0; j < secondKernels; ++j, ++idx) {
-            ns += records[idx].end - records[idx].start;
-        }
-        secondTimes[i] = static_cast<float>(ns * 1e-6);
         speedupSum += firstTimes[i] / secondTimes[i];
     }
     return {variableDimensionValue, computeStats(firstTimes), computeStats(secondTimes),
-            static_cast<float>(speedupSum / ITERS)};
+            static_cast<float>(speedupSum / ITERS), firstTimes, secondTimes};
 }
 
-// <benchmarkName>_<ParArch>.csv, as FKL names its benchmark files
+// <benchmarkName>_<ParArch>.csv, as FKL names its benchmark files, and its _per_iteration.csv
 inline void writeTwoExecutionsCSV(const std::filesystem::path& outDir, const std::string& benchmarkName,
                                   const std::string& variableDimension, const std::string& firstLabel,
                                   const std::string& secondLabel, const std::vector<TwoExecutionsResult>& results) {
@@ -334,6 +323,18 @@ inline void writeTwoExecutionsCSV(const std::filesystem::path& outDir, const std
             file << ", " << s->median << ", " << s->p10 << ", " << s->p90;
         }
         file << std::endl;
+    }
+    // <benchmarkName>_<ParArch>_per_iteration.csv: every timed iteration's pair of times (ms) and their ratio, which
+    // the mean speedup averages
+    std::ofstream pairs(outDir / (benchmarkName + "_" + std::string(fk::toStrView(fk::defaultParArch)) +
+                                  "_per_iteration.csv"));
+    pairs << variableDimension << ", Iteration, " << firstLabel << " Time (ms), " << secondLabel
+          << " Time (ms), Speedup" << std::endl;
+    for (const auto& r : results) {
+        for (size_t i = 0; i < r.firstTimes.size() && i < r.secondTimes.size(); ++i) {
+            pairs << r.variableDimensionValue << ", " << WARMUP_ITERS + i << ", " << r.firstTimes[i] << ", "
+                  << r.secondTimes[i] << ", " << static_cast<double>(r.firstTimes[i]) / r.secondTimes[i] << std::endl;
+        }
     }
 }
 
