@@ -13,8 +13,8 @@
 //                 rows), written at those columns of the 8 bit RGB frame, which the rest reads as before: 4N + 3
 //                 kernels
 //   fkl_bvf       one FKL kernel for the whole chain (BVF)
-// The two OpenCV forms each have their own loop and speedup in every mode; per batch size, the one with the lower
-// latency median is OpenCV's, in every mode (the paper's rule for a library's variants).
+// The two OpenCV forms each have their own loop and speedup in every mode; per batch size, each view (latency, GPU
+// only, GPU only with the L2 flushed) reports the form with the lower median in that view.
 
 #include <opencv2/core.hpp>
 #include <opencv2/core/cuda.hpp>
@@ -147,8 +147,9 @@ struct OpenCVCudaVsFkl {
               "FRAME_H x w pixels (w its width); the frame is written only at the columns of the iteration's regions "
               "(overlapping strips are converted twice), and only pixels of the regions are read; before every "
               "validated run, the 8 bit frame is filled with 0 as well as the output with NaN.\n"
-           << "The two OpenCV forms each have their own loop and speedup in every mode; per batch size, the one "
-              "with the lower latency median is OpenCV's, in every mode.\n";
+           << "The two OpenCV forms each have their own loop and speedup in every mode; per batch size, each view "
+              "(latency, GPU only, GPU only with the L2 flushed) reports the form with the lower median in that "
+              "view.\n";
     }
 
     static std::string diagnostic(const Context& ctx) { return opencv::conversionDiagnostic(ctx); }

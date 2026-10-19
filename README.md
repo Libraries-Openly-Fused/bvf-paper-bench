@@ -57,8 +57,9 @@ Every benchmark of this repository takes its workload from [`common/bench_geomet
   NPPDx's through `FromLimitedLuma`, `FromLimitedChroma` and `ColorConvert<yuv_bt601, rgb>`). Every baseline converts
   with its own library, and where the library can convert less than the frame, the per-crop form is a variant of the
   full-frame one (NPP and OpenCV on the CPU convert each crop; OpenCV CUDA's converter cannot restrict the rows, so it
-  converts the full-height strip of each crop's columns), and per batch size the form with the lower latency median is
-  the library's, in every mode (on the CPU, per thread count);
+  converts the full-height strip of each crop's columns). Both forms are measured in every mode, and per batch size
+  each view (latency, GPU only, GPU only with the L2 flushed; on the CPU, each thread count) reports the library's form
+  with the lower median in that view;
 - the regions, new in every iteration (warm-up and timed): 100 per iteration, batch N uses the first N. Their sizes are
   20x10, 32x16 and 48x24 by turns: region i of iteration t has the size (i + t) mod 3 of that list, so every iteration
   mixes the three and every region cycles through them. Their positions are uniform random (seed 42), with even

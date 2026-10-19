@@ -30,6 +30,8 @@
 //                  frame, which the rest of the pipeline reads as before): 2N + 4 and 3N + 3 kernels. npp_32f_frame
 //                  converts the whole 8 bit frame to float, so it keeps the conversion of the whole frame.
 //   fkl_dpp        FKL's MorphologyDPP box blur, one kernel (neighborhood_common.h)
+// Per batch size, of each pipeline's two conversion forms (npp and npp_crop_nv12, npp_32f and npp_32f_crop_nv12), each
+// view (latency, GPU only, GPU only with the L2 flushed) reports the one with the lower median in that view.
 
 #include "neighborhood_common.h"
 
@@ -241,7 +243,10 @@ struct NppVsFklDpp {
               "the pipeline reads as npp and npp_32f do: 2N + 4 and 3N + 3 kernels. The frame is written only where "
               "the crops of the iteration land (overlapping crops are converted twice), and only those pixels are "
               "read; before every validated run, the 8 bit frame is filled with 0 as well as the output with NaN. "
-              "npp_32f_frame converts the whole 8 bit frame to float, so it keeps the conversion of the whole frame.\n"
+              "npp_32f_frame converts the whole 8 bit frame to float, so it keeps the conversion of the whole frame. "
+              "Per batch size, of each pipeline's two conversion forms (npp and npp_crop_nv12, npp_32f and "
+              "npp_32f_crop_nv12), each view (latency, GPU only, GPU only with the L2 flushed) reports the one with "
+              "the lower median in that view.\n"
            << "References: the 8 bit RGB of NPP's conversion (FKL's conversion rounded to nearest, see the diagnostic "
               "below), with the box rounded down for npp and npp_crop_nv12 and in float for npp_32f, npp_32f_frame and "
               "npp_32f_crop_nv12.\n";

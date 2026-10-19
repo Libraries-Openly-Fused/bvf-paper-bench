@@ -84,9 +84,12 @@ chroma of a luma row at a distance fixed by the surface's height), but it can th
 the full-height strip of each crop's columns (2160 x 64 pixels) into those columns of the 8 bit frame. The frame of a
 per-crop form is written only where the crops (or their strips) of the iteration land, and only pixels of the crops are
 read; before every validated run of a per-crop form the 8 bit frame is filled with 0, so that a pixel the crops do not
-convert would fail the check. Each form has its own loop and speedup in every mode; per batch size, the form with the
-lower latency median is its library's, in every mode (the paper's rule for a library's variants; NPP's 8 bit and float
-forms are variants as before).
+convert would fail the check. Each form has its own loop and speedup in every mode. Per batch size, of each pipeline's
+two conversion forms (`npp` and `npp_crop_nv12`, `npp_32f` and `npp_32f_crop_nv12`, `opencv_cuda` and
+`opencv_cuda_crop_nv12`, `opencv_cuda_rgba` and `opencv_cuda_rgba_crop_nv12`), each view (latency, GPU only, GPU only
+with the L2 flushed) reports the one with the lower median in that view (the results report says which form each view
+reports, and the CSVs keep both); the pipelines themselves (NPP's 8 bit and float boxes, OpenCV's RGB and RGBA) are
+reported as before.
 
 **NPPDx configurations:** every tile of the crop that NPPDx supports (64x32, then halvings of
 the longer side down to 8x8, in 4x2 pixel cells) runs with NPPDx's recommended block and with `BlockDim` 64, 128, 256

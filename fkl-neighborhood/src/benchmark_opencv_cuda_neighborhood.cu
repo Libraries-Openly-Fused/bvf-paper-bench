@@ -34,8 +34,9 @@
 //   opencv_cuda_rgba_crop_nv12
 //                     the same with the conversion of each crop's strip: 3N + 4 kernels
 //   fkl_dpp           FKL's MorphologyDPP box blur, one kernel (neighborhood_common.h)
-// Each OpenCV form has its own loop and speedup in every mode; per batch size, the one with the lower latency median is
-// OpenCV's, in every mode.
+// Each OpenCV form has its own loop and speedup in every mode; per batch size, of each pipeline's two conversion forms
+// (opencv_cuda and opencv_cuda_crop_nv12, opencv_cuda_rgba and opencv_cuda_rgba_crop_nv12), each view (latency, GPU
+// only, GPU only with the L2 flushed) reports the one with the lower median in that view.
 
 #include <opencv2/core/cuda_stream_accessor.hpp>
 #include <opencv2/cudaarithm.hpp>
@@ -240,8 +241,10 @@ struct OpenCVCudaVsFklDpp {
               "createLinearFilter(CV_32FC4, CV_32FC4, " << K << "x" << K << " taps of 1/" << K * K << ", "
               "BORDER_REPLICATE), one kernel per call, then multiply, subtract and divide on the 4 channel output and "
               "one cvtColor RGBA2RGB into the float3 output: 2N + 5 kernels (opencv_cuda_rgba_crop_nv12: 3N + 4)\n"
-           << "Each OpenCV form has its own loop and speedup in every mode; per batch size, the one with the lower "
-              "latency median is OpenCV's, in every mode.\n"
+           << "Each OpenCV form has its own loop and speedup in every mode; per batch size, of each pipeline's two "
+              "conversion forms (opencv_cuda and opencv_cuda_crop_nv12, opencv_cuda_rgba and "
+              "opencv_cuda_rgba_crop_nv12), each view (latency, GPU only, GPU only with the L2 flushed) reports the "
+              "one with the lower median in that view.\n"
            << "With the L2 flushed, the flush runs before every OpenCV call, not between the two kernels of the "
               "separable filter.\n"
            << "References: the 8 bit RGB of OpenCV's conversion (FKL's conversion truncated, see the diagnostic "
