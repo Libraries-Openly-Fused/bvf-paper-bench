@@ -87,9 +87,10 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
   on one stream (`kernels.csv`). The
   GPU time (`gpu_time.csv`) is a fraction of the iteration's time (`latency.csv`); the rest is host work and launch
   gaps.
-- **Thread count is per operator (CPU).** PyTorch parallelizes an operator only above its grain size (32768 elements).
-  On 32 threads, the per-region operators still run on one thread; only the border fills and the last three operators
-  run on all threads at large N. FKL's thread pool splits the fused loop into one chunk per output row of each region.
+- **Thread count is per operator (CPU).** PyTorch parallelizes its own operators only above their grain size (32768
+  elements). On 32 threads, its per-region operators still run on one thread; only the border fills and the last three
+  operators run on all threads at large N. With `addmm`, MKL's GEMM decides its own threading (`at::set_num_threads`
+  sets MKL's thread count too). FKL's thread pool splits the fused loop into one chunk per output row of each region.
 
 ## What PyTorch gets that FKL does not
 
@@ -156,8 +157,8 @@ the paper's numbers; medians, us, N = 1 / 4 / 16 / 50 / 100):
 | C: default spin, 11 ms gap (about twice libgomp's spin as measured then) | 145 / 949 / 1786 / 3298 / 15736 | — | 39 / 85 / 238 / 492 / 596 |
 
 - **B: PyTorch's workers disturb FKL.** PyTorch's spinning workers are still on the cores when FKL runs: FKL is up to
-  3.6x slower than alone.
-- **A: matching the spin costs PyTorch.** With FKL's spin, PyTorch is 1.2 to 2.6x slower than with its default. One
+  4.5x slower than alone (N = 50).
+- **A: matching the spin costs PyTorch.** With FKL's spin, PyTorch is 1.25 to 2.64x slower than with its default. One
   PyTorch run has long serial stretches (the per-region operators, below the grain size) between its parallel
   regions, and its workers fall asleep between them.
 - **C: a longer gap slows both.**
@@ -198,8 +199,9 @@ OpenCV on the CPU explains the change.
   in the channels-last variants, a kernel otherwise; its fills are kernels). The
   span runs from the first start to the last end in the trace: it is measured under the profiler, so it includes
   the profiler's cost per launch and can exceed the latency.
-- **Counts.** Kernels, memcpys and memsets of one execution, and the device memory segments PyTorch's caching
-  allocator allocated during each implementation's timed latency iterations.
+- **Counts.** Kernels, memcpys and memsets of one execution (every traced execution must have the same counts, or the
+  program fails), and the device memory segments PyTorch's caching allocator allocated during each implementation's
+  timed latency iterations.
 - **The GPU.** `platform.txt` describes the device the program ran on (CUDA device 0, the first of
   `CUDA_VISIBLE_DEVICES`), and asks nvidia-smi about that device only, by its PCI bus ID.
 

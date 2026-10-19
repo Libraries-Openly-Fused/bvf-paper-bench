@@ -391,8 +391,16 @@ void gpuOnlyBatch(Context& ctx, std::vector<Result>& results) {
                 gpuMs[k].push_back(static_cast<float>(a.busyNs * 1e-6));
                 spanMs[k].push_back(static_cast<float>((a.lastEndNs - a.firstStartNs) * 1e-6));
             }
+            // Every chunk is its own profiler session: its executions must have the first chunk's counts too
+            const Activities& e = executions.front();
             if (first == 0) {
-                batchResults[k]->counts = executions.front();
+                batchResults[k]->counts = e;
+            } else if (e.kernels != batchResults[k]->counts.kernels || e.memcpys != batchResults[k]->counts.memcpys ||
+                       e.memsets != batchResults[k]->counts.memsets) {
+                throw std::runtime_error("GPU time: the executions of " + impls[k].name + " from iteration " +
+                                         std::to_string(WARMUP_ITERS + first) + " have other kernel, memcpy or " +
+                                         "memset counts than the first chunk's (" + std::to_string(e.kernels) +
+                                         " and " + std::to_string(batchResults[k]->counts.kernels) + " kernels)");
             }
         }
     }
@@ -490,7 +498,8 @@ void writePlatform(const std::filesystem::path& outDir, const Context& ctx) {
        << "every execution splitting the trace; the GPU time of one execution is the "
        << "sum of the execution times of its device activities: kernels, and memcpys and memsets when there are any "
        << "(PyTorch's copy into the output plane is a device to device memcpy in the channels-last variants and a "
-       << "kernel otherwise, its fills are kernels; kernels.csv has the counts), span = first start to last end "
+       << "kernel otherwise, its fills are kernels; kernels.csv has the counts, the same for every traced execution, "
+       << "checked), span = first start to last end "
        << "of its activities in the trace (measured under the profiler, so it includes the profiler's cost per launch "
        << "and can exceed the latency); "
        << "speedups per execution, averaged.\n"
