@@ -128,11 +128,10 @@ void runBatch(const Workload& w, std::vector<Row>& singleThread, std::vector<Row
                       maxAbsError(ocvOut, referenceOutput(w, N, t, Conventions::OpenCV)), maxAbsError(ocvOut, fklOut),
                       maxAbsError(fklMT->output(), fklOut), maxAbsError(ocvThreadsOut, ocvOut)};
         checks.push_back(c);
-        // std::max keeps a NaN only as its first argument: the error goes first
-        worst = Check{N, t, std::max(c.fklVsReference, worst.fklVsReference),
-                      std::max(c.opencvVsReference, worst.opencvVsReference), std::max(c.opencvVsFkl, worst.opencvVsFkl),
-                      std::max(c.fklMultithreadVsFkl, worst.fklMultithreadVsFkl),
-                      std::max(c.opencvThreadsVsOneThread, worst.opencvThreadsVsOneThread)};
+        worst = Check{N, t, worstError(c.fklVsReference, worst.fklVsReference),
+                      worstError(c.opencvVsReference, worst.opencvVsReference), worstError(c.opencvVsFkl, worst.opencvVsFkl),
+                      worstError(c.fklMultithreadVsFkl, worst.fklMultithreadVsFkl),
+                      worstError(c.opencvThreadsVsOneThread, worst.opencvThreadsVsOneThread)};
     }
     const Check& c = worst;
 
