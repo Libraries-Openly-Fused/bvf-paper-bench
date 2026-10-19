@@ -144,6 +144,9 @@ if(BENCH_GPU_LANGUAGE)
     if(BENCH_GPU_LANGUAGE STREQUAL "HIP" AND EXISTS "${BENCH_TORCH_SITE}/_rocm_sdk_core/lib")
         set_property(TARGET benchmark_pytorch_gpu APPEND PROPERTY BUILD_RPATH
                      "${BENCH_TORCH_SITE}/_rocm_sdk_core/lib" "${BENCH_TORCH_SITE}/_rocm_sdk_core/lib/rocm_sysdeps/lib")
+        # As an RPATH, not a RUNPATH: the loader searches an RPATH before LD_LIBRARY_PATH, which rocm/scripts/env.sh
+        # sets to the system's ROCm (LibTorch's own libraries have an RPATH too)
+        target_link_options(benchmark_pytorch_gpu PRIVATE "LINKER:--disable-new-dtags")
         message(STATUS "GPU program run path: the wheel's HIP runtime, ${BENCH_TORCH_SITE}/_rocm_sdk_core/lib")
     endif()
     message(STATUS "GPU program: FKL's code as ${BENCH_GPU_LANGUAGE} (${BENCH_GPU_COMPILER}, ${BENCH_GPU_ARCH})")

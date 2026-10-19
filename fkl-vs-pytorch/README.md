@@ -275,8 +275,9 @@ code; `HIP_ARCH` (default `gfx1200`) is its HIP architecture with a ROCm wheel.
 
 **ROCm.** The same commands build against a ROCm wheel's LibTorch, with `ROCM_PATH` set to the ROCm installation (for
 example `/opt/rocm/core-10.1`). LibTorch's CMake enables HIP with its own compiler and architectures, and the project
-then sets `HIP_ARCH` on FKL's side only. PyTorch's device is still `torch::kCUDA`, and its streams and guards keep
-their `c10::cuda` names in the hipified headers. A ROCm wheel ships its own HIP runtime (`_rocm_sdk_core/lib` next to
-`torch`); the GPU program's run path has the wheel's folders, so that it loads that runtime, as LibTorch does: with
-the system's HIP runtime (for example through `LD_LIBRARY_PATH`), Kineto records no device activity and the GPU time
-pass fails. On RDNA, `platform.txt`'s `multiProcessorCount` counts work-group processors (2 compute units each).
+then sets `HIP_ARCH` on FKL's side only. PyTorch's device is still `torch::kCUDA`, and its streams and guards keep their
+`c10::cuda` names in the hipified headers. A ROCm wheel ships its own HIP runtime (`_rocm_sdk_core/lib` next to
+`torch`); the GPU program has the wheel's folders in its RPATH, which the loader searches before `LD_LIBRARY_PATH` (set
+to the system's ROCm by `rocm/scripts/env.sh`), so that it loads that runtime, as LibTorch does: with the system's HIP
+runtime, Kineto records no device activity and the GPU time pass fails. On RDNA, `platform.txt`'s `multiProcessorCount`
+counts work-group processors (2 compute units each).
