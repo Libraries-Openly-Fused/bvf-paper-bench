@@ -109,10 +109,10 @@ public:
             // M_U U + M_V V + bias per chroma sample: (h / 2) * (w / 2) x 3
             const torch::Tensor chromaTerms =
                 torch::addmm(m_bias, chroma.to(torch::kFloat32).reshape({-1, 2}), m_chromaMatrix);
-            // + M_Y Y, each chroma sample broadcast to its 2x2 luma pixels: h x w x 3 float RGB
+            // + M_Y Y, each chroma sample broadcast to its 2x2 luma pixels: h x w x 3 float RGB. The 8-bit luma view goes
+            // in as it is: the add promotes it to float in its own kernel (no separate conversion)
             const torch::Tensor rgb = torch::add(chromaTerms.view({h / 2, 1, w / 2, 1, 3}),
-                                                 luma.to(torch::kFloat32).reshape({h / 2, 2, w / 2, 2, 1}),
-                                                 m_lumaScale)
+                                                 luma.reshape({h / 2, 2, w / 2, 2, 1}), m_lumaScale)
                                           .view({h, w, 3});
             // 1 x 3 x h x w (a view of the h x w x 3 values) -> 1 x 3 x 32 x 64 (NCHW), transposed by the copy
             const torch::Tensor resized = F::interpolate(rgb.permute({2, 0, 1}).unsqueeze(0), resizeOptions);

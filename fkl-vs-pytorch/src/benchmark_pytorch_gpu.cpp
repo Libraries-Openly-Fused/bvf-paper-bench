@@ -27,6 +27,7 @@
 
 #include <torch/torch.h>
 #include <ATen/Context.h>
+#include <ATen/DeviceAccelerator.h>
 #include <ATen/Version.h>
 #include <c10/core/Event.h>
 #include <kineto/ActivityType.h>
@@ -106,6 +107,9 @@ struct Result {
     double meanGpuSpeedupOfBvf{NAN};
     // Every timed iteration's latency and GPU time (ms), in iteration order
     std::vector<float> latencyMs, gpuMs;
+    // Device memory segments PyTorch's caching allocator allocated (cudaMalloc/hipMalloc calls) during this
+    // implementation's timed latency iterations
+    int64_t timedSegmentAllocations{0};
     Activities counts;
     // Over the validated iterations together, and per validated iteration (iteration, against its own reference,
     // against FKL's float reference)
@@ -149,12 +153,24 @@ std::vector<Implementation> implementations(Context& ctx) {
 // same time: each implementation's complete loop (warm-up and timed iterations, on the regions of each iteration)
 // runs before the next one's, PyTorch first and FKL BVF last, each run between two events on the stream and followed
 // by a synchronization. Returns the TIMED_ITERS execution times of each implementation, in ms, in iteration order.
-std::vector<std::vector<float>> measureSequential(const Context& ctx, const std::vector<Implementation>& impls) {
+// segments[k]: the device memory segments the caching allocator allocated during implementation k's timed iterations.
+std::vector<std::vector<float>> measureSequential(const Context& ctx, const std::vector<Implementation>& impls,
+                                                  std::vector<int64_t>& segments) {
     c10::Event start(c10::DeviceType::CUDA, c10::EventFlag::BACKEND_DEFAULT);
     c10::Event stop(c10::DeviceType::CUDA, c10::EventFlag::BACKEND_DEFAULT);
     std::vector<std::vector<float>> ms(impls.size(), std::vector<float>(TIMED_ITERS));
+    segments.assign(impls.size(), 0);
+    const auto segmentsAllocated = [&]() {
+        return at::accelerator::getDeviceStats(ctx.stream.device_index())
+            .segment[static_cast<size_t>(c10::CachingAllocator::StatType::AGGREGATE)]
+            .allocated;
+    };
     for (size_t k = 0; k < impls.size(); ++k) {
+        int64_t segmentsBefore = 0;
         for (int i = 0; i < WARMUP_ITERS + TIMED_ITERS; ++i) {
+            if (i == WARMUP_ITERS) {
+                segmentsBefore = segmentsAllocated();
+            }
             start.record(ctx.stream);
             impls[k].run(static_cast<size_t>(i));
             stop.record(ctx.stream);
@@ -163,6 +179,7 @@ std::vector<std::vector<float>> measureSequential(const Context& ctx, const std:
                 ms[k][i - WARMUP_ITERS] = static_cast<float>(start.elapsedTime(stop));
             }
         }
+        segments[k] = segmentsAllocated() - segmentsBefore;
     }
     return ms;
 }
@@ -232,10 +249,11 @@ std::vector<Activities> traceExecutions(const Context& ctx, const Implementation
     return executions;
 }
 
-// Validation, latency and GPU time of batch N
+// Validation and latency of batch N. Every batch's latency is measured before any profiler session of the process
+// (gpuOnlyBatch), as in common/bench_gpu.h.
 template <size_t N>
-void runBatch(Context& ctx, std::vector<Result>& results) {
-    std::cout << "=== N = " << N << std::endl;
+void latencyBatch(Context& ctx, std::vector<Result>& results) {
+    std::cout << "=== N = " << N << ": validation and latency" << std::endl;
     const auto impls = implementations<N>(ctx);
     const size_t bvf = impls.size() - 1;
     std::vector<Result> batchResults(impls.size());
@@ -263,10 +281,13 @@ void runBatch(Context& ctx, std::vector<Result>& results) {
                 r.errorsPerIteration.size() == 1 ? vsFkl : validation::combine(r.errorVsFklReference, vsFkl);
         }
     }
-    const auto ms = measureSequential(ctx, impls);
+    std::vector<int64_t> segments;
+    const auto ms = measureSequential(ctx, impls, segments);
     for (size_t k = 0; k < impls.size(); ++k) {
         Result& r = batchResults[k];
         r.timing = computeStats(ms[k]);
+        r.latencyMs = ms[k];
+        r.timedSegmentAllocations = segments[k];
         if (k != bvf) {
             double sum = 0.;
             for (int i = 0; i < TIMED_ITERS; ++i) {
@@ -274,8 +295,26 @@ void runBatch(Context& ctx, std::vector<Result>& results) {
             }
             r.meanSpeedupOfBvf = sum / TIMED_ITERS;
         }
+        results.push_back(r);
     }
-    // GPU time only: each implementation's warm-up, then its timed iterations traced in chunks, PyTorch first
+}
+
+// GPU time of batch N, after every batch's latency: each implementation's warm-up, then its timed iterations traced in
+// chunks, PyTorch first; fills in the results latencyBatch<N> wrote
+template <size_t N>
+void gpuOnlyBatch(Context& ctx, std::vector<Result>& results) {
+    std::cout << "=== N = " << N << ": GPU time only" << std::endl;
+    const auto impls = implementations<N>(ctx);
+    const size_t bvf = impls.size() - 1;
+    std::vector<Result*> batchResults;
+    for (const auto& impl : impls) {
+        const auto r = std::find_if(results.begin(), results.end(),
+                                    [&](const Result& x) { return x.name == impl.name && x.batch == N; });
+        if (r == results.end()) {
+            throw std::runtime_error("GPU time: no latency results for " + impl.name);
+        }
+        batchResults.push_back(&*r);
+    }
     std::vector<std::vector<float>> gpuMs(impls.size()), spanMs(impls.size());
     for (size_t k = 0; k < impls.size(); ++k) {
         for (int i = 0; i < WARMUP_ITERS; ++i) {
@@ -290,16 +329,13 @@ void runBatch(Context& ctx, std::vector<Result>& results) {
                 spanMs[k].push_back(static_cast<float>((a.lastEndNs - a.firstStartNs) * 1e-6));
             }
             if (first == 0) {
-                batchResults[k].counts = executions.front();
+                batchResults[k]->counts = executions.front();
             }
         }
     }
-    batchResults[0].latencyMs = ms[0];
-    batchResults[1].latencyMs = ms[1];
-    batchResults[0].gpuMs = gpuMs[0];
-    batchResults[1].gpuMs = gpuMs[1];
     for (size_t k = 0; k < impls.size(); ++k) {
-        Result& r = batchResults[k];
+        Result& r = *batchResults[k];
+        r.gpuMs = gpuMs[k];
         r.gpuTiming = computeStats(gpuMs[k]);
         r.gpuSpan = computeStats(spanMs[k]);
         if (k != bvf) {
@@ -313,7 +349,8 @@ void runBatch(Context& ctx, std::vector<Result>& results) {
                   << " median " << std::setw(8) << r.timing.median << " us  p10 " << std::setw(8) << r.timing.p10
                   << "  p90 " << std::setw(8) << r.timing.p90 << "  GPU time median " << std::setw(8)
                   << r.gpuTiming.median << " us  kernels " << r.counts.kernels << ", memcpys " << r.counts.memcpys
-                  << ", memsets " << r.counts.memsets;
+                  << ", memsets " << r.counts.memsets << ", cudaMallocs in the timed iterations "
+                  << r.timedSegmentAllocations;
         if (k != bvf) {
             std::cout << "  FKL BVF mean speedup " << std::setprecision(2) << r.meanSpeedupOfBvf << "x (GPU time "
                       << r.meanGpuSpeedupOfBvf << "x)";
@@ -321,7 +358,6 @@ void runBatch(Context& ctx, std::vector<Result>& results) {
         std::cout << "  max err " << std::scientific << std::setprecision(2) << r.errorVsOwnReference.max() << " ("
                   << r.reference << "), vs FKL's reference " << r.errorVsFklReference.max() << std::defaultfloat
                   << std::endl;
-        results.push_back(r);
     }
 }
 
@@ -337,29 +373,40 @@ void writePlatform(const std::filesystem::path& outDir, const Context& ctx) {
     std::ofstream os(outDir / "platform.txt");
     os << "Benchmark: FKL vs PyTorch on the GPU (fkl-vs-pytorch)\n" << describeGpuAndFkl();
 #ifndef USE_ROCM
-    os << "NVIDIA driver: " << shell("nvidia-smi --query-gpu=driver_version --format=csv,noheader") << "\n";
+    // nvidia-smi on this device only (its PCI bus ID): nvidia-smi's indices and CUDA's need not agree, and
+    // CUDA_VISIBLE_DEVICES does not apply to nvidia-smi
+    const std::string busId = gpuPciBusId();
+    os << "NVIDIA driver: " << shell("nvidia-smi --id=" + busId + " --query-gpu=driver_version --format=csv,noheader")
+       << "; this GPU in nvidia-smi: "
+       << shell("nvidia-smi --id=" + busId + " --query-gpu=index,pci.bus_id,uuid --format=csv,noheader") << "\n"
+       << "GPU clocks: not locked (locking needs root); application clocks as reported by nvidia-smi: "
+       << shell("nvidia-smi --id=" + busId + " --query-gpu=clocks.max.sm,clocks.max.mem --format=csv,noheader")
+       << "\n";
 #endif
     os << "PyTorch: " << BENCH_TORCH_VERSION << " (LibTorch C++ API of the wheel, eager mode, c10::InferenceMode, "
        << "device " << ctx.stream.device() << ", one stream of PyTorch's pool; cuBLAS TF32 "
        << (at::globalContext().allowTF32CuBLAS() ? "allowed" : "not allowed")
        << "); full configuration in pytorch_build_information.txt\n"
-       << "PyTorch's code: compiled with " << hostCompiler() << "\n"
+       << "The benchmark's code (the calls into LibTorch and the harness): compiled with " << hostCompiler()
+       << "; LibTorch itself is the wheel's build (its compilers and CUDA architectures in "
+       << "pytorch_build_information.txt)\n"
        << "Benchmark repository: commit " << BENCH_REPO_COMMIT << "\n"
        << "CPU: " << cpuName() << "\n"
        << "OS: " << osName() << ", kernel " << kernelVersion() << "\n\n"
        << "Workload: " << describe() << ". AddBorder (black), then Mul (1/255), Sub (0.485, 0.456, 0.406), Div (0.229, "
        << "0.224, 0.225), float3 tensor of N planes " << OUT_W << "x" << OUT_H << "\n"
        << "PyTorch pipeline: per region, views of the region's luma and chroma planes, chroma to float and addmm with "
-          "FKL's chroma coefficients and every offset folded into the bias, luma to float and a broadcast add with "
-          "its coefficient (chroma replicated to 2x2 pixels), interpolate (bilinear, align_corners=false: "
+          "FKL's chroma coefficients and every offset folded into the bias, a broadcast add of the 8-bit luma with "
+          "its coefficient (chroma replicated to 2x2 pixels; the add converts the luma), interpolate (bilinear, "
+          "align_corners=false: "
           "pixel-center sampling) and a device to device copy into its output plane; per iteration the border rows "
           "set to 0 and mul_, sub_, div_ on the whole N x 64 x 64 x 3 tensor. Temporaries from PyTorch's caching "
           "allocator.\n"
        << "FKL BVF: one executeOperations call, one kernel: no intermediates in memory, float3 from the color "
           "conversion to the write.\n"
-       << "Regions: iteration t of every loop (the " << WARMUP_ITERS << " warm-up iterations are t in [0, "
+       << "Regions: iteration t of each pipeline's loop (the " << WARMUP_ITERS << " warm-up iterations are t in [0, "
        << WARMUP_ITERS << "), the " << TIMED_ITERS << " timed ones t in [" << WARMUP_ITERS << ", "
-       << WARMUP_ITERS + TIMED_ITERS << ")) runs both pipelines on the regions of iteration t, generated before the "
+       << WARMUP_ITERS + TIMED_ITERS << ")) runs that pipeline on the regions of iteration t, generated before the "
        << "loops (statistics of the timed ones in regions.csv); FKL's build() calls and fusion and PyTorch's "
           "per-region calls are timed.\n"
        << "Timing: the two libraries never run at the same time: for every batch size, pytorch's complete loop ("
@@ -367,12 +414,16 @@ void writePlatform(const std::filesystem::path& outDir, const Context& ctx) {
        << "regions, every run timed with device events (c10::Event) on one stream around the complete pipeline "
        << "(all host enqueue work included) and followed by a synchronization. FKL BVF's speedup is computed per "
        << "iteration (pytorch time / BVF time of the same iteration) and averaged (*_per_iteration.csv have every "
-       << "pair). Median, p10, p90 with linear interpolation.\n"
-       << "GPU time only: a second pass with the same loops, pytorch's then FKL BVF's, the timed iterations traced with "
+       << "pair). Median, p10, p90 with linear interpolation. Every batch's latency is measured before the process "
+       << "starts any profiler session. kernels.csv has the device memory segments PyTorch's caching allocator "
+       << "allocated during each implementation's timed iterations (0: no cudaMalloc there).\n"
+       << "GPU time only: after every batch's latency, a second pass with the same loops, pytorch's then FKL BVF's, "
+       << "the timed iterations traced with "
        << "PyTorch's profiler (Kineto) in chunks of " << PROFILE_CHUNK << " iterations, an empty marker kernel after "
        << "every execution splitting the trace; the GPU time of one execution is the "
-       << "sum of the execution times of its device activities (kernels, memcpys and memsets: PyTorch's device to "
-       << "device copies are memcpys), span = first start to last end; speedups per execution, averaged.\n"
+       << "sum of the execution times of its device activities: kernels, and memcpys and memsets when there are any "
+       << "(PyTorch's copies and fills here are kernels; kernels.csv has the counts), span = first start to last end; "
+       << "speedups per execution, averaged.\n"
        << "Validation: before the timing, both pipelines on the regions of the first, every "
        << validation::VALIDATION_STRIDE << "th and the last timed iteration (validation.csv, one row per iteration): "
        << "PyTorch against the plain C++ reference with its pixel-center sampling (common/bench_reference.h), FKL BVF "
@@ -394,7 +445,9 @@ int run(int argc, char** argv) {
                 fklConversion()};
     std::cout << "=== FKL vs PyTorch on the GPU (fkl-vs-pytorch)" << std::endl;
     std::vector<Result> results;
-    forEachBatch([&]<size_t N>() { runBatch<N>(ctx, results); });
+    // Every batch's validation and latency first, then every batch's GPU time: no profiler session before a latency
+    forEachBatch([&]<size_t N>() { latencyBatch<N>(ctx, results); });
+    forEachBatch([&]<size_t N>() { gpuOnlyBatch<N>(ctx, results); });
 
     std::ofstream latency(outDir / "latency.csv");
     latency << "implementation,N,median_us,p10_us,p90_us,iterations,max_abs_err,kernels_launched,mean_us,"
@@ -404,7 +457,7 @@ int run(int argc, char** argv) {
                      "non_finite_values,max_abs_err_vs_float_reference,values_beyond_1e-3,values,tolerance,"
                      "within_tolerance\n";
     std::ofstream kernels(outDir / "kernels.csv");
-    kernels << "implementation,N,kernels,memsets,memcpys\n";
+    kernels << "implementation,N,kernels,memsets,memcpys,device_mallocs_in_timed_iterations\n";
     std::ofstream gpuTime(outDir / "gpu_time.csv");
     gpuTime << "implementation,N,gpu_median_us,gpu_p10_us,gpu_p90_us,gpu_mean_us,iterations,kernels_launched,"
             << FKL_BVF << "_mean_gpu_speedup,span_median_us,memcpys,memsets\n";
@@ -426,7 +479,7 @@ int run(int argc, char** argv) {
                           << (validation::withinTolerance(e, TOLERANCE) ? "yes" : "no") << "\n";
         }
         kernels << r.name << "," << r.batch << "," << r.counts.kernels << "," << r.counts.memsets << ","
-                << r.counts.memcpys << "\n";
+                << r.counts.memcpys << "," << r.timedSegmentAllocations << "\n";
         gpuTime << r.name << "," << r.batch << "," << std::fixed << std::setprecision(2) << r.gpuTiming.median << ","
                 << r.gpuTiming.p10 << "," << r.gpuTiming.p90 << "," << r.gpuTiming.mean << "," << TIMED_ITERS << ","
                 << r.counts.kernels << ",";

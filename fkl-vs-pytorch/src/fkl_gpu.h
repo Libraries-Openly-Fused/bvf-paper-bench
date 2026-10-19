@@ -71,6 +71,9 @@ std::string parArchName();
 // The GPU, the GPU runtime and the compiler and flags of FKL's code, for the platform file
 std::string describeGpuAndFkl();
 
+// The PCI bus ID of the current device (cudaDeviceGetPCIBusId / hipDeviceGetPCIBusId), as nvidia-smi --id takes it
+std::string gpuPciBusId();
+
 } // namespace bench::pytorch
 
 #endif // BVF_BENCH_PYTORCH_FKL_GPU_H

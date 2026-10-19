@@ -87,11 +87,14 @@ if { has_step opencv-cuda || has_step opencv-cpu; } && [ -z "${OpenCV_DIR:-}" ];
     exit 1
 fi
 TORCH_PREFIX=""
+TORCH_GPU=0
 if has_step pytorch; then
     TORCH_PREFIX=$("${TORCH_PYTHON:-}" -c 'import torch; print(torch.utils.cmake_prefix_path)' 2>/dev/null) || {
         echo "Set TORCH_PYTHON to the Python of the environment with PyTorch (the pytorch step needs it)" >&2
         exit 1
     }
+    # Whether the wheel has a GPU backend, and so the GPU program must be built
+    TORCH_GPU=$("$TORCH_PYTHON" -c 'import torch; print(int(bool(torch.version.cuda or torch.version.hip)))')
 fi
 # Every size has its own build, results and log paths, so a size listed twice would overwrite its first measurements
 seen=" "
@@ -174,13 +177,19 @@ if has_step pytorch; then
     build=$BUILD_ROOT/build-pytorch
     out=$RESULTS/fkl-vs-pytorch
     echo "  fkl-vs-pytorch ($build)"
+    # Torch_DIR at every configure: a build folder configured with another environment follows TORCH_PYTHON
     configure "$REPO/fkl-vs-pytorch" "$build" -DBENCH_REGIONS=mixed -DCMAKE_CXX_COMPILER="$CPU_CXX" \
-              -DCMAKE_PREFIX_PATH="$TORCH_PREFIX"
+              -DCMAKE_PREFIX_PATH="$TORCH_PREFIX" -DTorch_DIR="$TORCH_PREFIX/Torch"
     run "$LOGS/benchmark_pytorch_cpu.log" env -u GOMP_SPINCOUNT "$build/benchmark_pytorch_cpu" "$out/cpu"
     # CMake removes the GPU program of an earlier configuration that does not build it (BENCH_PYTORCH_GPU=OFF, or a
-    # LibTorch without a GPU backend), so it exists exactly when this one built it
+    # LibTorch without a GPU backend), so it exists exactly when this one built it; a LibTorch with a GPU backend must
+    # have built it
     if [ -x "$build/benchmark_pytorch_gpu" ]; then
         run "$LOGS/benchmark_pytorch_gpu.log" "$build/benchmark_pytorch_gpu" "$out/gpu"
+    elif [ "$TORCH_GPU" = 1 ]; then
+        echo "LibTorch has a GPU backend (torch.version.cuda or torch.version.hip), but $build has no" \
+             "benchmark_pytorch_gpu (BENCH_PYTORCH_GPU=OFF in CMAKE_ARGS?)" >&2
+        exit 1
     fi
 fi
 if has_step nppdx; then

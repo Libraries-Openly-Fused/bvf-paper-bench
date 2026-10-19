@@ -235,4 +235,17 @@ std::string describeGpuAndFkl() {
     return os.str();
 }
 
+std::string gpuPciBusId() {
+    int device = 0;
+    char busId[64] = {};
+#if defined(__HIPCC__)
+    gpuErrchk(hipGetDevice(&device));
+    gpuErrchk(hipDeviceGetPCIBusId(busId, sizeof(busId), device));
+#else
+    gpuErrchk(cudaGetDevice(&device));
+    gpuErrchk(cudaDeviceGetPCIBusId(busId, sizeof(busId), device));
+#endif
+    return busId;
+}
+
 } // namespace bench::pytorch

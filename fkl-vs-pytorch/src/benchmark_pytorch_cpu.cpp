@@ -43,6 +43,12 @@ namespace bench::cpu {
 struct Check {
     size_t batch, iteration;
     float fklVsReference, pytorchVsReference, pytorchVsFkl, fklMultithreadVsFkl, pytorchThreadsVsOneThread;
+    // What the program requires (withinTolerance): FKL and PyTorch against the references of their conventions, FKL's
+    // pool against FKL, and PyTorch on `threads` threads against PyTorch on one
+    bool passed() const {
+        return withinTolerance(fklVsReference) && withinTolerance(pytorchVsReference) &&
+               withinTolerance(fklMultithreadVsFkl) && withinTolerance(pytorchThreadsVsOneThread);
+    }
 };
 
 template <size_t N>
@@ -73,11 +79,12 @@ void runBatch(Workload& w, std::vector<Row>& singleThread, std::vector<Row>& mul
                       maxAbsError(torchOut, fklOut), maxAbsError(fklMT->output(), fklOut),
                       maxAbsError(torchThreadsOut, torchOut)};
         checks.push_back(c);
-        worst = Check{N, t, std::max(worst.fklVsReference, c.fklVsReference),
-                      std::max(worst.pytorchVsReference, c.pytorchVsReference),
-                      std::max(worst.pytorchVsFkl, c.pytorchVsFkl),
-                      std::max(worst.fklMultithreadVsFkl, c.fklMultithreadVsFkl),
-                      std::max(worst.pytorchThreadsVsOneThread, c.pytorchThreadsVsOneThread)};
+        // std::max keeps a NaN only as its first argument: the error goes first
+        worst = Check{N, t, std::max(c.fklVsReference, worst.fklVsReference),
+                      std::max(c.pytorchVsReference, worst.pytorchVsReference),
+                      std::max(c.pytorchVsFkl, worst.pytorchVsFkl),
+                      std::max(c.fklMultithreadVsFkl, worst.fklMultithreadVsFkl),
+                      std::max(c.pytorchThreadsVsOneThread, worst.pytorchThreadsVsOneThread)};
     }
     const Check& c = worst;
 
@@ -156,10 +163,13 @@ int main(int argc, char** argv) {
         v << "Batch size, Iteration, FKL MaxAbsError vs FKL-convention reference, PyTorch MaxAbsError vs "
              "pixel-center reference, PyTorch vs FKL MaxAbsDifference, FKL CPU_MULTITHREAD vs FKL CPU "
              "MaxAbsDifference, PyTorch "
-          << threads << " threads vs PyTorch 1 thread MaxAbsDifference" << std::endl;
+          << threads << " threads vs PyTorch 1 thread MaxAbsDifference, Within tolerance" << std::endl;
+        bool passed = true;
         for (const auto& c : checks) {
             v << c.batch << ", " << c.iteration << ", " << c.fklVsReference << ", " << c.pytorchVsReference << ", "
-              << c.pytorchVsFkl << ", " << c.fklMultithreadVsFkl << ", " << c.pytorchThreadsVsOneThread << std::endl;
+              << c.pytorchVsFkl << ", " << c.fklMultithreadVsFkl << ", " << c.pytorchThreadsVsOneThread << ", "
+              << (c.passed() ? "yes" : "no") << std::endl;
+            passed &= c.passed();
         }
         writeRegionStats((outDir / "regions.csv").string(), *w.regions, WARMUP_ITERS, ITERS);
         std::ofstream(outDir / "pytorch_build_information.txt") << at::show_config() << "\n" << at::get_parallel_info();
@@ -174,12 +184,18 @@ int main(int argc, char** argv) {
           << "and each of FKL's CPU_MULTITHREAD workers " << spin.fklBusyUs << " us per run (1 region): work plus spin "
           << "before sleeping (libgomp's default spin is kept)\n"
           << "PyTorch pipeline: per region, views of the region's luma and chroma planes, chroma to float and addmm "
-             "with FKL's chroma coefficients and every offset folded into the bias, luma to float and a broadcast "
-             "add with its coefficient (chroma replicated to 2x2 pixels), interpolate (bilinear, align_corners=false: "
+             "with FKL's chroma coefficients and every offset folded into the bias, a broadcast add of the 8-bit luma "
+             "with its coefficient (chroma replicated to 2x2 pixels; the add converts the luma), interpolate "
+             "(bilinear, align_corners=false: "
              "pixel-center sampling) and a copy into its output plane; per iteration the border rows set to 0 and "
              "mul_, sub_, div_ on the whole N x 64 x 64 x 3 tensor\n";
         writeCpuPlatform(p, threads);
         std::cout << "Results written to " << std::filesystem::absolute(outDir) << std::endl;
+        if (!passed) {
+            throw std::runtime_error("validation failed (FKL or PyTorch against its reference, FKL's pool against FKL, "
+                                     "or PyTorch on " + std::to_string(threads) + " threads against PyTorch on one, "
+                                     "beyond the tolerance): see cpu_validation.csv");
+        }
     } catch (const std::exception& e) {
         std::cerr << "ERROR: " << e.what() << std::endl;
         return 1;

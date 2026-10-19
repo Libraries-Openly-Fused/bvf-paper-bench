@@ -16,10 +16,15 @@ set_property(CACHE BENCH_PYTORCH_GPU PROPERTY STRINGS AUTO OFF)
 set(CUDA_ARCH "native" CACHE STRING "CUDA architectures of FKL's code, passed verbatim to CUDA_ARCHITECTURES")
 set(HIP_ARCH "gfx1200" CACHE STRING "HIP architecture of FKL's code (one target)")
 
-# The wheel's full version (with its CUDA or ROCm variant) and git commit, from its version.py, next to the CMake files
-# of the LibTorch that find_package(Torch) finds
-find_path(BENCH_TORCH_CONFIG_DIR TorchConfig.cmake PATH_SUFFIXES Torch REQUIRED)
-file(STRINGS "${BENCH_TORCH_CONFIG_DIR}/../../../version.py" TORCH_VERSION_LINES REGEX "^(__version__|git_version|cuda|hip)[: ]")
+# LibTorch's CMake folder (<wheel>/share/cmake/Torch): Torch_DIR if given (scripts/run_all.sh gives it at every
+# configure, so that a build folder follows TORCH_PYTHON), otherwise the one in CMAKE_PREFIX_PATH. find_package(Torch)
+# uses the same folder.
+if(NOT Torch_DIR)
+    find_path(torchConfigDir TorchConfig.cmake PATH_SUFFIXES Torch NO_CACHE REQUIRED)
+    set(Torch_DIR "${torchConfigDir}" CACHE PATH "LibTorch's CMake folder (<wheel>/share/cmake/Torch)")
+endif()
+# The wheel's full version (with its CUDA or ROCm variant) and git commit, from its version.py, next to those CMake files
+file(STRINGS "${Torch_DIR}/../../../version.py" TORCH_VERSION_LINES REGEX "^(__version__|git_version|cuda|hip)[: ]")
 set(BENCH_TORCH_VERSION "")
 set(BENCH_TORCH_CUDA FALSE)
 foreach(line IN LISTS TORCH_VERSION_LINES)
@@ -79,7 +84,13 @@ if(BENCH_GPU_LANGUAGE)
         set_target_properties(fkl_gpu PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON
                                                  CUDA_ARCHITECTURES "${CUDA_ARCH}" CUDA_RUNTIME_LIBRARY Shared)
         set(BENCH_GPU_COMPILER "nvcc ${CMAKE_CUDA_COMPILER_VERSION}")
-        set(BENCH_GPU_ARCH "CUDA_ARCHITECTURES ${CUDA_ARCH}")
+        # native: the architectures CMake found, as common/bench_gpu.cmake records them
+        if(CUDA_ARCH STREQUAL "native")
+            string(REPLACE ";" " " nativeList "${CMAKE_CUDA_ARCHITECTURES_NATIVE}")
+            set(BENCH_GPU_ARCH "CUDA_ARCHITECTURES native (${nativeList})")
+        else()
+            set(BENCH_GPU_ARCH "CUDA_ARCHITECTURES ${CUDA_ARCH}")
+        endif()
         set(BENCH_GPU_LANGUAGE_FLAGS "${CMAKE_CUDA_FLAGS} ${CMAKE_CUDA_FLAGS_RELEASE}")
     else()
         # LibTorch's CMake for ROCm has enabled HIP with its compiler and set CMAKE_HIP_ARCHITECTURES to its
@@ -95,7 +106,19 @@ if(BENCH_GPU_LANGUAGE)
     endif()
     target_compile_options(fkl_gpu PRIVATE $<$<COMPILE_LANGUAGE:${BENCH_GPU_LANGUAGE}>:${BENCH_GPU_OPTIONS}>)
     string(JOIN " " BENCH_GPU_OPTIONS_STR ${BENCH_GPU_OPTIONS})
-    set(BENCH_GPU_FLAGS "${BENCH_GPU_LANGUAGE_FLAGS} -std=c++20 ${BENCH_GPU_OPTIONS_STR}, ${BENCH_GPU_ARCH}")
+    # The C++20 option CMake passes: with the language's extensions (its default, unless CMAKE_<LANG>_EXTENSIONS is
+    # set) the GNU dialect where the compiler has one (clang for HIP: -std=gnu++20; nvcc: -std=c++20 either way)
+    set(extensions ${CMAKE_${BENCH_GPU_LANGUAGE}_EXTENSIONS_DEFAULT})
+    if(DEFINED CMAKE_${BENCH_GPU_LANGUAGE}_EXTENSIONS)
+        set(extensions ${CMAKE_${BENCH_GPU_LANGUAGE}_EXTENSIONS})
+    endif()
+    if(extensions)
+        set(BENCH_GPU_DIALECT "${CMAKE_${BENCH_GPU_LANGUAGE}20_EXTENSION_COMPILE_OPTION}")
+    else()
+        set(BENCH_GPU_DIALECT "${CMAKE_${BENCH_GPU_LANGUAGE}20_STANDARD_COMPILE_OPTION}")
+    endif()
+    set(BENCH_GPU_FLAGS
+        "${BENCH_GPU_LANGUAGE_FLAGS} ${BENCH_GPU_DIALECT} ${BENCH_GPU_OPTIONS_STR}, ${BENCH_GPU_ARCH}")
     # The flags become a string literal: CMake's Windows defaults have double quotes (-Xcompiler=" /GR /EHsc"), and a
     # list of architectures (-DCUDA_ARCH='89;120') has semicolons, which would split the compile definition
     string(REPLACE "\"" "'" BENCH_GPU_FLAGS "${BENCH_GPU_FLAGS}")

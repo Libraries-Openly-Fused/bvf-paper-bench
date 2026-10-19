@@ -594,7 +594,7 @@ if(BENCHMARKS STREQUAL "cpu")
         get_torch(cpu TORCH_PREFIX)
         if(TORCH_PREFIX)
             build_benchmark(pytorch-cpu "${REPO}/fkl-vs-pytorch" -DBENCH_REGIONS=mixed -DBENCH_PYTORCH_GPU=OFF
-                            "-DCMAKE_PREFIX_PATH=${TORCH_PREFIX}")
+                            "-DCMAKE_PREFIX_PATH=${TORCH_PREFIX}" "-DTorch_DIR=${TORCH_PREFIX}/Torch")
             run(benchmark_pytorch_cpu COMMAND "${BUILD_DIR}/pytorch-cpu/benchmark_pytorch_cpu" "${OUT_DIR}/fkl-vs-pytorch/cpu")
             # PyTorch on as many threads as FKL's pool has workers against PyTorch on one: the column is named after
             # the runner's thread count
@@ -648,7 +648,7 @@ else()
         get_torch(cu132 TORCH_PREFIX)
         if(TORCH_PREFIX)
             build_benchmark(pytorch-gpu "${REPO}/fkl-vs-pytorch" ${cudaOptions} -DBENCH_REGIONS=mixed
-                            "-DCMAKE_PREFIX_PATH=${TORCH_PREFIX}")
+                            "-DCMAKE_PREFIX_PATH=${TORCH_PREFIX}" "-DTorch_DIR=${TORCH_PREFIX}/Torch")
             set(out "${OUT_DIR}/fkl-vs-pytorch/gpu")
             run(benchmark_pytorch_gpu COMMAND "${BUILD_DIR}/pytorch-gpu/benchmark_pytorch_gpu" "${out}")
             check_csv("${out}/validation.csv" within_tolerance yes)
