@@ -11,13 +11,9 @@
 // ROI arguments of its calls at the ROI arrays of t.
 //
 //   rpp*:   RPP has no NV12 conversion on its HOST backend (rppt_yuv_to_rgb is HIP only), so every RPP HOST pipeline
-//           starts with FKL's CPU conversion to 8 bit RGB (the first kernel of the GPU benchmark's FKL VF+HF:
-//           normalize, add half a level, saturate, denormalize to uchar3), on one thread (ParArch::CPU) for the 1 thread
-//           runs and on FKL's thread pool (ParArch::CPU_MULTITHREAD) for the all threads runs: of the full frame
-//           (rpp_frame), or of only the N crops of the iteration (rpp_crop: one executeOperations per region size,
-//           batched over the crops of that size, Crop fused into the read, each crop written at its own position in
-//           the RGB frame; FklRgb8::runCrops says why not one call over all the crops). The calls after
-//           the conversion are the same in both forms: they read the crops of the frame through their ROIs. Then the
+//           starts with FKL's CPU conversion of the full frame to 8 bit RGB (the first kernel of the GPU benchmark's
+//           FKL VF+HF: normalize, add half a level, saturate, denormalize to uchar3), on one thread (ParArch::CPU) for
+//           the 1 thread runs and on FKL's thread pool (ParArch::CPU_MULTITHREAD) for the all threads runs. Then the
 //           same RPP variants as the GPU benchmark (rocm/src/rocm_bench.hip), with RPP_HOST_BACKEND:
 //             rpp                 rppt_crop_mirror_normalize 8u -> 32f (one batched call, all batch images aliasing
 //                                 the RGB frame, into a crop buffer of one slot of the largest region size per region),
@@ -36,17 +32,15 @@
 //           RPP's HOST backend parallelizes over the batch images with OpenMP; it is timed with 1 thread and with all
 //           the hardware threads (numThreads of rppCreate).
 // Two comparisons, each with the same number of threads on both sides, as in fkl-vs-opencv-cpu: RPP with 1 thread
-// against fkl, and RPP with all the hardware threads against fkl mt, each with the chosen RPP pipeline (chosen by a
-// selection pass with the per-crop conversion) in both forms of its conversion (rpp_frame, rpp_crop); per N and thread
-// count the faster form is the reported RPP pipeline (rpp_frame on a tie).
+// against fkl, and RPP with all the hardware threads against fkl mt.
 //   fkl:    one executeOperations<TransformDPP<ParArch::CPU>> call with the whole chain (BVF), on one thread.
 //   fkl mt: the same call with TransformDPP<ParArch::CPU_MULTITHREAD> on FKL's thread pool (one worker per hardware
 //           thread), in chunks of one output row of one region.
 //
-// The two libraries never run at the same time: for every N and thread count, RPP's complete loops (warm-up and timed
-// iterations; rpp_frame's, then rpp_crop's) run first, then FKL's on the same regions. FKL's speedup is the mean over
-// the timed iterations of (RPP time / FKL time) of the same iteration, which pairs runs on identical inputs; every pair
-// is in the *_per_iteration.csv files. Both libraries' thread pools spin for a while after finishing before their workers go to
+// The two libraries never run at the same time: for every N and thread count, RPP's complete loop (warm-up and timed
+// iterations) runs first, then FKL's on the same regions. FKL's speedup is the mean over the timed iterations of
+// (RPP time / FKL time) of the same iteration, which pairs runs on identical inputs; every pair is in the
+// *_per_iteration.csv files. Both libraries' thread pools spin for a while after finishing before their workers go to
 // sleep, so every timed run is preceded by an idle gap that lets them fall asleep. The timing thread busy-waits the gap
 // instead of sleeping: a sleeping core enters its deepest C-state, and the run right after it then pays a wake-up whose
 // cost depends on each binary's code.
@@ -91,7 +85,6 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <tuple>
 #include <vector>
 
 #define RPP_CHECK(expr)                                                                                     \
@@ -210,15 +203,6 @@ size_t paperSizeIndex(int width, int height) {
                              " region is not of a paper size");
 }
 
-// FKL's pool workers spin FKL_POOL_SPIN after their last chunk before they sleep (fkl/thread-pool/include/ThreadPool.h).
-// The RPP all-threads pipeline starts with FKL's conversion on that pool, then RPP's OpenMP team runs on the same
-// hardware threads: the pool's spin is turned off before every timed run of it, and restored to FKL's default before
-// every timed run of FKL, both outside of the timing (before the idle gap)
-constexpr auto FKL_POOL_SPIN = std::chrono::microseconds(100);
-void fklPoolSpin(bool on) {
-    fk::cpuThreadPool().setSpinTime(on ? std::chrono::nanoseconds(FKL_POOL_SPIN) : std::chrono::nanoseconds(0));
-}
-
 // ------------------------------------------------------------------------------------------------
 // FKL's conversion of the full frame to 8 bit RGB, the first step of every RPP HOST pipeline
 // ------------------------------------------------------------------------------------------------
@@ -237,186 +221,9 @@ struct FklRgb8 {
             fk::PerThreadWrite<fk::ND::_2D, fk::uchar3>::build(rgb.ptr()));
         stream.sync();
     }
-    // Only the first N regions of iteration t, each converted at its own size and written at its own position in the
-    // frame: one executeOperations per region size, batched over the regions of that size (Crop fused backwards into the
-    // read, so only their pixels are read and converted; the writes are FKL's crops of rgb, Ptr2D::crop2D). Not
-    // one call over all the N crops: TransformDPP takes a batch's iteration space from its largest plane, with no bound
-    // per plane, so with mixed sizes every crop would be converted at the largest size and written past the smaller
-    // ones. Region i of iteration t has size regionSize(t, i) = REGION_SIZES[(i + t) % REGION_SIZE_COUNT], so how many
-    // regions have each size depends only on N and t % REGION_SIZE_COUNT, the phase: one instantiation per phase, chosen
-    // at run time. The rectangles and views of every iteration are computed by prepareCrops when the pipeline is
-    // created, as the ROIs are; inside the timing each batch copies those of iteration t. The same chain as run(), so
-    // every crop byte is the full-frame conversion's (perCropConversionCheck, which also checks that nothing outside the
-    // crops is written).
-    // On the thread pool (CPU_MULTITHREAD) the batches run one after the other with the pool spinning between them
-    // (FKL_POOL_SPIN), and its spin goes to 0 before the last one: the all-threads RPP pipeline turns the pool's spin off
-    // before every run, so that its workers sleep while RPP's OpenMP team runs after the conversion, and without the
-    // spin between the batches every batch would pay the pool's wake-up again (the split by size is FKL's, not RPP's).
-    // So the conversion pays one wake-up, after the idle gap, as the full-frame one does.
-    std::vector<fk::Rect> cropRects;
-    std::vector<fk::RawPtr<fk::ND::_2D, fk::uchar3>> cropViews;
-    size_t cropCount{0};
-    // The rectangles and views of the first n regions of every iteration, iteration t's at t * n, ordered by size, then
-    // by index
-    void prepareCrops(const RegionSets& sets, size_t n) {
-        cropCount = n;
-        cropRects.clear();
-        cropViews.clear();
-        const unsigned pitchBytes = rgb.dims().pitch;
-        for (size_t t = 0; t < sets.iterations(); ++t) {
-            for (size_t k = 0; k < REGION_SIZE_COUNT; ++k) {
-                for (size_t i = 0; i < n; ++i) {
-                    if ((i + t) % REGION_SIZE_COUNT != k) {
-                        continue;
-                    }
-                    const Region& r = sets.at(t, i);
-                    cropRects.push_back(fk::Rect(static_cast<unsigned>(r.x), static_cast<unsigned>(r.y), r.width,
-                                                 r.height));
-                    // FKL's own crop of the frame: a view of the region, with the frame's pitch, sharing its allocation
-                    cropViews.push_back(rgb.crop2D(fk::Point(static_cast<unsigned>(r.x), static_cast<unsigned>(r.y)),
-                                                   fk::PtrDims<fk::ND::_2D>(static_cast<unsigned>(r.width),
-                                                                            static_cast<unsigned>(r.height), pitchBytes))
-                                            .ptr());
-                }
-            }
-        }
-    }
-    template <size_t N>
-    void runCrops(const NV12Image& frame, size_t t) {
-        if (cropCount != N) {
-            throw std::runtime_error("The crops were prepared for another N");
-        }
-        (void)[&]<size_t... Ps>(std::index_sequence<Ps...>) {
-            return ((t % REGION_SIZE_COUNT == Ps ? (runCropsOfPhase<N, Ps>(frame, t), true) : false) || ...);
-        }(std::make_index_sequence<REGION_SIZE_COUNT>{});
-    }
-    // How many of the first N regions of an iteration of phase P have size k, where the first of them is in the order of
-    // prepareCrops, and the last size that has any
-    static constexpr size_t regionsOfSize(size_t n, size_t phase, size_t k) {
-        size_t count = 0;
-        for (size_t i = 0; i < n; ++i) {
-            count += (i + phase) % REGION_SIZE_COUNT == k;
-        }
-        return count;
-    }
-    static constexpr size_t firstOfSize(size_t n, size_t phase, size_t k) {
-        size_t first = 0;
-        for (size_t j = 0; j < k; ++j) {
-            first += regionsOfSize(n, phase, j);
-        }
-        return first;
-    }
-    static constexpr size_t lastSize(size_t n, size_t phase) {
-        size_t last = 0;
-        for (size_t k = 0; k < REGION_SIZE_COUNT; ++k) {
-            if (regionsOfSize(n, phase, k) > 0) {
-                last = k;
-            }
-        }
-        return last;
-    }
-    template <size_t N, size_t P>
-    void runCropsOfPhase(const NV12Image& frame, size_t t) {
-        [&]<size_t... Ks>(std::index_sequence<Ks...>) {
-            (runCropsOfSize<N, P, Ks>(frame, t), ...);
-        }(std::make_index_sequence<REGION_SIZE_COUNT>{});
-    }
-    template <size_t N, size_t P, size_t K>
-    void runCropsOfSize(const NV12Image& frame, size_t t) {
-        constexpr size_t C = regionsOfSize(N, P, K);
-        if constexpr (C > 0) {
-            constexpr size_t FIRST = firstOfSize(N, P, K);
-            std::array<fk::Rect, C> rects;
-            std::array<fk::RawPtr<fk::ND::_2D, fk::uchar3>, C> views;
-            std::copy_n(cropRects.begin() + t * N + FIRST, C, rects.begin());
-            std::copy_n(cropViews.begin() + t * N + FIRST, C, views.begin());
-            if constexpr (PA == fk::ParArch::CPU_MULTITHREAD) {
-                fk::cpuThreadPool().setSpinTime(K == lastSize(N, P) ? std::chrono::nanoseconds(0)
-                                                                    : std::chrono::nanoseconds(FKL_POOL_SPIN));
-            }
-            fk::executeOperations<fk::TransformDPP<PA>>(stream,
-                fk::ReadYUV<fk::PixelFormat::NV12>::build(frame),
-                YUVToRGB::build(),
-                fk::Crop<>::build(rects),
-                fk::NormalizePixel<fk::float3, fk::ColorDepth::p8bit>::build(),
-                fk::Add<fk::float3>::build(fk::make_set<fk::float3>(QUANTIZATION_OFFSET)),
-                fk::SaturateDenormalizePixel<fk::float3, fk::uchar3, fk::ColorDepth::p8bit>::build(),
-                fk::PerThreadWrite<fk::ND::_2D, fk::uchar3>::build(views));
-            // Finished before the next batch's spin setting (and, after the last, before the RPP calls read the frame)
-            stream.sync();
-        }
-    }
-    // Every byte of the frame to value (validation of the per-crop form, never timed)
-    void fill(uint8_t value) {
-        const auto raw = rgb.ptr();
-        std::memset(raw.data, value, static_cast<size_t>(raw.dims.pitch) * FRAME_H);
-    }
     uint8_t* data() { return reinterpret_cast<uint8_t*>(rgb.ptr().data); }
     unsigned pitch() const { return static_cast<unsigned>(rgb.ptr().dims.pitch); }
 };
-
-// The 8 bit RGB frame's bytes before validating a per-crop pipeline: a value outside the crops then stays this one, so a
-// call that read a pixel no crop converted would give an output off the reference
-constexpr uint8_t RGB_SENTINEL = 0x5A;
-
-// The NV12 -> RGB conversion of an RPP HOST pipeline: of the full frame, or of only the N crops of the iteration
-enum class Conversion { Frame, Crop };
-// The form the selection pass times the RPP variants with: the per-crop one, in which the RPP calls (the variant) are a
-// large share of the pipeline's time; with the full-frame conversion they are a few percent of it, and the ranking would
-// be set by the conversion's noise
-constexpr Conversion SELECTION_CONVERSION = Conversion::Crop;
-
-// FKL's per-crop conversion (FklRgb8::runCrops) against its full-frame one (FklRgb8::run), on the MAX_BATCH regions of
-// every validated timed iteration, each iteration into a frame of RGB_SENTINEL bytes: every byte of the crops must be the
-// full-frame conversion's, and every byte outside them must still be the sentinel. Throws otherwise; returns the summary
-// for cpu_platform.txt.
-template <fk::ParArch PA>
-std::string perCropConversionCheck(const Workload& w) {
-    FklRgb8<PA> full, crops;
-    full.run(*w.frame);
-    crops.prepareCrops(w.sets, MAX_BATCH);
-    const size_t pitch = full.pitch(), rowBytes = static_cast<size_t>(FRAME_W) * 3;
-    std::vector<uint8_t> inCrop(static_cast<size_t>(FRAME_W) * FRAME_H);
-    size_t count = 0, cropBytes = 0, differ = 0, outsideBytes = 0, outsideWritten = 0;
-    const auto validated = bench::validation::validatedIterations(ITERS);
-    for (const size_t v : validated) {
-        const size_t t = static_cast<size_t>(WARMUP_ITERS) + v;
-        crops.fill(RGB_SENTINEL);
-        crops.template runCrops<MAX_BATCH>(*w.frame, t);
-        std::fill(inCrop.begin(), inCrop.end(), uint8_t{0});
-        for (size_t i = 0; i < MAX_BATCH; ++i) {
-            const Region& r = w.sets.at(t, i);
-            for (int y = r.y; y < r.y + r.height; ++y) {
-                std::fill_n(inCrop.begin() + static_cast<size_t>(y) * FRAME_W + r.x, r.width, uint8_t{1});
-            }
-            ++count;
-        }
-        for (size_t y = 0; y < static_cast<size_t>(FRAME_H); ++y) {
-            const uint8_t* a = crops.data() + y * pitch;
-            const uint8_t* b = full.data() + y * pitch;
-            for (size_t x = 0; x < rowBytes; ++x) {
-                if (inCrop[y * FRAME_W + x / 3]) {
-                    ++cropBytes;
-                    differ += a[x] != b[x];
-                } else {
-                    ++outsideBytes;
-                    outsideWritten += a[x] != RGB_SENTINEL;
-                }
-            }
-        }
-    }
-    std::ostringstream os;
-    os << "FKL's per-crop conversion (" << fk::toStrView(PA) << ", one executeOperations per region size batched over "
-       << "the crops of that size, each crop written at its position in the frame) against its full-frame conversion, "
-       << "on the " << MAX_BATCH
-       << " regions of each of the " << validated.size() << " validated timed iterations (" << count << " crops): "
-       << differ << " of " << cropBytes << " crop bytes differ, " << outsideWritten << " of " << outsideBytes
-       << " bytes outside the crops written";
-    if (differ != 0 || outsideWritten != 0) {
-        throw std::runtime_error(os.str());
-    }
-    return os.str();
-}
 
 // ------------------------------------------------------------------------------------------------
 // RPP HOST pipelines. Buffers, descriptors and parameter tensors are created once, outside of the timing, and so are
@@ -450,7 +257,6 @@ struct RppHost {
     size_t n;
     Variant variant;
     unsigned threads;
-    Conversion conversion;
     rppHandle_t handle{};
     FklRgb8<PA> rgb8;
     int resizedPitch{alignUp(RES_W, RPP_PIXEL_ALIGN)};
@@ -460,8 +266,7 @@ struct RppHost {
     // The ROIs of every iteration, n per iteration: each region in the frame (crop_mirror_normalize and
     // resize_mirror_normalize) and in its slot of the crop buffer (resize)
     std::vector<RpptROI> allCropRois, allResizeRois;
-    // The ROIs of the iteration being run, in the arrays above, and its index: set by run(t)
-    size_t iteration{0};
+    // The ROIs of the iteration being run, in the arrays above: set by run(t)
     RpptROI* cropRois{nullptr};
     RpptROI* resizeRois{nullptr};
     std::vector<RpptROI> resizedRois;
@@ -475,12 +280,9 @@ struct RppHost {
     RpptDesc frameBatchDesc, cropDesc, resizedDesc, outInteriorDesc;
     RpptGenericDesc volumeDesc{}, rowsDesc{}, rowDesc{};
     std::vector<std::pair<std::string, std::function<void()>>> ops;
-    // The per-crop conversion of the iteration being run, for this pipeline's n (FKL's batches have a compile-time size)
-    std::function<void()> convertCrops;
 
-    RppHost(const Workload& workload, size_t batch, Variant v, unsigned numThreads,
-            Conversion c = Conversion::Frame)
-        : w(workload), n(batch), variant(v), threads(numThreads), conversion(c) {
+    RppHost(const Workload& workload, size_t batch, Variant v, unsigned numThreads)
+        : w(workload), n(batch), variant(v), threads(numThreads) {
         RPP_CHECK(static_cast<RppStatus>(rppCreate(&handle, 1, threads, nullptr, RppBackend::RPP_HOST_BACKEND)));
         const unsigned N = static_cast<unsigned>(n);
         cropped.assign(RPP_FRONT_SLACK_FLOATS + n * CROP_SLOT_FLOATS + RPP_SLACK_FLOATS, 0.f);
@@ -566,34 +368,8 @@ struct RppHost {
 
     ~RppHost() { rppDestroy(handle, RppBackend::RPP_HOST_BACKEND); }
 
-    // The pipeline's name: its variant, with "_crop" for the per-crop conversion
-    std::string name() const { return variantName(variant) + (conversion == Conversion::Crop ? "_crop" : ""); }
-
-    template <size_t... Is>
-    void bindCropConversion(std::index_sequence<Is...>) {
-        rgb8.prepareCrops(w.sets, n);
-        // Every page of the RGB frame touched now, outside the timing: the per-crop conversion writes only the crops, so
-        // without this its first runs would pay page faults (the full-frame conversion writes every page in its first run)
-        rgb8.fill(RGB_SENTINEL);
-        (void)((n == BATCHES[Is] ? (convertCrops = [this]() { rgb8.template runCrops<BATCHES[Is]>(*w.frame, iteration); },
-                                    true)
-                                 : false) ||
-               ...);
-        if (!convertCrops) {
-            throw std::runtime_error("No per-crop conversion for N = " + std::to_string(n));
-        }
-    }
-
-    // Before a validated run: the per-crop form's RGB frame to RGB_SENTINEL (never timed)
-    void prepareValidation() {
-        if (conversion == Conversion::Crop) {
-            rgb8.fill(RGB_SENTINEL);
-        }
-    }
-
     // The ROI arguments of the calls: the ROIs of iteration t
     void setIteration(size_t t) {
-        iteration = t;
         cropRois = allCropRois.data() + t * n;
         resizeRois = allResizeRois.data() + t * n;
     }
@@ -664,12 +440,7 @@ struct RppHost {
 
     void buildOps() {
         const auto add = [&](const std::string& name, std::function<void()> f) { ops.emplace_back(name, std::move(f)); };
-        if (conversion == Conversion::Frame) {
-            add("fkl_nv12_to_rgb8_full_frame", [this]() { rgb8.run(*w.frame); });
-        } else {
-            bindCropConversion(std::make_index_sequence<BATCHES.size()>{});
-            add("fkl_nv12_to_rgb8_per_crop", [this]() { convertCrops(); });
-        }
+        add("fkl_nv12_to_rgb8_full_frame", [this]() { rgb8.run(*w.frame); });
         switch (variant) {
         case Variant::Rpp:
             add("rppt_crop_mirror_normalize_8u32f_batch", [this]() { cropConvert(); });
@@ -1124,30 +895,29 @@ std::vector<double> timeLoop(const std::function<void(size_t)>& run, const std::
     return ms;
 }
 
+// FKL's pool workers spin FKL_POOL_SPIN after their last chunk before they sleep (fkl/thread-pool/include/ThreadPool.h).
+// The RPP all-threads pipeline starts with FKL's conversion on that pool, then RPP's OpenMP team runs on the same
+// hardware threads: the pool's spin is turned off before every timed run of it, and restored to FKL's default before
+// every timed run of FKL, both outside of the timing (before the idle gap)
+constexpr auto FKL_POOL_SPIN = std::chrono::microseconds(100);
+void fklPoolSpin(bool on) {
+    fk::cpuThreadPool().setSpinTime(on ? std::chrono::nanoseconds(FKL_POOL_SPIN) : std::chrono::nanoseconds(0));
+}
 
-// One comparison row from the timed iterations of an RPP loop and of FKL's: the statistics and the mean of the
-// per-iteration speedups (iteration i of both on the same regions)
-Row makeRow(size_t batch, std::vector<double> rppMs, const std::vector<double>& fklMs) {
-    Row row{batch, stats(rppMs), stats(fklMs), 0., std::move(rppMs), fklMs};
+// RPP's complete loop, then FKL's: in both, warm-up iteration i runs the regions of iteration i and timed iteration i
+// those of iteration WARMUP_ITERS + i, so timed iteration i of RPP and of FKL ran on the same regions
+Row timeTwo(size_t batch, const std::function<void(size_t)>& rpp, const std::function<void(size_t)>& fkl,
+            const std::function<void()>& beforeRpp = {}, const std::function<void()>& beforeFkl = {}) {
+    Row row{batch, {}, {}, 0., timeLoop(rpp, beforeRpp, WARMUP_ITERS, ITERS), {}};
+    row.fklMs = timeLoop(fkl, beforeFkl, WARMUP_ITERS, ITERS);
     double speedup = 0.;
     for (int i = 0; i < ITERS; ++i) {
         speedup += row.rppMs[i] / row.fklMs[i];
     }
+    row.rpp = stats(row.rppMs);
+    row.fkl = stats(row.fklMs);
     row.meanSpeedup = speedup / ITERS;
     return row;
-}
-
-// The RPP pipeline's complete loop with the full-frame conversion, then with the per-crop conversion, then FKL's: in
-// all three, warm-up iteration i runs the regions of iteration i and timed iteration i those of iteration
-// WARMUP_ITERS + i, so timed iteration i of every loop ran on the same regions. Each form's row pairs its times with
-// FKL's loop.
-std::array<Row, 2> timeForms(size_t batch, const std::function<void(size_t)>& rppFrame,
-                             const std::function<void(size_t)>& rppCrop, const std::function<void(size_t)>& fkl,
-                             const std::function<void()>& beforeRpp = {}, const std::function<void()>& beforeFkl = {}) {
-    auto frameMs = timeLoop(rppFrame, beforeRpp, WARMUP_ITERS, ITERS);
-    auto cropMs = timeLoop(rppCrop, beforeRpp, WARMUP_ITERS, ITERS);
-    const auto fklMs = timeLoop(fkl, beforeFkl, WARMUP_ITERS, ITERS);
-    return {makeRow(batch, std::move(frameMs), fklMs), makeRow(batch, std::move(cropMs), fklMs)};
 }
 
 // One comparison in FKL's two-execution format (times in ms), one row per batch size, at path, and every timed
@@ -1188,68 +958,10 @@ void writeCSV(const std::filesystem::path& path, const std::string& rppLabel, co
     }
 }
 
-// The per-crop form of an RPP pipeline must give exactly the output of its full-frame form (the pipelines come in
-// pairs: full frame, then per crop) on the regions of every validated iteration: the crops' RGB bytes are the full-frame
-// conversion's and the RPP calls are the same. A per-crop pipeline that read a pixel no crop converted (its RGB frame
-// holds RGB_SENTINEL elsewhere when it is validated) would differ, and the run stops.
-template <typename Pipelines>
-void requireCropFormsMatchTheirFrameForms(const Pipelines& pipelines, size_t t) {
-    for (size_t j = 0; j + 1 < pipelines.size(); j += 2) {
-        const auto& frame = *pipelines[j];
-        const auto& crop = *pipelines[j + 1];
-        if (frame.conversion != Conversion::Frame || crop.conversion != Conversion::Crop || frame.variant != crop.variant) {
-            throw std::runtime_error("The RPP pipelines are not in full-frame / per-crop pairs");
-        }
-        const auto a = frame.outputValues(), b = crop.outputValues();
-        if (a.size() != b.size() || std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) != 0) {
-            throw std::runtime_error(crop.name() + " (" + std::to_string(crop.threads) + " threads): its output on the "
-                                     "regions of iteration " + std::to_string(t) + " is not exactly " + frame.name() +
-                                     "'s");
-        }
-    }
-}
-
-// Per operation breakdown of an RPP pipeline, after the comparisons of its N: its own loop of WARMUP_ITERS + ITERS
-// runs, as in the comparison (iteration i on the regions of iteration i, before() and the idle gap before every run),
-// every operation of every timed run timed on its own with steady_clock. The first operation is the conversion: in the
-// all-threads pipelines it also pays the wake-up of FKL's thread pool after the idle gap, which this cannot separate
-// from the conversion, as the first RPP call pays that of RPP's OpenMP team.
-struct OperationTiming {
-    unsigned threads;
-    size_t batch;
-    std::string implementation, operation;
-    Stats timing;
-};
-std::vector<OperationTiming> operationBreakdown;
-
-template <typename Pipeline>
-void measureOperations(Pipeline& p, const std::function<void()>& before) {
-    std::vector<std::vector<double>> ms(p.ops.size(), std::vector<double>(ITERS));
-    for (int i = 0; i < WARMUP_ITERS + ITERS; ++i) {
-        if (before) {
-            before();
-        }
-        idleGap();
-        p.setIteration(static_cast<size_t>(i));
-        for (size_t k = 0; k < p.ops.size(); ++k) {
-            const auto t0 = std::chrono::steady_clock::now();
-            p.ops[k].second();
-            const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-            if (i >= WARMUP_ITERS) {
-                ms[k][i - WARMUP_ITERS] = elapsed;
-            }
-        }
-    }
-    for (size_t k = 0; k < p.ops.size(); ++k) {
-        operationBreakdown.push_back({p.threads, p.n, p.name(), std::to_string(k + 1) + "_" + p.ops[k].first,
-                                      stats(ms[k])});
-    }
-}
-
-// The comparisons, each with the same number of threads on both sides: RPP 1 thread vs FKL CPU, RPP all threads vs FKL
-// CPU_MULTITHREAD, each with the RPP pipeline that the selection pass chose for that thread count, in both forms of
-// its conversion (full frame, per crop)
-enum Pairing { ONE_THREAD_FRAME, ONE_THREAD_CROP, ALL_THREADS_FRAME, ALL_THREADS_CROP, PAIRINGS };
+// The two comparisons of fkl-vs-opencv-cpu, each with the same number of threads on both sides: RPP 1 thread vs FKL
+// CPU, RPP all threads vs FKL CPU_MULTITHREAD, each with the RPP pipeline that the selection pass chose for that thread
+// count
+enum Pairing { ONE_THREAD_VS_CPU, ALL_THREADS_VS_MT, PAIRINGS };
 
 // ------------------------------------------------------------------------------------------------
 // Selection of the RPP pipeline, for each thread count (1 and all hardware threads). Every RPP variant runs the regions
@@ -1276,9 +988,8 @@ void selectionConfig(const Workload& w, unsigned threads, bool timing, const Ref
     constexpr size_t A = STABILITY_SEQUENCE.front();
     static_assert(STABILITY_SEQUENCE.back() == A, "The stability sequence runs the regions of A first and last");
     std::vector<std::unique_ptr<RppHost<PA>>> pipelines;
-    // The tail is selected with the per-crop conversion, the form in which the tail is a large share of the time
     for (const Variant v : VARIANTS) {
-        pipelines.push_back(std::make_unique<RppHost<PA>>(w, N, v, threads, SELECTION_CONVERSION));
+        pipelines.push_back(std::make_unique<RppHost<PA>>(w, N, v, threads));
     }
     std::vector<float> perOp; // rpp_per_op's output for the regions of A
     std::vector<SelectionRow> local;
@@ -1299,11 +1010,9 @@ void selectionConfig(const Workload& w, unsigned threads, bool timing, const Ref
         }
         // vs own reference (rppt_resize's or rppt_resize_mirror_normalize's convention), vs the RPP-convention reference
         // of rppt_resize (the column of cpu_validation.csv), vs FKL's float and 8 bit references
-        checks.push_back(makeCheck(w, N, A, "selection", pipelines[k]->name(), threads, out, refOwn, refA));
+        checks.push_back(makeCheck(w, N, A, "selection", variantName(VARIANTS[k]), threads, out, refOwn, refA));
         const Check& c = checks.back();
-        // The row names the variant (the check names the pipeline, with its conversion form)
-        SelectionRow r{threads, N, variantName(VARIANTS[k]), c.vsOwnReference, maxAbsError(out, perOp), sameOutput, false,
-                       {}};
+        SelectionRow r{threads, N, c.implementation, c.vsOwnReference, maxAbsError(out, perOp), sameOutput, false, {}};
         r.candidate = r.stable && r.vsOwnReference <= RPP_EQUIVALENCE && r.vsPerOp <= RPP_EQUIVALENCE;
         std::printf("N %3zu | %-20s %2u thread(s), regions of iteration %zu: max err vs its RPP-convention reference "
                     "%.2e (%s; first run %.2e, same output after iterations 1 and 2: %s), vs rpp_per_op %.2e, vs "
@@ -1416,30 +1125,24 @@ bool runBatch(const Workload& w, unsigned hardwareThreads, const std::vector<Var
               std::array<std::vector<Row>, PAIRINGS>& rows) {
     FklCpu<N> fkl(w);
     FklCpu<N, fk::ParArch::CPU_MULTITHREAD> fklMT(w);
-    // Every pipeline in both conversion forms: full frame, then per crop
     std::vector<std::unique_ptr<RppHost<fk::ParArch::CPU>>> rpp1;
     std::vector<std::unique_ptr<RppHost<fk::ParArch::CPU_MULTITHREAD>>> rppAll;
     for (const Variant v : oneThread) {
-        for (const Conversion c : {Conversion::Frame, Conversion::Crop}) {
-            rpp1.push_back(std::make_unique<RppHost<fk::ParArch::CPU>>(w, N, v, 1, c));
-        }
+        rpp1.push_back(std::make_unique<RppHost<fk::ParArch::CPU>>(w, N, v, 1));
     }
     for (const Variant v : allThreads) {
-        for (const Conversion c : {Conversion::Frame, Conversion::Crop}) {
-            rppAll.push_back(std::make_unique<RppHost<fk::ParArch::CPU_MULTITHREAD>>(w, N, v, hardwareThreads, c));
-        }
+        rppAll.push_back(std::make_unique<RppHost<fk::ParArch::CPU_MULTITHREAD>>(w, N, v, hardwareThreads));
     }
 
     // Validation, outside of the timing: the regions of timed iteration k are those of iteration WARMUP_ITERS + k
     const size_t firstCheck = checks.size();
     float mtVsCpu = 0.f;
     const auto validateRpp = [&](auto& p, size_t t, const References& refs) {
-        p.prepareValidation();
         p.run(t);
         if (!p.roisIntact(t)) {
-            throw std::runtime_error(p.name() + " modified the ROIs of iteration " + std::to_string(t));
+            throw std::runtime_error(variantName(p.variant) + " modified the ROIs of iteration " + std::to_string(t));
         }
-        checks.push_back(makeCheck(w, N, t, "sampled", p.name(), p.threads, p.outputValues(),
+        checks.push_back(makeCheck(w, N, t, "sampled", variantName(p.variant), p.threads, p.outputValues(),
                                    usesResizeMirrorNormalize(p.variant) ? refs.rppRmn : refs.rppResize, refs));
     };
     const auto sampled = bench::validation::validatedIterations(ITERS);
@@ -1460,8 +1163,6 @@ bool runBatch(const Workload& w, unsigned hardwareThreads, const std::vector<Var
         for (auto& p : rppAll) {
             validateRpp(*p, t, refs);
         }
-        requireCropFormsMatchTheirFrameForms(rpp1, t);
-        requireCropFormsMatchTheirFrameForms(rppAll, t);
     }
     // Summary per implementation over the validated iterations
     struct Summary {
@@ -1502,31 +1203,16 @@ bool runBatch(const Workload& w, unsigned hardwareThreads, const std::vector<Var
         return fklWithinTolerance;
     }
 
-    // The chosen pipeline of each thread count: its full-frame form (front), then its per-crop form
-    RppHost<fk::ParArch::CPU>& r1Frame = *rpp1[0];
-    RppHost<fk::ParArch::CPU>& r1Crop = *rpp1[1];
-    RppHost<fk::ParArch::CPU_MULTITHREAD>& rAllFrame = *rppAll[0];
-    RppHost<fk::ParArch::CPU_MULTITHREAD>& rAllCrop = *rppAll[1];
-    const auto one = timeForms(N, [&](size_t t) { r1Frame.run(t); }, [&](size_t t) { r1Crop.run(t); },
-                               [&](size_t t) { fkl.run(t); });
-    const auto all = timeForms(N, [&](size_t t) { rAllFrame.run(t); }, [&](size_t t) { rAllCrop.run(t); },
-                               [&](size_t t) { fklMT.run(t); }, [] { fklPoolSpin(false); }, [] { fklPoolSpin(true); });
-    rows[ONE_THREAD_FRAME].push_back(one[0]);
-    rows[ONE_THREAD_CROP].push_back(one[1]);
-    rows[ALL_THREADS_FRAME].push_back(all[0]);
-    rows[ALL_THREADS_CROP].push_back(all[1]);
-    std::printf("N %3zu | RPP 1 thread frame %9.1f us, crop %9.1f us vs FKL CPU %8.1f us (BVF mean speedup %6.2fx, "
-                "%6.2fx) | RPP %u threads frame %9.1f us, crop %9.1f us vs FKL CPU_MULTITHREAD %8.1f us (%6.2fx, "
-                "%6.2fx)\n", N, one[0].rpp.median * 1000., one[1].rpp.median * 1000., one[0].fkl.median * 1000.,
-                one[0].meanSpeedup, one[1].meanSpeedup, hardwareThreads, all[0].rpp.median * 1000.,
-                all[1].rpp.median * 1000., all[0].fkl.median * 1000., all[0].meanSpeedup, all[1].meanSpeedup);
-    // The per operation breakdown of the four RPP pipelines, with the comparisons' spin settings (FKL's pool does not
-    // spin before the all-threads runs; restored to FKL's default afterwards)
-    measureOperations(r1Frame, {});
-    measureOperations(r1Crop, {});
-    measureOperations(rAllFrame, [] { fklPoolSpin(false); });
-    measureOperations(rAllCrop, [] { fklPoolSpin(false); });
-    fklPoolSpin(true);
+    RppHost<fk::ParArch::CPU>& r1 = *rpp1.front();
+    RppHost<fk::ParArch::CPU_MULTITHREAD>& rAll = *rppAll.front();
+    rows[ONE_THREAD_VS_CPU].push_back(timeTwo(N, [&](size_t t) { r1.run(t); }, [&](size_t t) { fkl.run(t); }));
+    rows[ALL_THREADS_VS_MT].push_back(timeTwo(N, [&](size_t t) { rAll.run(t); }, [&](size_t t) { fklMT.run(t); },
+                                              [] { fklPoolSpin(false); }, [] { fklPoolSpin(true); }));
+    const Row& a = rows[ONE_THREAD_VS_CPU].back();
+    const Row& c = rows[ALL_THREADS_VS_MT].back();
+    std::printf("N %3zu | RPP 1 thread %9.1f us vs FKL CPU %8.1f us (BVF mean speedup %6.2fx) | RPP %u threads %9.1f us vs "
+                "FKL CPU_MULTITHREAD %8.1f us (%6.2fx)\n", N, a.rpp.median * 1000., a.fkl.median * 1000., a.meanSpeedup,
+                hardwareThreads, c.rpp.median * 1000., c.fkl.median * 1000., c.meanSpeedup);
     return true;
 }
 
@@ -1648,11 +1334,6 @@ int main(int argc, char** argv) {
         // The frame and the regions of every iteration of every loop, before anything runs
         Workload w;
         initWorkload(w);
-        // The per-crop conversion must be the full-frame one restricted to the crops, with both FKL backends
-        const std::string conversionCheck = perCropConversionCheck<fk::ParArch::CPU>(w) + "; " +
-                                            perCropConversionCheck<fk::ParArch::CPU_MULTITHREAD>(w);
-        fklPoolSpin(true); // the per-crop conversion leaves the pool's spin at 0
-        std::printf("%s\n", conversionCheck.c_str());
         writeRegionStats((outDir / "regions.csv").string(), w.sets, WARMUP_ITERS, ITERS);
         const SamplingTable resizeSampling = measureHostSampling(false);
         const SamplingTable rmnSampling = measureHostSampling(true);
@@ -1715,8 +1396,7 @@ int main(int argc, char** argv) {
             for (const size_t t : STABILITY_SEQUENCE) {
                 sel << "_" << t;
             }
-            sel << ",candidate,selection_median_ms,selection_p10_ms,selection_p90_ms,chosen,selection_iterations,"
-                   "selection_conversion\n";
+            sel << ",candidate,selection_median_ms,selection_p10_ms,selection_p90_ms,chosen,selection_iterations\n";
             for (const auto& r : selection) {
                 const bool chosen = r.variant == variantName(r.threads == 1 ? oneThread : allThreads);
                 sel << r.threads << "," << r.batch << "," << r.variant << "," << r.vsOwnReference << "," << r.vsPerOp << ","
@@ -1726,8 +1406,7 @@ int main(int argc, char** argv) {
                 } else {
                     sel << ",,";
                 }
-                sel << "," << (chosen ? "yes" : "no") << "," << SELECTION_ITERS << ","
-                    << (SELECTION_CONVERSION == Conversion::Crop ? "per_crop" : "full_frame") << "\n";
+                sel << "," << (chosen ? "yes" : "no") << "," << SELECTION_ITERS << "\n";
             }
         }
         // Validation of the sampled timed iterations and, unless validating only, the timing, N by N; after an FKL
@@ -1755,41 +1434,10 @@ int main(int argc, char** argv) {
             return 0;
         }
         const std::string all = std::to_string(hardwareThreads) + "threads";
-        writeCSV(outDir / "benchmark_cpu_rpp_frame_1thread_vs_fkl_bvf_CPU.csv", "RPP HOST frame 1 thread",
-                 rows[ONE_THREAD_FRAME], "FKL CPU");
-        writeCSV(outDir / "benchmark_cpu_rpp_crop_1thread_vs_fkl_bvf_CPU.csv", "RPP HOST crop 1 thread",
-                 rows[ONE_THREAD_CROP], "FKL CPU");
-        writeCSV(outDir / ("benchmark_cpu_rpp_frame_" + all + "_vs_fkl_bvf_CPU_MULTITHREAD.csv"),
-                 "RPP HOST frame " + all, rows[ALL_THREADS_FRAME], "FKL CPU_MULTITHREAD");
-        writeCSV(outDir / ("benchmark_cpu_rpp_crop_" + all + "_vs_fkl_bvf_CPU_MULTITHREAD.csv"),
-                 "RPP HOST crop " + all, rows[ALL_THREADS_CROP], "FKL CPU_MULTITHREAD");
-        {
-            std::ofstream b(outDir / "cpu_rpp_breakdown.csv");
-            b << "threads,N,implementation,operation,median_ms,p10_ms,p90_ms,mean_ms\n";
-            for (const auto& o : operationBreakdown) {
-                b << o.threads << "," << o.batch << "," << o.implementation << "," << o.operation << "," << o.timing.median
-                  << "," << o.timing.p10 << "," << o.timing.p90 << "," << o.timing.mean << "\n";
-            }
-        }
-        // The reported RPP pipeline per thread count and N: the conversion form with the lower median, the full frame
-        // on a tie
-        {
-            std::ofstream form(outDir / "cpu_rpp_conversion_form.csv");
-            form << "threads,N,implementation,conversion,median_ms,reported\n";
-            for (const auto& [threads, frameRows, cropRows, variant] :
-                 {std::tuple{1u, &rows[ONE_THREAD_FRAME], &rows[ONE_THREAD_CROP], oneThread},
-                  std::tuple{hardwareThreads, &rows[ALL_THREADS_FRAME], &rows[ALL_THREADS_CROP], allThreads}}) {
-                for (size_t i = 0; i < frameRows->size(); ++i) {
-                    const Row& f = (*frameRows)[i];
-                    const Row& c = (*cropRows)[i];
-                    const bool cropReported = c.rpp.median < f.rpp.median;
-                    form << threads << "," << f.batch << "," << variantName(variant) << ",full_frame," << f.rpp.median
-                         << "," << (cropReported ? "no" : "yes") << "\n";
-                    form << threads << "," << c.batch << "," << variantName(variant) << "_crop,per_crop," << c.rpp.median
-                         << "," << (cropReported ? "yes" : "no") << "\n";
-                }
-            }
-        }
+        writeCSV(outDir / "benchmark_cpu_rpp_1thread_vs_fkl_bvf_CPU.csv", "RPP HOST 1 thread", rows[ONE_THREAD_VS_CPU],
+                 "FKL CPU");
+        writeCSV(outDir / ("benchmark_cpu_rpp_" + all + "_vs_fkl_bvf_CPU_MULTITHREAD.csv"), "RPP HOST " + all,
+                 rows[ALL_THREADS_VS_MT], "FKL CPU_MULTITHREAD");
         const size_t validated = bench::validation::validatedIterations(ITERS).size();
         std::ofstream plat(outDir / "cpu_platform.txt");
         plat << "CPU: " << bench::cpuName() << ", " << std::thread::hardware_concurrency() << " hardware threads\n"
@@ -1819,31 +1467,13 @@ int main(int argc, char** argv) {
              << hardwareThreads << " threads runs. RPP pipeline: " << variantName(oneThread) << " with 1 thread, "
              << variantName(allThreads) << " with " << hardwareThreads << " threads, the fastest RPP variant numerically "
              << "equivalent (within " << RPP_EQUIVALENCE << ") to rpp_per_op and to its RPP-convention reference, chosen "
-             << "by a selection pass with the per-crop conversion, the form in which the RPP calls are a large share of "
-             << "the pipeline's time (cpu_rpp_breakdown.csv; with the full-frame conversion they are a few percent of it, "
-             << "and the conversion's noise would set the ranking) (each variant run on the regions of iterations 0, 1, 2 and 0 again, so that every "
+             << "by a selection pass (each variant run on the regions of iterations 0, 1, 2 and 0 again, so that every "
              << "slot of the crop buffer has held a region of every size: the two outputs of iteration 0 identical value "
              << "by value, the second within " << RPP_EQUIVALENCE << " of its reference and of rpp_per_op's; then every "
              << "candidate timed one after the other, each one's complete loop of " << SELECTION_WARMUP << " warm-up + "
              << SELECTION_ITERS << " iterations per N, iteration i with the regions of iteration i, lowest geometric "
              << "mean of the medians; "
-             << "cpu_rpp_selection.csv). That pipeline is measured in two forms of its conversion, each with its own "
-             << "loop and speedups: rpp_frame converts the full frame (FKL, one executeOperations), rpp_crop only the N "
-             << "crops of the iteration (FKL, one executeOperations per region size, batched over the crops of that "
-             << "size: Crop fused backwards into the read, so only the crops' pixels are read and converted, each crop "
-             << "written at its own position in the RGB frame; not one call over all the crops, because FKL's "
-             << "TransformDPP takes a batch's iteration space from its largest plane, with no bound per plane, so mixed "
-             << "sizes would convert every crop at the largest size and write past the smaller ones); the RPP calls "
-             << "after the conversion are the same in both forms. Per N and thread count, "
-             << "the form with the lower median is the reported RPP pipeline, rpp_frame on a tie "
-             << "(cpu_rpp_conversion_form.csv). Before rpp_crop is validated, its RGB frame is filled with the byte "
-             << static_cast<int>(RGB_SENTINEL) << ", and its output must be exactly rpp_frame's in every validated "
-             << "iteration (otherwise the run stops), so that a call reading a pixel no crop converted cannot go "
-             << "unnoticed. On the thread pool, rpp_crop's size batches run with the pool spinning between them and its "
-             << "spin goes to 0 before the last one, so the conversion pays one wake-up of the pool, as the full-frame "
-             << "one. The rectangles and views of every iteration's crops are computed when the pipeline is created. "
-             << conversionCheck
-             << ". "
+             << "cpu_rpp_selection.csv); only that pipeline is measured afterwards. "
              << "Variants: rpp_per_op (crop_mirror_normalize 8u->32f, memset of the output's border rows, resize into "
                 "the output rows, multiply_scalar, tensor_subtract_tensor, tensor_divide_tensor), rpp_npp_like (resized "
                 "regions in their own buffer, copied by crop), rpp_fused (memset of the border rows, "
@@ -1859,8 +1489,7 @@ int main(int argc, char** argv) {
                 "descriptor is "
              << MAX_REGION_W << "x" << MAX_REGION_H << ", the largest region size. "
                 "FKL's thread pool does not spin after the conversion of the RPP all-threads pipeline (setSpinTime(0) "
-                "before every timed run of it, outside of the timing; FKL's default 100 us before FKL's runs; rpp_crop's "
-                "conversion spins between its size batches and turns the spin off before the last one), so that its "
+                "before every timed run of it, outside of the timing; FKL's default 100 us before FKL's runs), so that its "
                 "workers do not compete with RPP's OpenMP team. "
                 "The crop buffer has one slot per region of the largest region size, "
              << MAX_REGION_W << "x" << MAX_REGION_H << " with rows of " << CROP_PITCH
@@ -1891,34 +1520,23 @@ int main(int argc, char** argv) {
                 "rppt_resize_mirror_normalize-based ones (rpp_fused, rpp_fused_normalize) differ at the last columns and "
                 "rows, each matching its own measured convention; the latter are therefore not numerically equivalent "
                 "to rpp_per_op and not candidates of the selection.\n"
-             << "Timing: steady_clock around each pipeline; for every N and thread count, RPP's loops (" << WARMUP_ITERS
-             << " warm-up and " << ITERS << " timed iterations; rpp_frame's, then rpp_crop's) run to completion "
-             << "first, then FKL's on the same "
+             << "Timing: steady_clock around each pipeline; for every N and thread count, RPP's loop (" << WARMUP_ITERS
+             << " warm-up and " << ITERS << " timed iterations) runs to completion first, then FKL's on the same "
              << "regions: the two libraries never run at the same time and never alternate within an iteration "
              << "(warm-up iteration i: the regions of iteration i; timed iteration i: those of iteration "
              << WARMUP_ITERS << " + i; regions.csv has their statistics). Every run is preceded by a "
              << std::chrono::milliseconds(IDLE_GAP).count()
              << " ms idle gap so that both thread pools are asleep, busy-waited by the timing thread (so that its core "
                 "does not enter a deep C-state). Speedup: mean over the timed iterations of (RPP time / FKL time) of the "
-                "same iteration (the *_per_iteration.csv files). Per operation breakdown (cpu_rpp_breakdown.csv, not "
-                "part of the comparison): after the comparisons of every N, each of the four RPP pipelines (both "
-                "conversion forms, 1 and all threads) runs its own loop of the same warm-up and timed iterations, with "
-                "the same idle gap and spin settings, every operation of every timed run timed on its own; in the "
-                "all-threads pipelines the conversion's time includes the wake-up of FKL's thread pool after the idle "
-                "gap, which cannot be separated from the conversion (as the first RPP call's includes that of RPP's "
-                "OpenMP team). "
+                "same iteration (the *_per_iteration.csv files). "
                 "Inside the timed region: FKL builds the whole chain from the regions of the iteration (Crop<>::build "
                 "of its N regions, every plane with its region's size and Resize with its own scale), fuses it and "
                 "executes it; RPP points the ROI arguments of its calls at the ROIs of the iteration and runs FKL's "
-                "conversion to 8 bit RGB (of the full frame, or of the iteration's crops: their precomputed rectangles "
-                "and views copied into the size batches and those calls built and fused inside the timing) and its "
-                "calls. Outside: the generation of the "
-                "regions of "
+                "conversion of the full frame to 8 bit RGB and its calls. Outside: the generation of the regions of "
                 "every iteration and their conversion to FKL rectangles and RPP ROIs (once per pipeline, when it is "
-                "created, before its first run), the idle gaps, the thread pool spin settings before every run (rpp_crop's "
-                "settings between its size batches are inside its timed conversion) and the validation.\n"
-             << "Validation: before the timing of every N, the six timed pipelines (RPP 1 thread and RPP "
-             << hardwareThreads << " threads, each in both conversion forms, FKL CPU, FKL CPU_MULTITHREAD) run the regions of the timed iterations k = " << sampledText()
+                "created, before its first run), the idle gaps, the thread pool spin settings and the validation.\n"
+             << "Validation: before the timing of every N, the four timed pipelines (RPP 1 thread, RPP " << hardwareThreads
+             << " threads, FKL CPU, FKL CPU_MULTITHREAD) run the regions of the timed iterations k = " << sampledText()
              << " (" << validated << (validated == 1 ? " iteration" : " iterations") << ": the first, every "
              << bench::validation::VALIDATION_STRIDE << "th and the last), those of iterations " << WARMUP_ITERS
              << " + k, and their outputs are compared with host references of those regions: FKL against the FKL float "

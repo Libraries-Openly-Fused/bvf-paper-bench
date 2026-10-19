@@ -23,8 +23,7 @@ iteration to its own arguments when it is created; inside the timed region there
 receive the regions of its iteration: for FKL, `build()` of its operations with the iteration's rectangles and the
 fusion, in every `executeOperations` call; for RPP, one `hipMemcpyAsync` of the iteration's ROIs from a pinned buffer
 to the device ROI tensors that its kernels read (the first operation of every RPP run, like NPP's descriptors in the
-CUDA benchmark); in the CPU benchmark's per-crop form of the conversion, FKL's precomputed rectangles and crops of the
-RGB frame, copied into the size batches. Region buffers (RPP's crop buffer, FKL VF+HF's crop tensor) have planes of the largest region,
+CUDA benchmark). Region buffers (RPP's crop buffer, FKL VF+HF's crop tensor) have planes of the largest region,
 48x24; RPP's calls take each region's size from its ROI, and FKL VF+HF's resize reads each plane through a view of
 its region's size.
 
@@ -149,37 +148,16 @@ or, after the build below, `./build-rocm/rocm_neighborhood ../results/rocm-neigh
 
 RPP's HOST backend against FKL's CPU backends, with the same number of threads on both sides: RPP with 1 thread
 against FKL's `ParArch::CPU`, and RPP with all hardware threads against FKL's `ParArch::CPU_MULTITHREAD`. For every
-N and thread count, RPP's complete loops run first (the chosen pipeline with each form of its conversion, below), then
-FKL's on the same regions, and every timed run is preceded by
+N and thread count, RPP's complete loop runs first, then FKL's on the same regions, and every timed run is preceded by
 a 1 ms idle gap that the timing thread busy-waits (a sleeping core would enter its deepest C-state, and the run after
 it would pay a wake-up whose cost depends on the binary). RPP's NV12 conversion is HIP only, so the RPP HOST pipelines
 get their 8 bit RGB frame from FKL's CPU conversion (one thread for the 1 thread runs, FKL's thread pool for the
-others), then one of the five RPP variants on the HOST backend: for each thread count, a selection pass with the
-per-crop conversion (below; the form in which the RPP calls are a large share of the pipeline's time, as
-`cpu_rpp_breakdown.csv` shows, while with the full-frame conversion they are a few percent of it and its noise would
-set the ranking) validates all of them (on the regions of iterations 0, 1, 2 and 0 again, so that every crop slot has held every size: the two outputs
+others), then one of the five RPP variants on the HOST backend: for each thread count, a selection pass validates all
+of them (on the regions of iterations 0, 1, 2 and 0 again, so that every crop slot has held every size: the two outputs
 of iteration 0 must be identical) and times the ones numerically equivalent to `rpp_per_op` (each one's complete
 loop of 10 warm-up + 100 iterations per N, iteration i on the regions of iteration i), and only the fastest is
-measured (`cpu_rpp_selection.csv`), in two forms of its conversion: `rpp_frame` (FKL's conversion of the full frame)
-and `rpp_crop` (FKL's conversion of only the N crops of the iteration, through FKL's own crop functionality: one
-`executeOperations` per region size, batched over the crops of that size, with FKL's `Crop` fused into the read and
-each crop written to FKL's crop of the RGB frame at its position (`Ptr2D::crop2D`); not one call over all the
-crops, because FKL's `TransformDPP` takes a batch's iteration space from its largest plane, with no bound per plane,
-so mixed sizes would convert every crop at the largest size and write past the smaller ones; on FKL's thread pool the
-size batches run with the pool spinning between them, its spin set to 0 before the last one, so the conversion pays
-one wake-up of the pool, as the full-frame one; the crops' rectangles and views are computed, and the RGB frame written
-once, when the pipeline is created). RPP's GPU conversion (`rppt_yuv_to_rgb`) has no ROI or crop parameter, so the GPU
-benchmark and Experiment 3 keep the full-frame conversion only. The program checks the per-crop conversion against the full-frame one first (every crop byte equal, nothing
-outside the crops written, with both FKL backends, in `cpu_platform.txt`), fills `rpp_crop`'s RGB frame with a
-sentinel byte before validating it, and stops if `rpp_crop`'s output is not exactly `rpp_frame`'s in every validated
-iteration.
-Outputs: `benchmark_cpu_rpp_<frame|crop>_1thread_vs_fkl_bvf_CPU.csv` and
-`benchmark_cpu_rpp_<frame|crop>_<T>threads_vs_fkl_bvf_CPU_MULTITHREAD.csv`, each with its `_per_iteration.csv`
-sibling (each form's loop paired with the same FKL loop), `cpu_rpp_conversion_form.csv` (per thread count and N, the
-form with the lower median is the reported RPP pipeline, `rpp_frame` on a tie) and `cpu_rpp_breakdown.csv` (after the comparisons of every N,
-each of the four RPP pipelines runs its own loop of the same iterations, with the same idle gap and spin settings, and
-every operation of every timed run is timed on its own; in the all-threads pipelines the conversion's time includes
-the wake-up of FKL's thread pool after the idle gap, which cannot be separated from the conversion). As on the GPU, the regions change every iteration:
+measured (`cpu_rpp_selection.csv`; outputs `benchmark_cpu_rpp_1thread_vs_fkl_bvf_CPU.csv` and
+`benchmark_cpu_rpp_<T>threads_vs_fkl_bvf_CPU_MULTITHREAD.csv`, each with its `_per_iteration.csv` sibling). As on the GPU, the regions change every iteration:
 each pipeline converts the regions of every iteration when it is created (RPP: its XYWH ROIs; FKL: its rectangles),
 and inside the timed region RPP's calls get the ROI arrays of the iteration (host memory, read by RPP on the host) and
 FKL builds its operations with the iteration's rectangles and fuses them. Validation, before the timing of each N and
@@ -262,8 +240,7 @@ measured execution exceeds the smallest of its three warm-up executions (the sam
 flushed) by more than 2 % and 256 KiB of traffic, up to `MAX_REPEATS` (3) rounds; the rejected profiles stay in
 `raw_rejected/` and `traffic_repeats.csv`, and `traffic.csv` has their count per row and whether a leak is still
 suspected. Duration on the paper's machine (bare metal, Ubuntu 26.04, Ryzen 7 5800X3D, RX 9060, performance level
-`STABLE_STD`), from `run_all.sh` started to finished, measured at `be2d5f9`, before the CPU benchmark's per-crop
-form of the conversion (which makes the CPU benchmark longer): the paper run of Experiment 1 and the CPU benchmark, with
+`STABLE_STD`), from `run_all.sh` started to finished: the paper run of Experiment 1 and the CPU benchmark, with
 `SKIP_COUNTERS=1`, 466 s, of which the builds 57 s (the GPU build also builds `rocm_neighborhood`), the GPU benchmark
 with its GPU time only passes 102 s and the CPU benchmark 306 s; Experiment 3's paper run (`EXPERIMENT=3`) 379 s, of
 which the build 47 s and `rocm_neighborhood` 331 s.
