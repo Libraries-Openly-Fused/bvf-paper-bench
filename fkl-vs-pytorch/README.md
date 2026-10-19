@@ -120,7 +120,9 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
   the gather and the resize have grains of their own (in the wheel's `libtorch_cpu.so`): `take` splits every 3000
   indices (1728 per region: 3, 10, 29 and 32 chunks at N = 4, 16, 50 and 100) and `grid_sample` every 4 regions (1, 4,
   13 and 25 chunks). With `addmm`, MKL's GEMM decides its own threading (`at::set_num_threads` sets MKL's thread count
-  too). FKL's thread pool splits the fused loop into one chunk per output row of each region.
+  too). Every split operator is a fork and join of PyTorch's whole OpenMP team (`#pragma omp parallel` without a thread
+  count, `ATen/ParallelOpenMP.h`), so on 32 threads one worker displaced by another thread on the machine delays the
+  whole run. FKL's thread pool splits the fused loop into one chunk per output row of each region.
 
 ## What PyTorch gets that FKL does not
 
@@ -133,9 +135,11 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
   the bias, and the luma term into one broadcast add; PyTorch's pipeline takes the variant that was fastest in the
   sweep before each comparison, per-region or batched (FKL's pipeline is its generic operations).
 - **Operands laid out for its CPU kernels.** The tail's constants are whole planes, so that `mul_`, `sub_` and `div_`
-  vectorize. A channel-planar formulation (RGB as 3 x h x w, so that the luma add vectorizes too) needs `interpolate`'s
-  NCHW output transposed into the interleaved output, and was slower on the CPU in development runs; it is not among
-  the variants, and the luma add keeps the 3 channels innermost.
+  vectorize. A channel-planar formulation of the per-region variants (RGB as 3 x h x w, `interpolate` on contiguous
+  NCHW) needs `interpolate`'s NCHW output transposed into the interleaved output; its broadcast add was faster than
+  the channels-last one on its own (its innermost loop is the 2 luma pixels of a chroma sample, not vectorized
+  either), but end to end it was slower on the CPU in development runs. It is not among the variants, and a planar
+  batched formulation was not measured.
 - **Few operators for an eager pipeline.** In the per-region variants, region views without copies (the batched ones
   copy every window in one `take`); in every variant two fills per iteration for every border instead of a pad per
   region, and in-place tail operators.
