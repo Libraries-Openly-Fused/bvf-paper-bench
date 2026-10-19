@@ -15,7 +15,7 @@ rows added on top and bottom (64x64), then `(x * mul - sub) / div` with ImageNet
 [`common/bench_geometry.h`](../common/bench_geometry.h) (see the [workload](../README.md#workload)); the other
 benchmarks mix the three sizes in every iteration, but NPPDx's kernels are compiled for one region size and resize
 ratio, so this folder is built for one of them, with the CMake option `BENCH_REGIONS` (`20x10`, `32x16`, the default,
-or `48x24`). In every iteration both pipelines run on the regions of that iteration: NPPDx gets their origins as a
+or `48x24`). Iteration t of each pipeline's loop runs on the regions of iteration t: NPPDx gets their origins as a
 kernel parameter and FKL their rectangles in its `build()` calls, both converted from the regions before the loops.
 
 NPPDx is a device-side library: it has no host API and no kernels of its own, so using it always means writing a
