@@ -96,8 +96,10 @@ if(BENCH_GPU_LANGUAGE)
     target_compile_options(fkl_gpu PRIVATE $<$<COMPILE_LANGUAGE:${BENCH_GPU_LANGUAGE}>:${BENCH_GPU_OPTIONS}>)
     string(JOIN " " BENCH_GPU_OPTIONS_STR ${BENCH_GPU_OPTIONS})
     set(BENCH_GPU_FLAGS "${BENCH_GPU_LANGUAGE_FLAGS} -std=c++20 ${BENCH_GPU_OPTIONS_STR}, ${BENCH_GPU_ARCH}")
-    # The flags become a string literal: CMake's Windows defaults have double quotes (-Xcompiler=" /GR /EHsc")
+    # The flags become a string literal: CMake's Windows defaults have double quotes (-Xcompiler=" /GR /EHsc"), and a
+    # list of architectures (-DCUDA_ARCH='89;120') has semicolons, which would split the compile definition
     string(REPLACE "\"" "'" BENCH_GPU_FLAGS "${BENCH_GPU_FLAGS}")
+    string(REPLACE ";" " " BENCH_GPU_FLAGS "${BENCH_GPU_FLAGS}")
     target_compile_definitions(fkl_gpu PRIVATE ${BENCH_GEOMETRY_DEFINITIONS}
         BENCH_FKL_COMMIT="${FKL_COMMIT}" BENCH_FKL_BRANCH="${FKL_BRANCH}"
         BENCH_GPU_COMPILER="${BENCH_GPU_COMPILER}" BENCH_GPU_FLAGS="${BENCH_GPU_FLAGS}")
@@ -113,4 +115,11 @@ if(BENCH_GPU_LANGUAGE)
     message(STATUS "GPU program: FKL's code as ${BENCH_GPU_LANGUAGE} (${BENCH_GPU_COMPILER}, ${BENCH_GPU_ARCH})")
 else()
     message(STATUS "GPU program not built: LibTorch has no GPU backend here, or BENCH_PYTORCH_GPU is OFF")
+    # A GPU program built by an earlier configuration of this build folder would be left behind, stale: removed, so
+    # that the program exists exactly when this configuration builds it
+    file(GLOB staleGpuPrograms "${CMAKE_CURRENT_BINARY_DIR}/benchmark_pytorch_gpu${CMAKE_EXECUTABLE_SUFFIX}"
+                               "${CMAKE_CURRENT_BINARY_DIR}/*/benchmark_pytorch_gpu${CMAKE_EXECUTABLE_SUFFIX}")
+    if(staleGpuPrograms)
+        file(REMOVE ${staleGpuPrograms})
+    endif()
 endif()

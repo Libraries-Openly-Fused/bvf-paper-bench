@@ -177,6 +177,8 @@ if has_step pytorch; then
     configure "$REPO/fkl-vs-pytorch" "$build" -DBENCH_REGIONS=mixed -DCMAKE_CXX_COMPILER="$CPU_CXX" \
               -DCMAKE_PREFIX_PATH="$TORCH_PREFIX"
     run "$LOGS/benchmark_pytorch_cpu.log" env -u GOMP_SPINCOUNT "$build/benchmark_pytorch_cpu" "$out/cpu"
+    # CMake removes the GPU program of an earlier configuration that does not build it (BENCH_PYTORCH_GPU=OFF, or a
+    # LibTorch without a GPU backend), so it exists exactly when this one built it
     if [ -x "$build/benchmark_pytorch_gpu" ]; then
         run "$LOGS/benchmark_pytorch_gpu.log" "$build/benchmark_pytorch_gpu" "$out/gpu"
     fi

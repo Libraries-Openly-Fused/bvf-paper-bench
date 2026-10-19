@@ -596,10 +596,22 @@ if(BENCHMARKS STREQUAL "cpu")
             build_benchmark(pytorch-cpu "${REPO}/fkl-vs-pytorch" -DBENCH_REGIONS=mixed -DBENCH_PYTORCH_GPU=OFF
                             "-DCMAKE_PREFIX_PATH=${TORCH_PREFIX}")
             run(benchmark_pytorch_cpu COMMAND "${BUILD_DIR}/pytorch-cpu/benchmark_pytorch_cpu" "${OUT_DIR}/fkl-vs-pytorch/cpu")
+            # PyTorch on as many threads as FKL's pool has workers against PyTorch on one: the column is named after
+            # the runner's thread count
+            set(validation "${OUT_DIR}/fkl-vs-pytorch/cpu/cpu_validation.csv")
+            set(threadsColumn "")
+            if(EXISTS "${validation}")
+                file(STRINGS "${validation}" header LIMIT_COUNT 1)
+                string(REGEX MATCH "PyTorch [0-9]+ threads vs PyTorch 1 thread MaxAbsDifference" threadsColumn
+                       "${header}")
+            endif()
+            if(NOT threadsColumn)
+                set(threadsColumn "PyTorch <threads> threads vs PyTorch 1 thread MaxAbsDifference")
+            endif()
             foreach(column IN ITEMS "FKL MaxAbsError vs FKL-convention reference"
                                     "PyTorch MaxAbsError vs pixel-center reference"
-                                    "FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference")
-                check_csv("${OUT_DIR}/fkl-vs-pytorch/cpu/cpu_validation.csv" "${column}" 1e-3)
+                                    "FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference" "${threadsColumn}")
+                check_csv("${validation}" "${column}" 1e-3)
             endforeach()
         endif()
     else()
