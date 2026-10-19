@@ -27,7 +27,7 @@
 //   - multiply, subtract and divide in place on the whole N x 64 x 64 x 3 output tensor.
 // Or, with the batched variants (ResizeInput::Batched), without a host loop over the regions: the region parameters
 // uploaded in one copy, the 48 x 24 window at every region's origin (the largest region size; the geometry draws every
-// position for that box) gathered with one take per plane, converted in one pass, and resized with one
+// position for that box) gathered with one take from the NV12 frame, converted in one pass, and resized with one
 // grid_sample whose grid holds each region's pixel-center coordinates, clamped to the region, so that the window's
 // pixels outside the region get no weight: interpolate's sampling, to float rounding.
 // The conversion matrix and offsets are FKL's (common/bench_pipeline.h's Conversion, filled by FKL's side):
@@ -134,14 +134,16 @@ public:
         }
         m_chromaU = m_chromaMatrix.select(0, 0);
         m_chromaV = m_chromaMatrix.select(0, 1);
-        // The offsets of a window's values from its first one, in the luma plane (bytes) and in the chroma plane (UV
-        // pairs, int16): row * pitch + column
+        // The offsets of a window's bytes in the NV12 frame from its first one, row * pitch + column: row 0 the
+        // 24 x 48 luma window, row 1 the 12 x 48 chroma window (24 UV pairs per row) twice, so that both rows have
+        // WINDOW_BYTES offsets and one take gathers both planes (the second copy is not used)
         const auto i64 = torch::TensorOptions().dtype(torch::kInt64).device(device);
-        m_lumaWindow = (torch::arange(MAX_REGION_H, i64).view({MAX_REGION_H, 1}) * FRAME_W +
-                        torch::arange(MAX_REGION_W, i64)).contiguous();
-        m_chromaWindow = (torch::arange(MAX_REGION_H / 2, i64).view({MAX_REGION_H / 2, 1}) * (FRAME_W / 2) +
-                          torch::arange(MAX_REGION_W / 2, i64)).contiguous();
-        m_chroma16 = frame.narrow(0, FRAME_H, FRAME_H / 2).view(torch::kInt16);
+        const torch::Tensor luma =
+            torch::arange(MAX_REGION_H, i64).view({-1, 1}) * FRAME_W + torch::arange(MAX_REGION_W, i64);
+        const torch::Tensor chroma =
+            torch::arange(MAX_REGION_H / 2, i64).view({-1, 1}) * FRAME_W + torch::arange(MAX_REGION_W, i64);
+        m_windowOffsets = torch::stack({luma.reshape({-1}), chroma.reshape({-1}).repeat({2})});
+        m_frame = frame;
         if (device.is_cpu()) {
             m_cpuParameters = torch::empty({static_cast<int64_t>(n * PARAMETER_BYTES)},
                                            torch::TensorOptions().dtype(torch::kUInt8));
@@ -202,7 +204,7 @@ public:
         m_out.narrow(1, 0, BORDER_TOP).zero_();
         m_out.narrow(1, BORDER_TOP + RES_H, BORDER_BOTTOM).zero_();
         // The parameters of the iteration's regions, written on the host and uploaded in one copy: per region the
-        // index of its window's first value in the luma plane and in the chroma plane (int64), then its grid
+        // index in the NV12 frame of its luma window's first byte and of its chroma window's (int64), then its grid
         // coordinates, RES_W x and RES_H y, normalized to the window (float). On the GPU the host buffer is pinned
         // memory from PyTorch's caching host allocator, which keeps it until the copy is done.
         const torch::Tensor host =
@@ -218,7 +220,7 @@ public:
                 throw std::runtime_error("The batched variants need every region's 48 x 24 window inside the frame");
             }
             starts[2 * i + 0] = static_cast<int64_t>(r.y) * FRAME_W + r.x;
-            starts[2 * i + 1] = static_cast<int64_t>(r.y / 2) * (FRAME_W / 2) + r.x / 2;
+            starts[2 * i + 1] = static_cast<int64_t>(FRAME_H + r.y / 2) * FRAME_W + r.x;
             // interpolate's source coordinate, (dst + 0.5) * (in / out) - 0.5 clamped at 0, also clamped at the
             // region's last pixel (interpolate's second tap there is that pixel itself), then normalized for
             // grid_sample with align_corners=false: (2 src + 1) / window size - 1
@@ -235,15 +237,14 @@ public:
             }
         }
         const torch::Tensor parameters = m_device.is_cpu() ? host : host.to(m_device, /*non_blocking=*/true);
-        const torch::Tensor first = parameters.narrow(0, 0, n * START_BYTES).view(torch::kInt64).view({n, 2, 1, 1});
+        const torch::Tensor first = parameters.narrow(0, 0, n * START_BYTES).view(torch::kInt64).view({n, 2, 1});
         const torch::Tensor grid1d =
             parameters.narrow(0, n * START_BYTES, n * COORDINATE_BYTES).view(torch::kFloat32).view({n, RES_W + RES_H});
-        // n x 24 x 48 luma and n x 12 x 24 x 2 chroma windows, 8-bit, each plane in one take (the values at the
-        // windows' indices: first value + the window's offsets)
-        const torch::Tensor luma = torch::take(m_luma, first.select(1, 0) + m_lumaWindow);
-        const torch::Tensor chroma = torch::take(m_chroma16, first.select(1, 1) + m_chromaWindow)
-                                         .view(torch::kUInt8)
-                                         .view({n, WH / 2, WW / 2, 2});
+        // The n x 24 x 48 luma and n x 12 x 24 x 2 chroma windows, 8-bit, in one take from the frame: the bytes at
+        // every window's first byte + the window's offsets, n x 2 x WINDOW_BYTES
+        const torch::Tensor windows = torch::take(m_frame, first + m_windowOffsets);
+        const torch::Tensor luma = windows.select(1, 0).view({n, WH, WW});
+        const torch::Tensor chroma = windows.select(1, 1).narrow(1, 0, WINDOW_BYTES / 2).view({n, WH / 2, WW / 2, 2});
         const torch::Tensor chromaTerms =
             m_variant.chromaTerms == ChromaTerms::Addcmul
                 ? torch::addcmul(m_bias, chroma.narrow(3, 0, 1), m_chromaU).addcmul_(chroma.narrow(3, 1, 1), m_chromaV)
@@ -278,12 +279,14 @@ private:
     static constexpr int64_t START_BYTES = 2 * sizeof(int64_t);
     static constexpr int64_t COORDINATE_BYTES = (RES_W + RES_H) * sizeof(float);
     static constexpr int64_t PARAMETER_BYTES = START_BYTES + COORDINATE_BYTES;
+    // The bytes of a luma window (and twice those of a chroma window)
+    static constexpr int64_t WINDOW_BYTES = MAX_REGION_W * MAX_REGION_H;
 
     size_t m_n;
     torch::Device m_device;
     torch::Tensor m_luma, m_chroma, m_chromaMatrix, m_bias, m_mul, m_sub, m_div, m_out;
     torch::Tensor m_chromaU, m_chromaV;
-    torch::Tensor m_chroma16, m_lumaWindow, m_chromaWindow, m_cpuParameters;
+    torch::Tensor m_frame, m_windowOffsets, m_cpuParameters;
     Variant m_variant{VARIANTS[0]};
     float m_lumaScale{0.f};
 };

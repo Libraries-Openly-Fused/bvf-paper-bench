@@ -51,7 +51,8 @@ machine, the CUDA runtime library both libraries load is the system's (CUDA 13.3
 - **parameters:** per region, the index of its window's first value in the luma and in the chroma plane and its grid
   coordinates, computed on the host and, on the GPU, uploaded in one copy from pinned memory;
 - **gather:** the 48 x 24 window at every region's origin (the largest region size: the geometry draws every position
-  for that box, so it is inside the frame) with one `take` per plane: N x 24 x 48 luma and N x 12 x 24 x 2 chroma;
+  for that box, so it is inside the frame) with one `take` from the NV12 frame, at the windows' byte indices (each
+  window's first byte + the window's offsets): N x 24 x 48 luma and N x 12 x 24 x 2 chroma;
 - **conversion:** the chroma terms (`addmm` or two `addcmul`) and the broadcast `add` on the whole batch;
 - **resize:** one `grid_sample` (bilinear, `align_corners=false`) on the N windows, with each region's pixel-center
   coordinates, `(dst + 0.5) * (in / out) - 0.5` clamped to the region's own first and last pixel, so that the
@@ -67,11 +68,11 @@ has the sweep and the choice, and the validation checks every variant.
 On the GPU, in the per-region variants, a region runs the chroma terms (two `addcmul` kernels, or `addmm`'s conversion
 and two cuBLASLt kernels), the add and the upsample kernels, and the copy: a kernel from the NCHW view, a device to
 device memcpy from the channels-last one (both contiguous). Each iteration adds 2 fills and the 3 element-wise kernels
-(with `addcmul` and NCHW: 5 N + 5 kernels per iteration). The batched variants run the same operators once, whatever
-N: the parameters' memcpy, 2 fills, 2 index additions and 2 `take` kernels, the chroma terms, the add, the grid's
-stack, `grid_sample`, the copy and the 3 element-wise kernels (with `addcmul`: 15 kernels and 1 memcpy per
-iteration; with `addmm` the conversion and cuBLASLt's GEMM, whose algorithm depends on N: 2 or 3 kernels, at some N a
-memset as well). `kernels.csv` has the kernel, memcpy and memset counts of the variant of the comparison.
+(with `addcmul` and NCHW: 5 N + 5 kernels per iteration). The batched variants run the same operators once, whatever N:
+the parameters' memcpy, 2 fills, the index addition and the `take`, the chroma terms, the add, the grid's stack,
+`grid_sample`, the copy and the 3 element-wise kernels (with `addcmul`: 13 kernels and 1 memcpy per iteration; with
+`addmm` the conversion and cuBLASLt's GEMM, whose algorithm depends on N: 2 or 3 kernels, at some N a memset as well).
+`kernels.csv` has the kernel, memcpy and memset counts of the variant of the comparison.
 
 **Sampling convention.** `interpolate` samples at pixel centers, `src = (dst + 0.5) * (in / out) - 0.5` clamped at 0.
 FKL samples at `src = dst * (in / out)` (fused_kernel's `resize.h`), and `align_corners=true` is a third convention.
@@ -96,24 +97,24 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
   on.
 - **Intermediates in memory.** Per region: the chroma terms, the h x w x 3 float RGB crop (in the batched variants the
   48 x 24 window, after the gathered 8-bit windows) and the resized 3 x 32 x 64 image; in the batched variants also the
-  grid; with `addmm` also the float chroma (on both devices), and on the CPU the float copies TensorIterator makes of
-  the 8-bit inputs (the luma, and with `addcmul` the U and V views). The output is written, then rewritten three times
-  by `mul_`, `sub_` and `div_`, plus the two border fills. FKL keeps everything in registers and writes each output
-  value once.
+  int64 byte indices of the windows (2 x 1152 per region, 18432 bytes), the grid (32 x 64 coordinate pairs) and, on the
+  GPU, the device copy of the parameters; with `addmm` also the float chroma (on both devices), and on the CPU the float
+  copies TensorIterator makes of the 8-bit inputs (the luma, and with `addcmul` the U and V views). The output is
+  written, then rewritten three times by `mul_`, `sub_` and `div_`, plus the two border fills. FKL keeps everything in
+  registers and writes each output value once.
 - **Allocation and dispatch.** Every operator allocates its output (PyTorch's caching allocator on the GPU, its CPU
   allocator on the CPU), and goes through the dispatcher and TensorIterator's setup. FKL's `build()` calls and fusion
   are compile-time types plus a few parameters.
-- **Kernel launches, one stream, no overlap (GPU).** Each iteration is about 5 N to 6 N dependent kernels and memcpys
-  on one stream in the per-region variants, and about 15 in the batched ones (`kernels.csv`). The
-  GPU time (`gpu_time.csv`) is a fraction of the iteration's time (`latency.csv`); the rest is host work and launch
-  gaps.
-- **Thread count is per operator (CPU).** PyTorch splits each of its own operators into chunks of at least its grain
-  size (32768 elements), at most one per thread. On 32 threads, in the per-region variants, its per-region operators are
-  one chunk each and run on one thread; only the border fills (from N = 16) and the last three operators (from N = 4)
-  are split: at N = 50 into 5 chunks per fill and 19 per operator, at N = 100 into 10 and 32. The batched variants'
-  operators work on all regions at once and are split the same way by their size. With `addmm`, MKL's GEMM decides its
-  own threading (`at::set_num_threads` sets MKL's thread count too). FKL's thread pool splits the fused loop into one
-  chunk per output row of each region.
+- **Kernel launches, one stream, no overlap (GPU).** Each iteration is about 5 N to 6 N dependent kernels and memcpys on
+  one stream in the per-region variants, and about 13 kernels and a memcpy in the batched ones (`kernels.csv`). The GPU
+  time (`gpu_time.csv`) is a fraction of the iteration's time (`latency.csv`); the rest is host work and launch gaps.
+- **Thread count is per operator (CPU).** PyTorch splits an operator of more than its grain size (32768 elements) into
+  ceil(elements / 32768) equal chunks, at most one per thread; smaller operators run on one thread. On 32 threads, in
+  the per-region variants, its per-region operators are one chunk each and run on one thread; only the border fills
+  (from N = 16) and the last three operators (from N = 4) are split: at N = 50 into 5 chunks per fill and 19 per
+  operator, at N = 100 into 10 and 32. The batched variants' operators work on all regions at once. With `addmm`, MKL's
+  GEMM decides its own threading (`at::set_num_threads` sets MKL's thread count too). FKL's thread pool splits the fused
+  loop into one chunk per output row of each region.
 
 ## What PyTorch gets that FKL does not
 
@@ -125,8 +126,9 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
 - **The arithmetic folded, and the fastest variant per comparison.** The offsets of the conversion are folded into
   the bias, and the luma term into one broadcast add; PyTorch's pipeline takes the variant that was fastest in the
   sweep before each comparison, per-region or batched (FKL's pipeline is its generic operations).
-- **Few operators for an eager pipeline.** Region views without copies, two fills per iteration for every border
-  instead of a pad per region, and in-place tail operators.
+- **Few operators for an eager pipeline.** In the per-region variants, region views without copies (the batched ones
+  copy every window in one `take`); in every variant two fills per iteration for every border instead of a pad per
+  region, and in-place tail operators.
 - **Fast paths.** `InferenceMode` (no autograd bookkeeping) and the caching allocator, which serves the temporaries
   from its pool: `kernels.csv` records the device memory segments it allocated during each implementation's timed
   iterations (0: no `cudaMalloc` there).
@@ -218,10 +220,11 @@ OpenCV on the CPU explains the change.
   `common/bench_gpu.h`), a second pass with the same loops, PyTorch's then FKL BVF's. The timed iterations are traced
   with PyTorch's profiler (Kineto: CUPTI on CUDA, the ROCm tracer on ROCm), in chunks of 100 iterations, with an empty
   marker kernel after every execution to split the trace. The GPU time of an execution is the sum of its device
-  activities: kernels, and memcpys and memsets when there are any (PyTorch's copy into the output plane is a memcpy
-  in the channels-last variants, a kernel otherwise; its fills are kernels). The
-  span runs from the first start to the last end in the trace: it is measured under the profiler, so it includes
-  the profiler's cost per launch and can exceed the latency.
+  activities: kernels, and memcpys and memsets when there are any (PyTorch's copy into the output plane is a memcpy in
+  the channels-last variants, a kernel otherwise; the batched variants' parameter upload is a host to device memcpy, and
+  cuBLASLt may add a memset with `addmm`; the fills are kernels). The span runs from the first start to the last end in
+  the trace: it is measured under the profiler, so it includes the profiler's cost per launch and can exceed the
+  latency.
 - **Counts.** Kernels, memcpys and memsets of one execution (every traced execution must have the same counts, or the
   program fails), and the device memory segments PyTorch's caching allocator allocated during each implementation's
   timed latency iterations.

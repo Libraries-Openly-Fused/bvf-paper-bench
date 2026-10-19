@@ -245,12 +245,12 @@ int main(int argc, char** argv) {
              "region's luma and chroma planes, with interpolate (bilinear, align_corners=false: pixel-center sampling) "
              "on a view of the crop that PyTorch treats as NCHW or as channels-last and a copy into its output plane "
              "(a transposing one from NCHW), or batched: the regions' window starts and grid coordinates computed on "
-             "the host, the 48 x 24 window at every region's origin gathered with one take per plane, the conversion "
-             "on the whole batch, one grid_sample (bilinear, align_corners=false, each region's pixel-center "
-             "coordinates clamped to the region) and one copy into the output planes; per iteration the border rows "
-             "set to 0 and mul_, sub_, div_ on the whole N x 64 x 64 x 3 tensor. Variants: the two chroma terms with "
-             "the NCHW, channels-last or batched resize, six; for every thread count and batch size PyTorch's "
-             "complete loop runs with each before the comparison, which uses the one with the lower median "
+             "the host, the 48 x 24 window at every region's origin gathered with one take from the frame, the "
+             "conversion on the whole batch, one grid_sample (bilinear, align_corners=false, each region's "
+             "pixel-center coordinates clamped to the region) and one copy into the output planes; per iteration the "
+             "border rows set to 0 and mul_, sub_, div_ on the whole N x 64 x 64 x 3 tensor. Variants: the two chroma "
+             "terms with the NCHW, channels-last or batched resize, six; for every thread count and batch size "
+             "PyTorch's complete loop runs with each before the comparison, which uses the one with the lower median "
              "(pytorch_variant_sweep.csv)\n";
         writeCpuPlatform(p, threads,
                          {"cpu_validation.csv",

@@ -475,7 +475,7 @@ void writePlatform(const std::filesystem::path& outDir, const Context& ctx) {
           "planes, with interpolate (bilinear, align_corners=false: pixel-center sampling) on a view of the crop that "
           "PyTorch treats as NCHW or as channels-last and a copy into its output plane (a transposing one from NCHW), "
           "or batched: the regions' window starts and grid coordinates computed on the host and uploaded in one copy "
-          "from pinned memory, the 48 x 24 window at every region's origin gathered with one take per plane, the "
+          "from pinned memory, the 48 x 24 window at every region's origin gathered with one take from the frame, the "
           "conversion on the whole batch, one grid_sample (bilinear, align_corners=false, each region's pixel-center "
           "coordinates clamped to the region) and one copy into the output planes; per iteration the border rows set "
           "to 0 and mul_, sub_, div_ on the whole N x 64 x 64 x 3 tensor. Temporaries from PyTorch's caching "
