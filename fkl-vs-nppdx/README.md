@@ -54,8 +54,9 @@ own names.
 [`results/RTX4090`](results/RTX4090) and [`results/RTX4090-20x10`](results/RTX4090-20x10) were measured with NV12 to
 RGB in BT.2020 full range on a frame of uniform random bytes, with the same regions in every iteration (see their
 platform files), before the workload described above and before the NPPDx+NPP benchmark existed, by `benchmark_nppdx`
-under its earlier name, `benchmark_figure1_bvf` (the prefix of their files). Their configuration files do not match the
-current workload, so the scripts that check the workload refuse them.
+under its earlier name, `benchmark_figure1_bvf` (the prefix of their files), and with the earlier protocol: NPPDx and
+FKL alternated within every iteration, where the protocol below runs each one's complete loop in turn. Their
+configuration files do not match the current workload, so the scripts that check the workload refuse them.
 
 Three benchmarks, with the same iterations: 1000 timed after 100 warm-up ones. The two implementations never run at
 the same time: NPPDx's complete loop runs first, then FKL's, on the same regions. FKL's mean speedup is computed per

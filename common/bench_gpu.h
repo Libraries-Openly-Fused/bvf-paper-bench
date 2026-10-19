@@ -21,8 +21,8 @@
 // with the frame, region sizes, batch sizes and region positions of common/bench_geometry.h, and NV12 -> RGB in BT.601
 // limited range in every implementation.
 //
-// The regions change every iteration: iteration t of every loop runs every pipeline on the regions of iteration t of
-// common/bench_geometry.h, which are generated before any loop (ctx.regions). Each pipeline converts them into the
+// The regions change every iteration: iteration t of each implementation's loop runs its pipeline on the regions of
+// iteration t of common/bench_geometry.h, which are generated before any loop (ctx.regions). Each pipeline converts them into the
 // arguments its library takes (FKL's rectangles, OpenCV's cv::Rect...) when it is created, also before the loops; what
 // it does in run(t) is what the library needs to receive the regions of this iteration (FKL's build() calls and the
 // fusion of the chain, NPP's descriptor upload, OpenCV's per-region views and calls), so that is timed.
@@ -1160,9 +1160,9 @@ void writePlatform(const std::filesystem::path& outDir, const std::vector<std::s
            << "FKL BVF: one executeOperations call, one kernel: no intermediates in memory, float3 from the color "
               "conversion to the write.\n";
     }
-    os << "Regions: iteration t of every loop (the " << WARMUP_ITERS << " warm-up iterations are t in [0, " << WARMUP_ITERS
-       << "), the " << TIMED_ITERS << " timed ones t in [" << WARMUP_ITERS << ", " << WARMUP_ITERS + TIMED_ITERS
-       << ")) runs every pipeline on the regions of "
+    os << "Regions: iteration t of each implementation's loop (the " << WARMUP_ITERS << " warm-up iterations are t in "
+       << "[0, " << WARMUP_ITERS << "), the " << TIMED_ITERS << " timed ones t in [" << WARMUP_ITERS << ", "
+       << WARMUP_ITERS + TIMED_ITERS << ")) runs that implementation's pipeline on the regions of "
        << "iteration t, generated before the loops and the same for every implementation, program and machine "
        << "(statistics of the timed ones in regions.csv). Each pipeline converts them into its library's arguments "
        << "before the loops; inside the timed region is what the library needs to receive the regions of the "
