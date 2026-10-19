@@ -60,7 +60,8 @@ configuration files do not match the current workload, so the scripts that check
 
 Three benchmarks, with the same iterations: 1000 timed after 100 warm-up ones. The two implementations never run at
 the same time: NPPDx's complete loop runs first, then FKL's, on the same regions. FKL's mean speedup is computed per
-iteration (NPPDx time / FKL time of the same iteration) and averaged, as in FKL's and cvGPUSpeedup's benchmarks. The
+iteration (NPPDx time / FKL time of the same iteration) and averaged, as in FKL's and cvGPUSpeedup's benchmarks; every
+comparison CSV has a `_per_iteration.csv` sibling with every pair of times (ms) and its ratio. The
 paper's first results (`results-v3`) alternated the two implementations within every iteration instead. NPPDx runs in the configuration chosen for every N (see
 [NPPDx configuration](#nppdx-configuration)).
 

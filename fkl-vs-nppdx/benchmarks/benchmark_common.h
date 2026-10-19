@@ -59,6 +59,8 @@ struct TwoExecutionsResult {
     int variableDimensionValue{0};
     TimeStats first, second;
     float meanSpeedup{0.f};
+    // Every timed iteration's time of each (ms), in iteration order: the pairs the mean speedup averages
+    std::vector<float> firstTimes, secondTimes;
 };
 
 inline float percentile(const std::vector<float>& sorted, const double p) {
@@ -121,7 +123,7 @@ inline TwoExecutionsResult runTwoExecutions(cudaStream_t stream, const int varia
         speedupSum += firstTimes[i] / secondTimes[i];
     }
     return {variableDimensionValue, computeStats(firstTimes), computeStats(secondTimes),
-            static_cast<float>(speedupSum / ITERS)};
+            static_cast<float>(speedupSum / ITERS), firstTimes, secondTimes};
 }
 
 // Times one implementation alone, same protocol as runTwoExecutions
@@ -291,10 +293,10 @@ inline TwoExecutionsResult runTwoExecutionsGpuOnly(cudaStream_t stream, const in
         speedupSum += firstTimes[i] / secondTimes[i];
     }
     return {variableDimensionValue, computeStats(firstTimes), computeStats(secondTimes),
-            static_cast<float>(speedupSum / ITERS)};
+            static_cast<float>(speedupSum / ITERS), firstTimes, secondTimes};
 }
 
-// <benchmarkName>_<ParArch>.csv, as FKL names its benchmark files
+// <benchmarkName>_<ParArch>.csv, as FKL names its benchmark files, and its _per_iteration.csv
 inline void writeTwoExecutionsCSV(const std::filesystem::path& outDir, const std::string& benchmarkName,
                                   const std::string& variableDimension, const std::string& firstLabel,
                                   const std::string& secondLabel, const std::vector<TwoExecutionsResult>& results) {
@@ -321,6 +323,18 @@ inline void writeTwoExecutionsCSV(const std::filesystem::path& outDir, const std
             file << ", " << s->median << ", " << s->p10 << ", " << s->p90;
         }
         file << std::endl;
+    }
+    // <benchmarkName>_<ParArch>_per_iteration.csv: every timed iteration's pair of times (ms) and their ratio, which
+    // the mean speedup averages
+    std::ofstream pairs(outDir / (benchmarkName + "_" + std::string(fk::toStrView(fk::defaultParArch)) +
+                                  "_per_iteration.csv"));
+    pairs << variableDimension << ", Iteration, " << firstLabel << " Time (ms), " << secondLabel
+          << " Time (ms), Speedup" << std::endl;
+    for (const auto& r : results) {
+        for (size_t i = 0; i < r.firstTimes.size() && i < r.secondTimes.size(); ++i) {
+            pairs << r.variableDimensionValue << ", " << WARMUP_ITERS + i << ", " << r.firstTimes[i] << ", "
+                  << r.secondTimes[i] << ", " << static_cast<double>(r.firstTimes[i]) / r.secondTimes[i] << std::endl;
+        }
     }
 }
 

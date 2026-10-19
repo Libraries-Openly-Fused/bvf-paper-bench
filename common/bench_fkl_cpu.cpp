@@ -51,7 +51,8 @@ extern "C" __attribute__((aligned(4096), used, noinline)) void benchFklCodeStart
 // internal linkage and one with external linkage, which the linker places in two groups), data and zero-initialized
 // data sections, so that FKL's static objects (the thread pool's mutex, condition variable and atomics) and vtables
 // are also at the same addresses modulo 4096 in every CPU benchmark. Not aligned: the constants, strings and exception
-// tables the linker merges with the other objects', and the read-only data after the strings (type information's names).
+// tables the linker merges with the other objects' (some constants are read by FKL's timed code), the read-only data
+// after the strings (type information's names), and the per-function read-only data (switch tables).
 extern "C" {
 extern const char benchFklRodataStart[1];
 __attribute__((aligned(4096), used)) const char benchFklRodataStart[1] = {1};

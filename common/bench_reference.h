@@ -17,7 +17,7 @@
 // (FKL's, PyTorch's pixel centers or OpenCV's), the black rows on top and bottom, then (x * MUL - SUB) / DIV, into an
 // N x OUT_H x OUT_W x 3 float tensor. It includes FKL: in the CPU benchmarks only common/bench_fkl_cpu.cpp includes it
 // (FKL's headers define variable template specializations that are not inline, so one program can include them in one
-// translation unit only); fkl-vs-pytorch's GPU program includes it in src/fkl_gpu.cu.
+// translation unit only); fkl-vs-pytorch's GPU program (added by pull request #18) includes it in its src/fkl_gpu.cu.
 
 #ifndef BVF_BENCH_REFERENCE_H
 #define BVF_BENCH_REFERENCE_H
