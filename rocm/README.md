@@ -9,9 +9,12 @@ from the repository root.
 Timing protocol, in every program here (GPU, Experiment 3 and CPU): implementations never run at the same time and
 never alternate within an iteration. For every N (and, on the CPU, every thread count), each implementation runs its
 complete loop, 100 warm-up and 1000 timed iterations, before the next one starts: the baselines first and FKL BVF
-last. FKL's speedup over a baseline is the mean over the timed iterations of (baseline time / FKL time) of the same
-iteration, which ran on the same regions; every comparison file has a `_per_iteration.csv` sibling with every pair of
-times and its ratio.
+last (in Experiment 3, the RPP variants or `fkl_bvf_naive` first and the DPP tiles last, the speedups being over the
+chosen DPP tile). The speedup over a baseline is the mean over the timed iterations of (baseline time / FKL time) of
+the same iteration, which ran on the same regions. Every pair of times and its ratio is in a `_per_iteration.csv`
+file: the sibling of every two-execution comparison file (`<baseline>_vs_fkl_bvf_*.csv` on the GPU,
+`benchmark_cpu_*.csv` on the CPU; the speedups of the GPU benchmark's `latency.csv` and `gpu_time*.csv` are the same
+values, so those files have no sibling of their own) and of Experiment 3's `latency.csv` and `gpu_time*.csv`.
 
 The regions change every iteration (20x10, 32x16 and 48x24 by turns, new positions every warm-up and timed
 iteration, all generated before the loops by `RegionSets`): iteration t of every pipeline's loop runs on the regions
