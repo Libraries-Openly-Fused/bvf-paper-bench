@@ -33,7 +33,8 @@
 // the mean over the timed iterations of (library time / FKL time) of the same iteration, which pairs runs on identical
 // inputs. Every timed run is preceded by a 1 ms idle gap, as when a pipeline runs once per video frame: a pool whose
 // workers spin for less than that after a run (FKL's, OpenCV's, Halide's) is asleep when the run starts, one that spins
-// longer (PyTorch's libgomp) is still spinning; each library keeps its own threads and idle behaviour. The timing thread busy-waits the gap instead of sleeping: a sleeping
+// longer (PyTorch's libgomp) is still spinning; each library keeps its own threads, if it has any (Fern runs on FKL's
+// pool), and its own idle behaviour. The timing thread busy-waits the gap instead of sleeping: a sleeping
 // core enters its deepest C-state, and the run right after it then pays a wake-up whose cost depends on each binary's
 // code (fkl-vs-opencv-cpu/README.md).
 
@@ -261,10 +262,17 @@ void forEachBatch(F&& f) {
 }
 
 // Whether a validation error (a maximum absolute difference) is finite and within the tolerance of FKL's float outputs.
-// Every CPU benchmark requires it of FKL against its reference, of FKL's pool against FKL on one thread, and of the
-// library on its thread count against itself on one thread, and exits with an error after writing its files otherwise
+// Every CPU benchmark requires it of FKL against its reference and of FKL's pool against FKL on one thread, and of
+// what it checks of its library (its CpuPlatformText says what), and exits with an error after writing its files
+// otherwise
 inline bool withinTolerance(float error) {
     return std::isfinite(error) && error <= validation::TOLERANCE;
+}
+
+// The larger of two validation errors, NaN if either is (std::max would keep a NaN only as its first argument, and lose
+// it at the next iteration): the worst error over the validated iterations
+inline float worstError(float a, float b) {
+    return std::isnan(a) || std::isnan(b) ? NAN : std::max(a, b);
 }
 
 // What a program says about its library in the lines every CPU benchmark shares
@@ -312,7 +320,8 @@ inline void writeCpuPlatform(std::ostream& p, int threads, const CpuPlatformText
       << std::chrono::milliseconds(IDLE_GAP).count()
       << " ms idle gap, busy-waited by the timing thread (so that its core does not enter a deep C-state), in which "
          "the worker threads of the previous run fall asleep if they spin for less than that (the lines above say how "
-         "long each pool's workers stay busy after a run); each library keeps its own threads and idle behaviour. "
+         "long each pool's workers stay busy after a run); each library keeps its own threads, if it has any, and its "
+         "own idle behaviour. "
          "Speedup: mean over "
          "the timed iterations of (library time / FKL time) of the same iteration (the *_per_iteration.csv files, times "
          "in ms, as in the comparison CSVs).\n"
