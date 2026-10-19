@@ -3,11 +3,12 @@
 // The harness, the workload and FKL's pipelines are common/bench_cpu.h and common/bench_fkl_cpu.cpp; PyTorch's
 // pipeline is src/pytorch_pipeline.h, the same code as on the GPU.
 //
-//   pytorch: per region, views of the region's planes, NV12 -> float RGB (the chroma terms, then a broadcast add with
-//            the luma), interpolate (bilinear) and a copy into its output plane, in the fastest of four variants
-//            (pytorch_pipeline.h's VARIANTS); the border rows set to 0 and multiply, subtract and divide on
-//            the whole tensor once per iteration. PyTorch's own CPU kernels (its runtime SIMD dispatch) and its
-//            intra-op thread pool (OpenMP, libgomp, in the official wheels), under c10::InferenceMode.
+//   pytorch: NV12 -> float RGB (the chroma terms, then a broadcast add with the luma), bilinear resize and a copy into
+//            the output planes, in the fastest of six variants (pytorch_pipeline.h's VARIANTS): per region (views of
+//            the region's planes, interpolate), or batched (every region's 48 x 24 window gathered, one grid_sample);
+//            the border rows set to 0 and multiply, subtract and divide on the whole tensor once per iteration.
+//            PyTorch's own CPU kernels (its runtime SIMD dispatch) and its intra-op thread pool (OpenMP, libgomp, in
+//            the official wheels), under c10::InferenceMode.
 //   fkl:     one executeOperations<TransformDPP<ParArch::CPU>> call with the whole chain (BVF), on one thread.
 //   fkl mt:  the same call with ParArch::CPU_MULTITHREAD, on FKL's thread pool (one worker per hardware thread).
 //
@@ -237,21 +238,26 @@ int main(int argc, char** argv) {
           << "stays busy " << spin.ompBusyUs << " us per parallel run of PyTorch (an add with 32768 floats per thread) "
           << "and each of FKL's CPU_MULTITHREAD workers " << spin.fklBusyUs << " us per run (1 region): work plus spin "
           << "before sleeping (libgomp's default spin is kept)\n"
-          << "PyTorch pipeline: per region, views of the region's luma and chroma planes, the chroma terms (FKL's "
-             "chroma coefficients and every offset folded into the bias: addmm on the chroma converted to float, or two "
-             "addcmul on the 8-bit U and V views), a broadcast add of the 8-bit luma with its coefficient (chroma "
-             "replicated to 2x2 pixels; the add makes a float copy of the luma first), interpolate (bilinear, "
-             "align_corners=false: pixel-center sampling) on a view of the crop that PyTorch treats as NCHW or as "
-             "channels-last, and a copy into its output plane (a transposing one from NCHW); per iteration the border "
-             "rows set to 0 and mul_, sub_, div_ on the whole N x 64 x 64 x 3 tensor. Variants: the 2 x 2 "
-             "combinations of chroma terms and resize input; for every thread count and batch size PyTorch's complete "
-             "loop runs with each before the comparison, which uses the one with the lower median "
+          << "PyTorch pipeline: the chroma terms (FKL's chroma coefficients and every offset folded into the bias: "
+             "addmm on the chroma converted to float, or two addcmul on the 8-bit U and V views) and a broadcast add "
+             "of the 8-bit luma with its coefficient (chroma replicated to 2x2 pixels; the add makes a float copy of "
+             "the luma first), then the resize and a copy into the output planes; either per region, on views of the "
+             "region's luma and chroma planes, with interpolate (bilinear, align_corners=false: pixel-center sampling) "
+             "on a view of the crop that PyTorch treats as NCHW or as channels-last and a copy into its output plane "
+             "(a transposing one from NCHW), or batched: the regions' window starts and grid coordinates computed on "
+             "the host, the 48 x 24 window at every region's origin gathered with one take per plane, the conversion "
+             "on the whole batch, one grid_sample (bilinear, align_corners=false, each region's pixel-center "
+             "coordinates clamped to the region) and one copy into the output planes; per iteration the border rows "
+             "set to 0 and mul_, sub_, div_ on the whole N x 64 x 64 x 3 tensor. Variants: the two chroma terms with "
+             "the NCHW, channels-last or batched resize, six; for every thread count and batch size PyTorch's "
+             "complete loop runs with each before the comparison, which uses the one with the lower median "
              "(pytorch_variant_sweep.csv)\n";
         writeCpuPlatform(p, threads,
                          {"cpu_validation.csv",
                           "PyTorch against the reference with its pixel-center sampling, and PyTorch on its thread "
                           "count against PyTorch on one thread",
-                          "PyTorch's per-region views and operator calls are timed",
+                          "PyTorch's per-region views and operator calls, or the batched variants' parameters, are "
+                          "timed",
                           "one row per validated iteration and PyTorch variant"});
         std::cout << "Results written to " << std::filesystem::absolute(outDir) << std::endl;
         if (!passed) {

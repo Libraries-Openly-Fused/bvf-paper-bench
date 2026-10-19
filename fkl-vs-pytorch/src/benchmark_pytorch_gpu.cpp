@@ -4,11 +4,12 @@
 // source builds against LibTorch for CUDA and for ROCm (USE_ROCM, defined by LibTorch's CMake for ROCm), where PyTorch's
 // device is still torch::kCUDA and FKL's side (src/fkl_gpu.cu) is compiled as HIP.
 //
-//   pytorch  src/pytorch_pipeline.h on the GPU: per region, views of the region's planes, the chroma terms, a broadcast
-//            add with the 8-bit luma, interpolate and a copy into its output plane, in the fastest of four variants
-//            (pytorch_pipeline.h's VARIANTS, chosen per batch size); per iteration two
-//            zero fills for the border rows and mul_, sub_, div_ on the whole tensor. PyTorch's caching allocator
-//            serves the temporaries of every region.
+//   pytorch  src/pytorch_pipeline.h on the GPU: the chroma terms, a broadcast add with the 8-bit luma, the resize and
+//            a copy into the output planes, in the fastest of six variants (pytorch_pipeline.h's VARIANTS, chosen per
+//            batch size): per region (views of the region's planes, interpolate), or batched (the regions' parameters
+//            uploaded in one copy, every region's 48 x 24 window gathered, one grid_sample); per iteration two zero
+//            fills for the border rows and mul_, sub_, div_ on the whole tensor. PyTorch's caching allocator serves
+//            the temporaries.
 //   fkl_bvf  one FKL kernel for the whole chain (BVF), src/fkl_gpu.cu.
 // Both run on one PyTorch stream (a stream of PyTorch's pool, made current), FKL through the stream's handle.
 //
@@ -467,23 +468,27 @@ void writePlatform(const std::filesystem::path& outDir, const Context& ctx) {
        << "OS: " << osName() << ", kernel " << kernelVersion() << "\n\n"
        << "Workload: " << describe() << ". AddBorder (black), then Mul (1/255), Sub (0.485, 0.456, 0.406), Div (0.229, "
        << "0.224, 0.225), float3 tensor of N planes " << OUT_W << "x" << OUT_H << "\n"
-       << "PyTorch pipeline: per region, views of the region's luma and chroma planes, the chroma terms (FKL's "
-          "chroma coefficients and every offset folded into the bias: addmm on the chroma converted to float, or two "
-          "addcmul on the 8-bit U and V views), a broadcast add of the 8-bit luma with its coefficient (chroma "
-          "replicated to 2x2 pixels; the add converts the luma), interpolate (bilinear, align_corners=false: "
-          "pixel-center sampling) on a view of the crop that PyTorch treats as NCHW or as channels-last, and a copy "
-          "into its output plane (a transposing one from NCHW); per iteration the border rows set to 0 and mul_, sub_, "
-          "div_ on the whole N x 64 x 64 x 3 tensor. Temporaries from PyTorch's caching allocator. Variants: the 2 x 2 "
-          "combinations of chroma terms and resize input; for every batch size PyTorch's latency loop runs with each "
-          "before the comparison, which uses the one with the lower median, also in the GPU time pass "
-          "(pytorch_variant_sweep.csv; kernels.csv's variant)\n"
+       << "PyTorch pipeline: the chroma terms (FKL's chroma coefficients and every offset folded into the bias: "
+          "addmm on the chroma converted to float, or two addcmul on the 8-bit U and V views) and a broadcast add of "
+          "the 8-bit luma with its coefficient (chroma replicated to 2x2 pixels; the add converts the luma), then the "
+          "resize and a copy into the output planes; either per region, on views of the region's luma and chroma "
+          "planes, with interpolate (bilinear, align_corners=false: pixel-center sampling) on a view of the crop that "
+          "PyTorch treats as NCHW or as channels-last and a copy into its output plane (a transposing one from NCHW), "
+          "or batched: the regions' window starts and grid coordinates computed on the host and uploaded in one copy "
+          "from pinned memory, the 48 x 24 window at every region's origin gathered with one take per plane, the "
+          "conversion on the whole batch, one grid_sample (bilinear, align_corners=false, each region's pixel-center "
+          "coordinates clamped to the region) and one copy into the output planes; per iteration the border rows set "
+          "to 0 and mul_, sub_, div_ on the whole N x 64 x 64 x 3 tensor. Temporaries from PyTorch's caching "
+          "allocator. Variants: the two chroma terms with the NCHW, channels-last or batched resize, six; for every "
+          "batch size PyTorch's latency loop runs with each before the comparison, which uses the one with the lower "
+          "median, also in the GPU time pass (pytorch_variant_sweep.csv; kernels.csv's variant)\n"
        << "FKL BVF: one executeOperations call, one kernel: no intermediates in memory, float3 from the color "
           "conversion to the write.\n"
        << "Regions: iteration t of each pipeline's loop (the " << WARMUP_ITERS << " warm-up iterations are t in [0, "
        << WARMUP_ITERS << "), the " << TIMED_ITERS << " timed ones t in [" << WARMUP_ITERS << ", "
        << WARMUP_ITERS + TIMED_ITERS << ")) runs that pipeline on the regions of iteration t, generated before the "
        << "loops (statistics of the timed ones in regions.csv); FKL's build() calls and fusion and PyTorch's "
-          "per-region calls are timed.\n"
+          "per-region calls, or the batched variants' parameters and their upload, are timed.\n"
        << "Timing: the two libraries never run at the same time: for every batch size, pytorch's complete loop ("
        << WARMUP_ITERS << " warm-up then " << TIMED_ITERS << " timed iterations) runs first, then FKL BVF's on the same "
        << "regions, every run timed with device events (c10::Event) on one stream around the complete pipeline "
@@ -498,7 +503,8 @@ void writePlatform(const std::filesystem::path& outDir, const Context& ctx) {
        << "every execution splitting the trace; the GPU time of one execution is the "
        << "sum of the execution times of its device activities: kernels, and memcpys and memsets when there are any "
        << "(PyTorch's copy into the output plane is a device to device memcpy in the channels-last variants and a "
-       << "kernel otherwise, its fills are kernels; kernels.csv has the counts, the same for every traced execution, "
+       << "kernel otherwise, the batched variants upload their parameters with a host to device memcpy, and cuBLASLt "
+       << "may add a memset; its fills are kernels; kernels.csv has the counts, the same for every traced execution, "
        << "checked), span = first start to last end "
        << "of its activities in the trace (measured under the profiler, so it includes the profiler's cost per launch "
        << "and can exceed the latency); "
