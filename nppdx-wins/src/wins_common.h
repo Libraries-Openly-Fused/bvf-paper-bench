@@ -401,7 +401,7 @@ size_t chooseFastest(Context& ctx, const std::string& key, const size_t count, c
             impl.run(WARMUP_ITERS);
             gpuErrchk(cudaStreamSynchronize(ctx.stream));
             errors = compare(impl.download(), reference);
-            timing = computeStats(measureInterleaved(ctx, {impl})[0]);
+            timing = computeStats(measureSequential(ctx, {impl})[0]);
             launched = true;
         } catch (const std::exception& e) {
             std::cout << key << ": " << label(i) << " cannot run: " << e.what() << std::endl;
