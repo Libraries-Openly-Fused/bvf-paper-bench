@@ -220,11 +220,12 @@ The two libraries of a comparison never run at the same time:
 FKL's side is the only translation unit of a program that includes FKL: FKL's headers define variable template
 specializations that are not `inline`, so a program can include them in one translation unit only. It is compiled with
 FKL's options only (none of the compared library's), so its object file is the same in every CPU benchmark built with
-the same compiler and flags. It is linked first, and with GCC and Clang a function and three variables in it are
-aligned to 4096 bytes, which aligns its code, read-only data, data and zero-initialized data sections: FKL's functions
-(its template instantiations, in sections of their own, follow in the same order) and static objects then have the
-same addresses modulo 4096 in every CPU benchmark, whatever the sections before them (which grow with each library's
-imported symbols) take. The platform file records three of those addresses; `nm` on two programs compares all of
+the same compiler and flags. It is linked first, and with GCC and Clang a function and five variables in it are
+aligned to 4096 bytes, which aligns its code, read-only data, vtables, data and zero-initialized data sections: FKL's
+functions (its template instantiations, in sections of their own, follow in the same order), vtables and static
+objects then have the same addresses modulo 4096 in every CPU benchmark, whatever the sections before them (which grow
+with each library's imported symbols) take. Only the constants and exception tables the linker merges with the other
+objects' are not aligned. The platform file records three of those addresses; `nm` on two programs compares all of
 them. The [protocol change](fkl-vs-opencv-cpu/README.md#protocol-change)
 section of FKL vs OpenCV on the CPU explains the busy-waited gap and the separate translation unit.
 

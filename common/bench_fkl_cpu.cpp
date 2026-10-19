@@ -47,13 +47,21 @@
 // functions with it.
 #if defined(__GNUC__) || defined(__clang__)
 extern "C" __attribute__((aligned(4096), used, noinline)) void benchFklCodeStart() {}
-// The same for the file's read-only data, data and zero-initialized data sections, so that FKL's static objects (the
-// thread pool's mutex, condition variable and atomics) are also at the same addresses modulo 4096 in every CPU benchmark
+// The same for the file's read-only data, relocated read-only data (vtables and type information: a pointer with
+// internal linkage and one with external linkage, which the linker places in two groups), data and zero-initialized
+// data sections, so that FKL's static objects (the thread pool's mutex, condition variable and atomics) and vtables
+// are also at the same addresses modulo 4096 in every CPU benchmark. Merged constants and exception tables are pooled
+// with the other objects' by the linker, and are not aligned.
 extern "C" {
 extern const char benchFklRodataStart[1];
 __attribute__((aligned(4096), used)) const char benchFklRodataStart[1] = {1};
+extern const void* const benchFklRelroStart;
+__attribute__((aligned(4096), used)) const void* const benchFklRelroStart = reinterpret_cast<const void*>(&benchFklCodeStart);
 __attribute__((aligned(4096), used)) char benchFklDataStart[1] = {1};
 __attribute__((aligned(4096), used)) char benchFklBssStart[1];
+}
+namespace {
+__attribute__((aligned(4096), used)) const void* const relroLocalStart = reinterpret_cast<const void*>(&benchFklCodeStart);
 }
 #define BENCH_FKL_ALIGNED 1
 #else
@@ -152,9 +160,9 @@ Conversion fklConversion() {
 std::string fklCodeAlignment() {
 #ifdef BENCH_FKL_ALIGNED
     const auto page = [](const void* f) { return std::to_string(reinterpret_cast<std::uintptr_t>(f) % 4096); };
-    return "its code, read-only data, data and zero-initialized data sections aligned to 4096 bytes, so that FKL's "
-           "functions and static objects are at the same addresses modulo 4096 in every CPU benchmark built the same "
-           "way (in this program, modulo 4096: benchFklCodeStart " +
+    return "its code, read-only data, vtables, data and zero-initialized data sections aligned to 4096 bytes, so that "
+           "FKL's functions, vtables and static objects are at the same addresses modulo 4096 in every CPU benchmark "
+           "built the same way (in this program, modulo 4096: benchFklCodeStart " +
            page(reinterpret_cast<const void*>(&benchFklCodeStart)) + ", fklFrame " +
            page(reinterpret_cast<const void*>(&fklFrame)) + ", benchFklBssStart " + page(benchFklBssStart) +
            "; FKL's template instantiations, in sections of their own, follow in the same order, which nm shows)";
