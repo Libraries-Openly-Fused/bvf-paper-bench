@@ -31,7 +31,7 @@ BENCH=$(realpath -m "${2:-$REPO/build-rocm/rocm_bench}")
 . "$REPO/rocm/scripts/env.sh"
 COUNTERS=${COUNTERS:-"FETCH_SIZE GL2C_EA_WRREQ_sum GL2C_EA_WRREQ_64B_sum"}
 MAX_REPEATS=${MAX_REPEATS:-3}
-IMPLS="rpp_frame rpp_crop fkl_vf_hf fkl_vf_hf_float3_frame fkl_bvf"
+IMPLS="rpp fkl_vf_hf fkl_vf_hf_float3_frame fkl_bvf"
 mkdir -p "$OUT"
 # rocprofv3 writes .rocprofv3/<pid>-counter_values.dat into its working directory: it runs from a scratch directory of
 # $OUT, removed on exit, instead of the caller's (the repository root, usually)
@@ -68,8 +68,7 @@ if [ $CHECK_ONLY = 1 ]; then
     exit $status
 fi
 
-# rpp_frame and rpp_crop are the RPP pipeline chosen by the GPU benchmark's selection pass (the "chosen" row of
-# gpu/rpp_selection.csv), with the NV12 -> RGB conversion of the full frame and of only the crops
+# rpp is the RPP pipeline chosen by the GPU benchmark's selection pass (the "chosen" row of gpu/rpp_selection.csv)
 [ -n "${BENCH_RPP_VARIANT:-}" ] || { echo "set BENCH_RPP_VARIANT to the chosen variant of gpu/rpp_selection.csv"; exit 1; }
 export BENCH_RPP_VARIANT
 # The check first: if it fails, an earlier collection in $OUT stays as it was

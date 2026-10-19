@@ -239,7 +239,7 @@ struct FklRgb8 {
     }
     // Only the first N regions of iteration t, each converted at its own size and written at its own position in the
     // frame: one executeOperations per region size, batched over the regions of that size (Crop fused backwards into the
-    // read, so only their pixels are read and converted; the writes are views of rgb at the crops, with its pitch). Not
+    // read, so only their pixels are read and converted; the writes are FKL's crops of rgb, Ptr2D::crop2D). Not
     // one call over all the N crops: TransformDPP takes a batch's iteration space from its largest plane, with no bound
     // per plane, so with mixed sizes every crop would be converted at the largest size and written past the smaller
     // ones. Region i of iteration t has size regionSize(t, i) = REGION_SIZES[(i + t) % REGION_SIZE_COUNT], so how many
@@ -262,7 +262,7 @@ struct FklRgb8 {
         cropCount = n;
         cropRects.clear();
         cropViews.clear();
-        const auto raw = rgb.ptr();
+        const unsigned pitchBytes = rgb.dims().pitch;
         for (size_t t = 0; t < sets.iterations(); ++t) {
             for (size_t k = 0; k < REGION_SIZE_COUNT; ++k) {
                 for (size_t i = 0; i < n; ++i) {
@@ -272,12 +272,11 @@ struct FklRgb8 {
                     const Region& r = sets.at(t, i);
                     cropRects.push_back(fk::Rect(static_cast<unsigned>(r.x), static_cast<unsigned>(r.y), r.width,
                                                  r.height));
-                    fk::RawPtr<fk::ND::_2D, fk::uchar3> view{};
-                    view.data = reinterpret_cast<fk::uchar3*>(reinterpret_cast<uint8_t*>(raw.data) +
-                                                             static_cast<size_t>(r.y) * raw.dims.pitch) + r.x;
-                    view.dims = fk::PtrDims<fk::ND::_2D>(static_cast<unsigned>(r.width),
-                                                         static_cast<unsigned>(r.height), raw.dims.pitch);
-                    cropViews.push_back(view);
+                    // FKL's own crop of the frame: a view of the region, with the frame's pitch, sharing its allocation
+                    cropViews.push_back(rgb.crop2D(fk::Point(static_cast<unsigned>(r.x), static_cast<unsigned>(r.y)),
+                                                   fk::PtrDims<fk::ND::_2D>(static_cast<unsigned>(r.width),
+                                                                            static_cast<unsigned>(r.height), pitchBytes))
+                                            .ptr());
                 }
             }
         }
