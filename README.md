@@ -185,17 +185,18 @@ one `executeOperations` call (BVF) on FKL's CPU backend (one thread) and on its 
 thread pool, one worker per hardware thread). Each program compares its library on one thread with FKL on one thread,
 and on as many threads as FKL's pool has workers with FKL's pool.
 
-In each of the 1000 timed iterations (after 100 warm-up ones), the library and FKL run one after the other on the
-regions of that iteration, and FKL's speedup is computed per iteration and averaged.
+The two libraries of a comparison never run at the same time:
 
-- **Idle gap.** Every run follows a 1 ms idle gap. The timing thread busy-waits it, so the thread pools, whose workers
-  spin for a while after a run and then sleep, are asleep when a run starts, while the timing thread's core stays out
-  of a deep C-state.
+- **Sequential loops.** For every batch size, the library's complete loop (100 warm-up and 1000 timed iterations) runs
+  first, then FKL's, on the same regions.
+- **Paired speedups.** FKL's speedup is the mean over the timed iterations of (library time / FKL time) of the same
+  iteration, which pairs runs on identical inputs. Every comparison CSV has a `_per_iteration.csv` sibling with the
+  pairs.
+- **Idle gap.** Every run follows a 1 ms idle gap. The timing thread busy-waits it, so the library's thread pool,
+  whose workers spin for a while after a run and then sleep, is asleep when a run starts, while the timing thread's
+  core stays out of a deep C-state. Each library keeps its own pool and idle behaviour.
 - **Worker busy time.** Each program measures how long the workers of both pools stay busy after a run with little
-  work: their spin and wake-up, from `/proc/self/task/*/schedstat` on Linux. It records them in `cpu_platform.txt`;
-  the gap must outlast them.
-- **FKL-only control.** FKL is also timed alone with the same protocol (`fkl_control.csv`), so that FKL's times can be
-  compared between programs.
+  work: their spin and wake-up, from `/proc/self/task/*/schedstat` on Linux. It records them in `cpu_platform.txt`.
 
 FKL's side is the only translation unit of a program that includes FKL: FKL's headers define variable template
 specializations that are not `inline`, so a program can include them in one translation unit only. It is compiled with

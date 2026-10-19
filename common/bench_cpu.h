@@ -26,15 +26,16 @@
 //   makeFklCpu(N, true)   the same call on the CPU_MULTITHREAD backend: FKL's thread pool (one worker per hardware
 //                         thread), in chunks of one output row of one crop; it returns when the output is written
 //
-// Iteration t of every loop runs both pipelines of a comparison on the regions of iteration t, generated before the
-// loops; each converts them into its own arguments before the loops too, and what it does with them in the iteration
-// (FKL's build() calls and fusion, the library's per-region work) is timed. Every timed run is preceded by a 1 ms idle
-// gap, so that the thread pools, whose workers spin for a while after a run and then sleep, are asleep when the run
-// starts: neither library steals cores from the other, and both start from sleeping workers, as when a pipeline runs
-// once per video frame. The timing thread busy-waits the gap instead of sleeping: a sleeping core enters its deepest
-// C-state, and the run right after it then pays a wake-up whose cost depends on each binary's code (README.md of each
-// benchmark). Each benchmark also times FKL alone with the same protocol (a no-op in the library's place), the FKL-only
-// control, to compare FKL's times between benchmarks.
+// The two libraries of a comparison never run at the same time: the library's complete loop (warm-up and timed
+// iterations) runs first, then FKL's, on the same regions. Iteration t of each loop uses the regions of iteration t,
+// generated before the loops; each library converts them into its own arguments before the loops too, and what it does
+// with them in the iteration (FKL's build() calls and fusion, the library's per-region work) is timed. FKL's speedup is
+// the mean over the timed iterations of (library time / FKL time) of the same iteration, which pairs runs on identical
+// inputs. Every timed run is preceded by a 1 ms idle gap, so that the library's own thread pool, whose workers spin for
+// a while after a run and then sleep, is asleep when the run starts, as when a pipeline runs once per video frame; each
+// library keeps its own pool and idle behaviour. The timing thread busy-waits the gap instead of sleeping: a sleeping
+// core enters its deepest C-state, and the run right after it then pays a wake-up whose cost depends on each binary's
+// code (fkl-vs-opencv-cpu/README.md).
 
 #ifndef BVF_BENCH_CPU_H
 #define BVF_BENCH_CPU_H
@@ -125,97 +126,60 @@ int poolThreads();
 void runOnFklPool(size_t chunks, const std::function<void(size_t)>& function);
 
 // ------------------------------------------------------------------------------------------------
-// Two-execution timing in FKL's format: in every iteration the library and then FKL on the regions of that iteration,
-// each timed with steady_clock after the idle gap
+// Timing in FKL's two-execution format: the library's loop, then FKL's, on the same regions, each run timed with
+// steady_clock after the idle gap
 // ------------------------------------------------------------------------------------------------
 using Clock = std::chrono::steady_clock;
 
 // The idle gap before a timed run, busy-waited by the timing thread
-inline void idleGap(Clock::duration gap = IDLE_GAP) {
-    const auto end = Clock::now() + gap;
+inline void idleGap() {
+    const auto end = Clock::now() + IDLE_GAP;
     while (Clock::now() < end) {
     }
 }
 
+// One comparison for one batch size: the statistics of both loops, every timed iteration's times (ms, in iteration
+// order) and the mean of the per-iteration speedups
 struct Row {
     size_t batch;
     TimingStats baseline, fkl;
     double meanSpeedup;
+    std::vector<float> baselineMs, fklMs;
 };
 
-inline Row timeTwo(size_t batch, const std::function<void(size_t)>& baseline, const std::function<void(size_t)>& fkl,
-                   Clock::duration gap = IDLE_GAP) {
-    const auto time = [gap](const std::function<void(size_t)>& f, size_t t) {
-        idleGap(gap);
+// The warm-up iterations (0 to WARMUP_ITERS - 1) and the timed ones (from WARMUP_ITERS) of one library, each run after
+// the idle gap; returns the times of the timed ones (ms)
+inline std::vector<float> timeLoop(const std::function<void(size_t)>& run) {
+    std::vector<float> ms(ITERS);
+    for (int i = 0; i < WARMUP_ITERS + ITERS; ++i) {
+        idleGap();
         const auto t0 = Clock::now();
-        f(t);
-        return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-    };
-    for (int i = 0; i < WARMUP_ITERS; ++i) {
-        time(baseline, static_cast<size_t>(i));
-        time(fkl, static_cast<size_t>(i));
-    }
-    std::vector<float> a(ITERS), b(ITERS);
-    double speedup = 0.;
-    for (int i = 0; i < ITERS; ++i) {
-        const double ta = time(baseline, static_cast<size_t>(WARMUP_ITERS + i));
-        const double tb = time(fkl, static_cast<size_t>(WARMUP_ITERS + i));
-        a[i] = static_cast<float>(ta);
-        b[i] = static_cast<float>(tb);
-        speedup += ta / tb;
-    }
-    return {batch, computeStats(a), computeStats(b), speedup / ITERS};
-}
-
-// Every timed iteration's time of both libraries (ms), in iteration order
-struct PerIteration {
-    size_t batch;
-    std::vector<float> baseline, fkl;
-};
-
-// The same comparison with each library in a loop of its own, for a library whose thread pool cannot be interleaved
-// with FKL's (fkl-vs-pytorch's multithreaded comparison, README.md): the library's warm-up and timed iterations, then
-// FKL's, on the same regions, each run after the idle gap. The speedup is still the mean over the timed iterations of
-// (library time / FKL time) in the same iteration, which pairs runs on identical inputs; perIteration gets the times.
-inline Row timeSeparately(size_t batch, const std::function<void(size_t)>& baseline,
-                          const std::function<void(size_t)>& fkl, PerIteration& perIteration,
-                          Clock::duration gap = IDLE_GAP) {
-    const auto loop = [gap](const std::function<void(size_t)>& f) {
-        std::vector<float> ms(ITERS);
-        for (int i = 0; i < WARMUP_ITERS + ITERS; ++i) {
-            idleGap(gap);
-            const auto t0 = Clock::now();
-            f(static_cast<size_t>(i));
-            const double elapsed = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-            if (i >= WARMUP_ITERS) {
-                ms[i - WARMUP_ITERS] = static_cast<float>(elapsed);
-            }
-        }
-        return ms;
-    };
-    perIteration = {batch, loop(baseline), loop(fkl)};
-    double speedup = 0.;
-    for (int i = 0; i < ITERS; ++i) {
-        speedup += static_cast<double>(perIteration.baseline[i]) / perIteration.fkl[i];
-    }
-    return {batch, computeStats(perIteration.baseline), computeStats(perIteration.fkl), speedup / ITERS};
-}
-
-// The per-iteration times of timeSeparately (ms): one row per batch size and timed iteration, with the iteration's
-// regions (iteration index t) and the ratio that the mean speedup averages
-inline void writePerIterationCSV(const std::filesystem::path& path, const std::string& baselineLabel,
-                                 const std::vector<PerIteration>& rows, const std::string& fklLabel) {
-    std::ofstream f(path);
-    f << "Batch size, Iteration, " << baselineLabel << " Time, " << fklLabel << " Time, Speedup" << std::endl;
-    for (const auto& r : rows) {
-        for (size_t i = 0; i < r.baseline.size(); ++i) {
-            f << r.batch << ", " << WARMUP_ITERS + i << ", " << r.baseline[i] << ", " << r.fkl[i] << ", "
-              << static_cast<double>(r.baseline[i]) / r.fkl[i] << std::endl;
+        run(static_cast<size_t>(i));
+        const double elapsed = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+        if (i >= WARMUP_ITERS) {
+            ms[i - WARMUP_ITERS] = static_cast<float>(elapsed);
         }
     }
+    return ms;
 }
 
-// One comparison in FKL's two-execution format (times in ms), one row per batch size
+// The library's complete loop, then FKL's
+inline Row timeTwo(size_t batch, const std::function<void(size_t)>& baseline, const std::function<void(size_t)>& fkl) {
+    Row row{batch, {}, {}, 0., timeLoop(baseline), {}};
+    row.fklMs = timeLoop(fkl);
+    double speedup = 0.;
+    for (int i = 0; i < ITERS; ++i) {
+        speedup += static_cast<double>(row.baselineMs[i]) / row.fklMs[i];
+    }
+    row.baseline = computeStats(row.baselineMs);
+    row.fkl = computeStats(row.fklMs);
+    row.meanSpeedup = speedup / ITERS;
+    return row;
+}
+
+// One comparison in FKL's two-execution format (times in ms), one row per batch size, at path, and every timed
+// iteration's pair of times with its speedup next to it (<path>_per_iteration.csv): the iteration (its regions), the
+// library's time, FKL's time and their ratio, which the mean speedup averages
 inline void writeCSV(const std::filesystem::path& path, const std::string& baselineLabel, const std::vector<Row>& rows,
                      const std::string& fklLabel) {
     std::ofstream f(path);
@@ -223,32 +187,15 @@ inline void writeCSV(const std::filesystem::path& path, const std::string& basel
     for (const auto& r : rows) {
         writeTwoExecutionRow(f, static_cast<long long>(r.batch), r.baseline, r.fkl, r.meanSpeedup);
     }
-}
-
-// The FKL-only control: FKL on one thread and on its thread pool, timed with the same protocol (warm-up, idle gaps,
-// iterations and regions) with a no-op in the library's place
-struct Control {
-    size_t batch;
-    TimingStats single, multi;
-};
-
-inline Control timeFklControl(size_t batch, FklCpu& single, FklCpu& multi) {
-    const auto none = [](size_t) {};
-    return {batch, timeTwo(batch, none, [&](size_t t) { single.run(t); }).fkl,
-            timeTwo(batch, none, [&](size_t t) { multi.run(t); }).fkl};
-}
-
-// fkl_control.csv: the control's medians, p10 and p90 (ms)
-inline void writeControlCSV(const std::filesystem::path& path, const std::vector<Control>& controls) {
-    std::ofstream f(path);
-    f << "Batch size, FKL CPU MedianTime, FKL CPU P10Time, FKL CPU P90Time, FKL CPU_MULTITHREAD MedianTime, "
-         "FKL CPU_MULTITHREAD P10Time, FKL CPU_MULTITHREAD P90Time" << std::endl;
-    for (const auto& c : controls) {
-        f << c.batch;
-        for (const TimingStats* s : {&c.single, &c.multi}) {
-            f << ", " << s->median / 1000. << ", " << s->p10 / 1000. << ", " << s->p90 / 1000.;
+    std::filesystem::path perIteration = path;
+    perIteration.replace_filename(path.stem().string() + "_per_iteration" + path.extension().string());
+    std::ofstream p(perIteration);
+    p << "Batch size, Iteration, " << baselineLabel << " Time, " << fklLabel << " Time, Speedup" << std::endl;
+    for (const auto& r : rows) {
+        for (size_t i = 0; i < r.baselineMs.size(); ++i) {
+            p << r.batch << ", " << WARMUP_ITERS + i << ", " << r.baselineMs[i] << ", " << r.fklMs[i] << ", "
+              << static_cast<double>(r.baselineMs[i]) / r.fklMs[i] << std::endl;
         }
-        f << std::endl;
     }
 }
 
@@ -332,17 +279,18 @@ inline void writeCpuPlatform(std::ostream& p, int threads) {
       << "OS: " << osName() << "\n"
       << "Workload: " << describe() << "\n"
       << "Pipeline: as the GPU benchmarks, with BT.601 limited range for NV12 -> RGB\n"
-      << "Regions: iteration t (the " << WARMUP_ITERS << " warm-up iterations are t in [0, " << WARMUP_ITERS << "), the "
-      << ITERS << " timed ones t in [" << WARMUP_ITERS << ", " << WARMUP_ITERS + ITERS
-      << ")) runs both pipelines of a comparison on the regions of iteration t, generated before the loops and "
+      << "Regions: iteration t of each loop (the " << WARMUP_ITERS << " warm-up iterations are t in [0, " << WARMUP_ITERS
+      << "), the " << ITERS << " timed ones t in [" << WARMUP_ITERS << ", " << WARMUP_ITERS + ITERS
+      << ")) runs on the regions of iteration t, generated before the loops and "
       << "converted into each library's arguments before them too (statistics of the timed ones in regions.csv); "
       << "FKL's build() calls and fusion and the library's per-region work are timed.\n"
-      << "Timing: steady_clock around each pipeline, " << WARMUP_ITERS << " warm-up and " << ITERS
-      << " timed iterations, the library and FKL one after the other in each, each run preceded by a "
+      << "Timing: steady_clock around each pipeline; for every batch size, the library's loop (" << WARMUP_ITERS
+      << " warm-up and " << ITERS << " timed iterations) runs to completion first, then FKL's on the same regions: the "
+      << "two libraries never run at the same time. Every run is preceded by a "
       << std::chrono::milliseconds(IDLE_GAP).count()
-      << " ms idle gap (busy-waited by the timing thread, so that its core does not enter a deep C-state, while the "
-         "thread pools fall asleep); speedup computed per iteration and averaged. FKL-only control (fkl_control.csv): "
-         "FKL alone with the same protocol, a no-op in the library's place.\n"
+      << " ms idle gap, busy-waited by the timing thread (so that its core does not enter a deep C-state), while the "
+         "library's thread pool falls asleep; each library keeps its own pool and idle behaviour. Speedup: mean over "
+         "the timed iterations of (library time / FKL time) of the same iteration (the *_per_iteration.csv files).\n"
       << "Validation: before the timing, on the regions of the first, every " << validation::VALIDATION_STRIDE
       << "th and the last timed iteration (cpu_validation.csv, one row per iteration).\n";
 }
