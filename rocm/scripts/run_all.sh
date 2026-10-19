@@ -12,8 +12,9 @@
 # Environment (all optional):
 #   ROCM_PATH       ROCm installation (default /opt/rocm/core-10.1)
 #   ROCM_EXTRA      prefix with RPP, rocprofiler-sdk and amd-smi when they are not in ROCM_PATH (see env.sh)
-#   FKL_GPU_DIR     FusedKernelLibrary for the GPU benchmark, default <repo>/fkl (the submodule)
-#   FKL_CPU_DIR     FusedKernelLibrary with its thread-pool submodule for the CPU benchmark, default <repo>/fkl
+#   FKL_GPU_DIR     a git checkout of FusedKernelLibrary for the GPU benchmark, default <repo>/fkl (the submodule)
+#   FKL_CPU_DIR     a git checkout of FusedKernelLibrary with its thread-pool submodule for the CPU benchmark, default
+#                   <repo>/fkl
 #   CXX_CPU         C++ compiler of the CPU benchmark (default: the newest clang++-NN found, else clang++)
 #   COUNTERS        hardware counters for Experiment 2 (default "FETCH_SIZE GL2C_EA_WRREQ_sum GL2C_EA_WRREQ_64B_sum":
 #                   rocprofiler-sdk 1.4.1 defines FETCH_SIZE for gfx12 but not WRITE_SIZE, which summarize_counters.py
@@ -96,14 +97,24 @@ command -v rocminfo > /dev/null || die "rocminfo not found"
     die "rocprofv3 not found (install amdrocm-profiler-base10.1)"
 allowed SKIP_CPU || command -v "$CXX_CPU" > /dev/null || die "C++ compiler $CXX_CPU not found (set CXX_CPU)"
 [ -n "$FKL_PAPER_SHA" ] || allowed ALLOW_OTHER_FKL || die "no fkl submodule recorded in $REPO"
-FKL_GPU_SHA=$(git -C "$FKL_GPU_DIR" rev-parse HEAD 2>/dev/null) && [ -f "$FKL_GPU_DIR/CMakeLists.txt" ] ||
-    die "no FKL checkout in $FKL_GPU_DIR (git -C $REPO submodule update --init --recursive fkl)"
+# The commit of an FKL checkout: only a directory that is the top of its own git checkout has one (a plain copy inside
+# another repository would report that repository's commit)
+fkl_sha() {
+    [ -f "$1/CMakeLists.txt" ] && [ "$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$1" && pwd -P)" ] &&
+        git -C "$1" rev-parse HEAD 2>/dev/null
+}
+fkl_missing() {
+    if [ "$1" = "$FKL_DEFAULT_DIR" ]; then
+        die "no FKL checkout in $1 (git -C $REPO submodule update --init --recursive fkl)"
+    fi
+    die "$1 is not a git checkout of FKL (FKL_GPU_DIR / FKL_CPU_DIR must be the top of one)"
+}
+FKL_GPU_SHA=$(fkl_sha "$FKL_GPU_DIR") || fkl_missing "$FKL_GPU_DIR"
 FKL_DIRS=("$FKL_GPU_DIR")
 [ "$FKL_GPU_SHA" = "$FKL_PAPER_SHA" ] || allowed ALLOW_OTHER_FKL ||
     die "FKL_GPU_DIR is at ${FKL_GPU_SHA:0:7}, not $FKL_PAPER_COMMIT (the commit recorded for the repository's fkl submodule)"
 if ! allowed SKIP_CPU; then
-    FKL_CPU_SHA=$(git -C "$FKL_CPU_DIR" rev-parse HEAD 2>/dev/null) && [ -f "$FKL_CPU_DIR/CMakeLists.txt" ] ||
-        die "no FKL checkout in $FKL_CPU_DIR (git -C $REPO submodule update --init --recursive fkl)"
+    FKL_CPU_SHA=$(fkl_sha "$FKL_CPU_DIR") || fkl_missing "$FKL_CPU_DIR"
     [ "$FKL_CPU_SHA" = "$FKL_PAPER_SHA" ] || allowed ALLOW_OTHER_FKL ||
         die "FKL_CPU_DIR is at ${FKL_CPU_SHA:0:7}, not $FKL_PAPER_COMMIT (the commit recorded for the repository's fkl submodule)"
     FKL_DIRS+=("$FKL_CPU_DIR")
