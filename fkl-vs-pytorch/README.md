@@ -106,8 +106,10 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
   copies TensorIterator makes of the 8-bit inputs (the luma, and with `addcmul` the U and V views). The output is
   written, then rewritten three times by `mul_`, `sub_` and `div_`, plus the two border fills. FKL keeps everything in
   registers and writes each output value once.
-- **Allocation and dispatch.** Every operator allocates its output (PyTorch's caching allocator on the GPU, its CPU
-  allocator on the CPU), and goes through the dispatcher and TensorIterator's setup. FKL's `build()` calls and fusion
+- **Allocation and dispatch.** Every operator goes through the dispatcher. Each out-of-place one allocates its output
+  (PyTorch's caching allocator on the GPU, its CPU allocator on the CPU); the in-place ones (the fills, `addcmul_`, the
+  copies and the tail) write into existing tensors. The element-wise operators, the copies and `take` set up a
+  TensorIterator, which on the CPU also allocates the float copies of 8-bit inputs. FKL's `build()` calls and fusion
   are compile-time types plus a few parameters.
 - **Kernel launches, one stream, no overlap (GPU).** Each iteration is about 5 N to 6 N dependent kernels and memcpys on
   one stream in the per-region variants, and about 13 kernels and a memcpy in the batched ones (`kernels.csv`). The GPU
