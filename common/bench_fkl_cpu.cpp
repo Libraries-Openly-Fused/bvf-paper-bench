@@ -15,8 +15,9 @@
 // FKL's side of the CPU benchmarks (common/bench_cpu.h): the frame, FKL's pipelines on its CPU backend (one thread) and
 // CPU_MULTITHREAD backend (FKL's thread pool) for every batch size, the plain C++ reference and FKL's conversion
 // coefficients. This is the only translation unit of a CPU benchmark that includes FKL, and add_cpu_bench_target
-// (common/bench_cpu.cmake) compiles it first, so that FKL's code is the same, and placed the same way, in every CPU
-// benchmark, whatever the compared library adds.
+// (common/bench_cpu.cmake) links it first, so that FKL's code is the same in every CPU benchmark, whatever the compared
+// library adds; a page-aligned function (benchFklCodeStart) aligns its code section, so that FKL's code is also at the
+// same addresses modulo 4096 in all of them.
 
 #include <fused_kernel/fused_kernel.h>
 #include <fused_kernel/algorithms/basic_ops/arithmetic.h>
@@ -32,11 +33,23 @@
 #include "bench_reference.h"
 
 #include <array>
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <stdexcept>
 #include <string>
 #include <utility>
+
+// A function aligned to a page: the file's code section takes the largest alignment of its functions, and the linker
+// places it at the start of the program's code (the object is linked first, and keeps its sections in their order), so
+// every FKL function compiled here has the same address modulo 4096 in every CPU benchmark. What precedes the code
+// (.plt, dynamic symbols) grows with the libraries a program imports, and a 16-byte aligned section moved FKL's
+// functions with it.
+#if defined(__GNUC__) || defined(__clang__)
+extern "C" __attribute__((aligned(4096), used, noinline)) void benchFklCodeStart() {}
+#else
+extern "C" void benchFklCodeStart() {}
+#endif
 
 namespace bench::cpu {
 
@@ -125,6 +138,12 @@ std::vector<float> referenceOutput(const Workload& w, size_t n, size_t t, Conven
 
 Conversion fklConversion() {
     return reference::conversion();
+}
+
+std::string fklCodeAlignment() {
+    const auto page = [](const void* f) { return reinterpret_cast<std::uintptr_t>(f) % 4096; };
+    return "benchFklCodeStart at address mod 4096 = " + std::to_string(page(reinterpret_cast<const void*>(&benchFklCodeStart))) +
+           ", fklFrame at address mod 4096 = " + std::to_string(page(reinterpret_cast<const void*>(&fklFrame)));
 }
 
 int poolThreads() {

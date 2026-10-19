@@ -71,9 +71,10 @@ endfunction()
 # (common/bench_fkl_cpu.cpp, FKL's pipelines on the CPU and CPU_MULTITHREAD backends) is the object library <name>_fkl,
 # compiled with these options only, and the program's sources are the object library <name>_code, compiled with these
 # options and the usage requirements of LIBRARIES (the compared library; add the program's own include folders and
-# definitions to <name>_code). The executable links FKL's objects first, then the program's, so that FKL's code is the
-# same, and placed the same way, in every CPU benchmark (Makefile and Ninja generators put an executable's own sources
-# before the objects of object libraries, so the executable has none).
+# definitions to <name>_code). The executable links FKL's objects first, then the program's (Makefile and Ninja
+# generators put an executable's own sources before the objects of object libraries, so the executable has none):
+# FKL's object is the same in every CPU benchmark, and with its page-aligned first function (bench_fkl_cpu.cpp) every
+# FKL function has the same address modulo 4096 in all of them.
 function(add_cpu_bench_target TARGET_NAME)
     cmake_parse_arguments(PARSE_ARGV 1 BENCH "" "" "LIBRARIES")
     add_library(${TARGET_NAME}_fkl OBJECT ${BENCH_COMMON_DIR}/bench_fkl_cpu.cpp)

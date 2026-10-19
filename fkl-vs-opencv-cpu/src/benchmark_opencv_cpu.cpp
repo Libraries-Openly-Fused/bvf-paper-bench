@@ -95,7 +95,13 @@ struct OpenCVCpu {
 // The errors on the regions of one validated iteration
 struct Check {
     size_t batch, iteration;
-    float fklVsReference, opencvVsReference, opencvVsFkl, fklMultithreadVsFkl;
+    float fklVsReference, opencvVsReference, opencvVsFkl, fklMultithreadVsFkl, opencvThreadsVsOneThread;
+    // What the program requires (withinTolerance): FKL against its reference, FKL's pool against FKL, and OpenCV on
+    // `threads` threads against OpenCV on one
+    bool passed() const {
+        return withinTolerance(fklVsReference) && withinTolerance(fklMultithreadVsFkl) &&
+               withinTolerance(opencvThreadsVsOneThread);
+    }
 };
 
 template <size_t N>
@@ -104,11 +110,15 @@ void runBatch(const Workload& w, std::vector<Row>& singleThread, std::vector<Row
     OpenCVCpu opencv(w, N);
     const auto fkl = makeFklCpu(N, false, w);
     const auto fklMT = makeFklCpu(N, true, w);
-    cv::setNumThreads(1);
-    // Before the timing, on the regions of the first, every 50th and the last timed iteration
-    Check worst{N, 0, 0.f, 0.f, 0.f, 0.f};
+    // Before the timing, on the regions of the first, every 50th and the last timed iteration: OpenCV on one thread
+    // and on `threads` threads, FKL on one thread and on its pool
+    Check worst{N, 0, 0.f, 0.f, 0.f, 0.f, 0.f};
     for (const size_t k : validatedIterations(ITERS)) {
         const size_t t = WARMUP_ITERS + k;
+        cv::setNumThreads(threads);
+        opencv.run(t);
+        const auto ocvThreadsOut = opencv.output();
+        cv::setNumThreads(1);
         opencv.run(t);
         fkl->run(t);
         fklMT->run(t);
@@ -116,11 +126,13 @@ void runBatch(const Workload& w, std::vector<Row>& singleThread, std::vector<Row
         const auto fklOut = fkl->output();
         const Check c{N, t, maxAbsError(fklOut, referenceOutput(w, N, t, Conventions::Fkl)),
                       maxAbsError(ocvOut, referenceOutput(w, N, t, Conventions::OpenCV)), maxAbsError(ocvOut, fklOut),
-                      maxAbsError(fklMT->output(), fklOut)};
+                      maxAbsError(fklMT->output(), fklOut), maxAbsError(ocvThreadsOut, ocvOut)};
         checks.push_back(c);
-        worst = Check{N, t, std::max(worst.fklVsReference, c.fklVsReference),
-                      std::max(worst.opencvVsReference, c.opencvVsReference), std::max(worst.opencvVsFkl, c.opencvVsFkl),
-                      std::max(worst.fklMultithreadVsFkl, c.fklMultithreadVsFkl)};
+        // std::max keeps a NaN only as its first argument: the error goes first
+        worst = Check{N, t, std::max(c.fklVsReference, worst.fklVsReference),
+                      std::max(c.opencvVsReference, worst.opencvVsReference), std::max(c.opencvVsFkl, worst.opencvVsFkl),
+                      std::max(c.fklMultithreadVsFkl, worst.fklMultithreadVsFkl),
+                      std::max(c.opencvThreadsVsOneThread, worst.opencvThreadsVsOneThread)};
     }
     const Check& c = worst;
 
@@ -133,10 +145,10 @@ void runBatch(const Workload& w, std::vector<Row>& singleThread, std::vector<Row
     std::printf("N %3zu | OpenCV 1 thread %8.1f us, FKL CPU %8.1f us, mean speedup %6.2fx | OpenCV %d threads %8.1f us, "
                 "FKL CPU_MULTITHREAD %8.1f us, mean speedup %6.2fx | max err: FKL vs "
                 "reference %.2e, OpenCV vs OpenCV-convention reference %.2e, OpenCV vs FKL %.2e, FKL CPU_MULTITHREAD "
-                "vs FKL CPU %.2e\n",
+                "vs FKL CPU %.2e, OpenCV %d threads vs 1 thread %.2e\n",
                 N, s.baseline.median, s.fkl.median, s.meanSpeedup, threads, m.baseline.median, m.fkl.median,
                 m.meanSpeedup, c.fklVsReference,
-                c.opencvVsReference, c.opencvVsFkl, c.fklMultithreadVsFkl);
+                c.opencvVsReference, c.opencvVsFkl, c.fklMultithreadVsFkl, threads, c.opencvThreadsVsOneThread);
 }
 
 } // namespace cpubench
@@ -176,10 +188,14 @@ int main(int argc, char** argv) {
              "OpenCV " + std::to_string(threads) + " threads", multiThread, "FKL CPU_MULTITHREAD");
     std::ofstream v(outDir / "cpu_validation.csv");
     v << "Batch size, Iteration, FKL MaxAbsError vs FKL-convention reference, OpenCV MaxAbsError vs OpenCV-convention "
-         "reference, OpenCV vs FKL MaxAbsDifference, FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference" << std::endl;
+         "reference, OpenCV vs FKL MaxAbsDifference, FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference, OpenCV "
+      << threads << " threads vs OpenCV 1 thread MaxAbsDifference, Within tolerance" << std::endl;
+    bool passed = true;
     for (const auto& c : checks) {
         v << c.batch << ", " << c.iteration << ", " << c.fklVsReference << ", " << c.opencvVsReference << ", "
-          << c.opencvVsFkl << ", " << c.fklMultithreadVsFkl << std::endl;
+          << c.opencvVsFkl << ", " << c.fklMultithreadVsFkl << ", " << c.opencvThreadsVsOneThread << ", "
+          << (c.passed() ? "yes" : "no") << std::endl;
+        passed &= c.passed();
     }
     writeRegionStats((outDir / "regions.csv").string(), *w.regions, WARMUP_ITERS, ITERS);
     const std::string opencvBuild = cv::getBuildInformation();
@@ -196,5 +212,11 @@ int main(int argc, char** argv) {
       << "wake-up), which the " << std::chrono::milliseconds(IDLE_GAP).count() << " ms idle gap must outlast\n";
     writeCpuPlatform(p, threads);
     std::cout << "Results written to " << std::filesystem::absolute(outDir) << std::endl;
+    if (!passed) {
+        std::cerr << "ERROR: validation failed (FKL against its reference, FKL's pool against FKL, or OpenCV on "
+                  << threads << " threads against OpenCV on one beyond " << bench::validation::TOLERANCE
+                  << "): see cpu_validation.csv" << std::endl;
+        return 1;
+    }
     return 0;
 }
