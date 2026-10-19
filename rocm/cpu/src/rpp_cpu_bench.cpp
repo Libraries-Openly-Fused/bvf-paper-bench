@@ -37,8 +37,13 @@
 //   fkl mt: the same call with TransformDPP<ParArch::CPU_MULTITHREAD> on FKL's thread pool (one worker per hardware
 //           thread), in chunks of one output row of one region.
 //
-// Both libraries' thread pools spin for a while after finishing before their workers go to sleep, so every timed run
-// is preceded by an idle gap that lets them fall asleep, as in fkl-vs-opencv-cpu/src/benchmark_opencv_cpu.cpp.
+// The two libraries never run at the same time: for every N and thread count, RPP's complete loop (warm-up and timed
+// iterations) runs first, then FKL's on the same regions. FKL's speedup is the mean over the timed iterations of
+// (RPP time / FKL time) of the same iteration, which pairs runs on identical inputs; every pair is in the
+// *_per_iteration.csv files. Both libraries' thread pools spin for a while after finishing before their workers go to
+// sleep, so every timed run is preceded by an idle gap that lets them fall asleep. The timing thread busy-waits the gap
+// instead of sleeping: a sleeping core enters its deepest C-state, and the run right after it then pays a wake-up whose
+// cost depends on each binary's code.
 // Before the timing of every N, the timed pipelines run the regions of the timed iterations that
 // bench::validation::validatedIterations samples (the first, every 50th and the last), and their outputs are compared
 // with host references of those regions: FKL must be within bench::validation::TOLERANCE of its float reference in
@@ -101,8 +106,8 @@ constexpr int WARMUP_ITERS = BENCH_WARMUP_ITERATIONS;
 constexpr int ITERS = BENCH_ITERATIONS;
 static_assert(WARMUP_ITERS >= 0 && ITERS >= 1, "at least one timed iteration");
 constexpr auto IDLE_GAP = std::chrono::milliseconds(1);
-// Selection pass of the RPP pipeline (selectionConfig): the candidates are timed round-robin, SELECTION_WARMUP +
-// SELECTION_ITERS iterations per N, iteration i with the regions of iteration i
+// Selection pass of the RPP pipeline (selectionConfig): the candidates are timed one after the other, each one's complete
+// loop of SELECTION_WARMUP + SELECTION_ITERS iterations per N, iteration i with the regions of iteration i
 constexpr int SELECTION_WARMUP = 10;
 constexpr int SELECTION_ITERS = 100;
 // Stability check of the selection pass: the regions of iterations A, B, C and A again, three consecutive iterations,
@@ -818,8 +823,8 @@ std::string bySizeText(const std::array<float, PAPER_REGION_SIZES.size()>& error
 }
 
 // ------------------------------------------------------------------------------------------------
-// Two-execution timing in FKL's format: in every iteration RPP and then FKL, each timed with steady_clock after an
-// idle gap
+// Two-execution timing in FKL's format: RPP's complete loop, then FKL's, on the same regions, each run timed with
+// steady_clock after the busy-waited idle gap
 // ------------------------------------------------------------------------------------------------
 struct Stats {
     double mean{0.}, variance{0.}, max{0.}, min{0.}, median{0.}, p10{0.}, p90{0.};
@@ -849,11 +854,46 @@ Stats stats(std::vector<double> ms) {
     return s;
 }
 
+// One comparison for one batch size: the statistics of both loops, the mean of the per-iteration speedups and every
+// timed iteration's times (ms, in iteration order)
 struct Row {
     size_t batch;
     Stats rpp, fkl;
     double meanSpeedup;
+    std::vector<double> rppMs, fklMs;
 };
+
+// The idle gap before a timed run, busy-waited by the timing thread
+void idleGap() {
+    const auto end = std::chrono::steady_clock::now() + IDLE_GAP;
+    while (std::chrono::steady_clock::now() < end) {
+    }
+}
+
+// One timed run: before() (outside of the timing, before the gap), the idle gap, then f, timed with steady_clock (ms)
+double timeOnce(const std::function<void()>& f, const std::function<void()>& before = {}) {
+    if (before) {
+        before();
+    }
+    idleGap();
+    const auto t0 = std::chrono::steady_clock::now();
+    f();
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// The complete loop of one pipeline: the warm-up iterations (the regions of iterations 0 to warmup - 1), then the
+// timed ones (warmup to warmup + iters - 1), each run timed by timeOnce; returns the times of the timed ones (ms)
+std::vector<double> timeLoop(const std::function<void(size_t)>& run, const std::function<void()>& before, int warmup,
+                             int iters) {
+    std::vector<double> ms(iters);
+    for (int i = 0; i < warmup + iters; ++i) {
+        const double elapsed = timeOnce([&]() { run(static_cast<size_t>(i)); }, before);
+        if (i >= warmup) {
+            ms[i - warmup] = elapsed;
+        }
+    }
+    return ms;
+}
 
 // FKL's pool workers spin FKL_POOL_SPIN after their last chunk before they sleep (fkl/thread-pool/include/ThreadPool.h).
 // The RPP all-threads pipeline starts with FKL's conversion on that pool, then RPP's OpenMP team runs on the same
@@ -864,38 +904,37 @@ void fklPoolSpin(bool on) {
     fk::cpuThreadPool().setSpinTime(on ? std::chrono::nanoseconds(FKL_POOL_SPIN) : std::chrono::nanoseconds(0));
 }
 
-// Warm-up iteration i runs the regions of iteration i, timed iteration i those of iteration WARMUP_ITERS + i; RPP and
-// FKL run the same regions in every iteration
+// RPP's complete loop, then FKL's: in both, warm-up iteration i runs the regions of iteration i and timed iteration i
+// those of iteration WARMUP_ITERS + i, so timed iteration i of RPP and of FKL ran on the same regions
 Row timeTwo(size_t batch, const std::function<void(size_t)>& rpp, const std::function<void(size_t)>& fkl,
             const std::function<void()>& beforeRpp = {}, const std::function<void()>& beforeFkl = {}) {
-    using Clock = std::chrono::steady_clock;
-    const auto time = [](const std::function<void(size_t)>& f, size_t t, const std::function<void()>& before) {
-        if (before) {
-            before();
-        }
-        std::this_thread::sleep_for(IDLE_GAP);
-        const auto t0 = Clock::now();
-        f(t);
-        return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-    };
-    for (int i = 0; i < WARMUP_ITERS; ++i) {
-        const size_t t = static_cast<size_t>(i);
-        time(rpp, t, beforeRpp);
-        time(fkl, t, beforeFkl);
-    }
-    std::vector<double> a(ITERS), b(ITERS);
+    Row row{batch, {}, {}, 0., timeLoop(rpp, beforeRpp, WARMUP_ITERS, ITERS), {}};
+    row.fklMs = timeLoop(fkl, beforeFkl, WARMUP_ITERS, ITERS);
     double speedup = 0.;
     for (int i = 0; i < ITERS; ++i) {
-        const size_t t = static_cast<size_t>(WARMUP_ITERS + i);
-        a[i] = time(rpp, t, beforeRpp);
-        b[i] = time(fkl, t, beforeFkl);
-        speedup += a[i] / b[i];
+        speedup += row.rppMs[i] / row.fklMs[i];
     }
-    return {batch, stats(a), stats(b), speedup / ITERS};
+    row.rpp = stats(row.rppMs);
+    row.fkl = stats(row.fklMs);
+    row.meanSpeedup = speedup / ITERS;
+    return row;
 }
 
+// One comparison in FKL's two-execution format (times in ms), one row per batch size, at path, and every timed
+// iteration's pair of times with its speedup next to it (<path>_per_iteration.csv): the batch size, the iteration (its
+// regions), RPP's time, FKL's time and their ratio, which the mean speedup averages
 void writeCSV(const std::filesystem::path& path, const std::string& rppLabel, const std::vector<Row>& rows,
               const std::string& fklLabel) {
+    std::filesystem::path perIteration = path;
+    perIteration.replace_filename(path.stem().string() + "_per_iteration" + path.extension().string());
+    std::ofstream p(perIteration);
+    p << "Batch size, Iteration, " << rppLabel << " Time, " << fklLabel << " Time, Speedup" << std::endl;
+    for (const auto& r : rows) {
+        for (size_t i = 0; i < r.rppMs.size(); ++i) {
+            p << r.batch << ", " << WARMUP_ITERS + i << ", " << r.rppMs[i] << ", " << r.fklMs[i] << ", "
+              << r.rppMs[i] / r.fklMs[i] << std::endl;
+        }
+    }
     std::ofstream f(path);
     f << "Batch size";
     for (const std::string& label : {rppLabel, fklLabel}) {
@@ -930,9 +969,9 @@ enum Pairing { ONE_THREAD_VS_CPU, ALL_THREADS_VS_MT, PAIRINGS };
 // library state may change between calls, and no value that the regions of B and C leave in its buffers may be used),
 // and the second one within RPP_EQUIVALENCE of its RPP-convention reference for A and of rpp_per_op's output for A:
 // those variants are the candidates (numerically equivalent to the one-call-per-operation pipeline). The candidates
-// are timed round-robin, each run after the idle gap, SELECTION_WARMUP + SELECTION_ITERS iterations per N, iteration i
-// with the regions of iteration i; the one with the lowest geometric mean of its medians over all N is the RPP
-// pipeline of that thread count, the only one in the measurements.
+// are timed one after the other, each one's complete loop of SELECTION_WARMUP + SELECTION_ITERS iterations per N, each
+// run after the idle gap, iteration i with the regions of iteration i; the one with the lowest geometric mean of its
+// medians over all N is the RPP pipeline of that thread count, the only one in the measurements.
 // ------------------------------------------------------------------------------------------------
 struct SelectionRow {
     unsigned threads;
@@ -942,16 +981,6 @@ struct SelectionRow {
     bool stable, candidate;
     Stats timing;
 };
-
-double timeOnce(const std::function<void()>& f, const std::function<void()>& before = {}) {
-    if (before) {
-        before();
-    }
-    std::this_thread::sleep_for(IDLE_GAP);
-    const auto t0 = std::chrono::steady_clock::now();
-    f();
-    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-}
 
 template <size_t N, fk::ParArch PA>
 void selectionConfig(const Workload& w, unsigned threads, bool timing, const References& refA,
@@ -994,19 +1023,13 @@ void selectionConfig(const Workload& w, unsigned threads, bool timing, const Ref
     }
     if (timing) {
         std::vector<std::vector<double>> ms(VARIANTS.size());
-        for (int i = 0; i < SELECTION_WARMUP + SELECTION_ITERS; ++i) {
-            const size_t t = static_cast<size_t>(i);
-            for (size_t k = 0; k < VARIANTS.size(); ++k) {
-                if (local[k].candidate) {
-                    const double ms_ = timeOnce([&]() { pipelines[k]->run(t); }, [] {
-                        if constexpr (PA == fk::ParArch::CPU_MULTITHREAD) {
-                            fklPoolSpin(false);
-                        }
-                    });
-                    if (i >= SELECTION_WARMUP) {
-                        ms[k].push_back(ms_);
+        for (size_t k = 0; k < VARIANTS.size(); ++k) {
+            if (local[k].candidate) {
+                ms[k] = timeLoop([&](size_t t) { pipelines[k]->run(t); }, [] {
+                    if constexpr (PA == fk::ParArch::CPU_MULTITHREAD) {
+                        fklPoolSpin(false);
                     }
-                }
+                }, SELECTION_WARMUP, SELECTION_ITERS);
             }
         }
         fklPoolSpin(true);
@@ -1446,8 +1469,9 @@ int main(int argc, char** argv) {
              << "by a selection pass (each variant run on the regions of iterations 0, 1, 2 and 0 again, so that every "
              << "slot of the crop buffer has held a region of every size: the two outputs of iteration 0 identical value "
              << "by value, the second within " << RPP_EQUIVALENCE << " of its reference and of rpp_per_op's; then every "
-             << "candidate timed round-robin, " << SELECTION_WARMUP << " warm-up + " << SELECTION_ITERS
-             << " iterations per N, iteration i with the regions of iteration i, lowest geometric mean of the medians; "
+             << "candidate timed one after the other, each one's complete loop of " << SELECTION_WARMUP << " warm-up + "
+             << SELECTION_ITERS << " iterations per N, iteration i with the regions of iteration i, lowest geometric "
+             << "mean of the medians; "
              << "cpu_rpp_selection.csv); only that pipeline is measured afterwards. "
              << "Variants: rpp_per_op (crop_mirror_normalize 8u->32f, memset of the output's border rows, resize into "
                 "the output rows, multiply_scalar, tensor_subtract_tensor, tensor_divide_tensor), rpp_npp_like (resized "
@@ -1495,12 +1519,15 @@ int main(int argc, char** argv) {
                 "rppt_resize_mirror_normalize-based ones (rpp_fused, rpp_fused_normalize) differ at the last columns and "
                 "rows, each matching its own measured convention; the latter are therefore not numerically equivalent "
                 "to rpp_per_op and not candidates of the selection.\n"
-             << "Timing: steady_clock around each pipeline, " << WARMUP_ITERS << " warm-up and " << ITERS
-             << " timed iterations, RPP and FKL one after the other in each, both with the regions of the same "
-             << "iteration (warm-up iteration i: the regions of iteration i; timed iteration i: those of iteration "
-             << WARMUP_ITERS << " + i; regions.csv has their statistics), each run preceded by a "
+             << "Timing: steady_clock around each pipeline; for every N and thread count, RPP's loop (" << WARMUP_ITERS
+             << " warm-up and " << ITERS << " timed iterations) runs to completion first, then FKL's on the same "
+             << "regions: the two libraries never run at the same time and never alternate within an iteration "
+             << "(warm-up iteration i: the regions of iteration i; timed iteration i: those of iteration "
+             << WARMUP_ITERS << " + i; regions.csv has their statistics). Every run is preceded by a "
              << std::chrono::milliseconds(IDLE_GAP).count()
-             << " ms idle gap so that both thread pools are asleep; speedup computed per iteration and averaged. "
+             << " ms idle gap so that both thread pools are asleep, busy-waited by the timing thread (so that its core "
+                "does not enter a deep C-state). Speedup: mean over the timed iterations of (RPP time / FKL time) of the "
+                "same iteration (the *_per_iteration.csv files). "
                 "Inside the timed region: FKL builds the whole chain from the regions of the iteration (Crop<>::build "
                 "of its N regions, every plane with its region's size and Resize with its own scale), fuses it and "
                 "executes it; RPP points the ROI arguments of its calls at the ROIs of the iteration and runs FKL's "

@@ -2,8 +2,10 @@
 // pipeline on an AMD GPU:
 // ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
 // with the frame, sizes, batch sizes and the regions of every iteration of common/bench_geometry.h: new regions every
-// iteration (warm-up and timed), 20x10, 32x16 and 48x24 by turns, precomputed before the loops; iteration t of every
-// loop runs every implementation on the regions of iteration t.
+// iteration (warm-up and timed), 20x10, 32x16 and 48x24 by turns, precomputed before the loops. For every N, each
+// implementation runs its complete loop (warm-up and timed iterations) before the next one starts, the baselines first
+// and FKL BVF last; never two implementations at the same time, never interleaved per iteration. Iteration t of every
+// loop runs on the regions of iteration t, so FKL BVF's speedup pairs the runs of the same iteration.
 //
 // Implementations: rpp (the fastest of the RPP variants below, chosen by a selection pass; the only RPP pipeline in the
 // measurements), fkl_vf_hf and fkl_bvf. RPP variants (ROCm Performance Primitives, HIP backend):
@@ -96,7 +98,8 @@ using namespace geometry;
 constexpr int WARMUP_ITERS = BENCH_WARMUP_ITERATIONS;
 constexpr int TIMED_ITERS = BENCH_ITERATIONS;
 static_assert(WARMUP_ITERS >= 0 && TIMED_ITERS >= 1, "at least one timed iteration");
-// The RPP selection pass (CPU + GPU, interleaved, SELECTION_WARMUP + SELECTION_ITERS iterations per N)
+// The RPP selection pass (CPU + GPU, one variant's complete loop after the other, SELECTION_WARMUP + SELECTION_ITERS
+// iterations per N)
 constexpr int SELECTION_WARMUP = 20;
 constexpr int SELECTION_ITERS = 200;
 // The regions of every iteration of every loop of this program, generated before any loop (common/bench_geometry.h):
@@ -951,20 +954,22 @@ TimingStats computeStats(std::vector<float> ms) {
     return t;
 }
 
-// Latency of each complete pipeline, the way FKL's two-execution benchmarks measure: in every iteration all the
-// implementations run one after the other, each one between two HIP events on the same stream (everything the
-// host does to enqueue it is included) and followed by a synchronization. Inputs are already in device memory.
-// Iteration i (warm-up first) runs every implementation on the regions of iteration i, so the warm-up uses the regions
-// of iterations 0 to warmup - 1 and the timed iterations those of warmup to warmup + iters - 1.
+// Latency of each complete pipeline, the way FKL's two-execution benchmarks measure, one implementation at a time: the
+// complete loop of impls[0] (warm-up and timed iterations), then the complete loop of impls[1], and so on, never two
+// implementations at the same time or interleaved per iteration. Each execution runs between two HIP events on the
+// same stream (everything the host does to enqueue it is included) and is followed by a synchronization. Inputs are
+// already in device memory. Iteration i of every loop (warm-up first) runs on the regions of iteration i, so the
+// warm-up uses the regions of iterations 0 to warmup - 1 and the timed iterations those of warmup to
+// warmup + iters - 1, and timed iteration i of two implementations ran on identical inputs.
 // Returns the iters execution times of each implementation, in ms, in iteration order.
-std::vector<std::vector<float>> measureInterleaved(const Context& ctx, const std::vector<Implementation>& impls,
-                                                   int warmup = WARMUP_ITERS, int iters = TIMED_ITERS) {
+std::vector<std::vector<float>> measureSequential(const Context& ctx, const std::vector<Implementation>& impls,
+                                                  int warmup = WARMUP_ITERS, int iters = TIMED_ITERS) {
     hipEvent_t start, stop;
     gpuErrchk(hipEventCreate(&start));
     gpuErrchk(hipEventCreate(&stop));
     std::vector<std::vector<float>> ms(impls.size(), std::vector<float>(iters));
-    for (int i = 0; i < warmup + iters; ++i) {
-        for (size_t k = 0; k < impls.size(); ++k) {
+    for (size_t k = 0; k < impls.size(); ++k) {
+        for (int i = 0; i < warmup + iters; ++i) {
             gpuErrchk(hipEventRecord(start, ctx.stream));
             impls[k].run(static_cast<size_t>(i));
             gpuErrchk(hipEventRecord(stop, ctx.stream));
@@ -1209,6 +1214,9 @@ struct Result {
     TimingStats gpuFlushedTiming;
     double meanGpuFlushedSpeedupOfBvf{NAN};
     bool gpuFlushedMeasured{false};
+    // The time of every timed iteration (ms, in iteration order) of the CPU + GPU, GPU only and flushed GPU only
+    // passes, for the *_per_iteration.csv files
+    std::vector<float> ms, gpuMs, gpuFlushedMs;
     // The errors of every validated iteration (validation::validatedIterations), and all of them together
     // (validation::combine)
     struct IterationErrors {
@@ -1298,8 +1306,8 @@ std::vector<Implementation> makeImplementations(Context& ctx) {
     return impls;
 }
 
-// Validation, interleaved timing with per-execution speedups, and per operation breakdown, for batch N. With timing
-// false, validation only.
+// Validation, sequential timing (each implementation's complete loop, FKL BVF's last) with per-execution speedups, and
+// per operation breakdown, for batch N. With timing false, validation only.
 // Progress messages on stderr with BENCH_VERBOSE=1
 void progress(const std::string& what) {
     static const bool verbose = std::getenv("BENCH_VERBOSE") != nullptr;
@@ -1399,7 +1407,7 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
         return;
     }
     progress("CPU + GPU timing");
-    const auto ms = measureInterleaved(ctx, impls);
+    const auto ms = measureSequential(ctx, impls);
     // The outputs after the timed iterations must still be the validated ones, every value within 1e-6 and finite (no
     // library state, such as ROI tensors, may change from one call to the next): the first validated iteration again
     const size_t firstValidated = static_cast<size_t>(WARMUP_ITERS) + validated.front();
@@ -1417,10 +1425,11 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
     for (size_t k = 0; k < impls.size(); ++k) {
         Result& r = batchResults[k];
         r.timing = computeStats(ms[k]);
+        r.ms = ms[k];
         if (k != bvf) {
             double sum = 0.;
             for (int i = 0; i < TIMED_ITERS; ++i) {
-                sum += ms[k][i] / ms[bvf][i];
+                sum += static_cast<double>(ms[k][i]) / ms[bvf][i];
             }
             r.meanSpeedupOfBvf = sum / TIMED_ITERS;
         }
@@ -1445,9 +1454,9 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
 
 // ------------------------------------------------------------------------------------------------
 // Selection of the RPP pipeline: every RPP variant is validated against the RPP-convention reference on the validated
-// iterations of the selection pass and timed (CPU + GPU, interleaved, SELECTION_WARMUP + SELECTION_ITERS iterations per
-// N, iteration i on the regions of iteration i); the numerically equivalent variant with the lowest geometric mean of
-// its medians over all N is the benchmark's RPP pipeline, the only one in the measurements
+// iterations of the selection pass and timed (CPU + GPU, one variant's complete loop after the other, SELECTION_WARMUP +
+// SELECTION_ITERS iterations per N, iteration i on the regions of iteration i); the numerically equivalent variant with
+// the lowest geometric mean of its medians over all N is the benchmark's RPP pipeline, the only one in the measurements
 // ------------------------------------------------------------------------------------------------
 
 struct SelectionRow {
@@ -1472,7 +1481,7 @@ void selectionBatch(Context& ctx) {
             errors[j] = validation::combine(errors[j], compare(variants[j].download(), ref));
         }
     }
-    const auto ms = measureInterleaved(ctx, variants, SELECTION_WARMUP, SELECTION_ITERS);
+    const auto ms = measureSequential(ctx, variants, SELECTION_WARMUP, SELECTION_ITERS);
     std::cout << "RPP selection N = " << N << ":";
     for (size_t k = 0; k < variants.size(); ++k) {
         selectionRows.push_back({static_cast<int>(N), variants[k].name, errors[k], computeStats(ms[k])});
@@ -1580,8 +1589,45 @@ void countBatch(Context& ctx, std::vector<Result>& results) {
     }
 }
 
-// GPU time only benchmark: the same interleaved iterations as the CPU + GPU one (warm-up on the regions of iterations
-// 0 to W - 1, timed on those of W to W + T - 1), with kernel dispatch tracing on.
+// Executions inside windows of rocprofiler timestamps (the clock of the dispatch records), for the GPU time only
+// benchmark: a record belongs to the execution whose window contains its start. The executions are sequential
+// (synchronized), so the windows do not overlap, and they are pushed in the order they run, so their begins increase.
+struct Window {
+    rocprofiler_timestamp_t begin, end;
+    size_t k;
+    int i;
+};
+
+// The GPU time only loops, as measureSequential: the complete loop of each implementation in turn, the warm-up
+// iterations (regions of iterations 0 to W - 1) without tracing, then the timed ones (regions of W to W + T - 1) with
+// kernel dispatch tracing on, each execution inside its window. Returns the windows of every timed execution.
+std::vector<Window> runGpuOnlyLoops(const Context& ctx, const std::vector<Implementation>& impls) {
+    std::vector<Window> windows;
+    windows.reserve(static_cast<size_t>(TIMED_ITERS) * impls.size());
+    for (size_t k = 0; k < impls.size(); ++k) {
+        for (int i = 0; i < WARMUP_ITERS; ++i) {
+            impls[k].run(static_cast<size_t>(i));
+            gpuErrchk(hipStreamSynchronize(ctx.stream));
+        }
+        ROCP_CHECK(rocprofiler_start_context(rocprof::kernelContext));
+        for (int i = 0; i < TIMED_ITERS; ++i) {
+            Window w{0, 0, k, i};
+            ROCP_CHECK(rocprofiler_get_timestamp(&w.begin));
+            impls[k].run(static_cast<size_t>(WARMUP_ITERS + i));
+            gpuErrchk(hipStreamSynchronize(ctx.stream));
+            ROCP_CHECK(rocprofiler_get_timestamp(&w.end));
+            windows.push_back(w);
+            if (i % 100 == 99) {
+                rocprof::flushKernels();
+            }
+        }
+        ROCP_CHECK(rocprofiler_stop_context(rocprof::kernelContext));
+    }
+    return windows;
+}
+
+// GPU time only benchmark: the same sequential loops as the CPU + GPU one (runGpuOnlyLoops), with kernel dispatch
+// tracing on in the timed iterations.
 // The GPU time of one execution is the sum of the execution times of its kernels: no host work and no launch gaps.
 // Only where kernelTracingAvailable(); never on WSL2.
 template <size_t N>
@@ -1594,43 +1640,13 @@ void gpuOnlyBatch(Context& ctx, std::vector<Result>& results, CacheFlusher* flus
         gpuErrchk(hipStreamSynchronize(ctx.stream));
         kernelsPerRun[k] = countLaunches(ctx, impls[k], static_cast<size_t>(WARMUP_ITERS)).kernels;
     }
-    activeFlusher = flusher;
-    for (int i = 0; i < WARMUP_ITERS; ++i) {
-        for (const auto& impl : impls) {
-            impl.run(static_cast<size_t>(i));
-            gpuErrchk(hipStreamSynchronize(ctx.stream));
-        }
-    }
     rocprof::flushKernels();
     {
         std::lock_guard<std::mutex> lock(rocprof::mutex);
         rocprof::kernels.clear();
     }
-    // Every execution runs inside a window of rocprofiler timestamps (the clock of the dispatch records); a record
-    // belongs to the execution whose window contains its start. The executions are sequential (synchronized), so the
-    // windows do not overlap.
-    struct Window {
-        rocprofiler_timestamp_t begin, end;
-        size_t k;
-        int i;
-    };
-    std::vector<Window> windows;
-    windows.reserve(static_cast<size_t>(TIMED_ITERS) * impls.size());
-    ROCP_CHECK(rocprofiler_start_context(rocprof::kernelContext));
-    for (int i = 0; i < TIMED_ITERS; ++i) {
-        for (size_t k = 0; k < impls.size(); ++k) {
-            Window w{0, 0, k, i};
-            ROCP_CHECK(rocprofiler_get_timestamp(&w.begin));
-            impls[k].run(static_cast<size_t>(WARMUP_ITERS + i));
-            gpuErrchk(hipStreamSynchronize(ctx.stream));
-            ROCP_CHECK(rocprofiler_get_timestamp(&w.end));
-            windows.push_back(w);
-        }
-        if (i % 100 == 99) {
-            rocprof::flushKernels();
-        }
-    }
-    ROCP_CHECK(rocprofiler_stop_context(rocprof::kernelContext));
+    activeFlusher = flusher;
+    const std::vector<Window> windows = runGpuOnlyLoops(ctx, impls);
     rocprof::flushKernels();
     activeFlusher = nullptr;
     std::vector<KernelRecord> records;
@@ -1698,6 +1714,7 @@ void gpuOnlyBatch(Context& ctx, std::vector<Result>& results, CacheFlusher* flus
         double& speedup = flusher ? r->meanGpuFlushedSpeedupOfBvf : r->meanGpuSpeedupOfBvf;
         (flusher ? r->gpuFlushedMeasured : r->gpuMeasured) = true;
         timing = computeStats(ms[k]);
+        (flusher ? r->gpuFlushedMs : r->gpuMs) = ms[k];
         (flusher ? r->gpuFlushedBlitTiming : r->gpuBlitTiming) = computeStats(blitMs[k]);
         std::vector<float> counts = blitCount[k];
         std::sort(counts.begin(), counts.end());
@@ -1705,7 +1722,7 @@ void gpuOnlyBatch(Context& ctx, std::vector<Result>& results, CacheFlusher* flus
         if (k != bvf) {
             double sum = 0.;
             for (int i = 0; i < TIMED_ITERS; ++i) {
-                sum += ms[k][i] / ms[bvf][i];
+                sum += static_cast<double>(ms[k][i]) / ms[bvf][i];
             }
             speedup = sum / TIMED_ITERS;
         }
@@ -2003,13 +2020,15 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << OUT_H << "\n";
     os << "Timing: " << WARMUP_ITERS << " warm-up then " << TIMED_ITERS << " timed iterations; iteration t (the "
        << "warm-up iterations are t in [0, " << WARMUP_ITERS << "), the timed ones t in [" << WARMUP_ITERS << ", "
-       << WARMUP_ITERS + TIMED_ITERS << ")) runs every implementation on the regions of iteration t (" << REGION_ITERATIONS << " iterations of "
-       << "regions generated before any loop). In every iteration "
-       << "the RPP pipeline (rpp), FKL VF+HF and FKL BVF run one after the other, each timed with HIP events on one "
-       << "stream "
-       << "around the complete pipeline (all host enqueue work included) and followed by a synchronization. "
-       << "FKL BVF's speedup over each baseline is computed per iteration (baseline time / BVF time) and averaged "
-       << "(mean speedup, FKL's two-execution convention). Median, p10, p90 with linear interpolation.\n"
+       << WARMUP_ITERS + TIMED_ITERS << ")) of every loop runs on the regions of iteration t (" << REGION_ITERATIONS
+       << " iterations of regions generated before any loop). For every N, the RPP pipeline (rpp), then FKL VF+HF, "
+       << "then FKL BVF each run their complete loop (" << WARMUP_ITERS << " warm-up and " << TIMED_ITERS << " timed "
+       << "iterations) before the next one starts: never two implementations at the same time, never interleaved per "
+       << "iteration. Every execution is timed with HIP events on one stream around the complete pipeline (all host "
+       << "enqueue work included) and followed by a synchronization. FKL BVF's speedup over each baseline is the mean "
+       << "over the timed iterations of (baseline time / BVF time) of the same iteration, which ran on the same regions "
+       << "(mean speedup, FKL's two-execution convention; every pair in the *_per_iteration.csv files). Median, p10, "
+       << "p90 with linear interpolation.\n"
        << "Validation: before the timing, on the timed iterations " << validation::VALIDATION_STRIDE << " apart from the "
        << "first, and the last (" << validation::validatedIterations(TIMED_ITERS).size() << " iterations: t = "
        << WARMUP_ITERS << " + 0, " << validation::VALIDATION_STRIDE << ", ...): every implementation runs on the regions "
@@ -2019,9 +2038,10 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << "validated iteration is run again and must give the same output (every value within 1e-6).\n"
        << "RPP pipeline: rpp = " << selectedRpp << ", the fastest of the five RPP variants below, which are "
        << "numerically equivalent (within " << RPP_EQUIVALENCE << " of the RPP-convention reference, on the validated "
-       << "iterations of the selection pass): a selection pass validates and times every variant (CPU + GPU, "
-       << "interleaved, " << SELECTION_WARMUP << " warm-up + " << SELECTION_ITERS << " timed iterations per N, iteration "
-       << "i on the regions of iteration i) and picks the one with the lowest geometric mean "
+       << "iterations of the selection pass): a selection pass validates and times every variant (CPU + GPU, one "
+       << "variant's complete loop after the other, " << SELECTION_WARMUP << " warm-up + " << SELECTION_ITERS
+       << " timed iterations per N, iteration i on the regions of iteration i) and picks the one with the lowest "
+       << "geometric mean "
        << "of its medians (rpp_selection.csv); only that one is measured afterwards.\n"
        << "RPP variants (HIP backend), each one starting with the hipMemcpyAsync of the ROIs of its iteration (below): "
        << "rpp_per_op = rppt_yuv_to_rgb (RpptColorStandard_BT601, RpptColorRange_STUDIO; 1 kernel plus 8 hipMemcpyToSymbol per "
@@ -2104,9 +2124,10 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << " us median (p10 " << eventFloor.oneKernel.p10 << ", p90 " << eventFloor.oneKernel.p90 << "); four empty "
        << "kernels " << eventFloor.fourKernels.median << " us median" << std::defaultfloat << "\n"
        << "GPU time only: "
-       << (kernelTracing ? "a second pass with the same interleaved iterations and rocprofiler-sdk kernel dispatch "
-                           "tracing on (in the profiling child process); the GPU time of one execution is the sum of "
-                           "the execution times of its kernels."
+       << (kernelTracing ? "a second pass with the same sequential loops and regions (each implementation's complete "
+                           "loop, FKL BVF's last) and rocprofiler-sdk kernel dispatch tracing on in the timed iterations "
+                           "(in the profiling child process); the GPU time of one execution is the sum of the execution "
+                           "times of its kernels, and the speedups pair the executions of the same iteration."
                          : onWsl() ? "NOT MEASURED: rocprofiler-sdk delivers no kernel dispatch records on WSL2 "
                                      "(wsl-dxcore agents, no /dev/kfd), and hipEvents attached to each kernel distort the "
                                      "execution (an empty kernel measured about 31 us instead of about 2 us)."
@@ -2166,6 +2187,30 @@ void writeTwoExecutionRow(std::ostream& two, long long key, const TimingStats& t
     two << std::endl;
 }
 
+// The per-iteration sibling of a two-execution CSV (<path>_per_iteration.csv): one row per batch size and timed
+// iteration with the iteration (its regions), the baseline's time and FKL BVF's time in ms and their ratio, which the
+// Mean Speedup column averages
+std::filesystem::path perIterationPath(const std::filesystem::path& path) {
+    std::filesystem::path perIteration = path;
+    perIteration.replace_filename(path.stem().string() + "_per_iteration" + path.extension().string());
+    return perIteration;
+}
+
+void writePerIterationHeader(std::ostream& p, const std::string& baseline) {
+    p << "Batch size, Iteration, " << baseline << " Time, fkl_bvf Time, Speedup" << std::endl;
+}
+
+void writePerIterationRows(std::ostream& p, long long key, const std::vector<float>& baselineMs,
+                           const std::vector<float>& fklMs) {
+    if (baselineMs.size() != fklMs.size()) {
+        throw std::runtime_error("Per-iteration times of different lengths for batch size " + std::to_string(key));
+    }
+    for (size_t i = 0; i < baselineMs.size(); ++i) {
+        p << key << ", " << WARMUP_ITERS + i << ", " << baselineMs[i] << ", " << fklMs[i] << ", "
+          << static_cast<double>(baselineMs[i]) / fklMs[i] << std::endl;
+    }
+}
+
 const std::array<std::string, 2> BASELINES{"rpp", "fkl_vf_hf"};
 
 template <size_t... Is>
@@ -2213,6 +2258,17 @@ void writeProfileRows(const std::filesystem::path& file, const std::vector<Resul
         os << "," << r.gpuBlitDispatches;
         writeStats(os, r.gpuFlushedBlitTiming);
         os << "," << r.gpuFlushedBlitDispatches << "\n";
+        // The time of every timed iteration of the two GPU time only passes, for the *_per_iteration.csv files
+        for (const auto& [pass, ms] : {std::pair<const char*, const std::vector<float>*>{"gpu", &r.gpuMs},
+                                       std::pair<const char*, const std::vector<float>*>{"gpu_flushed", &r.gpuFlushedMs}}) {
+            if (!ms->empty()) {
+                os << "times," << pass << "," << r.name << "," << r.batch;
+                for (const float v : *ms) {
+                    os << "," << v;
+                }
+                os << "\n";
+            }
+        }
     }
 }
 
@@ -2228,6 +2284,24 @@ bool mergeProfileRows(const std::filesystem::path& file, std::vector<Result>& re
         }
         if (f.size() == 2 && f[0] == "tracing") {
             tracing = f[1] == "1";
+            continue;
+        }
+        if (!f.empty() && f[0] == "times") {
+            // times,<gpu|gpu_flushed>,<implementation>,<N>,<the time of every timed iteration in ms>
+            if (f.size() != 4 + static_cast<size_t>(TIMED_ITERS) || (f[1] != "gpu" && f[1] != "gpu_flushed")) {
+                throw std::runtime_error("Malformed profiling pass times row: " + line.substr(0, 200));
+            }
+            const auto r = std::find_if(results.begin(), results.end(), [&](const Result& x) {
+                return x.name == f[2] && x.batch == std::stoi(f[3]);
+            });
+            if (r == results.end()) {
+                throw std::runtime_error("Profiling pass times row without a timed result: " + line.substr(0, 200));
+            }
+            std::vector<float>& ms = f[1] == "gpu" ? r->gpuMs : r->gpuFlushedMs;
+            ms.clear();
+            for (size_t i = 4; i < f.size(); ++i) {
+                ms.push_back(std::stof(f[i]));
+            }
             continue;
         }
         if (f.size() != 39) {
@@ -2455,8 +2529,10 @@ int main(int argc, char** argv) {
         if (!tracing) {
             for (const std::string& baseline : BASELINES) {
                 for (const std::string suffix : {"gpu_only_", "gpu_only_l2_flushed_"}) {
-                    std::filesystem::remove(outDir / (baseline + "_vs_fkl_bvf_" + suffix +
-                                                      std::string(fk::toStrView(fk::defaultParArch)) + ".csv"));
+                    const auto two = outDir / (baseline + "_vs_fkl_bvf_" + suffix +
+                                               std::string(fk::toStrView(fk::defaultParArch)) + ".csv");
+                    std::filesystem::remove(two);
+                    std::filesystem::remove(perIterationPath(two));
                 }
             }
             std::filesystem::remove(outDir / "gpu_time.csv");
@@ -2491,7 +2567,7 @@ int main(int argc, char** argv) {
         // One CSV per baseline in FKL's two-execution format (times in ms):
         // <baseline>_vs_fkl_bvf_GPU_AMD.csv (CPU + GPU) and, where measured, <baseline>_vs_fkl_bvf_gpu_only_GPU_AMD.csv
         // and <baseline>_vs_fkl_bvf_gpu_only_l2_flushed_GPU_AMD.csv (the CUDA benchmark's names; on AMD the flush
-        // buffer covers L2 and MALL)
+        // buffer covers L2 and MALL), each with its _per_iteration.csv sibling
         const std::string parArch(fk::toStrView(fk::defaultParArch));
         for (const int mode : {0, 1, 2}) {
             if (mode > 0 && !tracing) {
@@ -2499,8 +2575,11 @@ int main(int argc, char** argv) {
             }
             const std::string suffix = mode == 0 ? "" : mode == 1 ? "gpu_only_" : "gpu_only_l2_flushed_";
             for (const std::string& baseline : BASELINES) {
-                std::ofstream two(outDir / (baseline + "_vs_fkl_bvf_" + suffix + parArch + ".csv"));
+                const auto path = outDir / (baseline + "_vs_fkl_bvf_" + suffix + parArch + ".csv");
+                std::ofstream two(path);
+                std::ofstream perIteration(perIterationPath(path));
                 writeTwoExecutionHeader(two, "Batch size", baseline);
+                writePerIterationHeader(perIteration, baseline);
                 for (const auto& b : results) {
                     if (b.name != baseline) {
                         continue;
@@ -2508,13 +2587,19 @@ int main(int argc, char** argv) {
                     const auto f = std::find_if(results.begin(), results.end(), [&](const Result& r) {
                         return r.name == "fkl_bvf" && r.batch == b.batch;
                     });
+                    if (f == results.end()) {
+                        throw std::runtime_error("No fkl_bvf result for N = " + std::to_string(b.batch));
+                    }
                     if (mode == 0) {
                         writeTwoExecutionRow(two, b.batch, b.timing, f->timing, b.meanSpeedupOfBvf);
+                        writePerIterationRows(perIteration, b.batch, b.ms, f->ms);
                     } else if (mode == 1) {
                         writeTwoExecutionRow(two, b.batch, b.gpuTiming, f->gpuTiming, b.meanGpuSpeedupOfBvf);
+                        writePerIterationRows(perIteration, b.batch, b.gpuMs, f->gpuMs);
                     } else {
                         writeTwoExecutionRow(two, b.batch, b.gpuFlushedTiming, f->gpuFlushedTiming,
                                              b.meanGpuFlushedSpeedupOfBvf);
+                        writePerIterationRows(perIteration, b.batch, b.gpuFlushedMs, f->gpuFlushedMs);
                     }
                 }
             }

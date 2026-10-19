@@ -12,7 +12,7 @@
 # Environment (all optional):
 #   ROCM_PATH       ROCm installation (default /opt/rocm/core-10.1)
 #   ROCM_EXTRA      prefix with RPP, rocprofiler-sdk and amd-smi when they are not in ROCM_PATH (see env.sh)
-#   FKL_GPU_DIR     FusedKernelLibrary for the GPU benchmark, default <repo>/fkl (the submodule, 63782f6)
+#   FKL_GPU_DIR     FusedKernelLibrary for the GPU benchmark, default <repo>/fkl (the submodule)
 #   FKL_CPU_DIR     FusedKernelLibrary with its thread-pool submodule for the CPU benchmark, default <repo>/fkl
 #   CXX_CPU         C++ compiler of the CPU benchmark (default: the newest clang++-NN found, else clang++)
 #   COUNTERS        hardware counters for Experiment 2 (default "FETCH_SIZE GL2C_EA_WRREQ_sum GL2C_EA_WRREQ_64B_sum":
@@ -21,8 +21,9 @@
 #   BENCH_CMAKE_ARGS extra CMake arguments of both builds, e.g. "-DBENCH_REGIONS=32x16" (default none: mixed sizes)
 #   BENCH_MALL_KIB  MALL (Infinity Cache) size in KiB, if rocminfo / amd-smi cannot report it
 #   EXPERIMENT      1 (default): Experiments 1 and 2 and the CPU benchmark, as above. 3: Experiment 3 only: the GPU
-#                   build, the kernel tracing check and rocm_neighborhood (into <results dir>/neighborhood), with FKL at
-#                   the commit recorded for the repository's fkl submodule; no hardware counters, no CPU benchmark
+#                   build, the kernel tracing check and rocm_neighborhood (into <results dir>/neighborhood); no hardware
+#                   counters, no CPU benchmark
+# Every experiment uses FKL at the commit recorded for the repository's fkl submodule.
 # The hardware counter step needs counters that count: on gfx1200 only at a profiling performance level (at "auto" the
 # GL2C counters read 0; sudo amd-smi set -l STABLE_STD, which also pins the shader clock: 1494 MHz on the RX 9060). The
 # script checks it before the GPU benchmark with rocprof_counters.sh --check (FETCH_SIZE of a cache flush kernel) and
@@ -47,20 +48,12 @@ REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 . "$REPO/rocm/scripts/env.sh"
 EXPERIMENT=${EXPERIMENT:-1}
 [ "$EXPERIMENT" = 1 ] || [ "$EXPERIMENT" = 3 ] || { echo "run_all.sh: STOP: EXPERIMENT is 1 or 3, not $EXPERIMENT" >&2; exit 1; }
-# The paper's FKL commit of Experiments 1 and 2 (and of the CPU benchmark); Experiment 3 uses the commit recorded for
-# the repository's fkl submodule, which has MorphologyDPP's executeBoxBlur
-if [ "$EXPERIMENT" = 1 ]; then
-    FKL_PAPER_COMMIT=63782f6
-else
-    FKL_PAPER_COMMIT=$(git -C "$REPO" ls-tree HEAD fkl | awk '{print substr($3, 1, 7)}')
-fi
-# FKL_GPU_DIR / FKL_CPU_DIR, or by default the repository's fkl submodule. The submodule is at Experiment 3's FKL: when
-# it is not at 63782f6, Experiments 1 and 2 default to a detached worktree of it at 63782f6, with its submodules, made
-# once next to the build directories (build-fkl-63782f6, ignored by git; see the FKL checks below)
+# The paper's FKL commit of every experiment (and of the CPU benchmark): the commit recorded for the repository's fkl
+# submodule, which has MorphologyDPP's executeBoxBlur for Experiment 3
+FKL_PAPER_COMMIT=$(git -C "$REPO" ls-tree HEAD fkl | awk '{print substr($3, 1, 7)}')
+[ -n "$FKL_PAPER_COMMIT" ] || { echo "run_all.sh: STOP: no fkl submodule recorded in $REPO" >&2; exit 1; }
+# FKL_GPU_DIR / FKL_CPU_DIR, or by default the repository's fkl submodule (see the FKL checks below)
 FKL_DEFAULT_DIR=$REPO/fkl
-if [ "$EXPERIMENT" = 1 ] && [ "$(git -C "$REPO/fkl" rev-parse --short=7 HEAD 2>/dev/null)" != "$FKL_PAPER_COMMIT" ]; then
-    FKL_DEFAULT_DIR=$REPO/build-fkl-$FKL_PAPER_COMMIT
-fi
 FKL_GPU_DIR=${FKL_GPU_DIR:-$FKL_DEFAULT_DIR}
 FKL_CPU_DIR=${FKL_CPU_DIR:-$FKL_DEFAULT_DIR}
 # Experiment 3 has no CPU benchmark
@@ -101,15 +94,6 @@ command -v rocminfo > /dev/null || die "rocminfo not found"
 [ "$EXPERIMENT" = 3 ] || allowed SKIP_COUNTERS || command -v rocprofv3 > /dev/null ||
     die "rocprofv3 not found (install amdrocm-profiler-base10.1)"
 allowed SKIP_CPU || command -v "$CXX_CPU" > /dev/null || die "C++ compiler $CXX_CPU not found (set CXX_CPU)"
-if [ "$FKL_DEFAULT_DIR" != "$REPO/fkl" ] && [ ! -f "$FKL_DEFAULT_DIR/CMakeLists.txt" ] &&
-    { [ "$FKL_GPU_DIR" = "$FKL_DEFAULT_DIR" ] || { ! allowed SKIP_CPU && [ "$FKL_CPU_DIR" = "$FKL_DEFAULT_DIR" ]; }; }; then
-    echo "FKL $FKL_PAPER_COMMIT for experiment $EXPERIMENT: a worktree of the fkl submodule in $FKL_DEFAULT_DIR"
-    { git -C "$REPO/fkl" worktree add --detach "$FKL_DEFAULT_DIR" "$FKL_PAPER_COMMIT" &&
-        git -C "$FKL_DEFAULT_DIR" submodule update --init --recursive; } > "$OUT/logs/fkl_worktree.log" 2>&1 ||
-        die "no FKL worktree at $FKL_PAPER_COMMIT in $FKL_DEFAULT_DIR (log: $OUT/logs/fkl_worktree.log): initialize the fkl \
-submodule (git -C $REPO submodule update --init --recursive fkl), or set FKL_GPU_DIR and FKL_CPU_DIR to a checkout at \
-$FKL_PAPER_COMMIT"
-fi
 FKL_GPU_COMMIT=$(git -C "$FKL_GPU_DIR" rev-parse --short=7 HEAD 2>/dev/null) && [ -f "$FKL_GPU_DIR/CMakeLists.txt" ] ||
     die "no FKL checkout in $FKL_GPU_DIR (git -C $REPO submodule update --init --recursive fkl)"
 FKL_DIRS=("$FKL_GPU_DIR")

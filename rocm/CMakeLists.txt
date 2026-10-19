@@ -33,15 +33,14 @@ find_library(ROCPROFILER_SDK_LIBRARY rocprofiler-sdk HINTS "${ROCPROFILER_SDK_RO
 # --dirty: a modified FKL tree shows up in platform.txt
 execute_process(COMMAND git -C ${FKL_DIR} describe --always --dirty --abbrev=7 OUTPUT_VARIABLE FKL_COMMIT
                 OUTPUT_STRIP_TRAILING_WHITESPACE)
-# The paper's FKL commits: 63782f6 for Experiments 1 and 2 (rocm_bench), the commit recorded for the repository's fkl
-# submodule for Experiment 3 (rocm_neighborhood, which needs MorphologyDPP's batched box blur)
+# The paper's FKL commit: the commit recorded for the repository's fkl submodule, for every experiment
 execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR}/.. ls-tree HEAD fkl OUTPUT_VARIABLE FKL_SUBMODULE_ENTRY
                 OUTPUT_STRIP_TRAILING_WHITESPACE)
 string(REGEX MATCH "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]" FKL_SUBMODULE_COMMIT
        "${FKL_SUBMODULE_ENTRY}")
-if(NOT FKL_COMMIT MATCHES "^63782f6" AND (NOT FKL_SUBMODULE_COMMIT OR NOT FKL_COMMIT MATCHES "^${FKL_SUBMODULE_COMMIT}"))
-    message(WARNING "FKL_DIR (${FKL_DIR}) is at ${FKL_COMMIT}, neither 63782f6 (the FKL commit of Experiments 1 and 2) "
-                    "nor ${FKL_SUBMODULE_COMMIT} (the repository's fkl submodule, the FKL commit of Experiment 3)")
+if(NOT FKL_SUBMODULE_COMMIT OR NOT FKL_COMMIT MATCHES "^${FKL_SUBMODULE_COMMIT}")
+    message(WARNING "FKL_DIR (${FKL_DIR}) is at ${FKL_COMMIT}, not ${FKL_SUBMODULE_COMMIT} (the repository's fkl "
+                    "submodule, the paper's FKL commit)")
 endif()
 execute_process(COMMAND git -C ${FKL_DIR} rev-parse --abbrev-ref HEAD OUTPUT_VARIABLE FKL_BRANCH OUTPUT_STRIP_TRAILING_WHITESPACE)
 # The commit of this repository (its SHA even at a tag), and whether its checkout has changes, as in
@@ -81,7 +80,7 @@ endfunction()
 
 add_bench_program(rocm_bench src/rocm_bench.hip)
 # rocm_neighborhood needs MorphologyDPP's box blur (executeBoxBlur, FKL PR #393, batched over the planes of its input),
-# which FKL 63782f6 does not have, so the program is only built with an FKL that has it
+# which older FKL commits (63782f6) do not have, so the program is only built with an FKL that has it
 file(STRINGS "${FKL_DIR}/include/fused_kernel/algorithms/image_processing/morphology.h" FKL_BOX_BLUR
      REGEX "executeBoxBlur")
 if(FKL_BOX_BLUR)
