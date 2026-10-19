@@ -23,7 +23,8 @@ iteration to its own arguments when it is created; inside the timed region there
 receive the regions of its iteration: for FKL, `build()` of its operations with the iteration's rectangles and the
 fusion, in every `executeOperations` call; for RPP, one `hipMemcpyAsync` of the iteration's ROIs from a pinned buffer
 to the device ROI tensors that its kernels read (the first operation of every RPP run, like NPP's descriptors in the
-CUDA benchmark). Region buffers (RPP's crop buffer, FKL VF+HF's crop tensor) have planes of the largest region,
+CUDA benchmark), and in the per-crop form of the conversion the precomputed pointers and sizes of its per-crop calls
+(on the CPU, FKL's precomputed rectangles and views of the crops, copied into the size batches). Region buffers (RPP's crop buffer, FKL VF+HF's crop tensor) have planes of the largest region,
 48x24; RPP's calls take each region's size from its ROI, and FKL VF+HF's resize reads each plane through a view of
 its region's size.
 
@@ -31,7 +32,7 @@ its region's size.
 
 | Implementation | What runs |
 |---|---|
-| `rpp_frame`, `rpp_crop` | the RPP pipeline of the benchmark, in two forms of its NV12 to RGB conversion: the fastest of the five RPP variants below, which are numerically equivalent (within 1e-5 of the RPP-convention reference); a selection pass validates and times all of them with the full-frame conversion (CPU + GPU, each variant's complete loop in turn, 20 warm-up + 200 timed iterations per N) and keeps the one with the lowest geometric mean of its medians over N (`rpp_selection.csv`). `rpp_frame` converts the full frame (one `rppt_yuv_to_rgb`); `rpp_crop` only the N crops of the iteration: `rppt_yuv_to_rgb` takes no ROI tensor, so each crop is an ROI in NPP's sense, one call per crop with the Y and UV pointers offset to the crop origin (`Y + y * pitch + x`, `UV + (y / 2) * pitch + x`), the frame's pitches and the crop's width and height, written at the crop's own position in the 8 bit RGB frame; the calls after the conversion are the same in both forms. Each form has its own loops and speedups; per N the one with the lower CPU + GPU median is the reported RPP pipeline (`rpp_conversion_form.csv`, with both forms' kernels, memsets and memcpys). Exact: the regions' origins and sizes are even, so every crop starts on a chroma sample, and RPP's chroma is nearest-neighbour; the program checks it before anything else (every crop byte equal to the full-frame conversion's and nothing outside the crops written, on the 100 regions of every validated iteration, in `platform.txt`), and fills `rpp_crop`'s RGB frame with a sentinel byte before validating it, so that a call reading a pixel no crop converted would fail the validation |
+| `rpp_frame`, `rpp_crop` | the RPP pipeline of the benchmark, in two forms of its NV12 to RGB conversion: the fastest of the five RPP variants below, which are numerically equivalent (within 1e-5 of the RPP-convention reference); a selection pass validates and times all of them with the full-frame conversion (CPU + GPU, each variant's complete loop in turn, 20 warm-up + 200 timed iterations per N) and keeps the one with the lowest geometric mean of its medians over N (`rpp_selection.csv`). `rpp_frame` converts the full frame (one `rppt_yuv_to_rgb`); `rpp_crop` only the N crops of the iteration: `rppt_yuv_to_rgb` takes no ROI tensor, so each crop is an ROI in NPP's sense, one call per crop with the Y and UV pointers offset to the crop origin (`Y + y * pitch + x`, `UV + (y / 2) * pitch + x`), the frame's pitches and the crop's width and height, written at the crop's own position in the 8 bit RGB frame; the calls after the conversion are the same in both forms. Each form has its own loops and speedups; per N and per metric (CPU + GPU, GPU only, GPU only flushed) the one with the lower median in that metric is the reported RPP pipeline, `rpp_frame` on a tie (`rpp_conversion_form.csv`, with both forms' medians, kernels, memsets and memcpys). The per-crop calls' pointers and sizes are computed when the pipeline is created, as its ROIs are. Exact: the regions' origins and sizes are even, so every crop starts on a chroma sample, and RPP's chroma is nearest-neighbour; the program checks it before anything else (every crop byte equal to the full-frame conversion's and nothing outside the crops written, on the 100 regions of every validated iteration, in `platform.txt`), fills `rpp_crop`'s RGB frame with a sentinel byte before validating it, and stops if `rpp_crop`'s output is not exactly `rpp_frame`'s in every validated iteration, so that a call reading a pixel no crop converted cannot go unnoticed |
 | `rpp_per_op` (variant) | the upload of the iteration's ROIs (every variant starts with it), then one RPP call per operation: `rppt_yuv_to_rgb` (NV12 to 8 bit RGB, BT.601 limited range: `RpptColorStandard_BT601`, `RpptColorRange_STUDIO`; it also uploads 8 constants with `hipMemcpyToSymbol` on every call), one batched `rppt_crop_mirror_normalize` 8u to 32f (all batch images alias the frame), `hipMemsetAsync` of the output (RPP has no constant border), one batched `rppt_resize` into the rows of the output planes below the top border, `rppt_multiply_scalar`, `rppt_tensor_subtract_tensor` and `rppt_tensor_divide_tensor` on the whole tensor |
 | `rpp_npp_like` (variant) | the same calls with exactly the intermediates of the paper's NPP pipeline: the resized crops in their own buffer, copied into the output rows by a batched `rppt_crop` |
 | `rpp_fused` (variant) | `rppt_yuv_to_rgb`, `hipMemsetAsync` of the top border rows of the first output plane, then RPP's fused `rppt_resize_mirror_normalize` (crop + 8u to 32f + resize + Mul; it zeroes everything from its destination pointer, which starts below that border, and synchronizes the stream itself), Sub and Div on the whole tensor (the border rows also need the normalization, which `rppt_resize_mirror_normalize` cannot apply to them) |
@@ -80,8 +81,9 @@ way), and
 `kernel_counts_per_operation.csv`, `rpp_selection.csv`, `rpp_conversion_form.csv` (per N and form: the CPU + GPU
 median, the counts and which form is reported), `rpp_resize_convention.csv` and `regions.csv` (the sizes and
 areas of the regions of the timed iterations per N, as in every results folder); the RPP pipelines' memcpy counts
-include the upload of the ROIs and the 8 of every `rppt_yuv_to_rgb` (`rpp_frame`: 9 per execution; `rpp_crop`:
-8N + 1); `validation.csv` has an
+include the upload of the ROIs and the 8 of every `rppt_yuv_to_rgb` (with `rpp_normalize` or `rpp_fused_normalize`:
+`rpp_frame` 9 per execution, `rpp_crop` 8N + 1; the variants with `rppt_tensor_subtract_tensor` and
+`rppt_tensor_divide_tensor` have 12 more, 6 in each of those calls); `validation.csv` has an
 `iteration` column after N, and two more columns, the errors against the RPP-convention reference and against the paper's 8 bit reference, and `gpu_time*.csv` five more, the GPU time and dispatches of the HIP runtime's blit kernels (memsets, copies) of each execution, which the GPU time only sums leave out. `--validate` validates every RPP variant.
 
 ## Experiment 3: neighborhood operations (`rocm/src/rocm_neighborhood.hip`)
@@ -121,7 +123,10 @@ In every group every implementation is validated, then timed one at a time (its 
 the RPP variants or `fkl_bvf_naive` first, the DPP tiles last), on the same crops in iteration t; the chosen DPP tile is
 the fastest (median, CPU + GPU) within its tolerance and the chosen RPP variant the fastest of the eight (four
 variants, two conversion forms) within its tolerance and within `RPP_EQUIVALENCE` of its RPP-convention reference
-(`chosen` column); every one is recorded, and the speedups are
+(`chosen` column, by the CPU + GPU median; `gpu_time*.csv` also name the fastest such RPP variant by their own median,
+`rpp_chosen_in_this_metric`, the first in order on a tie; the speedups of every metric are over the DPP tile chosen by
+the CPU + GPU median); every `_crop` variant must give exactly its full-frame twin's output in every validated
+iteration (otherwise the run stops); every one is recorded, and the speedups are
 per iteration over the chosen DPP tile, in the same iteration. References (`bench::neighborhood::boxReference`: the box in double, then the
 normalization in float; a box does not commute with the normalization in float, so the references blur first, the
 order of the pipeline and of every implementation but `rpp_f32box_cmn`, which normalizes in `rppt_crop_mirror_normalize`
@@ -159,21 +164,26 @@ FKL's on the same regions, and every timed run is preceded by
 a 1 ms idle gap that the timing thread busy-waits (a sleeping core would enter its deepest C-state, and the run after
 it would pay a wake-up whose cost depends on the binary). RPP's NV12 conversion is HIP only, so the RPP HOST pipelines
 get their 8 bit RGB frame from FKL's CPU conversion (one thread for the 1 thread runs, FKL's thread pool for the
-others), then one of the five RPP variants on the HOST backend: for each thread count, a selection pass validates all
-of them (on the regions of iterations 0, 1, 2 and 0 again, so that every crop slot has held every size: the two outputs
+others), then one of the five RPP variants on the HOST backend: for each thread count, a selection pass with the
+per-crop conversion (below; the form in which the RPP calls make most of the pipeline's time, while the full-frame
+conversion would set the ranking with its noise) validates all of them (on the regions of iterations 0, 1, 2 and 0 again, so that every crop slot has held every size: the two outputs
 of iteration 0 must be identical) and times the ones numerically equivalent to `rpp_per_op` (each one's complete
 loop of 10 warm-up + 100 iterations per N, iteration i on the regions of iteration i), and only the fastest is
 measured (`cpu_rpp_selection.csv`), in two forms of its conversion: `rpp_frame` (FKL's conversion of the full frame)
 and `rpp_crop` (FKL's conversion of only the N crops of the iteration: one `executeOperations` per region size, batched
 over the crops of that size, each crop written at its own position in the RGB frame; not one call over all the
 crops, because FKL's `TransformDPP` takes a batch's iteration space from its largest plane, with no bound per plane,
-so mixed sizes would convert every crop at the largest size and write past the smaller ones). The program checks the
-per-crop conversion against the full-frame one first (every crop byte equal, nothing outside the crops written, with
-both FKL backends, in `cpu_platform.txt`), and fills `rpp_crop`'s RGB frame with a sentinel byte before validating it.
+so mixed sizes would convert every crop at the largest size and write past the smaller ones; on FKL's thread pool the
+size batches run with the pool spinning between them, its spin set to 0 before the last one, so the conversion pays
+one wake-up of the pool, as the full-frame one; the crops' rectangles and views are computed when the pipeline is
+created). The program checks the per-crop conversion against the full-frame one first (every crop byte equal, nothing
+outside the crops written, with both FKL backends, in `cpu_platform.txt`), fills `rpp_crop`'s RGB frame with a
+sentinel byte before validating it, and stops if `rpp_crop`'s output is not exactly `rpp_frame`'s in every validated
+iteration.
 Outputs: `benchmark_cpu_rpp_<frame|crop>_1thread_vs_fkl_bvf_CPU.csv` and
 `benchmark_cpu_rpp_<frame|crop>_<T>threads_vs_fkl_bvf_CPU_MULTITHREAD.csv`, each with its `_per_iteration.csv`
 sibling (each form's loop paired with the same FKL loop), `cpu_rpp_conversion_form.csv` (per thread count and N, the
-form with the lower median is the reported RPP pipeline) and `cpu_rpp_breakdown.csv` (after the comparisons of every N,
+form with the lower median is the reported RPP pipeline, `rpp_frame` on a tie) and `cpu_rpp_breakdown.csv` (after the comparisons of every N,
 each of the four RPP pipelines runs its own loop of the same iterations, with the same idle gap and spin settings, and
 every operation of every timed run is timed on its own; in the all-threads pipelines the conversion's time includes
 the wake-up of FKL's thread pool after the idle gap, which cannot be separated from the conversion). As on the GPU, the regions change every iteration:
@@ -259,7 +269,8 @@ measured execution exceeds the smallest of its three warm-up executions (the sam
 flushed) by more than 2 % and 256 KiB of traffic, up to `MAX_REPEATS` (3) rounds; the rejected profiles stay in
 `raw_rejected/` and `traffic_repeats.csv`, and `traffic.csv` has their count per row and whether a leak is still
 suspected. Duration on the paper's machine (bare metal, Ubuntu 26.04, Ryzen 7 5800X3D, RX 9060, performance level
-`STABLE_STD`), from `run_all.sh` started to finished: the paper run of Experiment 1 and the CPU benchmark, with
+`STABLE_STD`), from `run_all.sh` started to finished, measured at `be2d5f9`, before the per-crop forms of the
+conversion (which make every run longer): the paper run of Experiment 1 and the CPU benchmark, with
 `SKIP_COUNTERS=1`, 466 s, of which the builds 57 s (the GPU build also builds `rocm_neighborhood`), the GPU benchmark
 with its GPU time only passes 102 s and the CPU benchmark 306 s; Experiment 3's paper run (`EXPERIMENT=3`) 379 s, of
 which the build 47 s and `rocm_neighborhood` 331 s.

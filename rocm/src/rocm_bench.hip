@@ -9,8 +9,8 @@
 //
 // Implementations: rpp_frame and rpp_crop (the fastest of the RPP variants below, chosen by a selection pass, with its
 // NV12 -> RGB conversion of the full frame or of only the N crops of the iteration: one rppt_yuv_to_rgb per crop, the
-// planes' pointers offset to the crop origin, written at the crop's position in the RGB frame; per N the faster of the
-// two is the reported RPP pipeline), fkl_vf_hf and fkl_bvf. RPP variants (ROCm Performance Primitives, HIP backend):
+// planes' pointers offset to the crop origin, written at the crop's position in the RGB frame; per N and metric the
+// faster of the two is the reported RPP pipeline), fkl_vf_hf and fkl_bvf. RPP variants (ROCm Performance Primitives, HIP backend):
 //   rpp_per_op         one RPP call per operation, batched where RPP can:
 //                      rppt_yuv_to_rgb on the full frame (8 bit RGB), one rppt_crop_mirror_normalize for all the
 //                      crops (8u -> 32f, every batch image aliasing the frame), hipMemsetAsync of the output tensor
@@ -657,16 +657,40 @@ RppStage yuvToRgbStage(Context& ctx, RppStatePtr st) {
 
 // rppt_yuv_to_rgb on one crop only. The function takes no ROI tensor (unlike rppt_crop_mirror_normalize or
 // rppt_box_filter), so the crop is an ROI in NPP's sense: the planes' pointers offset to the crop's origin, the frame's
-// pitches and the crop's width and height, writing the crop at its own position in the 8 bit RGB frame rgbFrame (rows of
+// pitches and the crop's width and height, writing the crop at its own position in the 8 bit RGB frame (rows of
 // FRAME_W * 3 bytes). Exact: the regions' origins and sizes are even (common/bench_geometry.h), so a crop starts on a
 // chroma sample of the frame, and RPP's chroma is nearest-neighbour, so every crop pixel gets the value of the full-frame
-// conversion (checked by perCropConversionCheck, which also checks that nothing outside the crops is written)
-void rppYuvToRgbCrop(const Context& ctx, RpptDesc& nv12Desc, RpptDesc& rgbDesc, uint8_t* rgbFrame, rppHandle_t handle,
-                     const Region& r) {
-    RPP_CHECK(rppt_yuv_to_rgb(ctx.y + static_cast<size_t>(r.y) * ctx.pitch + r.x,
-                              ctx.uv + static_cast<size_t>(r.y / 2) * ctx.pitch + r.x, &nv12Desc,
-                              rgbFrame + (static_cast<size_t>(r.y) * FRAME_W + r.x) * 3, &rgbDesc, ctx.pitch, ctx.pitch,
-                              FRAME_W * 3, r.width, r.height, RpptColorStandard_BT601, RpptColorRange_STUDIO, handle,
+// conversion (checked by perCropConversionCheck, which also checks that nothing outside the crops is written).
+struct RppCropCall {
+    uint8_t* y;
+    uint8_t* uv;
+    uint8_t* rgb;
+    int width, height;
+};
+
+RppCropCall rppCropCall(const Context& ctx, uint8_t* rgbFrame, const Region& r) {
+    return {ctx.y + static_cast<size_t>(r.y) * ctx.pitch + r.x, ctx.uv + static_cast<size_t>(r.y / 2) * ctx.pitch + r.x,
+            rgbFrame + (static_cast<size_t>(r.y) * FRAME_W + r.x) * 3, r.width, r.height};
+}
+
+// The calls of the first n crops of every iteration (iteration t's at t * n), computed when a pipeline is created, as
+// its ROIs are: inside the timing it only passes them
+std::vector<RppCropCall> rppCropCalls(const Context& ctx, uint8_t* rgbFrame, size_t n) {
+    std::vector<RppCropCall> calls;
+    const size_t iterations = ctx.regions->iterations();
+    calls.reserve(iterations * n);
+    for (size_t t = 0; t < iterations; ++t) {
+        for (size_t i = 0; i < n; ++i) {
+            calls.push_back(rppCropCall(ctx, rgbFrame, ctx.regions->at(t, i)));
+        }
+    }
+    return calls;
+}
+
+void rppYuvToRgbCrop(const Context& ctx, RpptDesc& nv12Desc, RpptDesc& rgbDesc, rppHandle_t handle,
+                     const RppCropCall& c) {
+    RPP_CHECK(rppt_yuv_to_rgb(c.y, c.uv, &nv12Desc, c.rgb, &rgbDesc, ctx.pitch, ctx.pitch, FRAME_W * 3, c.width,
+                              c.height, RpptColorStandard_BT601, RpptColorRange_STUDIO, handle,
                               RppBackend::RPP_HIP_BACKEND));
 }
 
@@ -676,10 +700,11 @@ void rppYuvToRgbCrop(const Context& ctx, RpptDesc& nv12Desc, RpptDesc& rgbDesc, 
 enum class RppConversion { Frame, Crop };
 
 RppStage yuvToRgbCropsStage(Context& ctx, RppStatePtr st) {
-    return {"rppt_yuv_to_rgb_per_crop", [&ctx, st](size_t t) {
+    auto calls = std::make_shared<const std::vector<RppCropCall>>(rppCropCalls(ctx, st->rgb8, st->n));
+    return {"rppt_yuv_to_rgb_per_crop", [&ctx, st, calls](size_t t) {
                 for (size_t i = 0; i < st->n; ++i) {
                     beforeKernel();
-                    rppYuvToRgbCrop(ctx, st->nv12Desc, st->rgbDesc, st->rgb8, st->handle, ctx.regions->at(t, i));
+                    rppYuvToRgbCrop(ctx, st->nv12Desc, st->rgbDesc, st->handle, (*calls)[t * st->n + i]);
                 }
             }};
 }
@@ -1311,7 +1336,7 @@ bool fklOutsideTolerance(const std::vector<Result>& results) {
 // The RPP variants, all numerically equivalent on the HIP backend. The benchmark's RPP pipeline is the fastest of them
 // with the full-frame conversion, chosen by the selection pass (chooseRpp) or given with BENCH_RPP_VARIANT (profiling
 // child, counter targets). It is measured in both conversion forms, rpp_frame and rpp_crop, each with its own loops and
-// speedups; per N the one with the lower CPU + GPU median is the reported RPP pipeline (rpp_conversion_form.csv). With
+// speedups; per N and metric the one with the lower median is the reported RPP pipeline (rpp_conversion_form.csv). With
 // allRppVariants (--validate) every variant is validated in both forms.
 const std::array<std::string, 5> RPP_VARIANTS{"rpp_per_op", "rpp_npp_like", "rpp_fused", "rpp_normalize",
                                               "rpp_fused_normalize"};
@@ -1367,6 +1392,41 @@ std::vector<Implementation> makeImplementations(Context& ctx) {
     return impls;
 }
 
+// The per-crop form of an RPP pipeline (rpp_crop, or <variant>_crop with --validate) must give exactly the output of its
+// full-frame form (rpp_frame, or <variant>) in every validated iteration: the crops' RGB bytes are the full-frame
+// conversion's and the calls after the conversion are the same. A per-crop pipeline that read a pixel no crop converted
+// (the RGB frame holds RGB_SENTINEL elsewhere when it is validated) would differ, and the run stops.
+std::string fullFrameTwin(const std::string& name) {
+    const std::string suffix = "_crop";
+    if (name == "rpp_crop") {
+        return "rpp_frame";
+    }
+    if (name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        return name.substr(0, name.size() - suffix.size());
+    }
+    return "";
+}
+
+void requireCropFormsMatchTheirFrameForms(const std::vector<Implementation>& impls,
+                                          const std::vector<std::vector<float>>& outputs, size_t t) {
+    for (size_t k = 0; k < impls.size(); ++k) {
+        const std::string twin = fullFrameTwin(impls[k].name);
+        if (twin.empty()) {
+            continue;
+        }
+        const auto f = std::find_if(impls.begin(), impls.end(), [&](const Implementation& i) { return i.name == twin; });
+        if (f == impls.end()) {
+            throw std::runtime_error(impls[k].name + ": no full-frame twin " + twin);
+        }
+        const auto& a = outputs[k];
+        const auto& b = outputs[static_cast<size_t>(f - impls.begin())];
+        if (a.size() != b.size() || std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) != 0) {
+            throw std::runtime_error(impls[k].name + ": its output on the regions of iteration " + std::to_string(t) +
+                                     " is not exactly " + twin + "'s");
+        }
+    }
+}
+
 // Validation, sequential timing (each implementation's complete loop, FKL BVF's last) with per-execution speedups, and
 // per operation breakdown, for batch N. With timing false, validation only.
 // Progress messages on stderr with BENCH_VERBOSE=1
@@ -1406,6 +1466,7 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
             return impl.reference == "fkl_cpu_float" ? refFloat
                    : impl.reference == "fkl_cpu_8bit_rgb" ? ref8bit : refRppConvention;
         };
+        std::vector<std::vector<float>> outputs(impls.size());
         for (size_t k = 0; k < impls.size(); ++k) {
             const Implementation& impl = impls[k];
             progress("validating " + impl.name + " on iteration " + std::to_string(t));
@@ -1426,6 +1487,7 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
             }
             gpuErrchk(hipStreamSynchronize(ctx.stream));
             const auto output = impl.download();
+            outputs[k] = output;
             if (v == 0) {
                 firstOutputs[k] = output;
             }
@@ -1446,6 +1508,7 @@ void runBatch(Context& ctx, std::vector<Result>& results, bool timing = true) {
             }
             batchResults[k].addIteration(e);
         }
+        requireCropFormsMatchTheirFrameForms(impls, outputs, t);
         // VF + HF with a float3 frame (per operation breakdown only) against the float reference
         float3Frame.fillNaN();
         float3Frame.run(t);
@@ -1931,7 +1994,7 @@ void perCropConversionCheck(Context& ctx, std::ostream& os) {
         std::fill(inCrop.begin(), inCrop.end(), uint8_t{0});
         for (size_t i = 0; i < MAX_BATCH; ++i) {
             const Region& r = ctx.regions->at(t, i);
-            rppYuvToRgbCrop(ctx, st->nv12Desc, st->rgbDesc, st->rgb8, st->handle, r);
+            rppYuvToRgbCrop(ctx, st->nv12Desc, st->rgbDesc, st->handle, rppCropCall(ctx, st->rgb8, r));
             for (int y = r.y; y < r.y + r.height; ++y) {
                 std::fill_n(inCrop.begin() + static_cast<size_t>(y) * FRAME_W + r.x, r.width, uint8_t{1});
             }
@@ -1952,8 +2015,8 @@ void perCropConversionCheck(Context& ctx, std::ostream& os) {
             }
         }
     }
-    os << "Per-crop conversion (rpp_crop: one rppt_yuv_to_rgb per crop, the planes' pointers offset to the crop origin, "
-          "the frame's pitches, the crop's width and height) against the full-frame conversion, on the "
+    os << "Per-crop conversion (one rppt_yuv_to_rgb per crop, the planes' pointers offset to the crop origin, the "
+          "frame's pitches, the crop's width and height) against the full-frame conversion, on the "
        << MAX_BATCH << " regions of each of the " << validated.size() << " validated timed iterations (" << crops
        << " crops): " << differ << " of " << cropBytes << " crop bytes differ, " << outsideWritten << " of "
        << outsideBytes << " bytes outside the crops written\n";
@@ -2131,7 +2194,7 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
     os << "Timing: " << WARMUP_ITERS << " warm-up then " << TIMED_ITERS << " timed iterations; iteration t (the "
        << "warm-up iterations are t in [0, " << WARMUP_ITERS << "), the timed ones t in [" << WARMUP_ITERS << ", "
        << WARMUP_ITERS + TIMED_ITERS << ")) of every loop runs on the regions of iteration t (" << REGION_ITERATIONS
-       << " iterations of regions generated before any loop). For every N, the RPP pipeline (rpp), then FKL VF+HF, "
+       << " iterations of regions generated before any loop). For every N, rpp_frame, then rpp_crop, then FKL VF+HF, "
        << "then FKL BVF each run their complete loop (" << WARMUP_ITERS << " warm-up and " << TIMED_ITERS << " timed "
        << "iterations) before the next one starts: never two implementations at the same time, never interleaved per "
        << "iteration. Every execution is timed with HIP events on one stream around the complete pipeline (all host "
@@ -2158,12 +2221,14 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << "the crop origin (Y + y * pitch + x, UV + (y / 2) * pitch + x), the frame's pitches, the crop's width and "
        << "height, written at the crop's own position in the 8 bit RGB frame; the cache flush, where there is one, "
        << "before every call). The calls after the conversion are the same in both forms: they read the crops of the "
-       << "RGB frame through their ROIs. Per N, the form with the lower CPU + GPU median is the reported RPP pipeline "
-       << "(rpp_conversion_form.csv, with both forms' counts). Exact: the regions' origins and sizes are even, so "
+       << "RGB frame through their ROIs. Per N and per metric (CPU + GPU, GPU only, GPU only flushed), the form with "
+       << "the lower median in that metric is the reported RPP pipeline, rpp_frame on a tie (rpp_conversion_form.csv, "
+       << "with both forms' medians and counts). Exact: the regions' origins and sizes are even, so "
        << "every crop starts on a chroma sample of the frame, and RPP's chroma is nearest-neighbour (the per-crop "
        << "conversion check above). Before rpp_crop is validated, its RGB frame is filled with the byte "
-       << static_cast<int>(RGB_SENTINEL) << ", so that a call reading a pixel no crop converted would fail the "
-       << "validation.\n"
+       << static_cast<int>(RGB_SENTINEL) << ", and its output must be exactly rpp_frame's in every validated "
+       << "iteration (otherwise the run stops), so that a call reading a pixel no crop converted cannot go "
+       << "unnoticed.\n"
        << "RPP variants (HIP backend), each one starting with the hipMemcpyAsync of the ROIs of its iteration (below): "
        << "rpp_per_op = rppt_yuv_to_rgb (RpptColorStandard_BT601, RpptColorRange_STUDIO; 1 kernel plus 8 hipMemcpyToSymbol per "
        << "call: its matrix and luma bias, and 6 integer constants used only by its cubic_v variant, uploaded on every "
@@ -2218,7 +2283,8 @@ void writePlatform(const std::filesystem::path& path, const std::string& diagnos
        << "the float3 output (the paper's NPP set). rpp_per_op and rpp_normalize write the 8 bit RGB frame and the float3 "
        << "crops, then the resized crops directly into the output tensor (after zeroing it), and then multiply, "
        << "subtract and divide it in place (rpp_normalize in one pass). rpp_fused and rpp_fused_normalize write the 8 "
-       << "bit RGB frame and the output. FKL BVF has no intermediates in memory: float3 from the color conversion to "
+       << "bit RGB frame and the output. With the per-crop conversion (rpp_crop) only the crops of the 8 bit RGB frame "
+       << "are written. FKL BVF has no intermediates in memory: float3 from the color conversion to "
        << "the write.\n"
        << "RPP-convention reference: RPP's own 8 bit RGB frame (rppt_yuv_to_rgb's output, downloaded once), RPP's "
        << "bilinear sampling with each region's own scale (pixel centers clamped to [0, size - 2], measured with linear "
@@ -2688,10 +2754,12 @@ int main(int argc, char** argv) {
             kernels << r.name << "," << r.batch << "," << r.launches.kernels << "," << r.launches.memsets << ","
                     << r.launches.memcpys << "\n";
         }
-        // The reported RPP pipeline per N: the conversion form (rpp_frame, rpp_crop) with the lower CPU + GPU median,
-        // rpp_frame on a tie, with both forms' medians and counts
+        // The reported RPP pipeline per N and metric: the conversion form (rpp_frame, rpp_crop) with the lower median in
+        // that metric (CPU + GPU, GPU only, GPU only flushed), rpp_frame on a tie, with both forms' medians and counts;
+        // the GPU only metrics only where they were measured
         std::ofstream form(outDir / "rpp_conversion_form.csv");
-        form << "N,implementation,conversion,median_us,kernels,memsets,memcpys,reported\n";
+        form << "N,implementation,conversion,median_us,gpu_median_us,gpu_flushed_median_us,kernels,memsets,memcpys,"
+                "reported_cpu_gpu,reported_gpu_only,reported_gpu_flushed\n";
         for (const size_t batch : BATCHES) {
             const auto find = [&](const std::string& name) {
                 const auto r = std::find_if(results.begin(), results.end(), [&](const Result& x) {
@@ -2703,16 +2771,36 @@ int main(int argc, char** argv) {
                 return r;
             };
             const auto frame = find("rpp_frame"), crop = find("rpp_crop");
-            const bool cropReported = crop->timing.median < frame->timing.median;
-            for (const auto& [r, conversion, reported] :
-                 {std::tuple{frame, "full_frame", !cropReported}, std::tuple{crop, "per_crop", cropReported}}) {
+            const bool cropCpuGpu = crop->timing.median < frame->timing.median;
+            const bool cropGpu = crop->gpuTiming.median < frame->gpuTiming.median;
+            const bool cropFlushed = crop->gpuFlushedTiming.median < frame->gpuFlushedTiming.median;
+            for (const auto& [r, conversion, isCrop] :
+                 {std::tuple{frame, "full_frame", false}, std::tuple{crop, "per_crop", true}}) {
+                const auto flag = [&](bool cropWins) { return cropWins == isCrop ? "yes" : "no"; };
                 form << batch << "," << r->name << "," << conversion << "," << std::fixed << std::setprecision(2)
-                     << r->timing.median << "," << r->launches.kernels << "," << r->launches.memsets << ","
-                     << r->launches.memcpys << "," << (reported ? "yes" : "no") << "\n";
+                     << r->timing.median << ",";
+                if (tracing) {
+                    form << r->gpuTiming.median << "," << r->gpuFlushedTiming.median;
+                } else {
+                    form << ",";
+                }
+                form << "," << r->launches.kernels << "," << r->launches.memsets << "," << r->launches.memcpys << ","
+                     << flag(cropCpuGpu) << ",";
+                if (tracing) {
+                    form << flag(cropGpu) << "," << flag(cropFlushed);
+                } else {
+                    form << ",";
+                }
+                form << "\n";
             }
-            std::cout << "RPP conversion form N = " << batch << ": rpp_frame " << std::fixed << std::setprecision(1)
-                      << frame->timing.median << " us, rpp_crop " << crop->timing.median << " us: reported "
-                      << (cropReported ? "rpp_crop" : "rpp_frame") << std::defaultfloat << std::endl;
+            std::cout << "RPP conversion form N = " << batch << ": CPU + GPU rpp_frame " << std::fixed
+                      << std::setprecision(1) << frame->timing.median << " us, rpp_crop " << crop->timing.median
+                      << " us: reported " << (cropCpuGpu ? "rpp_crop" : "rpp_frame");
+            if (tracing) {
+                std::cout << "; GPU only " << (cropGpu ? "rpp_crop" : "rpp_frame") << "; flushed "
+                          << (cropFlushed ? "rpp_crop" : "rpp_frame");
+            }
+            std::cout << std::defaultfloat << std::endl;
         }
         // One CSV per baseline in FKL's two-execution format (times in ms):
         // <baseline>_vs_fkl_bvf_GPU_AMD.csv (CPU + GPU) and, where measured, <baseline>_vs_fkl_bvf_gpu_only_GPU_AMD.csv
