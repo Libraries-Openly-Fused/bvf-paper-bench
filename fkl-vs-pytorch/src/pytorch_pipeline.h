@@ -55,14 +55,14 @@ using namespace pipeline;
 
 // The two formulations of the chroma terms, M_U U + M_V V + bias per chroma sample: addmm (the chroma converted to
 // float, then a 2 x 3 matrix product with the bias, cuBLASLt on the GPU and MKL on the CPU) and addcmul (two addcmul on
-// the 8-bit U and V views). Which is faster depends on the device, the thread count and the batch size, so the
+// the 8-bit U and V views). Which is faster can depend on the device, the thread count and the batch size, so the
 // programs time PyTorch's complete loop with each before every comparison and compare FKL with the faster one, as FKL
 // vs NPPDx chooses NPPDx's configuration.
 enum class ChromaTerms { Addmm, Addcmul };
 // The view interpolate gets of the h x w x 3 RGB crop: permute then unsqueeze, which PyTorch's layout check
 // (suggest_memory_format) treats as NCHW, so interpolate writes NCHW and the copy into the output plane transposes it;
 // or unsqueeze then permute, which it treats as channels-last, so interpolate writes channels-last and the copy is a
-// straight one. Neither was faster on both devices in development runs.
+// straight one (a device to device memcpy on the GPU). The sweep chooses between them as between the chroma terms.
 enum class ResizeInput { Nchw, ChannelsLast };
 // One way of writing PyTorch's pipeline: the sweep times every one before each comparison
 struct Variant {

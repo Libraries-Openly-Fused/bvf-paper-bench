@@ -70,9 +70,11 @@ and pixel centers for PyTorch), and their difference is reported. The work is th
   to 6 kernels, plus a device to device memcpy in the channels-last variants), and about as many operator calls on the
   CPU. FKL processes the N regions in one call and one kernel. Grouping regions by size would batch them here, only
   because this workload has three sizes; detections in general have any size.
-- **No code for this GPU in the wheel.** The cu132 wheel has SASS for sm_75, sm_80, sm_86, sm_90, sm_100 and sm_120
-  (`pytorch_build_information.txt`), none for the RTX 4090's sm_89: PyTorch's kernels run as sm_86 code there. FKL's
-  kernel is compiled for the GPU it runs on.
+- **No code for this GPU's operators in the wheel.** The cu132 wheel's build flags (`pytorch_build_information.txt`)
+  give SASS for sm_75, sm_80, sm_86, sm_90, sm_100 and sm_120; its only sm_89 code is a set of CUTLASS FP8 GEMM kernels
+  (`cuobjdump -arch sm_89` of `libtorch_cuda.so`). So PyTorch's own kernels in this pipeline run as sm_86 code on the
+  RTX 4090 (cuBLASLt's GEMM in the `addmm` variants is cuBLAS's code). FKL's kernel is compiled for the GPU it runs
+  on.
 - **Intermediates in memory.** Per region: the chroma terms, the h x w x 3 float RGB crop and the resized 3 x 32 x 64
   image; with `addmm` also the float chroma (on both devices), and on the CPU the float copies TensorIterator makes of
   the 8-bit inputs (the luma, and with `addcmul` the U and V views). The output is written, then rewritten three times
