@@ -235,11 +235,12 @@ function(build_opencv RESULT)
         string(APPEND compiler "${CMAKE_MATCH_1}")
     endif()
     if(BENCHMARKS STREQUAL "gpu")
-        # cudafilters and cudaimgproc for the box filters of fkl-neighborhood/; the tag names them, so that a build
-        # without them, made before they were needed, is not reused
-        set(modules core,imgproc,cudev,cudaarithm,cudawarping,cudafilters,cudaimgproc)
+        # cudafilters and cudaimgproc for the box filters of fkl-neighborhood/, cudacodec (which needs videoio) for
+        # OpenCV's NV12 conversion (its NVSurfaceToColorConverter needs CUDA only, not the Video Codec SDK); the tag
+        # names them, so that a build without them, made before they were needed, is not reused
+        set(modules core,imgproc,videoio,cudev,cudaarithm,cudawarping,cudafilters,cudaimgproc,cudacodec)
         string(REPLACE "." "" sm "${CUDA_ARCH_BIN}")
-        set(tag "${OPENCV_VERSION}-cuda${CUDA_VERSION}-sm${sm}-filters-${HOST_TAG}-${compiler}")
+        set(tag "${OPENCV_VERSION}-cuda${CUDA_VERSION}-sm${sm}-filters-codec-${HOST_TAG}-${compiler}")
     else()
         set(modules core,imgproc)
         set(tag "${OPENCV_VERSION}-cpu-${HOST_TAG}-${compiler}")

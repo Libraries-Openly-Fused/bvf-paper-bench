@@ -3,10 +3,10 @@
 // with the frame, sizes, batch sizes and crop positions of common/bench_geometry.h and NV12 -> RGB in BT.601 limited
 // range. The harness (validation, timing, modes, output files) is common/bench_gpu.h.
 //
-//   opencv_cuda   NPP NV12->RGB of the whole frame (OpenCV CUDA has no NV12 conversion), then per crop cv::cuda
-//                 convertTo, resize and copyMakeBorder, then multiply, subtract and divide on the whole output tensor:
-//                 3N + 4 kernels, with an 8 bit RGB frame, float3 crops, float3 resized crops and the float3 output
-//                 in memory
+//   opencv_cuda   OpenCV's NV12->RGB of the whole frame (cudacodec's NVSurfaceToColorConverter, which cannot convert
+//                 a crop: common/bench_opencv_cuda.h), then per crop cv::cuda convertTo, resize and
+//                 copyMakeBorder, then multiply, subtract and divide on the whole output tensor: 3N + 4 kernels, with
+//                 an 8 bit RGB frame, float3 crops, float3 resized crops and the float3 output in memory
 //   fkl_bvf       one FKL kernel for the whole chain (BVF)
 
 #include <opencv2/core.hpp>
@@ -16,11 +16,13 @@
 #include <opencv2/cudawarping.hpp>
 
 #include "bench_gpu.h"
+#include "bench_opencv_cuda.h"
 
 namespace bench {
 
 struct OpenCVState {
     cv::cuda::Stream stream;
+    opencv::Nv12Converter converter;
     cv::cuda::GpuMat rgb8;
     // The regions of every iteration, N per iteration (rects[t * N + i])
     std::vector<cv::Rect> rects;
@@ -48,9 +50,9 @@ Implementation makeOpenCV(Context& ctx) {
         st->resized.emplace_back(RES_H, RES_W, CV_32FC3);
     }
     cv::cuda::createContinuous(static_cast<int>(N) * OUT_H, OUT_W, CV_32FC3, st->tensor);
-    Implementation impl{"opencv_cuda", Reference::Fkl8bit};
-    impl.stages.emplace_back("1_nv12_to_rgb8_full_frame_npp", [&ctx, st](size_t) {
-        nv12ToRgb8(ctx, st->rgb8.data, static_cast<int>(st->rgb8.step));
+    Implementation impl{"opencv_cuda", Reference::Fkl8bitTruncated};
+    impl.stages.emplace_back("1_nv12_to_rgb8_full_frame", [&ctx, st](size_t) {
+        st->converter.convert(ctx, st->rgb8, cv::cudacodec::ColorFormat::RGB, st->stream);
     });
     impl.stages.emplace_back("2_per_crop_convertTo_resize_copyMakeBorder", [st](size_t t) {
         for (size_t i = 0; i < N; ++i) {
@@ -93,23 +95,25 @@ struct OpenCVCudaVsFkl {
     static void describe(std::ostream& os, const std::filesystem::path& outDir) {
         const std::string opencvBuild = cv::getBuildInformation();
         std::ofstream(outDir / "opencv_build_information.txt") << opencvBuild;
-        const NppLibraryVersion* npp = nppGetLibVersion();
         os << "OpenCV: " << cv::getVersionString() << " (opencv_contrib "
            << bench::buildInfoValue(opencvBuild, "Version control (extra):") << ", CUDA_ARCH_BIN "
            << bench::buildInfoValue(opencvBuild, "NVIDIA GPU arch:") << ", C++ compiler "
            << bench::buildInfoValue(opencvBuild, "C++ Compiler:")
            << "; full configuration in opencv_build_information.txt)\n"
-           << "NPP: " << npp->major << "." << npp->minor << "." << npp->build
-           << " (the NV12 -> RGB of the OpenCV pipeline: OpenCV CUDA has no NV12 conversion)\n"
-           << "OpenCV CUDA pipeline: NPP NV12->RGB of the whole frame into an 8 bit RGB frame (NPP's NV12 conversion "
-              "only writes 8 or 16 bit integers), then per region cv::cuda convertTo (float3 crop, into a buffer of the "
-              "largest region size through a view of the region's size), resize (float3 resized crop) and "
-              "copyMakeBorder (into its output plane), then multiply, subtract and divide on the whole float3 output: "
-              "3N + 4 kernels. Per iteration, inside the timed region: the GpuMat views of every region (of the RGB "
-              "frame and of its crop buffer) and the per-region calls with them.\n";
+           << "OpenCV CUDA pipeline: OpenCV's NV12->RGB of the whole frame into an 8 bit RGB frame "
+              "(cudacodec::createNVSurfaceToColorConverter(ColorSpaceStandard::BT601, videoFullRangeFlag false) and "
+              "convert(SF_NV12, ColorFormat::RGB, BitDepth::EIGHT, interleaved): one kernel, on the raw NV12 frame "
+              "without a decoder session; it cannot convert a crop, as its kernel reads the chroma of a luma row at "
+              "a distance fixed by the surface's height, so the whole frame is converted; it truncates to 8 bits, "
+              "and the pipeline is checked against the truncated 8 bit reference), then per region cv::cuda "
+              "convertTo (float3 crop, into a buffer of the largest region size through a view of the region's "
+              "size), resize (float3 resized crop) and copyMakeBorder (into its output plane), then multiply, "
+              "subtract and divide on the whole float3 output: 3N + 4 kernels. Per iteration, inside the timed "
+              "region: the GpuMat views of every region (of the RGB frame and of its crop buffer) and the per-region "
+              "calls with them.\n";
     }
 
-    static std::string diagnostic(const Context& ctx) { return nppConversionDiagnostic(ctx); }
+    static std::string diagnostic(const Context& ctx) { return opencv::conversionDiagnostic(ctx); }
 
     static bool extraMode(Context&, const std::string&, const std::filesystem::path&) { return false; }
 };

@@ -13,7 +13,7 @@
    limitations under the License. */
 
 // The compile-time units of FKL vs OpenCV CUDA (scripts/compile_time.sh, SET=opencv-cuda; common/compile_time_unit.h),
-// all with the headers of FKL, OpenCV CUDA and NPP (for the NV12 conversion):
+// all with the headers of FKL and OpenCV CUDA (cudacodec for the NV12 conversion):
 //   -DIMPL_HEADERS  the headers, no pipeline
 //   -DIMPL_OPENCV   the OpenCV CUDA calls of makeOpenCV in benchmark_opencv_cuda.cu
 //   -DIMPL_BVF      FKL BVF, one executeOperations call (Listing 2)
@@ -22,10 +22,8 @@
 #include <opencv2/core/cuda.hpp>
 #include <opencv2/core/cuda_stream_accessor.hpp>
 #include <opencv2/cudaarithm.hpp>
+#include <opencv2/cudacodec.hpp>
 #include <opencv2/cudawarping.hpp>
-#include <npp.h>
-
-#include "bench_npp.h"
 
 #include "compile_time_unit.h"
 
@@ -33,10 +31,9 @@
 // ---------------------------------------------------------------- makeOpenCV
 void runPipeline() {
     using namespace ct;
-    const Npp8u* y = nullptr;
-    const Npp8u* uv = nullptr;
-    const int pitch = 0;
-    const NppStreamContext npp{};
+    const cv::cuda::GpuMat nv12(FRAME_H * 3 / 2, FRAME_W, CV_8UC1);
+    const auto converter =
+        cv::cudacodec::createNVSurfaceToColorConverter(cv::cudacodec::ColorSpaceStandard::BT601, false);
     cv::cuda::Stream stream;
     cv::cuda::GpuMat rgb8(FRAME_H, FRAME_W, CV_8UC3);
     std::vector<cv::Rect> rects;
@@ -48,8 +45,8 @@ void runPipeline() {
         resized.emplace_back(RES_H, RES_W, CV_32FC3);
     }
     cv::cuda::createContinuous(static_cast<int>(N) * OUT_H, OUT_W, CV_32FC3, tensor);
-    bench::npp::nv12ToRgb8Bt601Limited(y, uv, pitch, rgb8.data, static_cast<int>(rgb8.step),
-                                       NppiSize{FRAME_W, FRAME_H}, npp);
+    converter->convert(nv12, rgb8, cv::cudacodec::SurfaceFormat::SF_NV12, cv::cudacodec::ColorFormat::RGB,
+                       cv::cudacodec::BitDepth::EIGHT, false, stream);
     for (size_t i = 0; i < N; ++i) {
         cv::cuda::GpuMat crop = cropped[i](cv::Rect(0, 0, rects[i].width, rects[i].height));
         rgb8(rects[i]).convertTo(crop, CV_32F, stream);

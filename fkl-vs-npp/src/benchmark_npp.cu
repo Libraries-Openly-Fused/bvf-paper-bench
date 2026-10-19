@@ -3,12 +3,18 @@
 // with the frame, sizes, batch sizes and crop positions of common/bench_geometry.h and NV12 -> RGB in BT.601 limited
 // range. The harness (validation, timing, modes, output files) is common/bench_gpu.h.
 //
-//   npp       NV12->RGB of the whole frame (color twist with the BT.601 limited range matrix, common/bench_npp.h), per
-//             crop 8u->32f, one batched resize (nppiResize for N = 1, since nppiResizeBatch rejects a batch of one),
-//             per crop CopyConstBorder (NPP has no batched border), then MulC, SubC, DivC on the whole output tensor:
-//             2N + 5 kernels, with an 8 bit RGB frame, float3 crops, float3 resized crops and the float3 output in
-//             memory
-//   fkl_bvf   one FKL kernel for the whole chain (BVF)
+//   npp            NV12->RGB of the whole frame (color twist with the BT.601 limited range matrix,
+//                  common/bench_npp.h), per crop 8u->32f, one batched resize (nppiResize for N = 1, since
+//                  nppiResizeBatch rejects a batch of one), per crop CopyConstBorder (NPP has no batched border), then
+//                  MulC, SubC, DivC on the whole output tensor: 2N + 5 kernels, with an 8 bit RGB frame, float3 crops,
+//                  float3 resized crops and the float3 output in memory
+//   npp_crop_nv12  the same pipeline with NV12->RGB of each crop only (the same color twist with the source pointers at
+//                  the crop's origin and the crop's size, writing at the crop's position in the 8 bit RGB frame, which
+//                  the rest of the pipeline reads as before): 3N + 4 kernels
+//   fkl_bvf        one FKL kernel for the whole chain (BVF)
+// The two NPP forms each have their own loop and speedup in every mode; per batch size, each view (latency, GPU only,
+// GPU only with the L2 flushed) reports the validated form with the lower median in that view (the results report says
+// which).
 
 #include <npp.h>
 
@@ -40,7 +46,10 @@ struct NPPState {
     }
 };
 
-template <size_t N>
+// The two forms of NPP's NV12 -> RGB: the whole frame, or each crop only
+enum class Nv12Form { Frame, Crop };
+
+template <size_t N, Nv12Form F>
 Implementation makeNPP(Context& ctx) {
     // One float3 crop of the largest region size per region; a region of another size uses its top-left corner
     const int cropStep = MAX_REGION_W * 3 * sizeof(Npp32f);
@@ -71,10 +80,20 @@ Implementation makeNPP(Context& ctx) {
         st->rects.insert(st->rects.end(), rects.begin(), rects.end());
     }
 
-    Implementation impl{"npp", Reference::NppSampling8bit};
-    impl.stages.emplace_back("1_nv12_to_rgb8_full_frame", [&ctx, st](size_t) {
-        nv12ToRgb8(ctx, st->rgb8, st->rgbStep);
-    });
+    Implementation impl{F == Nv12Form::Frame ? "npp" : "npp_crop_nv12", Reference::NppSampling8bit};
+    if constexpr (F == Nv12Form::Frame) {
+        impl.stages.emplace_back("1_nv12_to_rgb8_full_frame", [&ctx, st](size_t) {
+            nv12ToRgb8(ctx, st->rgb8, st->rgbStep);
+        });
+    } else {
+        // Written at each crop's position in the 8 bit RGB frame: the frame is written only where the crops of the
+        // iteration land, and the rest of the pipeline reads only those pixels
+        impl.stages.emplace_back("1_nv12_to_rgb8_per_crop", [&ctx, st](size_t t) {
+            for (size_t i = 0; i < N; ++i) {
+                nv12ToRgb8Crop(ctx, st->rgb8, st->rgbStep, st->rects[t * N + i]);
+            }
+        });
+    }
     impl.stages.emplace_back("2_per_crop_convert_8u32f", [&ctx, st, cropFloats, cropStep](size_t t) {
         for (size_t i = 0; i < N; ++i) {
             const fk::Rect& r = st->rects[t * N + i];
@@ -133,7 +152,14 @@ Implementation makeNPP(Context& ctx) {
     });
     impl.run = runStages(impl.stages);
     impl.download = [st, outFloats]() { return downloadDevice(st->tensor, N * outFloats); };
-    impl.fillNaN = [st, outFloats]() { gpuErrchk(cudaMemset(st->tensor, 0xFF, N * outFloats * sizeof(Npp32f))); };
+    impl.fillNaN = [st, outFloats]() {
+        gpuErrchk(cudaMemset(st->tensor, 0xFF, N * outFloats * sizeof(Npp32f)));
+        if constexpr (F == Nv12Form::Crop) {
+            // The 8 bit frame too, which keeps the crops of earlier runs: a pixel the crops of the validated iteration
+            // do not convert, if the pipeline read it, would be 0 instead of a converted value
+            gpuErrchk(cudaMemset(st->rgb8, 0, static_cast<size_t>(st->rgbStep) * FRAME_H));
+        }
+    };
     return impl;
 }
 
@@ -143,7 +169,8 @@ struct NppVsFkl {
     template <size_t N>
     static std::vector<Implementation> implementations(Context& ctx) {
         std::vector<Implementation> impls;
-        impls.push_back(makeNPP<N>(ctx));
+        impls.push_back(makeNPP<N, Nv12Form::Frame>(ctx));
+        impls.push_back(makeNPP<N, Nv12Form::Crop>(ctx));
         return impls;
     }
 
@@ -160,7 +187,18 @@ struct NppVsFkl {
               "uploaded with one cudaMemcpyAsync on the pipeline's stream (one memory copy per execution for N > 1; "
               "the destination descriptors are the same in every iteration and are uploaded once, before the loops). "
               "NPP samples its bilinear resize at dst * scale - 0.25 (measured), so it is checked against a reference "
-              "with that sampling.\n";
+              "with that sampling.\n"
+           << "npp_crop_nv12: the same pipeline with the NV12->RGB of each crop only: per region one "
+              "nppiNV12ToRGB_8u_ColorTwist32f_P2C3R with the same matrix, its Y and UV source pointers at the crop's "
+              "origin (row y of the luma, row y / 2 of the chroma; every region has even coordinates and sizes) and "
+              "oSizeROI the crop's size, writing the 8 bit RGB at the crop's position in the frame, which the rest of "
+              "the pipeline reads with the same views and calls as npp: 3N + 4 kernels. The frame is written only "
+              "where the crops of the iteration land (overlapping crops are converted twice), and only those pixels "
+              "are read; before every validated run, the 8 bit frame is filled with 0 as well as the output with "
+              "NaN.\n"
+           << "The two NPP forms each run their own loop (npp, then npp_crop_nv12, then FKL BVF) and have their own "
+              "speedup in every mode; per batch size, each view (latency, GPU only, GPU only with the L2 flushed) "
+              "reports the validated form with the lower median in that view.\n";
     }
 
     static std::string diagnostic(const Context& ctx) { return nppConversionDiagnostic(ctx); }

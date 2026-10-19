@@ -28,12 +28,15 @@ One folder per library compared with FKL, each its own CMake project with its ow
 
 Next to them:
 
-- [`common/`](common): the workload of every benchmark (`bench_geometry.h`, `bench_geometry.cmake`), the harness of the
-  GPU benchmarks of OpenCV CUDA, NPP and FKL's ablation (`bench_gpu.h`, `bench_gpu.cmake`), the validation rules
-  shared by every GPU benchmark (`bench_validation.h`), NPP's error check and NV12 conversion (`bench_npp.h`), the
-  platform description (`bench_platform.h`), the common part of the compile-time units (`compile_time_unit.h`), and the
-  workload and BVF box operation of the neighborhood experiment (`bench_neighborhood.h`,
-  `bench_neighborhood_ops.h`, shared with `rocm/`);
+- [`common/`](common): the workload of every benchmark (`bench_geometry.h`, `bench_geometry.cmake`), the harness of
+  the GPU benchmarks of OpenCV CUDA, NPP and FKL's ablation (`bench_gpu.h`, `bench_gpu.cmake`), the harness of the CPU
+  benchmarks (`bench_cpu.h`, `bench_cpu.cmake`, FKL's side in `bench_fkl_cpu.cpp`), the pipeline's constants and its
+  plain C++ reference (`bench_pipeline.h`, `bench_reference.h`), the timing statistics and FKL's two-execution CSV
+  format (`bench_timing.h`), the validation rules shared by every GPU benchmark (`bench_validation.h`), NPP's error
+  check and NV12 conversion (`bench_npp.h`), OpenCV CUDA's NV12 conversion (`bench_opencv_cuda.h`), the platform
+  description (`bench_platform.h`), the common part of the compile-time units (`compile_time_unit.h`), and the workload
+  and BVF box operation of the neighborhood experiment (`bench_neighborhood.h`, `bench_neighborhood_ops.h`, shared with
+  `rocm/`);
 - [`scripts/`](scripts): `run_all.sh` (every benchmark but `rocm/`), the memory traffic with Nsight Compute
   (`ncu_dram.sh`, `ncu_l2.sh`, `ncu_common.sh`, `ncu_summarize.py`, `ncu_traffic_model.py`), the compile time
   (`compile_time.sh`, `compile_time_summarize.py`), the runner-up NPPDx configurations (`nppdx_runner_up.py`) and the
@@ -49,9 +52,16 @@ Every benchmark of this repository takes its workload from [`common/bench_geomet
 
 - the frame: 3840x2160 NV12, uniform random values in the legal range of limited (video) range NV12, Y in [16, 235]
   and U, V in [16, 240] (seed 1), as in real video;
-- the color conversion: NV12 to RGB with BT.601 in limited range, in every implementation, because it is the only
-  NV12 conversion that every library offers (OpenCV's CPU `cvtColor` has no other; NPP's through its color twist with
-  the BT.601 matrix, NPPDx's through `FromLimitedLuma`, `FromLimitedChroma` and `ColorConvert<yuv_bt601, rgb>`);
+- the color conversion: NV12 to RGB with BT.601 in limited range, in every implementation, because it is the only NV12
+  conversion that every library offers (OpenCV's CPU `cvtColor` and `cvtColorTwoPlane` have no other; OpenCV CUDA's
+  through cudacodec's `NVSurfaceToColorConverter`, NPP's through its color twist with the BT.601 matrix, NPPDx's through
+  `FromLimitedLuma`, `FromLimitedChroma` and `ColorConvert<yuv_bt601, rgb>`). Every baseline converts with its own
+  library (except rocm/'s RPP HOST pipelines: RPP's NV12 conversion is HIP only, so they start with FKL's CPU conversion
+  of the full frame; see [rocm/README.md](rocm/README.md)), and where the library can convert a crop on its own (NPP,
+  OpenCV on the CPU), the per-crop form is a variant of the full-frame one (OpenCV CUDA's converter cannot convert a
+  crop: it cannot restrict the rows, and a full-height strip of a crop's columns is not a crop, so it converts the whole
+  frame). Both forms are measured in every mode, and per batch size each view (latency, GPU only, GPU only with the L2
+  flushed; on the CPU, each thread count) reports the library's validated form with the lower median in that view;
 - the regions, new in every iteration (warm-up and timed): 100 per iteration, batch N uses the first N. Their sizes are
   20x10, 32x16 and 48x24 by turns: region i of iteration t has the size (i + t) mod 3 of that list, so every iteration
   mixes the three and every region cycles through them. Their positions are uniform random (seed 42), with even
@@ -86,9 +96,23 @@ program runs its library's pipeline (the baseline) and FKL BVF, one `executeOper
 whole chain (the paper's Listing 2). FKL vs NPPDx has its own harness, described in its README, with the same three
 timings.
 
-In each of the 1000 timed iterations (after 100 warm-up ones) the baseline and FKL BVF run one after the other on the
-regions of that iteration, and FKL BVF's speedup over the baseline is computed per iteration and then averaged, as in
-FKL's two-execution benchmarks. Every run produces two benchmarks:
+The implementations never run at the same time:
+
+- **Sequential loops.** For every batch size, each implementation's complete loop (100 warm-up and 1000 timed
+  iterations) runs before the next one's, on the same regions, in a fixed order: the baselines first, FKL BVF last.
+  Each loop therefore starts with the L2 state its own previous iteration left.
+- **Paired speedups.** FKL BVF's speedup over a baseline is computed per iteration (baseline time / FKL BVF time of the
+  same iteration, identical inputs) and averaged, as in FKL's two-execution benchmarks. Every timed iteration's time of
+  every implementation is in `per_iteration_<mode>.csv` (latency, GPU only, GPU only with the L2 flushed), and FKL vs
+  NPPDx writes the pairs of each comparison CSV in its `_per_iteration.csv`.
+- **Earlier results.** The paper's first results (`results-v3`) alternated the implementations within every
+  iteration instead.
+- **`rocm/`.** The programs of `rocm/` (AMD GPU and RPP on the CPU) have their own harness, which pull request #19
+  moves to this protocol. Until it is merged, they still alternate the implementations within every iteration, and
+  their CPU program sleeps the idle gap and sets the thread pools' spin times, so their results are not comparable with
+  those of this protocol.
+
+Every run produces two benchmarks:
 
 - CPU + GPU: CUDA events around everything the host does to enqueue a pipeline, plus its GPU execution.
 - GPU only: a second pass with CUPTI kernel tracing, where the time of an execution is the sum of its kernels'
@@ -116,27 +140,31 @@ format, times in ms), `kernel_breakdown.csv` (time of each kernel or stage of th
 Every implementation is checked before the timing, on the regions of the first, every 50th and the last timed
 iteration (iterations 100, 150, ..., 1050 and 1099; one row per implementation, N and iteration in `validation.csv`;
 `latency.csv` has the largest error over them), against a reference with its own conventions: FKL BVF
-against the chain on FKL's CPU backend in float (tolerance 1e-3); OpenCV and FKL VF+HF, which write an 8 bit RGB
-frame, against the same chain with the RGB rounded to 8 bits; NPP, which also samples its resize differently (at
-`dst * scale - 0.25`, measured for upscales only), against that with NPP's sampling. Against an 8 bit reference the
-tolerance is one 8 bit level (a value on a half level can round either way), and at most one value in a thousand may be
+against the chain on FKL's CPU backend in float (tolerance 1e-3); FKL VF+HF, which writes an 8 bit RGB frame, against
+the same chain with the RGB rounded to 8 bits; OpenCV, whose converter truncates to 8 bits, against the chain with the
+RGB truncated to 8 bits (`fkl_cpu_8bit_rgb_truncated`); NPP, which rounds and also samples its resize differently (at
+`dst * scale - 0.25`, measured for upscales only), against the rounded chain with NPP's sampling. Against an 8 bit
+reference the tolerance is one 8 bit level (a value on a half level, or close to a whole one, can come out either
+way), and at most one value in a thousand may be
 more than 1e-3 away ([`common/bench_validation.h`](common/bench_validation.h)). The errors against FKL's float
 reference are in `validation.csv` too. A program fails if one of FKL's outputs is not within its tolerance in one of
 the validated iterations.
 
 ## Memory traffic with Nsight Compute
 
-`scripts/ncu_dram.sh` (DRAM traffic) and `scripts/ncu_l2.sh` (traffic between the SMs and L2) profile the OpenCV CUDA,
-NPP, FKL VF+HF and FKL BVF pipelines with Nsight Compute, through the `--ncu-target` modes: one execution on the
-regions of iteration 0, the same for every pipeline. `ncu_dram.sh` profiles every batch size with the caches flushed
-before every kernel (cold), and N = 1 and 100 without flushing (warm: L2 holds what the executions on iterations 1 to
-3 left there, as in the timed loop, where every iteration has new regions), each profile twice (`REPEATS`): the DRAM
-counters are device-wide, so a display on the same GPU adds other processes' traffic to some profiles, and the summary
-keeps the smallest of them. `ncu_l2.sh` profiles N = 1 and 100 (cold).
-They stop unless every benchmark was built for the same workload (`--workload`), take the batch sizes from the
-benchmarks (`--batches`), and write the regions of iteration 0 to `ncu_regions.csv` in the results folder
-(`--regions 0`) for the traffic model. The paths and their environment variables are at the top of
-`scripts/ncu_common.sh`.
+`scripts/ncu_dram.sh` (DRAM traffic) and `scripts/ncu_l2.sh` (traffic between the SMs and L2) profile the OpenCV CUDA
+pipeline, the NPP pipeline in both forms of its NV12 conversion (`npp` and `npp_crop_nv12`), and the FKL VF+HF and FKL
+BVF pipelines with Nsight Compute, through the `--ncu-target` modes: one execution on the regions of iteration 0, the
+same for every pipeline. `ncu_dram.sh` profiles every batch size with the caches flushed before every kernel (cold), and
+N = 1 and 100 without flushing (warm: L2 holds what the executions on iterations 1 to 3 left there, as in the timed
+loop, where every iteration has new regions), each profile twice (`REPEATS`): the DRAM counters are device-wide, so a
+display on the same GPU adds other processes' traffic to some profiles, and the summary keeps the smallest of them.
+`ncu_l2.sh` profiles N = 1 and 100 (cold). They stop unless every benchmark was built for the same workload
+(`--workload`), take the batch sizes from the benchmarks (`--batches`), and write the regions of iteration 0 to
+`ncu_regions.csv` in the results folder (`--regions 0`) for the traffic model. The paths and their environment variables
+are at the top of `scripts/ncu_common.sh`; `PIPELINES` limits the profiles to some of the pipelines (e.g. one profiled
+again after a change of its program); with only some of them, the scripts require `OUT`, a folder without reports, since
+each script deletes the earlier reports of its folder.
 
 They need root while the driver restricts the GPU performance counters to administrators (`RmProfilingAdminOnly=1` in
 `/proc/driver/nvidia/params`, the default); with the nvidia module option `NVreg_RestrictProfilingToAdminUsers=0` they
@@ -175,16 +203,66 @@ and max), `compile_time_kernels.csv` and `compile_time_phases.csv`, and prints a
     SET=ablation BUILD=build-ablation scripts/compile_time.sh ../results/compile_time/fkl-ablation
     SET=nppdx BUILD=build-nppdx-32x16 scripts/compile_time.sh ../results/compile_time/fkl-vs-nppdx-32x16   # after benchmark_nppdx
 
+## The CPU benchmarks
+
+FKL vs OpenCV on the CPU shares one harness with the other CPU benchmarks (FKL vs PyTorch, Halide and Fern, added by
+pull requests #18, #16 and #17; not `rocm/`'s RPP program, see [the GPU benchmarks](#the-gpu-benchmarks)),
+[`common/bench_cpu.h`](common/bench_cpu.h). FKL's side is [`common/bench_fkl_cpu.cpp`](common/bench_fkl_cpu.cpp):
+one `executeOperations` call (BVF) on FKL's CPU backend (one thread) and on its `CPU_MULTITHREAD` backend (FKL's
+thread pool, one worker per hardware thread). Each program compares its library on one thread with FKL on one thread,
+and on as many threads as FKL's pool has workers with FKL's pool.
+
+The two libraries of a comparison never run at the same time:
+
+- **Sequential loops.** For every batch size, the library's complete loop (100 warm-up and 1000 timed iterations) runs
+  first, then FKL's, on the same regions.
+- **Paired speedups.** FKL's speedup is the mean over the timed iterations of (library time / FKL time) of the same
+  iteration, which pairs runs on identical inputs. Every comparison CSV has a `_per_iteration.csv` sibling with the
+  pairs.
+- **Idle gap.** Every run follows a 1 ms idle gap, which the timing thread busy-waits, so that its core stays out of a
+  deep C-state. A pool whose workers spin for less than that after a run (FKL's and OpenCV's, as the platform file's
+  busy times show) is asleep when the next run starts; one that spins longer (libgomp's, by default: PyTorch's, #18)
+  is still spinning. Each library keeps its
+  own threads, if it has any, and its own idle behaviour.
+- **Worker busy time.** Each program measures how long the workers of every pool it uses (FKL's, and the library's if
+  it has one) stay busy after a run with little
+  work: their spin and wake-up, from `/proc/self/task/*/schedstat` on Linux. It records them in its platform file
+  (`cpu_platform*.txt`).
+- **Validation.** Before the timing, on the regions of the first, every 50th and the last timed iteration, FKL against
+  the reference with its conventions, FKL's pool against FKL on one thread, and what each program requires of its
+  library (its README and platform file say what: against a reference of its conventions, or on its thread count
+  against itself on one thread) must agree within 1e-3: otherwise the program writes its files and exits with an
+  error.
+
+FKL's side is the only translation unit of a program that includes FKL: FKL's headers define variable template
+specializations that are not `inline`, so a program can include them in one translation unit only. It is compiled with
+FKL's options only (none of the compared library's), so its object file is the same in every CPU benchmark built with
+the same compiler and flags. It is linked first, and with GCC and Clang a function and five variables in it are
+aligned to 4096 bytes, which aligns its code, read-only data, vtables, data and zero-initialized data sections: FKL's
+functions (its template instantiations, in sections of their own, follow in the same order), vtables and static
+objects then have the same addresses modulo 4096 in every CPU benchmark, whatever the sections before them (which grow
+with each library's imported symbols) take. Not aligned: the constants, strings and exception tables the linker merges
+with the other objects', the read-only data the object places after its strings (the type names of its type
+information), and its per-function read-only data (switch tables, not in the timed loops). FKL's timed code reads some
+of those merged 8-, 16- and 32-byte constants, whose addresses modulo 4096 differ by a few cache lines between programs;
+whether that changes FKL's times is not measured separately: the cross-program FKL times of the paper's runs show it.
+The platform file records the addresses modulo 4096 of two aligned symbols (`benchFklCodeStart` and `benchFklBssStart`,
+0 by construction) and of one function in FKL's aligned code section (`fklFrame`), and `nm` on two programs compares
+every FKL symbol; the merged constants have no symbols
+(`objdump -d` shows the addresses FKL's code loads them from). The
+[protocol change](fkl-vs-opencv-cpu/README.md#protocol-change) section of FKL vs OpenCV on the CPU explains the
+busy-waited gap and the separate translation unit.
+
 ## Requirements
 
 Each benchmark has its own requirements, besides a C++20 compiler:
 
 | Benchmark | Needs |
 |---|---|
-| `fkl-vs-opencv-cuda` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.28, OpenCV 4.14 built with CUDA and the opencv_contrib modules `cudaarithm` and `cudawarping` |
+| `fkl-vs-opencv-cuda` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.28, OpenCV 4.14 built with CUDA and the opencv_contrib modules `cudaarithm`, `cudacodec` (which needs `videoio`) and `cudawarping` |
 | `fkl-vs-npp`, `fkl-ablation` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.28; no OpenCV |
 | `fkl-vs-nppdx` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.30, a Linux x86_64 or Windows x64 machine (NPPDx's platforms); no OpenCV |
-| `fkl-neighborhood` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.28, FusedKernelLibrary with the batched `MorphologyDPP` and `executeBoxBlur` (PR #393, the `fkl` submodule), OpenCV 4.14 built with CUDA and the opencv_contrib modules `cudaarithm`, `cudafilters` and `cudaimgproc` for its OpenCV program, and for its NPPDx programs what `fkl-vs-nppdx` needs (or `-DBENCH_NPPDX=OFF`) |
+| `fkl-neighborhood` | an NVIDIA GPU, CUDA 13.3 or newer with NPP, CUPTI and NVTX, CMake 3.28, FusedKernelLibrary with the batched `MorphologyDPP` and `executeBoxBlur` (PR #393, the `fkl` submodule), OpenCV 4.14 built with CUDA and the opencv_contrib modules `cudaarithm`, `cudacodec` (which needs `videoio` and `cudawarping`), `cudafilters` and `cudaimgproc` for its OpenCV program, and for its NPPDx programs what `fkl-vs-nppdx` needs (or `-DBENCH_NPPDX=OFF`) |
 | `fkl-vs-opencv-cpu` | CMake 3.28 and OpenCV 4.14 with `core` and `imgproc`; no GPU or CUDA |
 | `rocm` | Linux, an AMD GPU (gfx1200 by default, another one with `-DCMAKE_HIP_ARCHITECTURES`), ROCm 10.1 with RPP 3.2.0 and rocprofiler-sdk, CMake 3.28, Ninja (see [its README](rocm/README.md)); no CUDA or OpenCV |
 
@@ -237,8 +315,9 @@ Every job runs [`scripts/ci/run_benchmarks.cmake`](scripts/ci/run_benchmarks.cma
 `~/bvf-paper-bench-deps` (so the first run on a runner takes much longer), builds the benchmarks (FKL vs NPPDx for
 every region size, `NPPDX_SIZES`, and the NPPDx neighborhood programs) with one timed iteration and no warm-up (`ITERATIONS` and `WARMUP_ITERATIONS` of the
 script), runs every mode except those for Nsight Compute (`--ncu-target` and the profiling scripts), and fails if a
-benchmark fails or if FKL's or NPPDx's outputs do not match their references (OpenCV's and NPP's are in
-`validation.csv` but not required: they come from the OpenCV build and the CUDA toolkit of each runner). The results
+benchmark fails (a CPU benchmark fails when its own validation fails: FKL's checks and what it checks of its library,
+as its README says) or if FKL's or NPPDx's outputs do not match their references (on the GPU, OpenCV's and NPP's are
+in the validation files but not required: they come from the OpenCV build and the CUDA toolkit of each runner). The results
 and logs of every job are uploaded as artifacts. Times measured on shared CI runners are not the paper's numbers.
 
 The runners are persistent machines and this repository is public, so the workflow only runs trusted code: pull

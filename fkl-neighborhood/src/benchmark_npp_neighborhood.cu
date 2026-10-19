@@ -24,7 +24,14 @@
 //                  nppiFilterBoxBorder_32f_C3R into its output plane; MulC, SubC, DivC: 2N + 4 kernels
 //   npp_32f_frame  NV12->RGB; one nppiConvert_8u32f_C3R of the whole frame; per crop nppiFilterBoxBorder_32f_C3R from
 //                  the crop of the float frame into its output plane; MulC, SubC, DivC: N + 5 kernels
+//   npp_crop_nv12, npp_32f_crop_nv12
+//                  npp and npp_32f with the NV12->RGB of each crop only (the same color twist with the source
+//                  pointers at the crop's origin and the crop's size, writing at the crop's position in the 8 bit
+//                  frame, which the rest of the pipeline reads as before): 2N + 4 and 3N + 3 kernels. npp_32f_frame
+//                  converts the whole 8 bit frame to float, so it keeps the conversion of the whole frame.
 //   fkl_dpp        FKL's MorphologyDPP box blur, one kernel (neighborhood_common.h)
+// Per batch size, of each pipeline's two conversion forms (npp and npp_crop_nv12, npp_32f and npp_32f_crop_nv12), each
+// view (latency, GPU only, GPU only with the L2 flushed) reports the validated one with the lower median in that view.
 
 #include "neighborhood_common.h"
 
@@ -33,6 +40,8 @@ namespace bench::neighborhood {
 constexpr int K = BOX_K;
 
 enum class NppVariant { Box8u, Convert32fPerCrop, Convert32fFrame };
+// The two forms of NPP's NV12 -> RGB: the whole frame, or each crop only
+enum class Nv12Form { Frame, Crop };
 
 struct NPPState {
     Npp8u* rgb8{nullptr};
@@ -55,16 +64,18 @@ struct NPPState {
     }
 };
 
-inline const char* nppVariantName(const NppVariant v) {
+inline const char* nppVariantName(const NppVariant v, const Nv12Form f) {
     switch (v) {
-        case NppVariant::Box8u: return "npp";
-        case NppVariant::Convert32fPerCrop: return "npp_32f";
+        case NppVariant::Box8u: return f == Nv12Form::Frame ? "npp" : "npp_crop_nv12";
+        case NppVariant::Convert32fPerCrop: return f == Nv12Form::Frame ? "npp_32f" : "npp_32f_crop_nv12";
         default: return "npp_32f_frame";
     }
 }
 
-template <size_t N, NppVariant V>
+template <size_t N, NppVariant V, Nv12Form F = Nv12Form::Frame>
 Implementation makeNPP(Context& ctx) {
+    static_assert(F == Nv12Form::Frame || V != NppVariant::Convert32fFrame,
+                  "npp_32f_frame converts the whole 8 bit frame to float: it converts the whole NV12 frame");
     const int plane8Step = PLANE_W * 3;
     const int planeStep = PLANE_W * 3 * sizeof(Npp32f);
     const NppiSize crop{CROP_W, CROP_H};
@@ -92,10 +103,20 @@ Implementation makeNPP(Context& ctx) {
         st->rects.insert(st->rects.end(), rects.begin(), rects.end());
     }
 
-    Implementation impl{nppVariantName(V), V == NppVariant::Box8u ? Reference::Fkl8bitFloorBox : Reference::Fkl8bit};
-    impl.stages.emplace_back("1_nv12_to_rgb8_full_frame", [&ctx, st](size_t) {
-        nv12ToRgb8(ctx, st->rgb8, st->rgbStep);
-    });
+    Implementation impl{nppVariantName(V, F), V == NppVariant::Box8u ? Reference::Fkl8bitFloorBox : Reference::Fkl8bit};
+    if constexpr (F == Nv12Form::Frame) {
+        impl.stages.emplace_back("1_nv12_to_rgb8_full_frame", [&ctx, st](size_t) {
+            nv12ToRgb8(ctx, st->rgb8, st->rgbStep);
+        });
+    } else {
+        // Written at each crop's position in the 8 bit RGB frame: the frame is written only where the crops of the
+        // iteration land, and the rest of the pipeline reads only those pixels
+        impl.stages.emplace_back("1_nv12_to_rgb8_per_crop", [&ctx, st](size_t t) {
+            for (size_t i = 0; i < N; ++i) {
+                nv12ToRgb8Crop(ctx, st->rgb8, st->rgbStep, st->rects[t * N + i]);
+            }
+        });
+    }
     if constexpr (V == NppVariant::Box8u) {
         impl.stages.emplace_back("2_per_crop_filter_box_border_8u", [&ctx, st, plane8Step, crop, mask, anchor,
                                                                      origin](size_t t) {
@@ -158,7 +179,14 @@ Implementation makeNPP(Context& ctx) {
     });
     impl.run = runStages(impl.stages);
     impl.download = [st]() { return downloadDevice(st->tensor, N * PLANE_FLOATS); };
-    impl.fillNaN = [st]() { gpuErrchk(cudaMemset(st->tensor, 0xFF, N * PLANE_FLOATS * sizeof(Npp32f))); };
+    impl.fillNaN = [st]() {
+        gpuErrchk(cudaMemset(st->tensor, 0xFF, N * PLANE_FLOATS * sizeof(Npp32f)));
+        if constexpr (F == Nv12Form::Crop) {
+            // The 8 bit frame too, which keeps the crops of earlier runs: a pixel the crops of the validated iteration
+            // do not convert, if the pipeline read it, would be 0 instead of a converted value
+            gpuErrchk(cudaMemset(st->rgb8, 0, static_cast<size_t>(st->rgbStep) * FRAME_H));
+        }
+    };
     return impl;
 }
 
@@ -175,6 +203,8 @@ struct NppVsFklDpp {
         impls.push_back(makeNPP<N, NppVariant::Box8u>(ctx));
         impls.push_back(makeNPP<N, NppVariant::Convert32fPerCrop>(ctx));
         impls.push_back(makeNPP<N, NppVariant::Convert32fFrame>(ctx));
+        impls.push_back(makeNPP<N, NppVariant::Box8u, Nv12Form::Crop>(ctx));
+        impls.push_back(makeNPP<N, NppVariant::Convert32fPerCrop, Nv12Form::Crop>(ctx));
         return impls;
     }
 
@@ -206,8 +236,20 @@ struct NppVsFklDpp {
               "nppiFilterBoxBorder_32f_C3R into its output plane: 2N + 4 kernels\n"
            << "  npp_32f_frame: one nppiConvert_8u32f_C3R of the whole frame, then per crop "
               "nppiFilterBoxBorder_32f_C3R from the crop of the float frame into its output plane: N + 5 kernels\n"
+           << "  npp_crop_nv12 and npp_32f_crop_nv12: npp and npp_32f with the NV12->RGB of each crop only: per crop "
+              "one nppiNV12ToRGB_8u_ColorTwist32f_P2C3R with the same matrix, its Y and UV source pointers at the "
+              "crop's origin (row y of the luma, row y / 2 of the chroma; every crop has even coordinates) and "
+              "oSizeROI the crop's size, writing the 8 bit RGB at the crop's position in the frame, which the rest of "
+              "the pipeline reads as npp and npp_32f do: 2N + 4 and 3N + 3 kernels. The frame is written only where "
+              "the crops of the iteration land (overlapping crops are converted twice), and only those pixels are "
+              "read; before every validated run, the 8 bit frame is filled with 0 as well as the output with NaN. "
+              "npp_32f_frame converts the whole 8 bit frame to float, so it keeps the conversion of the whole frame. "
+              "Per batch size, of each pipeline's two conversion forms (npp and npp_crop_nv12, npp_32f and "
+              "npp_32f_crop_nv12), each view (latency, GPU only, GPU only with the L2 flushed) reports the "
+              "validated one with the lower median in that view.\n"
            << "References: the 8 bit RGB of NPP's conversion (FKL's conversion rounded to nearest, see the diagnostic "
-              "below), with the box rounded down for npp and in float for npp_32f and npp_32f_frame.\n";
+              "below), with the box rounded down for npp and npp_crop_nv12 and in float for npp_32f, npp_32f_frame and "
+              "npp_32f_crop_nv12.\n";
     }
 
     static std::string diagnostic(const Context& ctx) { return nppConversionDiagnostic(ctx); }

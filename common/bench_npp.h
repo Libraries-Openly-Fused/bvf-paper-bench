@@ -88,6 +88,16 @@ inline void nv12ToRgb8Bt601Limited(const Npp8u* y, const Npp8u* uv, int pitch, N
     NPP_CHECK(nppiNV12ToRGB_8u_ColorTwist32f_P2C3R_Ctx(src, srcSteps, dst, dstStep, size, twist, ctx));
 }
 
+// The same conversion of one crop only (x, y, w, h, all even, as every region of common/bench_geometry.h): the Y and
+// UV source pointers offset to the crop's origin (the chroma of row y is UV row y / 2), oSizeROI the crop's size, and
+// the 8 bit RGB written at the crop's own position in the full-size RGB frame (dst, dstStep), so that the rest of a
+// pipeline reads the crop from the frame with the ROI it reads after the full-frame conversion. One call, one kernel.
+inline void nv12ToRgb8Bt601LimitedCrop(const Npp8u* y, const Npp8u* uv, int pitch, Npp8u* dst, int dstStep, int x0,
+                                       int y0, int w, int h, const NppStreamContext& ctx) {
+    nv12ToRgb8Bt601Limited(y + static_cast<size_t>(y0) * pitch + x0, uv + static_cast<size_t>(y0 / 2) * pitch + x0,
+                           pitch, dst + static_cast<size_t>(y0) * dstStep + 3 * x0, dstStep, NppiSize{w, h}, ctx);
+}
+
 } // namespace bench::npp
 
 #endif // BVF_BENCH_NPP_H

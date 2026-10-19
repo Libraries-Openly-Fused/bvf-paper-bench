@@ -7,8 +7,8 @@ cmake_minimum_required(VERSION 3.28)
 project(fkl_neighborhood LANGUAGES CXX CUDA)
 include(${CMAKE_CURRENT_SOURCE_DIR}/../common/bench_gpu.cmake)
 
-# The OpenCV CUDA program needs OpenCV 4.14 with CUDA and the opencv_contrib modules cudaarithm, cudafilters and
-# cudaimgproc (-DOpenCV_DIR=<OpenCV build or install>), and NPP for the NV12 conversion
+# The OpenCV CUDA program needs OpenCV 4.14 with CUDA and the opencv_contrib modules cudaarithm, cudacodec (its NV12
+# conversion; it needs videoio and cudawarping), cudafilters and cudaimgproc (-DOpenCV_DIR=<OpenCV build or install>)
 option(BENCH_OPENCV "Build the OpenCV CUDA program" ON)
 # The NPPDx programs need CMake 3.30 or newer and the nppdx submodule (or NPPDX_DIR)
 option(BENCH_NPPDX "Build the NPPDx programs" ON)
@@ -41,11 +41,12 @@ target_link_libraries(benchmark_npp_neighborhood PRIVATE CUDA::nppc CUDA::nppicc
 if(BENCH_OPENCV)
     # OpenCVConfig.cmake still calls find_package(CUDA), which needs the legacy FindCUDA module
     cmake_policy(SET CMP0146 OLD)
-    find_package(OpenCV 4.14 REQUIRED COMPONENTS core imgproc cudaarithm cudafilters cudaimgproc)
+    find_package(OpenCV 4.14 REQUIRED COMPONENTS core imgproc cudaarithm cudacodec cudafilters cudaimgproc)
     add_bench_target(benchmark_opencv_cuda_neighborhood src/benchmark_opencv_cuda_neighborhood.cu)
     target_link_libraries(benchmark_opencv_cuda_neighborhood PRIVATE CUDA::nppc CUDA::nppicc opencv_core
                                                                      opencv_imgproc opencv_cudaarithm
-                                                                     opencv_cudafilters opencv_cudaimgproc)
+                                                                     opencv_cudacodec opencv_cudafilters
+                                                                     opencv_cudaimgproc)
 endif()
 
 # Part (b): MorphologyDPP against NPPDx (hand written normalization and float write: benchmark_nppdx_neighborhood),

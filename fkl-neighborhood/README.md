@@ -68,10 +68,27 @@ These programs use a 5x5 box, one pass, and every batch size.
 | `benchmark_npp_neighborhood` | `npp` | NV12->RGB of the frame (8 bit); per crop `nppiFilterBoxBorder_8u_C3R` from the crop of the frame (`oSrcSize` the crop, `NPP_BORDER_REPLICATE`) into its packed 8 bit plane, which rounds down; one `nppiConvert_8u32f_C3R` of the N planes; `nppiMulC`, `nppiSubC`, `nppiDivC` on the whole output | N + 5 |
 | | `npp_32f` | NV12->RGB; per crop `nppiConvert_8u32f_C3R` of the crop, then `nppiFilterBoxBorder_32f_C3R` into its output plane; the three passes | 2N + 4 |
 | | `npp_32f_frame` | NV12->RGB; one `nppiConvert_8u32f_C3R` of the whole frame; per crop `nppiFilterBoxBorder_32f_C3R` from the crop of the float frame into its output plane; the three passes | N + 5 |
-| `benchmark_opencv_cuda_neighborhood` | `opencv_cuda` | NPP NV12->RGB of the frame (OpenCV CUDA has none); per crop `convertTo` 32FC3 of the crop, then `createSeparableLinearFilter` (`CV_32FC3`, 5 taps of 1/5 for the rows and the columns, `BORDER_REPLICATE`; a row and a column kernel) into its plane; `multiply`, `subtract`, `divide` on the float3 output | 3N + 4 |
-| | `opencv_cuda_rgba` | NPP NV12->RGB; `cvtColor` RGB2RGBA of the frame; per crop `convertTo` 32FC4, then `createLinearFilter` (`CV_32FC4`, 5x5 taps of 1/25, `BORDER_REPLICATE`; one kernel) into its plane of a 4 channel output; `multiply`, `subtract`, `divide` on it; `cvtColor` RGBA2RGB into the float3 output | 2N + 6 |
+| | `npp_crop_nv12` | `npp` with the NV12->RGB of each crop only: per crop one `nppiNV12ToRGB_8u_ColorTwist32f_P2C3R` with its Y and UV source pointers at the crop's origin and `oSizeROI` the crop's size, writing at the crop's position in the 8 bit frame, which the rest reads as `npp` does | 2N + 4 |
+| | `npp_32f_crop_nv12` | `npp_32f` with the NV12->RGB of each crop only, as `npp_crop_nv12` (`npp_32f_frame` converts the whole 8 bit frame to float, so it keeps the conversion of the whole frame) | 3N + 3 |
+| `benchmark_opencv_cuda_neighborhood` | `opencv_cuda` | OpenCV's NV12->RGB of the frame (cudacodec's `NVSurfaceToColorConverter`, which cannot convert a crop, [`common/bench_opencv_cuda.h`](../common/bench_opencv_cuda.h)); per crop `convertTo` 32FC3 of the crop, then `createSeparableLinearFilter` (`CV_32FC3`, 5 taps of 1/5 for the rows and the columns, `BORDER_REPLICATE`; a row and a column kernel) into its plane; `multiply`, `subtract`, `divide` on the float3 output | 3N + 4 |
+| | `opencv_cuda_rgba` | OpenCV's NV12->RGBA of the frame (the converter writes RGBA directly); per crop `convertTo` 32FC4, then `createLinearFilter` (`CV_32FC4`, 5x5 taps of 1/25, `BORDER_REPLICATE`; one kernel) into its plane of a 4 channel output; `multiply`, `subtract`, `divide` on it; `cvtColor` RGBA2RGB into the float3 output | 2N + 5 |
 | `benchmark_nppdx_neighborhood` | `nppdx` | one kernel ([`src/nppdx_box.h`](src/nppdx_box.h)): NPPDx's NV12 ingest of the crop (the crop is the image, so the halo replicates its edge), `FromLimitedLuma` / `FromLimitedChroma`, `ColorConvert` BT.601 and `BoxBlur<5, 5>`, then the normalization and the float3 write written by hand, as `fkl-vs-nppdx`'s NPPDx kernel (NPPDx has no float output); one launch for the N crops | 1 |
 | every program | `fkl_dpp` | one kernel (see above) | 1 |
+
+**NV12 conversions:** every baseline converts with its own library (OpenCV CUDA with cudacodec's converter, NPP with its
+color twist). NPP's per-crop forms convert each crop only, at its position in the 8 bit frame: the frame is written only
+where the crops of the iteration land, and only those pixels are read; before every validated run of a per-crop form the
+8 bit frame is filled with 0, so that a pixel the crops do not convert would fail the check. OpenCV's converter cannot
+convert a crop: its kernel reads the chroma of a luma row at a distance fixed by the surface's height, so the rows
+cannot be restricted (a view of some of the frame's columns with every row would convert, but such a full-height strip
+is not a crop), and the OpenCV pipelines convert the whole frame. Each NPP form has its own loop and speedup in every
+mode. Per batch size, of each NPP pipeline's two conversion forms (`npp` and `npp_crop_nv12`, `npp_32f` and
+`npp_32f_crop_nv12`), each view (latency, GPU only, GPU only with the L2 flushed) reports the validated one with the
+lower median in that view (the results report says which form each view reports, and the CSVs keep both). The pipelines
+themselves are not variants of one another: `npp`, `npp_32f` and `npp_32f_frame` (NPP's 8 bit box, float box on float
+crops, float box on the float frame) and `opencv_cuda` and `opencv_cuda_rgba` (OpenCV's RGB and RGBA pipelines) are each
+reported on their own, with their own speedups, as in results-v4; the choice by view is only between an NPP pipeline's
+two conversion forms.
 
 **NPPDx configurations:** every tile of the crop that NPPDx supports (64x32, then halvings of
 the longer side down to 8x8, in 4x2 pixel cells) runs with NPPDx's recommended block and with `BlockDim` 64, 128, 256
@@ -100,8 +117,9 @@ is computed in double and rounded as the implementation rounds it (`boxReference
 | Reference | Crops | Box | Implementations |
 |---|---|---|---|
 | `fkl_cpu_float` | float (with the resize for the `_resize` programs) | float | `fkl_dpp`, `fkl_bvf_ops`, `nppdx` |
-| `fkl_cpu_8bit_rgb` | the RGB rounded to 8 bits after the conversion (the 8 bit frame of NPP's conversion) | float | `npp_32f`, `npp_32f_frame`, `opencv_cuda`, `opencv_cuda_rgba` |
-| `fkl_cpu_8bit_rgb_floor_box` | the same 8 bit RGB | rounded down, floor(sum / 25) | `npp` |
+| `fkl_cpu_8bit_rgb` | the RGB rounded to 8 bits after the conversion (the 8 bit frame of NPP's conversion) | float | `npp_32f`, `npp_32f_frame`, `npp_32f_crop_nv12` |
+| `fkl_cpu_8bit_rgb_truncated` | the RGB truncated to 8 bits after the conversion (the 8 bit frame of OpenCV's converter) | float | `opencv_cuda`, `opencv_cuda_rgba` |
+| `fkl_cpu_8bit_rgb_floor_box` | the RGB rounded to 8 bits | rounded down, floor(sum / 25) | `npp`, `npp_crop_nv12` |
 
 The tolerances are those of every GPU benchmark: 1e-3 against the float reference, and one level of 8 bit RGB against
 the others.
