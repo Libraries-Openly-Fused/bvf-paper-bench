@@ -62,6 +62,7 @@ profile_pipelines() { # <N>: every profiled pipeline at batch size N
     local n=$1
     profile "fkl-vs-opencv-cuda__opencv_cuda_N$n" "$OPENCV_CUDA_BENCH" opencv_cuda "$n"
     profile "fkl-vs-npp__npp_N$n" "$NPP_BENCH" npp "$n"
+    profile "fkl-vs-npp__npp_crop_nv12_N$n" "$NPP_BENCH" npp_crop_nv12 "$n"
     profile "fkl-ablation__fkl_vf_hf_N$n" "$ABLATION_BENCH" fkl_vf_hf "$n"
     profile "fkl-ablation__fkl_bvf_N$n" "$ABLATION_BENCH" fkl_bvf "$n"
 }

@@ -31,8 +31,8 @@ std::array<fk::RawPtr<fk::ND::_2D, T>, N> planeViews(const fk::Tensor<T>& tensor
 }
 
 // VF + HF without BVF: four kernels with the intermediates in DRAM, the same intermediates as the OpenCV and NPP
-// pipelines: an 8 bit RGB frame (NPP's NV12 -> RGB can only write 8 or 16 bit integers, and OpenCV CUDA has no NV12
-// conversion), quantized as in the 8 bit reference (normalize, add half a level, __saturatef, denormalize), then
+// pipelines: an 8 bit RGB frame (NPP's NV12 -> RGB and OpenCV's cudacodec one can only write 8 or 16 bit integers),
+// quantized as in the 8 bit reference (normalize, add half a level, __saturatef, denormalize), then
 // float3 crops (like their per crop convertTo / Convert_8u32f) in planes of the largest region size, float3 resized
 // crops and the float3 output. The crop kernel is one batch of N crops of different sizes; an FKL batch runs the
 // threads of its largest plane in every plane (the largest region of the iteration, 48x24 as soon as N >= 3), so for

@@ -18,14 +18,16 @@
 // OpenCV CUDA's box filter (createBoxFilter) takes 8UC1, 8UC4 and 32FC1 only, so the box is a linear filter: the
 // separable filter takes 3 channels, the 2D one (createLinearFilter) 1 or 4. Its filters build their border from the
 // image they are given (a view of the crop), so REPLICATE replicates the edge of the crop.
-//   opencv_cuda       NPP NV12->RGB of the whole frame (OpenCV CUDA has no NV12 conversion); per crop convertTo
-//                     32FC3 of the crop of the 8 bit frame, then createSeparableLinearFilter (CV_32FC3, row and column
-//                     taps 1/5, BORDER_REPLICATE; a row and a column kernel) into its plane of the float3 output; then
-//                     multiply, subtract and divide on the whole output: 3N + 4 kernels
-//   opencv_cuda_rgba  NPP NV12->RGB; cvtColor RGB2RGBA of the whole frame; per crop convertTo 32FC4, then
-//                     createLinearFilter (CV_32FC4, 5x5 taps 1/25, BORDER_REPLICATE; one kernel) into its plane of a
-//                     4 channel output; multiply, subtract and divide on it; cvtColor RGBA2RGB into the float3 output:
-//                     2N + 6 kernels
+// The NV12 -> RGB is OpenCV's own (cudacodec's NVSurfaceToColorConverter, common/bench_opencv_cuda.h), of the whole
+// frame: it converts whole surfaces only.
+//   opencv_cuda       OpenCV's NV12->RGB of the whole frame; per crop convertTo 32FC3 of the crop of the 8 bit frame,
+//                     then createSeparableLinearFilter (CV_32FC3, row and column taps 1/5, BORDER_REPLICATE; a row and
+//                     a column kernel) into its plane of the float3 output; then multiply, subtract and divide on the
+//                     whole output: 3N + 4 kernels
+//   opencv_cuda_rgba  OpenCV's NV12->RGBA of the whole frame (the converter writes RGBA directly); per crop convertTo
+//                     32FC4, then createLinearFilter (CV_32FC4, 5x5 taps 1/25, BORDER_REPLICATE; one kernel) into its
+//                     plane of a 4 channel output; multiply, subtract and divide on it; cvtColor RGBA2RGB into the
+//                     float3 output: 2N + 5 kernels
 //   fkl_dpp           FKL's MorphologyDPP box blur, one kernel (neighborhood_common.h)
 
 #include <opencv2/core/cuda_stream_accessor.hpp>
@@ -36,14 +38,17 @@
 
 #include "neighborhood_common.h"
 
+#include "bench_opencv_cuda.h"
+
 namespace bench::neighborhood {
 
 constexpr int K = BOX_K;
 
 struct OpenCVState {
     cv::cuda::Stream stream;
+    opencv::Nv12Converter converter;
+    // The whole frame in 8 bit RGB (opencv_cuda) or RGBA (opencv_cuda_rgba)
     cv::cuda::GpuMat rgb8;
-    // The whole frame with 4 channels (opencv_cuda_rgba)
     cv::cuda::GpuMat rgba8;
     // The crops of every iteration, N per iteration (rects[t * N + i])
     std::vector<cv::Rect> rects;
@@ -59,9 +64,10 @@ template <size_t N, bool RGBA>
 Implementation makeOpenCV(Context& ctx) {
     auto st = std::make_shared<OpenCVState>();
     st->stream = cv::cuda::StreamAccessor::wrapStream(ctx.stream);
-    st->rgb8.create(FRAME_H, FRAME_W, CV_8UC3);
     if constexpr (RGBA) {
         st->rgba8.create(FRAME_H, FRAME_W, CV_8UC4);
+    } else {
+        st->rgb8.create(FRAME_H, FRAME_W, CV_8UC3);
     }
     for (size_t t = 0; t < ctx.regions->iterations(); ++t) {
         for (size_t i = 0; i < N; ++i) {
@@ -85,16 +91,14 @@ Implementation makeOpenCV(Context& ctx) {
     }
     cv::cuda::createContinuous(static_cast<int>(N) * PLANE_H, PLANE_W, CV_32FC3, st->tensor);
 
-    Implementation impl{RGBA ? "opencv_cuda_rgba" : "opencv_cuda", Reference::Fkl8bit};
-    impl.stages.emplace_back("1_nv12_to_rgb8_full_frame_npp", [&ctx, st](size_t) {
-        nv12ToRgb8(ctx, st->rgb8.data, static_cast<int>(st->rgb8.step));
+    Implementation impl{RGBA ? "opencv_cuda_rgba" : "opencv_cuda", Reference::Fkl8bitTruncated};
+    impl.stages.emplace_back(RGBA ? "1_nv12_to_rgba8_full_frame" : "1_nv12_to_rgb8_full_frame", [&ctx, st](size_t) {
+        if constexpr (RGBA) {
+            st->converter.convert(ctx, st->rgba8, cv::cudacodec::ColorFormat::RGBA, st->stream);
+        } else {
+            st->converter.convert(ctx, st->rgb8, cv::cudacodec::ColorFormat::RGB, st->stream);
+        }
     });
-    if constexpr (RGBA) {
-        impl.stages.emplace_back("2_rgb_to_rgba_full_frame", [st](size_t) {
-            beforeKernel();
-            cv::cuda::cvtColor(st->rgb8, st->rgba8, cv::COLOR_RGB2RGBA, 0, st->stream);
-        });
-    }
     impl.stages.emplace_back(RGBA ? "3_per_crop_convertTo_linear_filter" : "3_per_crop_convertTo_separable_filter",
                              [st](size_t t) {
         cv::cuda::GpuMat& output = RGBA ? st->tensor4 : st->tensor;
@@ -174,15 +178,16 @@ struct OpenCVCudaVsFklDpp {
     static void describe(std::ostream& os, const std::filesystem::path& outDir) {
         const std::string opencvBuild = cv::getBuildInformation();
         std::ofstream(outDir / "opencv_build_information.txt") << opencvBuild;
-        const NppLibraryVersion* npp = nppGetLibVersion();
         os << "OpenCV: " << cv::getVersionString() << " (opencv_contrib "
            << bench::buildInfoValue(opencvBuild, "Version control (extra):") << ", CUDA_ARCH_BIN "
            << bench::buildInfoValue(opencvBuild, "NVIDIA GPU arch:") << ", C++ compiler "
            << bench::buildInfoValue(opencvBuild, "C++ Compiler:")
            << "; full configuration in opencv_build_information.txt)\n"
-           << "NPP: " << npp->major << "." << npp->minor << "." << npp->build
-           << " (the NV12 -> RGB of the OpenCV pipelines: OpenCV CUDA has no NV12 conversion)\n"
-           << "OpenCV CUDA pipelines: NPP NV12->RGB of the whole frame into an 8 bit RGB frame, then per crop "
+           << "OpenCV CUDA pipelines: OpenCV's NV12->RGB of the whole frame into an 8 bit RGB (opencv_cuda) or RGBA "
+              "(opencv_cuda_rgba) frame (cudacodec::createNVSurfaceToColorConverter(ColorSpaceStandard::BT601, "
+              "videoFullRangeFlag false) and convert(SF_NV12, ColorFormat::RGB or RGBA, BitDepth::EIGHT, "
+              "interleaved): one kernel, on the raw NV12 frame without a decoder session; it converts whole surfaces "
+              "only, and truncates to 8 bits), then per crop "
               "convertTo of the crop of the frame (a view of it) into a float crop and the box as a linear filter on "
               "it, written into the crop's plane of the output (OpenCV CUDA's createBoxFilter takes 8UC1, 8UC4 and "
               "32FC1 only). The filters build their border from the float crop, so BORDER_REPLICATE replicates the "
@@ -190,17 +195,17 @@ struct OpenCVCudaVsFklDpp {
            << "  opencv_cuda: convertTo 32FC3 and createSeparableLinearFilter(CV_32FC3, CV_32FC3, " << K << " taps of "
               "1/" << K << " for the rows and the columns, BORDER_REPLICATE), a row and a column kernel per call, "
               "then multiply, subtract and divide on the float3 output: 3N + 4 kernels\n"
-           << "  opencv_cuda_rgba: cvtColor RGB2RGBA of the whole 8 bit frame, convertTo 32FC4 and "
+           << "  opencv_cuda_rgba: the converter's RGBA output (no cvtColor RGB2RGBA), convertTo 32FC4 and "
               "createLinearFilter(CV_32FC4, CV_32FC4, " << K << "x" << K << " taps of 1/" << K * K << ", "
               "BORDER_REPLICATE), one kernel per call, then multiply, subtract and divide on the 4 channel output and "
-              "one cvtColor RGBA2RGB into the float3 output: 2N + 6 kernels\n"
+              "one cvtColor RGBA2RGB into the float3 output: 2N + 5 kernels\n"
            << "With the L2 flushed, the flush runs before every OpenCV call, not between the two kernels of the "
               "separable filter.\n"
-           << "References: the 8 bit RGB of NPP's conversion (FKL's conversion rounded to nearest, see the diagnostic "
+           << "References: the 8 bit RGB of OpenCV's conversion (FKL's conversion truncated, see the diagnostic "
               "below) with the box in float.\n";
     }
 
-    static std::string diagnostic(const Context& ctx) { return nppConversionDiagnostic(ctx); }
+    static std::string diagnostic(const Context& ctx) { return opencv::conversionDiagnostic(ctx); }
 
     static bool extraMode(Context&, const std::string&, const std::filesystem::path&) { return false; }
 };

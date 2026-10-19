@@ -52,8 +52,11 @@ Every benchmark of this repository takes its workload from [`common/bench_geomet
 - the frame: 3840x2160 NV12, uniform random values in the legal range of limited (video) range NV12, Y in [16, 235]
   and U, V in [16, 240] (seed 1), as in real video;
 - the color conversion: NV12 to RGB with BT.601 in limited range, in every implementation, because it is the only
-  NV12 conversion that every library offers (OpenCV's CPU `cvtColor` has no other; NPP's through its color twist with
-  the BT.601 matrix, NPPDx's through `FromLimitedLuma`, `FromLimitedChroma` and `ColorConvert<yuv_bt601, rgb>`);
+  NV12 conversion that every library offers (OpenCV's CPU `cvtColor` and `cvtColorTwoPlane` have no other; OpenCV
+  CUDA's through cudacodec's `NVSurfaceToColorConverter`, NPP's through its color twist with the BT.601 matrix,
+  NPPDx's through `FromLimitedLuma`, `FromLimitedChroma` and `ColorConvert<yuv_bt601, rgb>`). Every baseline converts
+  with its own library, and where the library can convert a crop on its own (NPP, OpenCV on the CPU), the per-crop
+  form is a variant of the full-frame one, and the faster of the two is the library's per batch size;
 - the regions, new in every iteration (warm-up and timed): 100 per iteration, batch N uses the first N. Their sizes are
   20x10, 32x16 and 48x24 by turns: region i of iteration t has the size (i + t) mod 3 of that list, so every iteration
   mixes the three and every region cycles through them. Their positions are uniform random (seed 42), with even
@@ -143,14 +146,14 @@ the validated iterations.
 ## Memory traffic with Nsight Compute
 
 `scripts/ncu_dram.sh` (DRAM traffic) and `scripts/ncu_l2.sh` (traffic between the SMs and L2) profile the OpenCV CUDA,
-NPP, FKL VF+HF and FKL BVF pipelines with Nsight Compute, through the `--ncu-target` modes: one execution on the
-regions of iteration 0, the same for every pipeline. `ncu_dram.sh` profiles every batch size with the caches flushed
-before every kernel (cold), and N = 1 and 100 without flushing (warm: L2 holds what the executions on iterations 1 to
-3 left there, as in the timed loop, where every iteration has new regions), each profile twice (`REPEATS`): the DRAM
-counters are device-wide, so a display on the same GPU adds other processes' traffic to some profiles, and the summary
-keeps the smallest of them. `ncu_l2.sh` profiles N = 1 and 100 (cold).
-They stop unless every benchmark was built for the same workload (`--workload`), take the batch sizes from the
-benchmarks (`--batches`), and write the regions of iteration 0 to `ncu_regions.csv` in the results folder
+NPP (both forms of its NV12 conversion: `npp` and `npp_crop_nv12`), FKL VF+HF and FKL BVF pipelines with Nsight Compute,
+through the `--ncu-target` modes: one execution on the regions of iteration 0, the same for every pipeline.
+`ncu_dram.sh` profiles every batch size with the caches flushed before every kernel (cold), and N = 1 and 100 without
+flushing (warm: L2 holds what the executions on iterations 1 to 3 left there, as in the timed loop, where every
+iteration has new regions), each profile twice (`REPEATS`): the DRAM counters are device-wide, so a display on the same
+GPU adds other processes' traffic to some profiles, and the summary keeps the smallest of them. `ncu_l2.sh` profiles N =
+1 and 100 (cold). They stop unless every benchmark was built for the same workload (`--workload`), take the batch sizes
+from the benchmarks (`--batches`), and write the regions of iteration 0 to `ncu_regions.csv` in the results folder
 (`--regions 0`) for the traffic model. The paths and their environment variables are at the top of
 `scripts/ncu_common.sh`.
 

@@ -213,6 +213,13 @@ inline void nv12ToRgb8(const Context& ctx, Npp8u* dst, int dstStep) {
     npp::nv12ToRgb8Bt601Limited(ctx.y, ctx.uv, ctx.pitch, dst, dstStep, NppiSize{FRAME_W, FRAME_H}, ctx.npp);
 }
 
+// The same conversion of one crop only, written at the crop's position in the 8 bit RGB frame (common/bench_npp.h):
+// the per-crop form of the NPP pipelines, one call and one kernel per crop
+inline void nv12ToRgb8Crop(const Context& ctx, Npp8u* dst, int dstStep, const fk::Rect& r) {
+    beforeKernel();
+    npp::nv12ToRgb8Bt601LimitedCrop(ctx.y, ctx.uv, ctx.pitch, dst, dstStep, r.x, r.y, r.width, r.height, ctx.npp);
+}
+
 // The reference an implementation is checked against, with its tolerance: the Figure 1 chain on FKL's CPU backend in
 // float (FKL BVF); the same with the RGB rounded to 8 bits, for the pipelines with an 8 bit RGB frame (OpenCV, FKL
 // VF+HF), which resize at dst * scale like FKL; or that with NPP's resize sampling (NPP, nppConventionReference8bit).
@@ -220,7 +227,17 @@ inline void nv12ToRgb8(const Context& ctx, Npp8u* dst, int dstStep) {
 // chain with the filtered RGB rounded half up to 8 bits, NPPDx's 8 bit write) are only for programs with their own
 // reference() (fkl-neighborhood/). NppdxPixelCenterFloat (float, NPPDx's resize sampling at pixel centers) is for
 // nppdx-wins/.
-enum class Reference { FklFloat, Fkl8bit, NppSampling8bit, Fkl8bitFloorBox, FklFloatRounded, NppdxPixelCenterFloat };
+// Fkl8bit rounds FKL's conversion to the nearest 8 bit value (NPP's conversion); Fkl8bitTruncated truncates it
+// (OpenCV's cudacodec conversion)
+enum class Reference {
+    FklFloat,
+    Fkl8bit,
+    NppSampling8bit,
+    Fkl8bitFloorBox,
+    FklFloatRounded,
+    NppdxPixelCenterFloat,
+    Fkl8bitTruncated
+};
 
 inline const char* referenceName(Reference r) {
     switch (r) {
@@ -229,6 +246,7 @@ inline const char* referenceName(Reference r) {
         case Reference::Fkl8bitFloorBox: return "fkl_cpu_8bit_rgb_floor_box";
         case Reference::FklFloatRounded: return "fkl_cpu_float_rounded_8bit";
         case Reference::NppdxPixelCenterFloat: return "nppdx_pixel_center_float";
+        case Reference::Fkl8bitTruncated: return "fkl_cpu_8bit_rgb_truncated";
         default: return "npp_sampling_8bit";
     }
 }
@@ -318,7 +336,7 @@ inline Stage runStages(const std::vector<std::pair<std::string, Stage>>& stages)
 // References on FKL's CPU backend, for the regions of iteration t. The float reference is the Figure 1 chain itself. The
 // 8 bit reference quantizes the RGB values to 8 bit right after the color conversion, like the 8 bit RGB frame
 // pipelines do. Without LETTERBOX, the chain has no AddBorder and the output planes are RES_W x RES_H.
-template <size_t N, bool EIGHT_BIT, bool LETTERBOX = true>
+template <size_t N, bool EIGHT_BIT, bool LETTERBOX = true, bool TRUNCATE = false>
 std::vector<float> cpuReference(const Context& ctx, size_t t) {
     const auto crops = fklRects<N>(ctx, t);
     constexpr int outW = LETTERBOX ? OUT_W : RES_W;
@@ -353,7 +371,7 @@ std::vector<float> cpuReference(const Context& ctx, size_t t) {
     const auto rgbRead = fk::ReadYUV<fk::PixelFormat::NV12>::build(*ctx.frameHost).then(YUVToRGB::build());
     if constexpr (EIGHT_BIT) {
         tail(rgbRead.then(fk::NormalizePixel<fk::float3, fk::ColorDepth::p8bit>::build())
-                    .then(fk::Add<fk::float3>::build(fk::make_set<fk::float3>(QUANTIZATION_OFFSET)))
+                    .then(fk::Add<fk::float3>::build(fk::make_set<fk::float3>(TRUNCATE ? 0.f : QUANTIZATION_OFFSET)))
                     .then(fk::SaturateDenormalizePixel<fk::float3, fk::uchar3, fk::ColorDepth::p8bit>::build())
                     .then(fk::Cast<fk::uchar3, fk::float3>::build()));
     } else {
@@ -428,6 +446,7 @@ std::vector<float> referenceOutput(const Context& ctx, Reference r, size_t t) {
     switch (r) {
         case Reference::FklFloat: return cpuReference<N, false>(ctx, t);
         case Reference::Fkl8bit: return cpuReference<N, true>(ctx, t);
+        case Reference::Fkl8bitTruncated: return cpuReference<N, true, true, true>(ctx, t);
         case Reference::Fkl8bitFloorBox:
         case Reference::FklFloatRounded:
             throw std::runtime_error("This reference is only computed by programs with their own reference()");
@@ -492,17 +511,9 @@ constexpr auto batchesOf() {
     }
 }
 
-// Compares NPP's 8 bit NV12->RGB with FKL's float conversion, to show how NPP rounds (for the pipelines that use it)
-inline std::string nppConversionDiagnostic(const Context& ctx) {
-    Npp8u* rgb8 = nullptr;
-    size_t pitch = 0;
-    gpuErrchk(cudaMallocPitch(reinterpret_cast<void**>(&rgb8), &pitch, FRAME_W * 3, FRAME_H));
-    nv12ToRgb8(ctx, rgb8, static_cast<int>(pitch));
-    std::vector<Npp8u> host(static_cast<size_t>(FRAME_W) * 3 * FRAME_H);
-    gpuErrchk(cudaMemcpy2DAsync(host.data(), FRAME_W * 3, rgb8, pitch, FRAME_W * 3, FRAME_H, cudaMemcpyDeviceToHost,
-                                ctx.stream));
-    gpuErrchk(cudaStreamSynchronize(ctx.stream));
-    gpuErrchk(cudaFree(rgb8));
+// Compares a library's 8 bit NV12->RGB of the whole frame (host, packed rows of FRAME_W * 3 bytes) with FKL's float
+// conversion, to show how the library rounds (for the pipelines that use it)
+inline std::string conversionDiagnostic(const Context& ctx, const std::vector<Npp8u>& host, const std::string& label) {
     size_t diffRound = 0, diffTrunc = 0, total = 0;
     int maxRound = 0, maxTrunc = 0;
     for (int y = 0; y < FRAME_H; ++y) {
@@ -525,13 +536,27 @@ inline std::string nppConversionDiagnostic(const Context& ctx) {
         }
     }
     std::ostringstream os;
-    os << "NPP NV12->RGB (ColorTwist32f with the BT.601 limited range matrix of the standard, bench_npp.h) vs FKL's "
-          "float BT.601 limited range conversion:\n"
+    os << label << " vs FKL's float BT.601 limited range conversion:\n"
        << "  vs round-to-nearest of FKL: " << diffRound << " of " << total << " channel values differ, max "
        << maxRound << " levels\n"
        << "  vs truncation of FKL:       " << diffTrunc << " of " << total << " channel values differ, max "
        << maxTrunc << " levels\n";
     return os.str();
+}
+
+// NPP's 8 bit NV12->RGB of the whole frame against FKL's float conversion
+inline std::string nppConversionDiagnostic(const Context& ctx) {
+    Npp8u* rgb8 = nullptr;
+    size_t pitch = 0;
+    gpuErrchk(cudaMallocPitch(reinterpret_cast<void**>(&rgb8), &pitch, FRAME_W * 3, FRAME_H));
+    nv12ToRgb8(ctx, rgb8, static_cast<int>(pitch));
+    std::vector<Npp8u> host(static_cast<size_t>(FRAME_W) * 3 * FRAME_H);
+    gpuErrchk(cudaMemcpy2DAsync(host.data(), FRAME_W * 3, rgb8, pitch, FRAME_W * 3, FRAME_H, cudaMemcpyDeviceToHost,
+                                ctx.stream));
+    gpuErrchk(cudaStreamSynchronize(ctx.stream));
+    gpuErrchk(cudaFree(rgb8));
+    return conversionDiagnostic(ctx, host, "NPP NV12->RGB (ColorTwist32f with the BT.601 limited range matrix of the "
+                                           "standard, bench_npp.h)");
 }
 
 // Latency of each complete pipeline, the way FKL's two-execution benchmarks measure, with the implementations never

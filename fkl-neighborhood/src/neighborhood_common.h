@@ -45,9 +45,10 @@ namespace bench::neighborhood {
 
 // The first N crops of iteration t on FKL's CPU backend: ReadNV12 -> YUVtoRGB -> Crop, in float (FKL's conversion),
 // or with the RGB rounded to 8 bits right after the conversion as in cpuReference (common/bench_gpu.h), like NPP's 8
-// bit RGB frame; with RESIZE, the regions resized to PLANE_W x PLANE_H after the crop (Resize, FKL's bilinear). N
+// bit RGB frame (with TRUNCATE truncated to 8 bits instead, like OpenCV's cudacodec conversion); with RESIZE, the
+// regions resized to PLANE_W x PLANE_H after the crop (Resize, FKL's bilinear). N
 // planes of PLANE_W x PLANE_H interleaved RGB, one after the other.
-template <size_t N, bool EIGHT_BIT, bool RESIZE = false>
+template <size_t N, bool EIGHT_BIT, bool RESIZE = false, bool TRUNCATE = false>
 std::vector<double> cropRgb(const Context& ctx, const size_t t) {
     const auto crops = fklRects<N>(ctx, t);
     fk::Stream_<fk::ParArch::CPU> cpuStream;
@@ -65,7 +66,7 @@ std::vector<double> cropRgb(const Context& ctx, const size_t t) {
     };
     if constexpr (EIGHT_BIT) {
         run(rgbRead.then(fk::NormalizePixel<fk::float3, fk::ColorDepth::p8bit>::build())
-                .then(fk::Add<fk::float3>::build(fk::make_set<fk::float3>(QUANTIZATION_OFFSET)))
+                .then(fk::Add<fk::float3>::build(fk::make_set<fk::float3>(TRUNCATE ? 0.f : QUANTIZATION_OFFSET)))
                 .then(fk::SaturateDenormalizePixel<fk::float3, fk::uchar3, fk::ColorDepth::p8bit>::build())
                 .then(fk::Cast<fk::uchar3, fk::float3>::build()));
     } else {
@@ -81,7 +82,8 @@ std::vector<double> cropRgb(const Context& ctx, const size_t t) {
 // common/bench_neighborhood.h)
 //   FklFloat         FKL's float RGB, float box (FKL, NPPDx with its float write)
 //   FklFloatRounded  FKL's float RGB, box rounded half up to 8 bits (NPPDx's 8 bit write; no program uses it now)
-//   Fkl8bit          8 bit RGB, float box (NPP's 32f box, OpenCV's float filters)
+//   Fkl8bit          8 bit RGB, float box (NPP's 32f box)
+//   Fkl8bitTruncated 8 bit RGB truncated (OpenCV's cudacodec conversion), float box (OpenCV's float filters)
 //   Fkl8bitFloorBox  8 bit RGB, box rounded down, floor(sum / k^2) (NPP's 8 bit box)
 // With RESIZE (part (a)'s variant with the resize, FKL only), the float reference of the resized regions.
 template <size_t N, bool RESIZE = false>
@@ -100,6 +102,8 @@ std::vector<float> boxReferenceOf(const Context& ctx, const Reference r, const s
             return boxReference(cropRgb<N, false>(ctx, t), N, k, passes, Rounding::HalfUp, MUL, SUB, DIV);
         case Reference::Fkl8bit:
             return boxReference(cropRgb<N, true>(ctx, t), N, k, passes, Rounding::None, MUL, SUB, DIV);
+        case Reference::Fkl8bitTruncated:
+            return boxReference(cropRgb<N, true, false, true>(ctx, t), N, k, passes, Rounding::None, MUL, SUB, DIV);
         case Reference::Fkl8bitFloorBox:
             return boxReference(cropRgb<N, true>(ctx, t), N, k, passes, Rounding::Floor, MUL, SUB, DIV);
         default: throw std::runtime_error("No box reference with NPP's resize sampling: there is no resize");

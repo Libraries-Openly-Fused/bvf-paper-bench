@@ -41,11 +41,12 @@ target_link_libraries(benchmark_npp_neighborhood PRIVATE CUDA::nppc CUDA::nppicc
 if(BENCH_OPENCV)
     # OpenCVConfig.cmake still calls find_package(CUDA), which needs the legacy FindCUDA module
     cmake_policy(SET CMP0146 OLD)
-    find_package(OpenCV 4.14 REQUIRED COMPONENTS core imgproc cudaarithm cudafilters cudaimgproc)
+    find_package(OpenCV 4.14 REQUIRED COMPONENTS core imgproc cudaarithm cudacodec cudafilters cudaimgproc)
     add_bench_target(benchmark_opencv_cuda_neighborhood src/benchmark_opencv_cuda_neighborhood.cu)
     target_link_libraries(benchmark_opencv_cuda_neighborhood PRIVATE CUDA::nppc CUDA::nppicc opencv_core
                                                                      opencv_imgproc opencv_cudaarithm
-                                                                     opencv_cudafilters opencv_cudaimgproc)
+                                                                     opencv_cudacodec opencv_cudafilters
+                                                                     opencv_cudaimgproc)
 endif()
 
 # Part (b): MorphologyDPP against NPPDx (hand written normalization and float write: benchmark_nppdx_neighborhood),
