@@ -190,7 +190,7 @@ if has_step nppdx; then
         for program in benchmark_nppdx benchmark_nppdx_npp; do
             run "$LOGS/${program}_$size.log" "$build/$program" "$out"
             run "$LOGS/${program}_${size}_l2_flushed.log" "$build/$program" "$out" --gpu-only-l2-flushed
-            # The second fastest configuration of the sweep against FKL, in the same interleaved iterations
+            # The second fastest configuration of the sweep against FKL, with the protocol and regions of the chosen one
             run "$LOGS/${program}_${size}_runner_up_configs.log" python3 "$REPO/scripts/nppdx_runner_up.py" \
                 "$out/${program}_nppdx_block_sweep_GPU_NVIDIA.csv" "$out/${program}_runner_up_config.csv"
             run "$LOGS/${program}_${size}_runner_up.log" "$build/$program" "$out/runner-up" --configs \
