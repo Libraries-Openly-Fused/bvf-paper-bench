@@ -27,9 +27,9 @@
 //                                  before each of its kernels but the first (the L2 flush of the GPU only benchmark
 //                                  with the L2 flushed)
 //   runKernel<N, C>(w, origins, b) its NPPDx kernel alone, timed to choose the configuration
-// Every loop runs both libraries on the regions of its iteration (common/bench_geometry.h), whose positions change every
-// iteration: NPPDx gets the origins of the iteration's regions (a kernel parameter) and FKL their rectangles (its
-// build() calls), both converted from the regions before the loops.
+// Iteration t of each library's loop runs on the regions of iteration t (common/bench_geometry.h), whose positions
+// change every iteration: NPPDx gets the origins of the iteration's regions (a kernel parameter) and FKL their
+// rectangles (its build() calls), both converted from the regions before the loops.
 //   kernel<N, C>                   the NPPDx kernel type of configuration C (block, grid, smem, init())
 //   analyze(w)                     its --analyze mode
 
@@ -685,9 +685,14 @@ int figure1Main(int argc, char** argv) {
         int runtime = 0;
         gpuErrchk(cudaRuntimeGetVersion(&runtime));
         std::ofstream platform(outDir / (name + "_platform.txt"));
+        char busId[64] = {};
+        gpuErrchk(cudaDeviceGetPCIBusId(busId, sizeof(busId), device));
         platform << "GPU: " << prop.name << " (sm_" << prop.major << prop.minor << ", " << prop.multiProcessorCount
-                 << " SMs)\n"
-                 << "NVIDIA driver: " << bench::shell("nvidia-smi --query-gpu=driver_version --format=csv,noheader") << "\n"
+                 << " SMs), CUDA device " << device << "; in nvidia-smi: " << bench::nvidiaSmi(busId, "index,pci.bus_id,uuid")
+                 << "\n"
+                 << "NVIDIA driver: " << bench::nvidiaSmi(busId, "driver_version") << "\n"
+                 << "GPU clocks: not locked by the benchmark (locking needs root); maximum SM and memory clocks (nvidia-smi clocks.max.sm, clocks.max.mem): "
+                 << bench::nvidiaSmi(busId, "clocks.max.sm,clocks.max.mem") << "\n"
                  << "CUDA runtime: " << runtime / 1000 << "." << (runtime % 1000) / 10 << "\n"
                  << "Host compiler: " << bench::hostCompiler() << "\n"
                  << "FKL: " << FKL_VERSION << "\n"
@@ -698,22 +703,25 @@ int figure1Main(int argc, char** argv) {
                     "(0.229, 0.224, 0.225), float3 tensor of N planes " << OUT_W << "x" << OUT_H << "\n"
                  << P::label << " pipeline: " << P::description() << "\n"
                  << "FKL pipeline: one executeOperations call (Backwards Vertical Fusion), one kernel.\n"
-                 << "Regions: iteration t of every loop (the " << benchmark::WARMUP_ITERS
+                 << "Regions: iteration t of each pipeline's loop (the " << benchmark::WARMUP_ITERS
                  << " warm-up iterations are t in [0, " << benchmark::WARMUP_ITERS << "), the " << benchmark::ITERS
                  << " timed ones t in [" << benchmark::WARMUP_ITERS << ", "
                  << benchmark::WARMUP_ITERS + benchmark::ITERS
-                 << ")) runs both pipelines on the regions of iteration t (all of one size, at positions that change every "
+                 << ")) runs that pipeline on the regions of iteration t (all of one size, at positions that change every "
                     "iteration), generated before the loops; NPPDx gets their origins as a kernel parameter and FKL "
                     "their rectangles in its build() calls, both converted before the loops (statistics of the timed "
                     "ones in regions.csv).\n"
-                 << "Timing, three benchmarks: " << benchmark::WARMUP_ITERS << " warm-up and " << benchmark::ITERS
-                 << " timed iterations, in each one " << P::label << " and then FKL, with a synchronization after each. "
+                 << "Timing, three benchmarks: the two pipelines never run at the same time: for every batch size, "
+                 << P::label << "'s complete loop (" << benchmark::WARMUP_ITERS << " warm-up and " << benchmark::ITERS
+                 << " timed iterations) runs first, then FKL's on the same regions, with a synchronization after every "
+                    "run. "
                     "CPU + GPU (" << name << "_" << parArch << ".csv): CUDA events around everything the host does "
                     "to enqueue the pipeline plus its execution. GPU only (" << name << "_gpu_only_" << parArch
                  << ".csv): a second pass with CUPTI kernel tracing, the sum of the GPU execution times of the "
                     "pipeline's kernels. GPU only with the L2 flushed before every kernel (" << name
                  << "_gpu_only_l2_flushed_" << parArch << ".csv, --gpu-only-l2-flushed, a separate run). The speedup is "
-                    "computed per iteration and averaged. Times in the CSV are in ms.\n"
+                    "computed per iteration (the runs of the same iteration, identical inputs) and averaged. Times in "
+                    "the CSV are in ms.\n"
                  << "nvcc flags: -O3 -DNDEBUG -std=c++20 --threads 0 -rdc=false -split-compile=0 -ftemplate-depth=1000 "
                     "-lineinfo --expt-relaxed-constexpr, CUDA_ARCHITECTURES " << CUDA_ARCHITECTURES_STR << "\n"
                  << "Correctness: before the timing, on the regions of the first, every "

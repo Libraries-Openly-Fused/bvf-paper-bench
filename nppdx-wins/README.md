@@ -13,8 +13,8 @@ candidate is a neighborhood operation before a resize with a compile-time ratio:
 - **Libraries and hardware:** NPPDx v0.1.2 for SM 890; RTX 4090, CUDA 13.3, driver 610.43.02.
 - **Results:** `results/RTX4090/regions` and `results/RTX4090/frame`, the harness's files and the logs of the runs. The
   second smoke (W2 with heavier filters, commit 485266f, below) is in `results/RTX4090/frame_k9`, `frame_k5_p2` and
-  `frame_gauss21`. The full-protocol W2 runs for citation (commit 57f08bc) are in `results/RTX4090-full` (section "Full
-  protocol").
+  `frame_gauss21`. The full-protocol W2 runs (commit 57f08bc, under the interleaved protocol of that commit: rerun before
+  citing next to sequential-protocol results) are in `results/RTX4090-full` (section "Full protocol").
 
 ## Workloads
 
@@ -194,16 +194,18 @@ were excluded.
     1.31x faster than NPPDx in GPU time (625 vs 821 us), 1.41x with the L2 flushed and 1.30x in latency.
   - So the Gaussian is an NPPDx win only against the non-separable form.
 
-## Full protocol: the W2 cases for citation (commit 57f08bc, FKL 3e900e6)
+## Full protocol: the W2 cases under the interleaved protocol (commit 57f08bc, FKL 3e900e6; rerun before citing)
 
 **What was run:** the paper coordinator's request, 2026-10-15.
 - **The pipeline:** the 4K NV12 frame -> filter -> Resize 2:1 -> 1920x1080 float3, four cases (the 5x5 box in one and in
   two passes, the 9x9 box, the 21-tap Gaussian).
 - **Implementations:** nppdx; fkl_inline; fkl_staged; and, for the Gaussian, fkl_staged_separable as a labelled extra.
   - fkl_inline for the Gaussian is `GaussianBVF<21>` (common/bench_neighborhood_ops.h, commit bb0c245).
-- **Protocol:** the paper's, as Experiments 1 and 3.
+- **Protocol:** the one of Experiments 1 and 3 at 57f08bc, which interleaved the implementations in every iteration; not
+  the paper's current protocol. Rerun before citing next to results of the sequential protocol.
   - 100 warm-up and 1000 timed iterations in every mode (latency, GPU only, GPU only with the L2 flushed), the
-    implementations interleaved in every iteration, default clocks.
+    implementations interleaved in every iteration, default clocks. The harness (common/bench_gpu.h) now runs each
+    implementation's complete loop before the next one's instead (the baselines first, the FKL forms last).
   - Per-iteration mean speedups in both directions: nppdx over each FKL form, and each FKL form over nppdx.
   - Medians and p10-p90, CUPTI kernel counts, validation on 21 iterations (the first, every 50th and the last timed one).
 - **Run and data:**

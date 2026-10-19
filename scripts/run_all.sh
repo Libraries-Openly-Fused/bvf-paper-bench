@@ -18,7 +18,9 @@
 #
 # Environment variables:
 #   STEPS        the benchmarks to build and run, among opencv-cuda, npp, ablation, nppdx, neighborhood and opencv-cpu
-#                (default all)
+#                (default all), and pytorch (FKL vs PyTorch, not in the default: it needs TORCH_PYTHON)
+#   TORCH_PYTHON for the pytorch step: the Python of the environment with PyTorch (fkl-vs-pytorch/README.md), whose
+#                LibTorch the programs are built against
 #   NPPDX_SIZES  the region sizes of FKL vs NPPDx (default "20x10 32x16 48x24")
 #   COMPILE_TIME 1 to also run scripts/compile_time.sh after the runs (long: 10 rounds of every unit): FKL's ablation,
 #                the OpenCV and NPP units, and in the NPPDx builds the headers and FKL BVF (first size) and the NPPDx
@@ -26,10 +28,10 @@
 #   PROFILE      1 to run the Nsight Compute scripts (needs the opencv-cuda, npp and ablation steps and the GPU
 #                performance counters open to every user); without it, their commands are printed at the end
 #   BUILD_ROOT   where the build folders go (default this repository): build-<step>, and build-nppdx-<size>
-#   CPU_CXX      C++ compiler of the CPU benchmark (default clang++; the README recommends a recent clang)
+#   CPU_CXX      C++ compiler of the CPU benchmarks (default clang++; the README recommends a recent clang)
 #   CMAKE_ARGS   more options for every CMake project (for example -DBENCH_ITERATIONS=1 for a quick check). They
 #                come before the options this script sets for each project (BENCH_REGIONS, OpenCV_DIR, and CPU_CXX for
-#                the CPU benchmark), which win. Setting or unsetting BENCH_REGIONS in them is an error: this script sets
+#                the CPU benchmarks), which win. Setting or unsetting BENCH_REGIONS in them is an error: this script sets
 #                it for every project (mixed, or the NPPDx sizes of NPPDX_SIZES)
 # Results: <results>/<benchmark folder>, FKL vs NPPDx in <results>/fkl-vs-nppdx/<size> (the runner-up configurations in
 # its runner-up/), the neighborhood experiment in <results>/fkl-neighborhood/<program>, logs in <results>/logs. The GPU benchmarks run one at a time; leave the GPU otherwise idle.
@@ -83,6 +85,16 @@ has_step() { [[ " $STEPS " == *" $1 "* ]]; }
 if { has_step opencv-cuda || has_step opencv-cpu; } && [ -z "${OpenCV_DIR:-}" ]; then
     echo "Set OpenCV_DIR to the OpenCV build or install folder (the OpenCV benchmarks need it)" >&2
     exit 1
+fi
+TORCH_PREFIX=""
+TORCH_GPU=0
+if has_step pytorch; then
+    TORCH_PREFIX=$("${TORCH_PYTHON:-}" -c 'import torch; print(torch.utils.cmake_prefix_path)' 2>/dev/null) || {
+        echo "Set TORCH_PYTHON to the Python of the environment with PyTorch (the pytorch step needs it)" >&2
+        exit 1
+    }
+    # Whether the wheel has a GPU backend, and so the GPU program must be built
+    TORCH_GPU=$("$TORCH_PYTHON" -c 'import torch; print(int(bool(torch.version.cuda or torch.version.hip)))')
 fi
 # Every size has its own build, results and log paths, so a size listed twice would overwrite its first measurements
 seen=" "
@@ -160,6 +172,28 @@ for step in opencv-cuda npp ablation opencv-cpu; do
         run "$LOGS/bvf_types.log" "$build/bvf_types"
     fi
 done
+if has_step pytorch; then
+    # The CPU program (PyTorch with libgomp's default spin), then the GPU program when LibTorch has a GPU backend
+    build=$BUILD_ROOT/build-pytorch
+    out=$RESULTS/fkl-vs-pytorch
+    echo "  fkl-vs-pytorch ($build)"
+    # Torch_DIR at every configure: a build folder configured with another environment follows TORCH_PYTHON
+    configure "$REPO/fkl-vs-pytorch" "$build" -DBENCH_REGIONS=mixed -DCMAKE_CXX_COMPILER="$CPU_CXX" \
+              -DCMAKE_PREFIX_PATH="$TORCH_PREFIX" -DTorch_DIR="$TORCH_PREFIX/Torch"
+    # libgomp's default spin: neither GOMP_SPINCOUNT nor OMP_WAIT_POLICY (passive: no spin; active: no limit)
+    run "$LOGS/benchmark_pytorch_cpu.log" env -u GOMP_SPINCOUNT -u OMP_WAIT_POLICY "$build/benchmark_pytorch_cpu" \
+        "$out/cpu"
+    # CMake removes the GPU program of an earlier configuration that does not build it (BENCH_PYTORCH_GPU=OFF, or a
+    # LibTorch without a GPU backend), so it exists exactly when this one built it; a LibTorch with a GPU backend must
+    # have built it
+    if [ -x "$build/benchmark_pytorch_gpu" ]; then
+        run "$LOGS/benchmark_pytorch_gpu.log" "$build/benchmark_pytorch_gpu" "$out/gpu"
+    elif [ "$TORCH_GPU" = 1 ]; then
+        echo "LibTorch has a GPU backend (torch.version.cuda or torch.version.hip), but $build has no" \
+             "benchmark_pytorch_gpu (BENCH_PYTORCH_GPU=OFF in CMAKE_ARGS?)" >&2
+        exit 1
+    fi
+fi
 if has_step nppdx; then
     for size in $NPPDX_SIZES; do
         build=$BUILD_ROOT/build-nppdx-$size
@@ -169,7 +203,7 @@ if has_step nppdx; then
         for program in benchmark_nppdx benchmark_nppdx_npp; do
             run "$LOGS/${program}_$size.log" "$build/$program" "$out"
             run "$LOGS/${program}_${size}_l2_flushed.log" "$build/$program" "$out" --gpu-only-l2-flushed
-            # The second fastest configuration of the sweep against FKL, in the same interleaved iterations
+            # The second fastest configuration of the sweep against FKL, with the protocol and regions of the chosen one
             run "$LOGS/${program}_${size}_runner_up_configs.log" python3 "$REPO/scripts/nppdx_runner_up.py" \
                 "$out/${program}_nppdx_block_sweep_GPU_NVIDIA.csv" "$out/${program}_runner_up_config.csv"
             run "$LOGS/${program}_${size}_runner_up.log" "$build/$program" "$out/runner-up" --configs \

@@ -15,7 +15,7 @@ rows added on top and bottom (64x64), then `(x * mul - sub) / div` with ImageNet
 [`common/bench_geometry.h`](../common/bench_geometry.h) (see the [workload](../README.md#workload)); the other
 benchmarks mix the three sizes in every iteration, but NPPDx's kernels are compiled for one region size and resize
 ratio, so this folder is built for one of them, with the CMake option `BENCH_REGIONS` (`20x10`, `32x16`, the default,
-or `48x24`). In every iteration both pipelines run on the regions of that iteration: NPPDx gets their origins as a
+or `48x24`). Iteration t of each pipeline's loop runs on the regions of iteration t: NPPDx gets their origins as a
 kernel parameter and FKL their rectangles in its `build()` calls, both converted from the regions before the loops.
 
 NPPDx is a device-side library: it has no host API and no kernels of its own, so using it always means writing a
@@ -54,12 +54,15 @@ own names.
 [`results/RTX4090`](results/RTX4090) and [`results/RTX4090-20x10`](results/RTX4090-20x10) were measured with NV12 to
 RGB in BT.2020 full range on a frame of uniform random bytes, with the same regions in every iteration (see their
 platform files), before the workload described above and before the NPPDx+NPP benchmark existed, by `benchmark_nppdx`
-under its earlier name, `benchmark_figure1_bvf` (the prefix of their files). Their configuration files do not match the
-current workload, so the scripts that check the workload refuse them.
+under its earlier name, `benchmark_figure1_bvf` (the prefix of their files), and with the earlier protocol: NPPDx and
+FKL alternated within every iteration, where the protocol below runs each one's complete loop in turn. Their
+configuration files do not match the current workload, so the scripts that check the workload refuse them.
 
-Three benchmarks, with the same iterations: 1000 timed after 100 warm-up ones, NPPDx and FKL one after the other in
-each, and FKL's mean speedup computed per iteration (NPPDx time / FKL time) and averaged, as in FKL's and
-cvGPUSpeedup's benchmarks. NPPDx runs in the configuration chosen for every N (see
+Three benchmarks, with the same iterations: 1000 timed after 100 warm-up ones. The two implementations never run at
+the same time: NPPDx's complete loop runs first, then FKL's, on the same regions. FKL's mean speedup is computed per
+iteration (NPPDx time / FKL time of the same iteration) and averaged, as in FKL's and cvGPUSpeedup's benchmarks; every
+comparison CSV has a `_per_iteration.csv` sibling with every pair of times (ms) and its ratio. The
+paper's first results (`results-v3`) alternated the two implementations within every iteration instead. NPPDx runs in the configuration chosen for every N (see
 [NPPDx configuration](#nppdx-configuration)).
 
 **CPU + GPU**: CUDA events around everything the host does to enqueue the kernel plus its execution. Median
@@ -202,8 +205,8 @@ with `SET=nppdx scripts/compile_time.sh` after a run of `benchmark_nppdx` with t
 Following FKL's benchmark convention, each benchmark writes `<benchmark>_<ParArch>.csv` with one row per batch
 size: `Batch size`, then `MeanTime`, `TimeVariance`, `MaxTime` and `MinTime` of the first (baseline, NPPDx or NPPDx+NPP) and
 second (FKL) implementation in milliseconds, `Mean Speedup`, and the `MedianTime`, `P10Time` and `P90Time` of
-each. In every iteration both implementations are timed one after the other with CUDA events on one stream,
-synchronizing after each. `<benchmark>_gpu_only_<ParArch>.csv` has the same columns for the GPU only benchmark.
+each. Each implementation's complete loop runs before the other's, every execution timed with CUDA events on one
+stream and followed by a synchronization. `<benchmark>_gpu_only_<ParArch>.csv` has the same columns for the GPU only benchmark.
 Next to them are `_validation_` (errors, tolerances and whether each output is within its tolerance, per N and
 validated iteration), `_nppdx_block_sweep_` (every NPPDx configuration tried: tile, block, blocks per crop, shared
 memory, time alone, error, whether it is within its tolerance and whether it was chosen), `_nppdx_config_` (the chosen

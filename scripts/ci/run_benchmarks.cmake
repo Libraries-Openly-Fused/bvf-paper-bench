@@ -8,14 +8,18 @@
 #
 # On Windows, run it from a Visual Studio developer shell (cl, link and ninja in the PATH).
 #
-#   BENCHMARKS           cpu: FKL vs OpenCV on the CPU (fkl-vs-opencv-cpu/); gpu: the GPU benchmarks (fkl-vs-opencv-cuda/,
+#   BENCHMARKS           cpu: the CPU benchmarks (fkl-vs-opencv-cpu/, fkl-vs-pytorch/); gpu: the GPU benchmarks (fkl-vs-opencv-cuda/,
 #                        fkl-vs-npp/, fkl-ablation/, fkl-vs-nppdx/ and fkl-neighborhood/)
 #   CXX_COMPILER         C++ compiler of the benchmarks; for gpu also the host compiler of nvcc (except with cl, which
 #                        nvcc finds in the PATH)
 #   CUDA_COMPILER        nvcc, for gpu
 #   OPENCV_CXX_COMPILER  C++ compiler for OpenCV (default CXX_COMPILER); OPENCV_C_COMPILER is derived from it
 #   NPPDX                ON, OFF or AUTO (default): AUTO builds FKL vs NPPDx on x86_64 only, the only CPU NPPDx supports
-#   DEPS_DIR             where OpenCV is built once and reused by later runs (default <home>/bvf-paper-bench-deps)
+#   PYTORCH              ON, OFF or AUTO (default): AUTO builds FKL vs PyTorch on Linux x86_64 when Python 3 can create a
+#                        virtual environment: its CPU program in the cpu runs (torch 2.14.1's CPU wheel) and its GPU
+#                        program in the gpu runs (its CUDA 13.2 wheel), each wheel installed once into DEPS_DIR
+#   DEPS_DIR             where OpenCV is built and PyTorch installed once, reused by later runs (default
+#                        <home>/bvf-paper-bench-deps)
 #   BUILD_DIR            build folders of the benchmarks (default <repo>/build-ci)
 #   OUT_DIR              results and logs (default <repo>/ci-results)
 #   NPPDX_SIZES          the region sizes FKL vs NPPDx is built and run for, separated by spaces (default
@@ -38,7 +42,8 @@ else()
     set(HOME_DIR "$ENV{HOME}")
     set(EXE "")
 endif()
-foreach(default IN ITEMS "GENERATOR=Ninja" "OPENCV_VERSION=4.14.0" "NPPDX=AUTO" "ITERATIONS=1" "WARMUP_ITERATIONS=0"
+foreach(default IN ITEMS "GENERATOR=Ninja" "OPENCV_VERSION=4.14.0" "NPPDX=AUTO" "PYTORCH=AUTO" "ITERATIONS=1"
+                         "WARMUP_ITERATIONS=0"
                          "NPPDX_SIZES=20x10 32x16 48x24"
                          "DEPS_DIR=${HOME_DIR}/bvf-paper-bench-deps"
                          "BUILD_DIR=${REPO}/build-ci" "OUT_DIR=${REPO}/ci-results")
@@ -102,6 +107,16 @@ else()
 endif()
 if(NPPDX STREQUAL "AUTO")
     set(NPPDX ${HOST_X64})
+endif()
+# PyTorch's wheels exist for more platforms, but the script installs them on Linux x86_64 only
+set(PYTORCH_AUTO FALSE)
+if(PYTORCH STREQUAL "AUTO")
+    set(PYTORCH_AUTO TRUE)
+    if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND HOST_X64)
+        set(PYTORCH ON)
+    else()
+        set(PYTORCH OFF)
+    endif()
 endif()
 # nvcc can need a few GB per compilation: at most one job per 3 GB of memory
 math(EXPR JOBS "${MEMORY_MIB} / 3072")
@@ -302,6 +317,48 @@ function(build_opencv RESULT)
 endfunction()
 
 build_opencv(OPENCV_PREFIX)
+
+# torch 2.14.1 in a virtual environment of DEPS_DIR, installed once per wheel (VARIANT: cpu or cu132, the index of the
+# wheel): RESULT is its LibTorch's CMake prefix (torch.utils.cmake_prefix_path), or empty when PYTORCH is AUTO and
+# Python 3 cannot create the environment
+function(get_torch VARIANT RESULT)
+    set(${RESULT} "" PARENT_SCOPE)
+    set(venv "${DEPS_DIR}/torch-2.14.1-${VARIANT}-${HOST_TAG}")
+    set(python "${venv}/bin/python")
+    if(NOT EXISTS "${venv}/bvf-complete.txt")
+        file(LOCK "${venv}.lock" GUARD FUNCTION TIMEOUT 7200)
+    endif()
+    if(NOT EXISTS "${venv}/bvf-complete.txt")
+        find_program(PYTHON3 NAMES python3)
+        set(error "")
+        if(NOT PYTHON3)
+            set(error "no python3")
+        else()
+            file(REMOVE_RECURSE "${venv}")
+            execute_process(COMMAND "${PYTHON3}" -m venv "${venv}" RESULT_VARIABLE result OUTPUT_VARIABLE output
+                            ERROR_VARIABLE output)
+            if(NOT result STREQUAL "0")
+                set(error "python3 -m venv failed: ${output}")
+            endif()
+        endif()
+        if(error)
+            if(PYTORCH_AUTO)
+                message(STATUS "FKL vs PyTorch not built: ${error}")
+                return()
+            endif()
+            message(FATAL_ERROR "PYTORCH=ON: ${error}")
+        endif()
+        run(torch_install_${VARIANT} FATAL COMMAND "${python}" -m pip install --no-input --disable-pip-version-check
+            torch==2.14.1 --index-url "https://download.pytorch.org/whl/${VARIANT}")
+        file(WRITE "${venv}/bvf-complete.txt" "torch 2.14.1 from https://download.pytorch.org/whl/${VARIANT}\n")
+    endif()
+    execute_process(COMMAND "${python}" -c "import torch; print(torch.utils.cmake_prefix_path)"
+                    OUTPUT_VARIABLE prefix OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE result)
+    if(NOT result STREQUAL "0" OR NOT EXISTS "${prefix}")
+        message(FATAL_ERROR "torch in ${venv} gives no CMake prefix")
+    endif()
+    set(${RESULT} "${prefix}" PARENT_SCOPE)
+endfunction()
 
 # Shared libraries found at run time: Linux executables have RPATHs, Windows needs the folders in the PATH
 if(CMAKE_HOST_WIN32)
@@ -531,6 +588,35 @@ if(BENCHMARKS STREQUAL "cpu")
     run(benchmark_opencv_cpu COMMAND "${bench}" "${OUT_DIR}/fkl-vs-opencv-cpu")
     check_csv("${OUT_DIR}/fkl-vs-opencv-cpu/cpu_validation.csv" "FKL MaxAbsError vs FKL-convention reference" 1e-3)
     check_csv("${OUT_DIR}/fkl-vs-opencv-cpu/cpu_validation.csv" "FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference" 1e-3)
+    if(PYTORCH)
+        # FKL vs PyTorch's CPU program, with the CPU wheel: FKL and PyTorch must match the references of their
+        # sampling conventions
+        get_torch(cpu TORCH_PREFIX)
+        if(TORCH_PREFIX)
+            build_benchmark(pytorch-cpu "${REPO}/fkl-vs-pytorch" -DBENCH_REGIONS=mixed -DBENCH_PYTORCH_GPU=OFF
+                            "-DCMAKE_PREFIX_PATH=${TORCH_PREFIX}" "-DTorch_DIR=${TORCH_PREFIX}/Torch")
+            run(benchmark_pytorch_cpu COMMAND "${BUILD_DIR}/pytorch-cpu/benchmark_pytorch_cpu" "${OUT_DIR}/fkl-vs-pytorch/cpu")
+            # PyTorch on as many threads as FKL's pool has workers against PyTorch on one: the column is named after
+            # the runner's thread count
+            set(validation "${OUT_DIR}/fkl-vs-pytorch/cpu/cpu_validation.csv")
+            set(threadsColumn "")
+            if(EXISTS "${validation}")
+                file(STRINGS "${validation}" header LIMIT_COUNT 1)
+                string(REGEX MATCH "PyTorch [0-9]+ threads vs PyTorch 1 thread MaxAbsDifference" threadsColumn
+                       "${header}")
+            endif()
+            if(NOT threadsColumn)
+                set(threadsColumn "PyTorch <threads> threads vs PyTorch 1 thread MaxAbsDifference")
+            endif()
+            foreach(column IN ITEMS "FKL MaxAbsError vs FKL-convention reference"
+                                    "PyTorch MaxAbsError vs pixel-center reference"
+                                    "FKL CPU_MULTITHREAD vs FKL CPU MaxAbsDifference" "${threadsColumn}")
+                check_csv("${validation}" "${column}" 1e-3)
+            endforeach()
+        endif()
+    else()
+        message(STATUS "FKL vs PyTorch not built: PYTORCH is OFF (AUTO builds it on Linux x86_64 only)")
+    endif()
 else()
     # The benchmarks on common/bench_gpu.h: <build name>:<folder>:<program>
     foreach(entry IN ITEMS "opencv-cuda:fkl-vs-opencv-cuda:benchmark_opencv_cuda" "npp:fkl-vs-npp:benchmark_npp"
@@ -556,6 +642,21 @@ else()
             run(${program}_host_overhead COMMAND "${bench}" "${out}" --host-overhead)
         endif()
     endforeach()
+    if(PYTORCH)
+        # FKL vs PyTorch's GPU program, with the CUDA 13.2 wheel: both pipelines must match their references (the
+        # program fails otherwise)
+        get_torch(cu132 TORCH_PREFIX)
+        if(TORCH_PREFIX)
+            build_benchmark(pytorch-gpu "${REPO}/fkl-vs-pytorch" ${cudaOptions} -DBENCH_REGIONS=mixed
+                            "-DCMAKE_PREFIX_PATH=${TORCH_PREFIX}" "-DTorch_DIR=${TORCH_PREFIX}/Torch")
+            set(out "${OUT_DIR}/fkl-vs-pytorch/gpu")
+            run(benchmark_pytorch_gpu COMMAND "${BUILD_DIR}/pytorch-gpu/benchmark_pytorch_gpu" "${out}")
+            check_csv("${out}/validation.csv" within_tolerance yes)
+            check_csv("${out}/validation.csv" non_finite_values 0)
+        endif()
+    else()
+        message(STATUS "FKL vs PyTorch not built: PYTORCH is OFF (AUTO builds it on Linux x86_64 only)")
+    endif()
     # The neighborhood experiment (fkl-neighborhood/): the tests of its BVF box operation and of MorphologyDPP's box,
     # then every program (part (a), MorphologyDPP against NPP and OpenCV CUDA, and with NPPDx against NPPDx) with the
     # checks of the benchmarks above; the NPPDx program must match its reference too
