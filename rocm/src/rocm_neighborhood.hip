@@ -24,9 +24,11 @@
 //   fkl_bvf_naive         one FKL kernel with the naive ReadBack operation BoxBVF<K> of common/bench_neighborhood_ops.h
 //                         (twice for two passes) in the BVF chain after the Crop (or the Resize)
 //   fkl_dpp_<W>x<H>       as in part (b), with executeBoxBlur<passes>, its input chain ending at the Crop (or the Resize)
-// In every group (part, operation, K, passes, N) all of them are validated and timed in the same interleaved iterations; the RPP
-// variant and the DPP tile of a group are the fastest (median of the CPU + GPU pass) of those that pass their checks,
-// and every one is recorded. The speedups are per iteration (baseline / chosen DPP tile), averaged.
+// In every group (part, operation, K, passes, N) all of them are validated, then timed one at a time in the order above
+// (the baselines first, the DPP tiles last): each one's complete loop (warm-up and timed iterations) before the next,
+// never interleaved per iteration, iteration t of every loop on the crops of iteration t. The RPP variant and the DPP
+// tile of a group are the fastest (median of the CPU + GPU pass) of those that pass their checks, and every one is
+// recorded. The speedups are per iteration (baseline / chosen DPP tile, the runs of the same iteration), averaged.
 //
 // The harness (context, timing, rocprofiler-sdk tool, cache flusher) is the one of rocm_bench.hip, which this file
 // includes. No HIP graphs anywhere.
@@ -668,7 +670,7 @@ void runGroup(Context& ctx, bool timing) {
         return;
     }
     progress("CPU + GPU timing");
-    const auto ms = measureInterleaved(ctx, impls);
+    const auto ms = measureSequential(ctx, impls);
     // The output after the timed iterations must still be the validated one (as in rocm_bench.hip)
     const size_t firstValidated = static_cast<size_t>(WARMUP_ITERS) + validated.front();
     for (size_t k = 0; k < impls.size(); ++k) {
@@ -686,6 +688,7 @@ void runGroup(Context& ctx, bool timing) {
     size_t dpp = impls.size();
     for (size_t k = 0; k < impls.size(); ++k) {
         rs[k].r.timing = computeStats(ms[k]);
+        rs[k].r.ms = ms[k];
     }
     for (size_t k = 0; k < impls.size(); ++k) {
         if (isDpp(impls[k].name) && rs[k].r.withinTolerance() &&
@@ -715,7 +718,7 @@ void runGroup(Context& ctx, bool timing) {
         if (k != dpp) {
             double sum = 0.;
             for (int i = 0; i < TIMED_ITERS; ++i) {
-                sum += ms[k][i] / ms[dpp][i];
+                sum += static_cast<double>(ms[k][i]) / ms[dpp][i];
             }
             gr.r.meanSpeedupOfBvf = sum / TIMED_ITERS;
         }
@@ -832,40 +835,14 @@ void gpuOnlyGroup(Context& ctx, CacheFlusher* flusher) {
         gpuErrchk(hipStreamSynchronize(ctx.stream));
         kernelsPerRun[k] = countLaunches(ctx, impls[k], static_cast<size_t>(WARMUP_ITERS)).kernels;
     }
-    activeFlusher = flusher;
-    for (int i = 0; i < WARMUP_ITERS; ++i) {
-        for (const auto& impl : impls) {
-            impl.run(static_cast<size_t>(i));
-            gpuErrchk(hipStreamSynchronize(ctx.stream));
-        }
-    }
     rocprof::flushKernels();
     {
         std::lock_guard<std::mutex> lock(rocprof::mutex);
         rocprof::kernels.clear();
     }
-    struct Window {
-        rocprofiler_timestamp_t begin, end;
-        size_t k;
-        int i;
-    };
-    std::vector<Window> windows;
-    windows.reserve(static_cast<size_t>(TIMED_ITERS) * impls.size());
-    ROCP_CHECK(rocprofiler_start_context(rocprof::kernelContext));
-    for (int i = 0; i < TIMED_ITERS; ++i) {
-        for (size_t k = 0; k < impls.size(); ++k) {
-            Window w{0, 0, k, i};
-            ROCP_CHECK(rocprofiler_get_timestamp(&w.begin));
-            impls[k].run(static_cast<size_t>(WARMUP_ITERS + i));
-            gpuErrchk(hipStreamSynchronize(ctx.stream));
-            ROCP_CHECK(rocprofiler_get_timestamp(&w.end));
-            windows.push_back(w);
-        }
-        if (i % 100 == 99) {
-            rocprof::flushKernels();
-        }
-    }
-    ROCP_CHECK(rocprofiler_stop_context(rocprof::kernelContext));
+    // Each implementation's complete loop in turn, the chosen DPP tile among the DPP tiles after the baselines
+    activeFlusher = flusher;
+    const std::vector<Window> windows = runGpuOnlyLoops(ctx, impls);
     // rocprofiler-sdk writes a dispatch record after the kernel completes, on its own thread: flush until the records
     // of every execution (at least kernelsPerRun of each) have arrived, for at most 2 s
     size_t expected = 0;
@@ -941,6 +918,7 @@ void gpuOnlyGroup(Context& ctx, CacheFlusher* flusher) {
         double& speedup = flusher ? r.meanGpuFlushedSpeedupOfBvf : r.meanGpuSpeedupOfBvf;
         (flusher ? r.gpuFlushedMeasured : r.gpuMeasured) = true;
         timing = computeStats(ms[k]);
+        (flusher ? r.gpuFlushedMs : r.gpuMs) = ms[k];
         (flusher ? r.gpuFlushedBlitTiming : r.gpuBlitTiming) = computeStats(blitMs[k]);
         std::vector<float> counts = blitCount[k];
         std::sort(counts.begin(), counts.end());
@@ -948,7 +926,7 @@ void gpuOnlyGroup(Context& ctx, CacheFlusher* flusher) {
         if (k != dpp) {
             double sum = 0.;
             for (int i = 0; i < TIMED_ITERS; ++i) {
-                sum += ms[k][i] / ms[dpp][i];
+                sum += static_cast<double>(ms[k][i]) / ms[dpp][i];
             }
             speedup = sum / TIMED_ITERS;
         }
@@ -1078,6 +1056,8 @@ bool runProfilingChild(const std::filesystem::path& outDir) {
         r.gpuBlitDispatches = p->gpuBlitDispatches;
         r.gpuFlushedBlitTiming = p->gpuFlushedBlitTiming;
         r.gpuFlushedBlitDispatches = p->gpuFlushedBlitDispatches;
+        r.gpuMs = p->gpuMs;
+        r.gpuFlushedMs = p->gpuFlushedMs;
     }
     std::filesystem::remove(rows);
     std::filesystem::remove(choices);
@@ -1132,6 +1112,42 @@ void writeGpuTime(const std::filesystem::path& path, bool flushed) {
         os << std::setprecision(2) << "," << b.median << "," << b.p10 << "," << b.p90 << "," << b.mean << ","
            << std::setprecision(1) << (flushed ? r.gpuFlushedBlitDispatches : r.gpuBlitDispatches) << std::defaultfloat
            << "\n";
+    }
+}
+
+// The per-iteration sibling of latency.csv (pass 0), gpu_time.csv (1) or gpu_time_l2_flushed.csv (2): one row per
+// implementation of every group and timed iteration with the iteration (its crops), the implementation's time and the
+// group's chosen DPP tile's time in that iteration, in us, and their ratio, which the chosen_dpp_mean_*speedup column
+// averages (none on the chosen DPP tile's own rows)
+void writePerIteration(const std::filesystem::path& path, int pass) {
+    const auto times = [pass](const Result& r) -> const std::vector<float>& {
+        return pass == 0 ? r.ms : pass == 1 ? r.gpuMs : r.gpuFlushedMs;
+    };
+    std::ofstream os(path);
+    os << GROUP_HEADER
+       << (pass == 0 ? ",iteration,time_us,chosen_dpp_time_us,chosen_dpp_speedup\n"
+                     : ",iteration,gpu_time_us,chosen_dpp_gpu_time_us,chosen_dpp_gpu_speedup\n");
+    for (const auto& gr : groupResults) {
+        const auto dpp = std::find_if(groupResults.begin(), groupResults.end(), [&](const GroupResult& x) {
+            return x.group.label() == gr.group.label() && x.chosen && isDpp(x.r.name);
+        });
+        if (dpp == groupResults.end()) {
+            throw std::runtime_error("No chosen DPP tile for " + gr.group.label());
+        }
+        const std::vector<float>& ms = times(gr.r);
+        const std::vector<float>& dppMs = times(dpp->r);
+        if (ms.size() != dppMs.size()) {
+            throw std::runtime_error(gr.group.label() + " " + gr.r.name + ": per-iteration times of different lengths");
+        }
+        for (size_t i = 0; i < ms.size(); ++i) {
+            writeGroupColumns(os, gr);
+            os << "," << WARMUP_ITERS + i << "," << std::fixed << std::setprecision(3) << ms[i] * 1000. << ","
+               << dppMs[i] * 1000. << "," << std::defaultfloat << std::setprecision(6);
+            if (&*dpp != &gr) {
+                os << static_cast<double>(ms[i]) / dppMs[i];
+            }
+            os << "\n";
+        }
     }
 }
 
@@ -1222,12 +1238,17 @@ void writePlatformNb(const std::filesystem::path& path, const std::string& diagn
     os << " (MorphologyDPPDetails<float3, W, H, K, K>, executeBoxBlur<passes>: every pass a mean, an Add reducer and a "
        << "Mul 1 / K^2 finalizer).\n"
        << "Timing (CPU + GPU): as rocm_bench.hip: " << WARMUP_ITERS << " warm-up then " << TIMED_ITERS
-       << " timed iterations; iteration t runs every implementation of the group on the crops of iteration t, each "
-       << "between two HIP events on one stream and followed by a synchronization. Chosen per group: the DPP tile with "
+       << " timed iterations per implementation; in every group each implementation runs its complete loop before the "
+       << "next one starts (the RPP variants or fkl_bvf_naive first, the DPP tiles last; never two implementations at "
+       << "the same time, never interleaved per iteration), iteration t of every loop on the crops of iteration t, each "
+       << "execution between two HIP events on one stream and followed by a synchronization. Chosen per group: the DPP "
+       << "tile with "
        << "the lowest median among those within the float tolerance, and the RPP variant with the lowest median among "
        << "those within their tolerance and within " << RPP_EQUIVALENCE << " of their RPP-convention reference "
        << "(chosen = yes in the CSV files; every implementation is recorded). Speedups: per iteration, implementation "
-       << "time / chosen DPP time, averaged over the timed iterations (the chosen DPP's own row has none).\n"
+       << "time / chosen DPP time of the same iteration (the same crops), averaged over the timed iterations (the chosen "
+       << "DPP's own row has none; every pair in latency_per_iteration.csv, gpu_time_per_iteration.csv and "
+       << "gpu_time_l2_flushed_per_iteration.csv).\n"
        << "Validation: as rocm_bench.hip, on the timed iterations " << validation::VALIDATION_STRIDE << " apart and the "
        << "last, into NaN-poisoned outputs. FKL against the float reference: FKL's CPU float chain ReadNV12 -> YUVtoRGB -> "
        << "Crop, then bench::neighborhood::boxReference (the box in double, no rounding, then the normalization in float; "
@@ -1259,7 +1280,7 @@ void writePlatformNb(const std::filesystem::path& path, const std::string& diagn
        << "F32 of the whole images into the output tensor. rpp_f32box_normalize: the same with the conversion only, "
        << "then rppt_normalize. No memset. One RPP handle per pipeline with batch size N.\n"
        << "Kernel counts, GPU time only and GPU time only with L2 + MALL flushed: as rocm_bench.hip, in a profiling child "
-       << "process, every implementation of every group"
+       << "process, every implementation of every group, with the same sequential loops"
        << (kernelTracing ? "" : onWsl() ? " (GPU time only NOT MEASURED on WSL2)" : " (GPU time only NOT MEASURED)") << ".\n";
     if (!profilingError.empty()) {
         os << "PROFILING PASS FAILED (" << profilingError << "): kernel counts and GPU time only are not measured\n";
@@ -1329,15 +1350,20 @@ int main(int argc, char** argv) {
             std::cerr << "ERROR in the profiling pass: " << profilingError << std::endl;
         }
         writeLatency(outDir / "latency.csv");
+        writePerIteration(outDir / "latency_per_iteration.csv", 0);
         writeValidation(outDir / "validation.csv");
         if (tracing) {
             writeGpuTime(outDir / "gpu_time.csv", false);
             writeGpuTime(outDir / "gpu_time_l2_flushed.csv", true);
+            writePerIteration(outDir / "gpu_time_per_iteration.csv", 1);
+            writePerIteration(outDir / "gpu_time_l2_flushed_per_iteration.csv", 2);
         } else {
             // The GPU time only files of an earlier run in this directory, which this run does not rewrite (as in
             // rocm_bench.hip)
-            std::filesystem::remove(outDir / "gpu_time.csv");
-            std::filesystem::remove(outDir / "gpu_time_l2_flushed.csv");
+            for (const char* file : {"gpu_time.csv", "gpu_time_l2_flushed.csv", "gpu_time_per_iteration.csv",
+                                     "gpu_time_l2_flushed_per_iteration.csv"}) {
+                std::filesystem::remove(outDir / file);
+            }
         }
         writeRegionStats((outDir / "regions.csv").string(), *ctx.regions, WARMUP_ITERS, TIMED_ITERS);
         writeRegionStats((outDir / "regions_resize.csv").string(), *resizeRegions, WARMUP_ITERS, TIMED_ITERS);

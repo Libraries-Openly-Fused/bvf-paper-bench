@@ -15,7 +15,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/../../common/bench_geometry.cmake)
 set(BENCH_ITERATIONS 1000 CACHE STRING "Timed iterations of every benchmark (at least 1)")
 set(BENCH_WARMUP_ITERATIONS 100 CACHE STRING "Warm-up iterations before the timed ones")
 
-set(FKL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../fkl" CACHE PATH "FusedKernelLibrary checkout (default: the repository's fkl submodule, 63782f6)")
+set(FKL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../fkl" CACHE PATH "FusedKernelLibrary checkout (default: the repository's fkl submodule)")
 set(ROCM_PATH "/opt/rocm/core-10.1" CACHE PATH "ROCm installation (HIP headers, which rpp.h includes)")
 set(RPP_ROOT "${ROCM_PATH}" CACHE PATH "Prefix with include/rpp/rpp.h and lib/librpp.so")
 # -march=native: every SIMD extension of this CPU (AVX2 and FMA on Zen 3, AVX-512 where available)
@@ -27,14 +27,29 @@ find_library(RPP_LIBRARY rpp HINTS "${RPP_ROOT}/lib" NO_DEFAULT_PATH REQUIRED)
 # --dirty: a modified FKL tree shows up in cpu_platform.txt
 execute_process(COMMAND git -C ${FKL_DIR} describe --always --dirty --abbrev=7 OUTPUT_VARIABLE FKL_COMMIT
                 OUTPUT_STRIP_TRAILING_WHITESPACE)
-if(NOT FKL_COMMIT MATCHES "63782f6")
-    message(WARNING "FKL_DIR (${FKL_DIR}) is at ${FKL_COMMIT}, not 63782f6 (the paper's FKL commit)")
+# The paper's FKL commit: the commit recorded for the repository's fkl submodule
+execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR}/../.. ls-tree HEAD fkl OUTPUT_VARIABLE FKL_SUBMODULE_ENTRY
+                OUTPUT_STRIP_TRAILING_WHITESPACE)
+string(REGEX MATCH "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]" FKL_SUBMODULE_COMMIT
+       "${FKL_SUBMODULE_ENTRY}")
+if(NOT FKL_SUBMODULE_COMMIT OR NOT FKL_COMMIT MATCHES "^${FKL_SUBMODULE_COMMIT}")
+    message(WARNING "FKL_DIR (${FKL_DIR}) is at ${FKL_COMMIT}, not ${FKL_SUBMODULE_COMMIT} (the repository's fkl "
+                    "submodule, the paper's FKL commit)")
 endif()
 execute_process(COMMAND git -C ${FKL_DIR}/thread-pool rev-parse --short HEAD OUTPUT_VARIABLE THREAD_POOL_COMMIT
                 OUTPUT_STRIP_TRAILING_WHITESPACE)
 if(NOT EXISTS "${FKL_DIR}/thread-pool/include")
     message(FATAL_ERROR "${FKL_DIR}/thread-pool is empty: the CPU_MULTITHREAD backend needs FKL's thread-pool submodule "
                         "(git submodule update --init --recursive)")
+endif()
+# The commit of this repository, and whether its checkout has changes, as in rocm/CMakeLists.txt: both show up in
+# cpu_platform.txt
+execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR}/../.. rev-parse --short HEAD OUTPUT_VARIABLE BENCH_REPO_COMMIT
+                OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR}/../.. status --porcelain --untracked-files=no
+                OUTPUT_VARIABLE BENCH_REPO_CHANGES OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(BENCH_REPO_CHANGES)
+    string(APPEND BENCH_REPO_COMMIT " (with uncommitted changes)")
 endif()
 find_package(Threads REQUIRED)
 
@@ -49,6 +64,7 @@ target_compile_options(rpp_cpu_bench PRIVATE ${CPU_ARCH_FLAGS_LIST} -ftemplate-d
 target_compile_definitions(rpp_cpu_bench PRIVATE ${BENCH_GEOMETRY_DEFINITIONS} FK_CPU_MULTITHREAD_ENABLED __HIP_PLATFORM_AMD__
                            BENCH_ITERATIONS=${BENCH_ITERATIONS} BENCH_WARMUP_ITERATIONS=${BENCH_WARMUP_ITERATIONS}
                            BENCH_FKL_COMMIT="${FKL_COMMIT}" BENCH_THREAD_POOL_COMMIT="${THREAD_POOL_COMMIT}"
+                           BENCH_REPO_COMMIT="${BENCH_REPO_COMMIT}"
                            BENCH_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
                            BENCH_CXX_FLAGS="${CMAKE_CXX_FLAGS_RELEASE} -std=c++20 ${CPU_ARCH_FLAGS} -ftemplate-depth=1000"
                            BENCH_RPP_LIB="${RPP_LIBRARY}")

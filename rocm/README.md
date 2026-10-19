@@ -3,12 +3,22 @@
 Part of the [BVF paper benchmarks](../README.md): the Figure 1 pipeline on an AMD GPU with ROCm, FKL's HIP backend
 against RPP (ROCm Performance Primitives), and FKL's CPU backends against RPP's HOST backend, on the
 [workload](../README.md#workload) of every benchmark of this repository (`common/bench_geometry.h`), with the constants
-and timing protocol of the CUDA benchmarks ([`common/bench_gpu.h`](../common/bench_gpu.h)). No HIP graphs anywhere.
-The commands below run from the repository root.
+of the CUDA benchmarks ([`common/bench_gpu.h`](../common/bench_gpu.h)). No HIP graphs anywhere. The commands below run
+from the repository root.
+
+Timing protocol, in every program here (GPU, Experiment 3 and CPU): implementations never run at the same time and
+never alternate within an iteration. For every N (and, on the CPU, every thread count), each implementation runs its
+complete loop, 100 warm-up and 1000 timed iterations, before the next one starts: the baselines first and FKL BVF
+last (in Experiment 3, the RPP variants or `fkl_bvf_naive` first and the DPP tiles last, the speedups being over the
+chosen DPP tile). The speedup over a baseline is the mean over the timed iterations of (baseline time / FKL time) of
+the same iteration, which ran on the same regions. Every pair of times and its ratio is in a `_per_iteration.csv`
+file: the sibling of every two-execution comparison file (`<baseline>_vs_fkl_bvf_*.csv` on the GPU,
+`benchmark_cpu_*.csv` on the CPU; the speedups of the GPU benchmark's `latency.csv` and `gpu_time*.csv` are the same
+values, so those files have no sibling of their own) and of Experiment 3's `latency.csv` and `gpu_time*.csv`.
 
 The regions change every iteration (20x10, 32x16 and 48x24 by turns, new positions every warm-up and timed
-iteration, all generated before the loops by `RegionSets`): iteration t of every loop runs every pipeline on the
-regions of iteration t (warm-up 0 to W - 1, timed W to W + T - 1). Every pipeline converts the regions of every
+iteration, all generated before the loops by `RegionSets`): iteration t of every pipeline's loop runs on the regions
+of iteration t (warm-up 0 to W - 1, timed W to W + T - 1). Every pipeline converts the regions of every
 iteration to its own arguments when it is created; inside the timed region there is only what each library needs to
 receive the regions of its iteration: for FKL, `build()` of its operations with the iteration's rectangles and the
 fusion, in every `executeOperations` call; for RPP, one `hipMemcpyAsync` of the iteration's ROIs from a pinned buffer
@@ -21,7 +31,7 @@ its region's size.
 
 | Implementation | What runs |
 |---|---|
-| `rpp` | the RPP pipeline of the benchmark: the fastest of the five RPP variants below, which are numerically equivalent (within 1e-5 of the RPP-convention reference); a selection pass validates and times all of them (CPU + GPU, interleaved, 20 warm-up + 200 timed iterations per N) and keeps the one with the lowest geometric mean of its medians over N (`rpp_selection.csv`); only that one is measured afterwards |
+| `rpp` | the RPP pipeline of the benchmark: the fastest of the five RPP variants below, which are numerically equivalent (within 1e-5 of the RPP-convention reference); a selection pass validates and times all of them (CPU + GPU, each variant's complete loop in turn, 20 warm-up + 200 timed iterations per N) and keeps the one with the lowest geometric mean of its medians over N (`rpp_selection.csv`); only that one is measured afterwards |
 | `rpp_per_op` (variant) | the upload of the iteration's ROIs (every variant starts with it), then one RPP call per operation: `rppt_yuv_to_rgb` (NV12 to 8 bit RGB, BT.601 limited range: `RpptColorStandard_BT601`, `RpptColorRange_STUDIO`; it also uploads 8 constants with `hipMemcpyToSymbol` on every call), one batched `rppt_crop_mirror_normalize` 8u to 32f (all batch images alias the frame), `hipMemsetAsync` of the output (RPP has no constant border), one batched `rppt_resize` into the rows of the output planes below the top border, `rppt_multiply_scalar`, `rppt_tensor_subtract_tensor` and `rppt_tensor_divide_tensor` on the whole tensor |
 | `rpp_npp_like` (variant) | the same calls with exactly the intermediates of the paper's NPP pipeline: the resized crops in their own buffer, copied into the output rows by a batched `rppt_crop` |
 | `rpp_fused` (variant) | `rppt_yuv_to_rgb`, `hipMemsetAsync` of the top border rows of the first output plane, then RPP's fused `rppt_resize_mirror_normalize` (crop + 8u to 32f + resize + Mul; it zeroes everything from its destination pointer, which starts below that border, and synchronizes the stream itself), Sub and Div on the whole tensor (the border rows also need the normalization, which `rppt_resize_mirror_normalize` cannot apply to them) |
@@ -31,12 +41,12 @@ its region's size.
 | `fkl_bvf` | the single `executeOperations` call of `makeFklBvf<N>` (Listing 2 of the paper), unchanged |
 
 Everything runs on one blocking HIP stream (so that RPP's null-stream `hipMemcpyToSymbol` calls serialize with it).
-Metrics, as in the CUDA benchmark: CPU + GPU (HIP events around the complete pipeline, all implementations
-interleaved in every iteration, per-execution speedups averaged), then, in a child process in which the
+Metrics, as in the CUDA benchmark: CPU + GPU (HIP events around the complete pipeline; `rpp`'s loop, then
+`fkl_vf_hf`'s, then `fkl_bvf`'s; per-execution speedups averaged), then, in a child process in which the
 rocprofiler-sdk tool is registered (so that no profiler wraps the HIP API during the timed runs), kernel / memset /
 memcpy counts per pipeline and per RPP call (HIP runtime API tracing), GPU time only (rocprofiler-sdk kernel dispatch
-tracing, the sum of the durations of the pipeline's kernels; the HIP runtime's own memset and copy blit kernels are
-not counted, like CUPTI's kernel records) and GPU time only with a flush kernel that reads 2 x (L2 + MALL) before
+tracing in the same sequential loops, the sum of the durations of the pipeline's kernels; the HIP runtime's own
+memset and copy blit kernels are not counted, like CUPTI's kernel records) and GPU time only with a flush kernel that reads 2 x (L2 + MALL) before
 every GPU operation (files named `l2_flushed` as in the CUDA benchmark). Kernel dispatch tracing and hardware
 counters are not available on WSL2 (ROCm runs on `/dev/dxg` there): on WSL2 the program measures CPU + GPU and the
 counts, and says that GPU time only was not measured; if the profiling child fails, the CPU + GPU results are still
@@ -62,7 +72,11 @@ regions of iteration t as CSV; `rpp_cpu_bench` has `--batches` and `--workload`.
 
 Output files: those of the CUDA benchmark with `GPU_AMD` instead of `GPU_NVIDIA` (`latency.csv`, `validation.csv`,
 `kernels.csv`, `kernel_breakdown.csv`, `<baseline>_vs_fkl_bvf_[gpu_only_|gpu_only_l2_flushed_]GPU_AMD.csv`,
-`gpu_time.csv`, `gpu_time_l2_flushed.csv`, `platform.txt`), plus
+`gpu_time.csv`, `gpu_time_l2_flushed.csv`, `platform.txt`), plus each `<baseline>_vs_fkl_bvf_*.csv` file's
+`_per_iteration.csv` sibling (`Batch size, Iteration, <baseline> Time, fkl_bvf Time, Speedup`, times in ms, one row
+per N and timed iteration; `Iteration` is the iteration t of the regions, W to W + T - 1 with W warm-up and T timed
+iterations, the argument of `--regions`; the CPU and Experiment 3 per-iteration files number their rows the same
+way), and
 `kernel_counts_per_operation.csv`, `rpp_selection.csv`, `rpp_resize_convention.csv` and `regions.csv` (the sizes and
 areas of the regions of the timed iterations per N, as in every results folder); the RPP pipelines' memcpy counts
 include the upload of the ROIs (9 per execution: that one and the 8 of `rppt_yuv_to_rgb`); `validation.csv` has an
@@ -98,10 +112,11 @@ harness). Two parts, each a set of groups (part, K, passes, N) whose implementat
   `resize_box`: Figure 1's chain on Experiment 1's regions without the border, ReadNV12 -> YUVtoRGB -> Crop -> Resize
   64x32 -> Box -> Mul -> Sub -> Div -> Write, the DPP's input chain ending at the resize).
 
-In every group every implementation is validated and timed in the same interleaved iterations; the chosen DPP tile is
+In every group every implementation is validated, then timed one at a time (its complete loop before the next one's:
+the RPP variants or `fkl_bvf_naive` first, the DPP tiles last), on the same crops in iteration t; the chosen DPP tile is
 the fastest (median, CPU + GPU) within its tolerance and the chosen RPP variant the fastest within its tolerance and
 within `RPP_EQUIVALENCE` of its RPP-convention reference (`chosen` column); every one is recorded, and the speedups are
-per iteration over the chosen DPP tile. References (`bench::neighborhood::boxReference`: the box in double, then the
+per iteration over the chosen DPP tile, in the same iteration. References (`bench::neighborhood::boxReference`: the box in double, then the
 normalization in float; a box does not commute with the normalization in float, so the references blur first, the
 order of the pipeline and of every implementation but `rpp_f32box_cmn`, which normalizes in `rppt_crop_mirror_normalize`
 before its F32 box: it is held to its tolerance against these references, and exactly to its own RPP-convention
@@ -112,12 +127,15 @@ not saturated, is recorded too. Each RPP variant is also checked against its RPP
 arithmetic on RPP's 8 bit frame operation by operation (U8 box `rint(float(sum) * scale)`, F32 box the window summed in
 float row after row times the scale, `crop_mirror_normalize` `fmaf(x, multiplier, offset)`, `rppt_normalize`
 `fmaf(x - mean, 1 / stdDev, 0)`). It needs FKL with MorphologyDPP's `executeBoxBlur`: the commit recorded for the
-repository's `fkl` submodule (CMake builds `rocm_neighborhood` only with an FKL that has it, so FKL `63782f6` builds
-`rocm_bench` alone).
+repository's `fkl` submodule (CMake builds `rocm_neighborhood` only with an FKL that has it, so an older FKL such as
+`63782f6` builds `rocm_bench` alone).
 
 Output files (in `<results dir>/neighborhood` with `run_all.sh`): `latency.csv`, `validation.csv`, `gpu_time.csv`,
-`gpu_time_l2_flushed.csv`, `kernel_breakdown.csv`, `kernel_counts_per_operation.csv`, `regions.csv`,
-`regions_resize.csv` and `platform.txt`,
+`gpu_time_l2_flushed.csv`, their per-iteration siblings `latency_per_iteration.csv`, `gpu_time_per_iteration.csv` and
+`gpu_time_l2_flushed_per_iteration.csv` (for every implementation and timed iteration, its time and the chosen DPP
+tile's time in that iteration, in us, and their ratio, empty on the chosen tile's own rows; `iteration` is the
+iteration t of the regions, W to W + T - 1), `kernel_breakdown.csv`, `kernel_counts_per_operation.csv`,
+`regions.csv`, `regions_resize.csv` and `platform.txt`,
 with the group in the first columns (`part,operation,K,passes,N,implementation,chosen`) or in the implementation name
 (`<part>_<operation>_k<K>_p<passes>_n<N>/<implementation>`); `regions_resize.csv` has the regions of the resize
 variant. `--validate` only validates every group.
@@ -129,14 +147,17 @@ or, after the build below, `./build-rocm/rocm_neighborhood ../results/rocm-neigh
 ## CPU benchmark (`rocm/cpu/`)
 
 RPP's HOST backend against FKL's CPU backends, with the same number of threads on both sides: RPP with 1 thread
-against FKL's `ParArch::CPU`, and RPP with all hardware threads against FKL's `ParArch::CPU_MULTITHREAD`, with the
-protocol of [`fkl-vs-opencv-cpu/`](../fkl-vs-opencv-cpu/README.md). RPP's NV12 conversion is HIP only, so the RPP HOST pipelines
+against FKL's `ParArch::CPU`, and RPP with all hardware threads against FKL's `ParArch::CPU_MULTITHREAD`. For every
+N and thread count, RPP's complete loop runs first, then FKL's on the same regions, and every timed run is preceded by
+a 1 ms idle gap that the timing thread busy-waits (a sleeping core would enter its deepest C-state, and the run after
+it would pay a wake-up whose cost depends on the binary). RPP's NV12 conversion is HIP only, so the RPP HOST pipelines
 get their 8 bit RGB frame from FKL's CPU conversion (one thread for the 1 thread runs, FKL's thread pool for the
 others), then one of the five RPP variants on the HOST backend: for each thread count, a selection pass validates all
 of them (on the regions of iterations 0, 1, 2 and 0 again, so that every crop slot has held every size: the two outputs
-of iteration 0 must be identical) and times the ones numerically equivalent to `rpp_per_op` (10 warm-up + 100
-iterations per N, iteration i on the regions of iteration i), and only the fastest is measured (`cpu_rpp_selection.csv`; outputs `benchmark_cpu_rpp_1thread_vs_fkl_bvf_CPU.csv` and
-`benchmark_cpu_rpp_<T>threads_vs_fkl_bvf_CPU_MULTITHREAD.csv`). As on the GPU, the regions change every iteration:
+of iteration 0 must be identical) and times the ones numerically equivalent to `rpp_per_op` (each one's complete
+loop of 10 warm-up + 100 iterations per N, iteration i on the regions of iteration i), and only the fastest is
+measured (`cpu_rpp_selection.csv`; outputs `benchmark_cpu_rpp_1thread_vs_fkl_bvf_CPU.csv` and
+`benchmark_cpu_rpp_<T>threads_vs_fkl_bvf_CPU_MULTITHREAD.csv`, each with its `_per_iteration.csv` sibling). As on the GPU, the regions change every iteration:
 each pipeline converts the regions of every iteration when it is created (RPP: its XYWH ROIs; FKL: its rectangles),
 and inside the timed region RPP's calls get the ROI arrays of the iteration (host memory, read by RPP on the host) and
 FKL builds its operations with the iteration's rectangles and fuses them. Validation, before the timing of each N and
@@ -170,19 +191,16 @@ thread pool, so that the idle gap before every timed run puts both pools to slee
 - The ROCm 10.1 packages `amdrocm-rpp10.1` and `amdrocm-rpp-dev10.1` (RPP 3.2.0: the library and its headers),
   `amdrocm-profiler-base10.1` (rocprofiler-sdk, rocprofv3) and `amdrocm-amdsmi10.1`. Without root, unpack them with
   `apt-get download <package> && dpkg -x <package>_*.deb <prefix>` and set `ROCM_EXTRA=<prefix>/opt/rocm/core-10.1`.
-- FusedKernelLibrary at `63782f6` for Experiments 1 and 2 and the CPU benchmark, and at the commit recorded for the
-  repository's `fkl` submodule (with MorphologyDPP's `executeBoxBlur`) for Experiment 3. `run_all.sh` uses the
+- FusedKernelLibrary at the commit recorded for the repository's `fkl` submodule (with MorphologyDPP's
+  `executeBoxBlur`, which Experiment 3 needs), for every experiment and the CPU benchmark. `run_all.sh` uses the
   repository's `fkl` submodule with its `thread-pool` submodule (`git submodule update --init --recursive fkl`) unless
-  `FKL_GPU_DIR` / `FKL_CPU_DIR` name other checkouts, and stops if FKL is not at the commit of the experiment it runs.
-  The submodule is at Experiment 3's commit, so for Experiments 1 and 2 the default is a detached worktree of the
-  submodule at `63782f6` with its submodules, which `run_all.sh` makes the first time in `build-fkl-63782f6` (ignored
-  by git) and reuses.
+  `FKL_GPU_DIR` / `FKL_CPU_DIR` name other checkouts, and stops if FKL is not at that commit.
 
 ## Build and run
 
-Everything, in one command (it writes a platform snapshot first, builds, checks that FKL is at the right commits and
-unmodified and that kernel dispatch tracing and the hardware counters are available and count, then runs the GPU
-benchmark, the counters and the CPU benchmark; the counters default to `FETCH_SIZE GL2C_EA_WRREQ_sum
+Everything, in one command (it checks that FKL is at the commit recorded for the fkl submodule and unmodified, writes
+a platform snapshot, builds, checks that kernel dispatch tracing and the hardware counters are available and count,
+then runs the GPU benchmark, the counters and the CPU benchmark; the counters default to `FETCH_SIZE GL2C_EA_WRREQ_sum
 GL2C_EA_WRREQ_64B_sum`, since rocprofiler-sdk 1.4.1 defines no `WRITE_SIZE` for gfx12):
 
     rocm/scripts/run_all.sh ../results/rocm
@@ -222,9 +240,10 @@ measured execution exceeds the smallest of its three warm-up executions (the sam
 flushed) by more than 2 % and 256 KiB of traffic, up to `MAX_REPEATS` (3) rounds; the rejected profiles stay in
 `raw_rejected/` and `traffic_repeats.csv`, and `traffic.csv` has their count per row and whether a leak is still
 suspected. Duration on the paper's machine (bare metal, Ubuntu 26.04, Ryzen 7 5800X3D, RX 9060, performance level
-`STABLE_STD`), the paper run with `SKIP_COUNTERS=1`: 436 s, of which the builds 32 s, the GPU benchmark with
-its GPU time only passes 103 s and the CPU benchmark 299 s (the counters took 61 s in an earlier run with one region
-size).
+`STABLE_STD`), from `run_all.sh` started to finished: the paper run of Experiment 1 and the CPU benchmark, with
+`SKIP_COUNTERS=1`, 466 s, of which the builds 57 s (the GPU build also builds `rocm_neighborhood`), the GPU benchmark
+with its GPU time only passes 102 s and the CPU benchmark 306 s; Experiment 3's paper run (`EXPERIMENT=3`) 379 s, of
+which the build 47 s and `rocm_neighborhood` 331 s.
 
 The workload is the one of `common/bench_geometry.h`, with the three region sizes by turns (`BENCH_REGIONS=mixed`,
 the paper's); one size for every region, as the NPPDx builds use, is another CMake option in `BENCH_CMAKE_ARGS`, for
