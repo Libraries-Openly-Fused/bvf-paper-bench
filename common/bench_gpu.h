@@ -14,14 +14,15 @@
 
 // The harness of the GPU benchmarks that compare a library's pipeline with FKL's (fkl-vs-opencv-cuda, fkl-vs-npp,
 // fkl-ablation): the workload in device memory, FKL BVF (the paper's Listing 2), the references and the validation,
-// the interleaved timing (CPU + GPU, GPU only, GPU only with the L2 flushed), the kernel counts and per-kernel times,
+// the timing, one implementation's loop after the other (CPU + GPU, GPU only, GPU only with the L2 flushed), the kernel
+// counts and per-kernel times,
 // the Nsight Compute target, the CSV and platform files, and main(). Figure 1 pipeline:
 //   ReadNV12 -> YUVtoRGB -> Crop -> Resize -> AddBorder -> Mul -> Sub -> Div -> Write
 // with the frame, region sizes, batch sizes and region positions of common/bench_geometry.h, and NV12 -> RGB in BT.601
 // limited range in every implementation.
 //
-// The regions change every iteration: iteration t of every loop runs every pipeline on the regions of iteration t of
-// common/bench_geometry.h, which are generated before any loop (ctx.regions). Each pipeline converts them into the
+// The regions change every iteration: iteration t of each implementation's loop runs its pipeline on the regions of
+// iteration t of common/bench_geometry.h, which are generated before any loop (ctx.regions). Each pipeline converts them into the
 // arguments its library takes (FKL's rectangles, OpenCV's cv::Rect...) when it is created, also before the loops; what
 // it does in run(t) is what the library needs to receive the regions of this iteration (FKL's build() calls and the
 // fusion of the chain, NPP's descriptor upload, OpenCV's per-region views and calls), so that is timed.
@@ -41,9 +42,6 @@
 //   setup(outDir, mode)                   called before any run, with the mode argument (empty for the main run)
 //   regionSize                            every region of this size (RegionSets' fixed-size constructor) instead of
 //                                         the sizes of BENCH_REGIONS
-//   perIterationTimes                     also write every timed iteration's time of every implementation
-//                                         (per_iteration_<mode>.csv), for per-iteration speedups between any two
-//                                         implementations (nppdx-wins/)
 
 #ifndef BVF_BENCH_GPU_H
 #define BVF_BENCH_GPU_H
@@ -64,6 +62,7 @@
 #include "bench_geometry.h"
 #include "bench_npp.h"
 #include "bench_platform.h"
+#include "bench_timing.h"
 #include "bench_validation.h"
 
 #include <algorithm>
@@ -535,50 +534,19 @@ inline std::string nppConversionDiagnostic(const Context& ctx) {
     return os.str();
 }
 
-// Statistics of a set of timed executions, in microseconds
-struct TimingStats {
-    double mean{0.}, variance{0.}, max{0.}, min{0.}, median{0.}, p10{0.}, p90{0.};
-};
-
-inline double percentile(const std::vector<float>& sorted, double p) {
-    const double pos = p * static_cast<double>(sorted.size() - 1);
-    const size_t lo = static_cast<size_t>(std::floor(pos));
-    const size_t hi = std::min(lo + 1, sorted.size() - 1);
-    return sorted[lo] + (pos - static_cast<double>(lo)) * (sorted[hi] - sorted[lo]);
-}
-
-inline TimingStats computeStats(std::vector<float> ms) {
-    TimingStats t;
-    double sum = 0.;
-    for (const float v : ms) {
-        sum += v;
-    }
-    t.mean = sum / ms.size() * 1000.;
-    double sumOfDiff = 0.;
-    for (const float v : ms) {
-        sumOfDiff += (v * 1000. - t.mean) * (v * 1000. - t.mean);
-    }
-    t.variance = ms.size() > 1 ? sumOfDiff / (ms.size() - 1) : 0.;
-    std::sort(ms.begin(), ms.end());
-    t.min = ms.front() * 1000.;
-    t.max = ms.back() * 1000.;
-    t.median = percentile(ms, 0.5) * 1000.;
-    t.p10 = percentile(ms, 0.1) * 1000.;
-    t.p90 = percentile(ms, 0.9) * 1000.;
-    return t;
-}
-
-// Latency of each complete pipeline, the way FKL's two-execution benchmarks measure: in every iteration all the
-// implementations run one after the other on the regions of that iteration, each one between two CUDA events on the
-// same stream (everything the host does to enqueue it is included) and followed by a synchronization. The frame is
-// already in device memory. Returns the TIMED_ITERS execution times of each implementation, in ms, in iteration order.
-inline std::vector<std::vector<float>> measureInterleaved(const Context& ctx, const std::vector<Implementation>& impls) {
+// Latency of each complete pipeline, the way FKL's two-execution benchmarks measure, with the implementations never
+// running at the same time: each implementation's complete loop (the warm-up iterations, then the timed ones, on the
+// regions of each iteration) runs before the next one's, the baselines first and FKL BVF last. Each run is between two
+// CUDA events on the same stream (everything the host does to enqueue it is included) and followed by a
+// synchronization. The frame is already in device memory. Returns the TIMED_ITERS execution times of each
+// implementation, in ms, in iteration order: the speedups pair the runs of the same iteration (identical inputs).
+inline std::vector<std::vector<float>> measureSequential(const Context& ctx, const std::vector<Implementation>& impls) {
     cudaEvent_t start, stop;
     gpuErrchk(cudaEventCreate(&start));
     gpuErrchk(cudaEventCreate(&stop));
     std::vector<std::vector<float>> ms(impls.size(), std::vector<float>(TIMED_ITERS));
-    for (int i = 0; i < WARMUP_ITERS + TIMED_ITERS; ++i) {
-        for (size_t k = 0; k < impls.size(); ++k) {
+    for (size_t k = 0; k < impls.size(); ++k) {
+        for (int i = 0; i < WARMUP_ITERS + TIMED_ITERS; ++i) {
             gpuErrchk(cudaEventRecord(start, ctx.stream));
             impls[k].run(static_cast<size_t>(i));
             gpuErrchk(cudaEventRecord(stop, ctx.stream));
@@ -788,8 +756,9 @@ inline PipelineProfile profilePipeline(const Context& ctx, const Implementation&
 inline std::vector<PipelineProfile> profiles;
 
 // Every timed iteration's time of every implementation, one file per mode (per_iteration_latency.csv,
-// per_iteration_gpu_only.csv, per_iteration_gpu_only_l2_flushed.csv), when the Program has perIterationTimes: the
-// directory is set by gpuBenchMain; each file is truncated by the first batch of a process and appended by the others
+// per_iteration_gpu_only.csv, per_iteration_gpu_only_l2_flushed.csv), for every program: the pairs the mean speedups
+// average, and per-iteration speedups between any two implementations. The directory is set by gpuBenchMain; each file
+// is truncated by the first batch of a process and appended by the others
 inline std::filesystem::path perIterationDir;
 inline void writePerIteration(const std::string& mode, const size_t batch, const std::vector<Implementation>& impls,
                               const std::vector<std::vector<float>>& ms) {
@@ -862,7 +831,8 @@ std::vector<std::string> baselineNames(Context& ctx) {
     return names;
 }
 
-// Validation on the validated iterations, interleaved timing with per-execution speedups, and per kernel breakdown, for
+// Validation on the validated iterations, timing (one implementation's loop after the other) with per-iteration
+// speedups, and per kernel breakdown, for
 // batch N
 template <typename P, size_t N>
 void runBatch(Context& ctx, std::vector<Result>& results) {
@@ -903,7 +873,7 @@ void runBatch(Context& ctx, std::vector<Result>& results) {
                 r.errorsPerIteration.size() == 1 ? vsFloat : validation::combine(r.errorVsFloatReference, vsFloat);
         }
     }
-    const auto ms = measureInterleaved(ctx, impls);
+    const auto ms = measureSequential(ctx, impls);
     writePerIteration("latency", N, impls, ms);
     for (size_t k = 0; k < impls.size(); ++k) {
         Result& r = batchResults[k];
@@ -986,8 +956,9 @@ void ncuTarget(Context& ctx, const std::string& name) {
     nvtxRangePop();
 }
 
-// GPU time only benchmark: the same interleaved iterations as the CPU + GPU one, with CUPTI kernel tracing on. The
-// GPU time of one execution is the sum of the execution times of its kernels: no host work and no launch gaps.
+// GPU time only benchmark: the same loops as the CPU + GPU one, one implementation after the other, with CUPTI kernel
+// tracing on during the timed iterations. The GPU time of one execution is the sum of the execution times of its
+// kernels: no host work and no launch gaps.
 template <typename P, size_t N>
 void gpuOnlyBatch(Context& ctx, std::vector<Result>& results, L2Flusher* flusher = nullptr) {
     const auto impls = implementationsOf<P, N>(ctx);
@@ -997,45 +968,37 @@ void gpuOnlyBatch(Context& ctx, std::vector<Result>& results, L2Flusher* flusher
         kernelsPerRun[k] = countLaunches(ctx, impls[k]).kernels;
     }
     activeFlusher = flusher;
-    for (int i = 0; i < WARMUP_ITERS; ++i) {
-        for (const auto& impl : impls) {
-            impl.run(static_cast<size_t>(i));
-            gpuErrchk(cudaStreamSynchronize(ctx.stream));
-        }
-    }
-    CUPTI_CHECK(cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED));
-    cupti::kernels.clear();
-    cupti::keepKernels = true;
-    CUPTI_CHECK(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
-    for (int i = 0; i < TIMED_ITERS; ++i) {
-        for (const auto& impl : impls) {
-            impl.run(static_cast<size_t>(WARMUP_ITERS + i));
-            gpuErrchk(cudaStreamSynchronize(ctx.stream));
-        }
-        if (i % 100 == 99) {
-            CUPTI_CHECK(cuptiActivityFlushAll(0));
-        }
-    }
-    CUPTI_CHECK(cuptiActivityDisable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
-    CUPTI_CHECK(cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED));
-    cupti::keepKernels = false;
-    activeFlusher = nullptr;
-    auto& records = cupti::kernels;
-    std::sort(records.begin(), records.end(), [](const KernelRecord& a, const KernelRecord& b) { return a.start < b.start; });
-    size_t expected = 0;
-    for (const size_t n : kernelsPerRun) {
-        expected += n * TIMED_ITERS;
-    }
-    if (records.size() != expected) {
-        throw std::runtime_error("GPU only benchmark: expected " + std::to_string(expected) + " kernel records, got " +
-                                 std::to_string(records.size()));
-    }
-    // The executions are sequential, so in start time order the records are iteration by iteration, implementation
-    // by implementation
+    // Each implementation's warm-up and traced timed iterations, then the next implementation's; the executions are
+    // sequential, so in start time order the records of one implementation are iteration by iteration
     std::vector<std::vector<float>> ms(impls.size(), std::vector<float>(TIMED_ITERS));
-    size_t idx = 0;
-    for (int i = 0; i < TIMED_ITERS; ++i) {
-        for (size_t k = 0; k < impls.size(); ++k) {
+    auto& records = cupti::kernels;
+    for (size_t k = 0; k < impls.size(); ++k) {
+        for (int i = 0; i < WARMUP_ITERS; ++i) {
+            impls[k].run(static_cast<size_t>(i));
+            gpuErrchk(cudaStreamSynchronize(ctx.stream));
+        }
+        CUPTI_CHECK(cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED));
+        records.clear();
+        cupti::keepKernels = true;
+        CUPTI_CHECK(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
+        for (int i = 0; i < TIMED_ITERS; ++i) {
+            impls[k].run(static_cast<size_t>(WARMUP_ITERS + i));
+            gpuErrchk(cudaStreamSynchronize(ctx.stream));
+            if (i % 100 == 99) {
+                CUPTI_CHECK(cuptiActivityFlushAll(0));
+            }
+        }
+        CUPTI_CHECK(cuptiActivityDisable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
+        CUPTI_CHECK(cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED));
+        cupti::keepKernels = false;
+        std::sort(records.begin(), records.end(),
+                  [](const KernelRecord& a, const KernelRecord& b) { return a.start < b.start; });
+        if (records.size() != kernelsPerRun[k] * TIMED_ITERS) {
+            throw std::runtime_error("GPU only benchmark: expected " + std::to_string(kernelsPerRun[k] * TIMED_ITERS) +
+                                     " kernel records of " + impls[k].name + ", got " + std::to_string(records.size()));
+        }
+        size_t idx = 0;
+        for (int i = 0; i < TIMED_ITERS; ++i) {
             uint64_t ns = 0;
             for (size_t j = 0; j < kernelsPerRun[k]; ++j, ++idx) {
                 ns += records[idx].end - records[idx].start;
@@ -1043,6 +1006,7 @@ void gpuOnlyBatch(Context& ctx, std::vector<Result>& results, L2Flusher* flusher
             ms[k][i] = static_cast<float>(ns * 1e-6);
         }
     }
+    activeFlusher = nullptr;
     records.clear();
     writePerIteration(flusher ? "gpu_only_l2_flushed" : "gpu_only", N, impls, ms);
     for (size_t k = 0; k < impls.size(); ++k) {
@@ -1131,34 +1095,6 @@ inline void freeL2Flusher(L2Flusher& flusher) {
     gpuErrchk(cudaFree(flusher.sink));
 }
 
-// FKL's two-execution CSV format (times in ms): one row per value of the first column
-inline void writeTwoExecutionHeader(std::ostream& two, const std::string& firstColumn, const std::string& baseline,
-                                    const std::string& fkl) {
-    two << firstColumn;
-    for (const std::string label : {baseline, fkl}) {
-        two << ", " << label << " MeanTime, " << label << " TimeVariance, " << label << " MaxTime, " << label
-            << " MinTime";
-    }
-    two << ", Mean Speedup";
-    for (const std::string label : {baseline, fkl}) {
-        two << ", " << label << " MedianTime, " << label << " P10Time, " << label << " P90Time";
-    }
-    two << std::endl;
-}
-
-inline void writeTwoExecutionRow(std::ostream& two, long long key, const TimingStats& tb, const TimingStats& tf,
-                                 double speedup) {
-    two << key;
-    for (const TimingStats* t : std::array<const TimingStats*, 2>{&tb, &tf}) {
-        two << ", " << t->mean / 1000. << ", " << t->variance / 1e6 << ", " << t->max / 1000. << ", " << t->min / 1000.;
-    }
-    two << ", " << speedup;
-    for (const TimingStats* t : std::array<const TimingStats*, 2>{&tb, &tf}) {
-        two << ", " << t->median / 1000. << ", " << t->p10 / 1000. << ", " << t->p90 / 1000.;
-    }
-    two << std::endl;
-}
-
 // One CSV per baseline in FKL's two-execution format: <baseline>_vs_<fkl>_<suffix><ParArch>.csv, with fkl the name of
 // the FKL implementation (fkl_bvf)
 template <typename Field>
@@ -1196,11 +1132,14 @@ void writePlatform(const std::filesystem::path& outDir, const std::vector<std::s
     for (const auto& b : baselines) {
         names += b + ", ";
     }
+    char busId[64] = {};
+    gpuErrchk(cudaDeviceGetPCIBusId(busId, sizeof(busId), device));
     std::ofstream os(outDir / "platform.txt");
     os << "Benchmark: " << P::title << "\n"
        << "GPU: " << prop.name << " (sm_" << prop.major << prop.minor << ", " << prop.multiProcessorCount << " SMs, "
-       << (prop.totalGlobalMem >> 20) << " MiB)\n"
-       << "NVIDIA driver: " << bench::shell("nvidia-smi --query-gpu=driver_version --format=csv,noheader") << "\n"
+       << (prop.totalGlobalMem >> 20) << " MiB), CUDA device " << device << "; in nvidia-smi: "
+       << bench::nvidiaSmi(busId, "index,pci.bus_id,uuid") << "\n"
+       << "NVIDIA driver: " << bench::nvidiaSmi(busId, "driver_version") << "\n"
        << "CUDA runtime: " << runtime / 1000 << "." << (runtime % 1000) / 10 << ", CUDA driver API: " << driver / 1000
        << "." << (driver % 1000) / 10 << "\n"
        << "nvcc: " << BENCH_NVCC_VERSION << "\n"
@@ -1210,8 +1149,8 @@ void writePlatform(const std::filesystem::path& outDir, const std::vector<std::s
     P::describe(os, outDir);
     os << "CPU: " << bench::cpuName() << "\n"
        << "OS: " << bench::osName() << ", kernel " << bench::kernelVersion() << "\n"
-       << "GPU clocks: not locked (locking needs root); application clocks as reported by nvidia-smi: "
-       << bench::shell("nvidia-smi --query-gpu=clocks.max.sm,clocks.max.mem --format=csv,noheader") << "\n"
+       << "GPU clocks: not locked by the benchmark (locking needs root); maximum SM and memory clocks (nvidia-smi clocks.max.sm, clocks.max.mem): "
+       << bench::nvidiaSmi(busId, "clocks.max.sm,clocks.max.mem") << "\n"
        << "\n";
     if constexpr (requires { P::workload(os); }) {
         P::workload(os);
@@ -1222,22 +1161,24 @@ void writePlatform(const std::filesystem::path& outDir, const std::vector<std::s
            << "FKL BVF: one executeOperations call, one kernel: no intermediates in memory, float3 from the color "
               "conversion to the write.\n";
     }
-    os << "Regions: iteration t of every loop (the " << WARMUP_ITERS << " warm-up iterations are t in [0, " << WARMUP_ITERS
-       << "), the " << TIMED_ITERS << " timed ones t in [" << WARMUP_ITERS << ", " << WARMUP_ITERS + TIMED_ITERS
-       << ")) runs every pipeline on the regions of "
+    os << "Regions: iteration t of each implementation's loop (the " << WARMUP_ITERS << " warm-up iterations are t in "
+       << "[0, " << WARMUP_ITERS << "), the " << TIMED_ITERS << " timed ones t in [" << WARMUP_ITERS << ", "
+       << WARMUP_ITERS + TIMED_ITERS << ")) runs that implementation's pipeline on the regions of "
        << "iteration t, generated before the loops and the same for every implementation, program and machine "
        << "(statistics of the timed ones in regions.csv). Each pipeline converts them into its library's arguments "
        << "before the loops; inside the timed region is what the library needs to receive the regions of the "
        << "iteration: FKL's build() calls and the fusion of the chain, and the per-region arguments and calls of "
        << "the baselines (see their pipelines).\n"
-       << "Timing: " << WARMUP_ITERS << " warm-up then " << TIMED_ITERS << " timed iterations. In every iteration "
-       << names << "then " << fklLabelOf<P>() << " run one after the other, each timed with CUDA events on one stream "
+       << "Timing: the implementations never run at the same time: for every batch size, each one's complete loop ("
+       << WARMUP_ITERS << " warm-up then " << TIMED_ITERS << " timed iterations) runs before the next one's, " << names
+       << "then " << fklLabelOf<P>() << ", every run timed with CUDA events on one stream "
        << "around the complete pipeline (all host enqueue work included) and followed by a synchronization. "
        << fklLabelOf<P>() << "'s speedup "
        << "over each baseline is computed per iteration (baseline time / " << fklShortLabelOf<P>()
-       << " time) and averaged (mean speedup, FKL's "
+       << " time of the same iteration, identical inputs) and averaged (mean speedup, FKL's "
        << "two-execution convention). Median, p10, p90 with linear interpolation.\n"
-       << "GPU time only: a second pass with the same interleaved iterations and regions and CUPTI kernel tracing on; "
+       << "GPU time only: a second pass with the same loops and regions, one implementation after the other, and "
+          "CUPTI kernel tracing on during the timed iterations; "
        << "the GPU time of one execution is the sum of the execution times of its kernels (no host work, no launch "
        << "gaps, no memory copies), and " << fklLabelOf<P>()
        << "'s speedups are again computed per execution and averaged.\n"
@@ -1284,9 +1225,7 @@ int gpuBenchMain(int argc, char** argv) {
         }
         std::filesystem::path outDir = argc > 1 ? argv[1] : "results";
         std::filesystem::create_directories(outDir);
-        if constexpr (requires { P::perIterationTimes; }) {
-            perIterationDir = outDir;
-        }
+        perIterationDir = outDir;
         if constexpr (requires { P::setup(outDir, std::string()); }) {
             P::setup(outDir, argc > 2 ? std::string(argv[2]) : std::string());
         }

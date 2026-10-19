@@ -4,7 +4,8 @@
 # per-kernel GPU times and bvf_types, the type of the fused operation), FKL vs NPPDx for every region size (both
 # programs: main run, L2 flushed, and the runner-up NPPDx configuration re-timed against FKL), the neighborhood
 # experiment (fkl-neighborhood: every program, main run and L2 flushed, on its fixed-size 64x32 crops),
-# FKL vs OpenCV on the CPU, with COMPILE_TIME=1 the compile-time units, and with PROFILE=1 the memory traffic with
+# FKL vs OpenCV on the CPU, with the halide step FKL vs Halide on the CPU (one process per Halide thread count), with
+# COMPILE_TIME=1 the compile-time units, and with PROFILE=1 the memory traffic with
 # Nsight Compute
 # (scripts/ncu_dram.sh and ncu_l2.sh, their summaries and the traffic model), which needs the driver to let every user
 # read the GPU performance counters (RmProfilingAdminOnly=0); otherwise, since those scripts then need root, their
@@ -18,7 +19,8 @@
 #
 # Environment variables:
 #   STEPS        the benchmarks to build and run, among opencv-cuda, npp, ablation, nppdx, neighborhood and opencv-cpu
-#                (default all)
+#                (default all), and halide (FKL vs Halide on the CPU, not in the default: it needs HALIDE_DIR)
+#   HALIDE_DIR   for the halide step: the folder of the Halide 21.0.0 release (fkl-vs-halide-cpu/README.md)
 #   NPPDX_SIZES  the region sizes of FKL vs NPPDx (default "20x10 32x16 48x24")
 #   COMPILE_TIME 1 to also run scripts/compile_time.sh after the runs (long: 10 rounds of every unit): FKL's ablation,
 #                the OpenCV and NPP units, and in the NPPDx builds the headers and FKL BVF (first size) and the NPPDx
@@ -26,10 +28,10 @@
 #   PROFILE      1 to run the Nsight Compute scripts (needs the opencv-cuda, npp and ablation steps and the GPU
 #                performance counters open to every user); without it, their commands are printed at the end
 #   BUILD_ROOT   where the build folders go (default this repository): build-<step>, and build-nppdx-<size>
-#   CPU_CXX      C++ compiler of the CPU benchmark (default clang++; the README recommends a recent clang)
+#   CPU_CXX      C++ compiler of the CPU benchmarks (default clang++; the README recommends a recent clang)
 #   CMAKE_ARGS   more options for every CMake project (for example -DBENCH_ITERATIONS=1 for a quick check). They
 #                come before the options this script sets for each project (BENCH_REGIONS, OpenCV_DIR, and CPU_CXX for
-#                the CPU benchmark), which win. Setting or unsetting BENCH_REGIONS in them is an error: this script sets
+#                the CPU benchmarks), which win. Setting or unsetting BENCH_REGIONS in them is an error: this script sets
 #                it for every project (mixed, or the NPPDx sizes of NPPDX_SIZES)
 # Results: <results>/<benchmark folder>, FKL vs NPPDx in <results>/fkl-vs-nppdx/<size> (the runner-up configurations in
 # its runner-up/), the neighborhood experiment in <results>/fkl-neighborhood/<program>, logs in <results>/logs. The GPU benchmarks run one at a time; leave the GPU otherwise idle.
@@ -82,6 +84,10 @@ has_step() { [[ " $STEPS " == *" $1 "* ]]; }
 # (BENCH_OPENCV, which CMAKE_ARGS can turn off): its CMake project enforces that, and gets OpenCV_DIR when it is set.
 if { has_step opencv-cuda || has_step opencv-cpu; } && [ -z "${OpenCV_DIR:-}" ]; then
     echo "Set OpenCV_DIR to the OpenCV build or install folder (the OpenCV benchmarks need it)" >&2
+    exit 1
+fi
+if has_step halide && [ ! -f "${HALIDE_DIR:-}/lib/cmake/Halide/HalideConfig.cmake" ]; then
+    echo "Set HALIDE_DIR to the folder of the Halide 21.0.0 release (the halide step needs it)" >&2
     exit 1
 fi
 # Every size has its own build, results and log paths, so a size listed twice would overwrite its first measurements
@@ -160,6 +166,16 @@ for step in opencv-cuda npp ablation opencv-cpu; do
         run "$LOGS/bvf_types.log" "$build/bvf_types"
     fi
 done
+if has_step halide; then
+    # One process per Halide thread count: Halide's JIT runtime cannot take threads away from a started pool
+    build=$BUILD_ROOT/build-halide
+    out=$RESULTS/fkl-vs-halide-cpu
+    echo "  fkl-vs-halide-cpu ($build)"
+    configure "$REPO/fkl-vs-halide-cpu" "$build" -DBENCH_REGIONS=mixed -DCMAKE_CXX_COMPILER="$CPU_CXX" \
+              -DHalide_DIR="$HALIDE_DIR/lib/cmake/Halide"
+    run "$LOGS/benchmark_halide_cpu_1thread.log" "$build/benchmark_halide_cpu" "$out" 1
+    run "$LOGS/benchmark_halide_cpu_pool.log" "$build/benchmark_halide_cpu" "$out" pool
+fi
 if has_step nppdx; then
     for size in $NPPDX_SIZES; do
         build=$BUILD_ROOT/build-nppdx-$size
@@ -169,7 +185,7 @@ if has_step nppdx; then
         for program in benchmark_nppdx benchmark_nppdx_npp; do
             run "$LOGS/${program}_$size.log" "$build/$program" "$out"
             run "$LOGS/${program}_${size}_l2_flushed.log" "$build/$program" "$out" --gpu-only-l2-flushed
-            # The second fastest configuration of the sweep against FKL, in the same interleaved iterations
+            # The second fastest configuration of the sweep against FKL, with the protocol and regions of the chosen one
             run "$LOGS/${program}_${size}_runner_up_configs.log" python3 "$REPO/scripts/nppdx_runner_up.py" \
                 "$out/${program}_nppdx_block_sweep_GPU_NVIDIA.csv" "$out/${program}_runner_up_config.csv"
             run "$LOGS/${program}_${size}_runner_up.log" "$build/$program" "$out/runner-up" --configs \

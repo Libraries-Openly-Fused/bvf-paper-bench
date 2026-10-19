@@ -6,8 +6,8 @@
 Reads the configuration sweep of a run of benchmark_nppdx or benchmark_nppdx_npp (every configuration validated and
 its NPPDx kernel timed alone) and writes, in the format of <benchmark>_nppdx_config_GPU_NVIDIA.csv that --configs
 reads, the second fastest configuration within its tolerance for every batch size: the fastest one that the run did
-not choose. Running the benchmark with --configs <output> then compares it with FKL in the same interleaved iterations
-as the chosen one, which shows how much the choice matters.
+not choose. Running the benchmark with --configs <output> then compares it with FKL with the same protocol and regions as
+the chosen one, which shows how much the choice matters.
 """
 import csv
 import sys

@@ -188,7 +188,7 @@ ConfigSweepRow sweepConfig(Context& ctx, const size_t index, const std::vector<f
             return;
         }
         // The pipeline is the NPPDx kernel alone
-        row.timing = computeStats(measureInterleaved(ctx, {makeNppdx<N, C>(ctx)})[0]);
+        row.timing = computeStats(measureSequential(ctx, {makeNppdx<N, C>(ctx)})[0]);
     });
     return row;
 }
